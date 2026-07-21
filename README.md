@@ -22,12 +22,13 @@ Detailed product planning, architecture drafts, decision notes, delivery plans, 
 - `agent-harness/workflow.md`: the slice, validation, and review loop
 - `agent-harness/prompts/implementation-review.md`: independent review contract
 - `agent-harness/templates/task-plan.md`: per-slice planning template
-- `.codex/config.toml`: project reviewer role registration
+- `.codex/agents/reviewer.toml`: project-scoped read-only reviewer definition
+- `.codex/config.toml`: subagent concurrency and nesting limits
 - `scripts/validate-docs.sh`: public-rule validation, plus local design validation when `local/` exists
 
 ## Current technical direction
 
-The working design uses a macOS-first Tauri desktop shell, React/TypeScript UI, and an independently-lived Rust daemon that owns agent processes, PTYs, event ordering, and local SQLite persistence. These choices remain subject to the documented feasibility spikes before product implementation.
+The working design uses a macOS-first Tauri 2 desktop shell, a React/TypeScript UI, and a Rust Core that is Flit's single control plane and SQLite writer. Codex and Claude Code remain owned by their documented native session runtimes; provider adapters reconcile those sessions into Flit, while Generic CLI runs use a Flit-owned PTY. The terminal surface defaults provisionally to xterm.js, with a Phase 0 comparison against ghostty-web. These choices remain subject to the documented feasibility spikes before product implementation.
 
 ## Validation
 

@@ -22,8 +22,8 @@ Before changing the repository, read `README.md`, this file, and `agent-harness/
 - Normal progress stays quiet; only moments that need human action are promoted.
 - Every summarized or inferred state must link to raw evidence such as an event, terminal range, transcript, command, or diff.
 - Keep lifecycle, current activity, and attention level as independent state dimensions.
-- The daemon is the sole owner of agent PTYs and SQLite writes; the UI projects state and sends validated commands.
-- Adapter inference records its source, confidence, and evidence. Uncertain behavior degrades to `Unknown` or raw terminal control.
+- Tauri Rust Core is Flit's sole event-ordering and SQLite writer. It owns Generic CLI PTYs; provider-native runtimes own Codex and Claude Code sessions.
+- Provider adapters use documented, version-probed surfaces and record source, confidence, capability, and evidence. Uncertain behavior degrades to `Unknown` and only exposes raw terminal control when the provider supports it safely.
 - Permission and question responses are bound to request identity and version. Reject stale and duplicate responses.
 - Never create a persistent permission rule for an action, path, or scope the user was not shown.
 - Treat transcripts and logs as local sensitive data that may contain secrets.
@@ -33,7 +33,7 @@ Before changing the repository, read `README.md`, this file, and `agent-harness/
 - Keep each change small enough to explain as one commit unit.
 - Record assumptions, success criteria, changed files, focused validation, and full validation before implementation.
 - Build the smallest vertical slice and avoid unrelated refactors.
-- Run focused validation, then have an independent reviewer inspect only the changed scope.
+- Run focused validation, then use the independent review gate defined in `agent-harness/workflow.md` for only the changed scope.
 - Fix findings, re-run the same checks, and repeat until the reviewer returns exactly `No Findings`.
 - Run full validation and `git diff --check` before reporting completion.
 - Preserve user changes and do not edit out-of-scope files.

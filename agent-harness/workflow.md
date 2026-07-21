@@ -100,7 +100,7 @@ Keep schema migrations, adapter behavior, UI copy, and release configuration in 
 2. Implement the minimum change that satisfies it.
 3. Re-read the changed files for scope and invariant drift.
 4. Run focused validation.
-5. Give an independent reviewer the plan, success criteria, changed files, and validation evidence.
+5. Delegate to the project-scoped custom agent whose configured `name` is `reviewer`, with the plan, success criteria, changed files, and validation evidence.
 6. Fix each finding with the smallest relevant change.
 7. Re-run the same focused checks and review.
 8. Continue until the reviewer returns exactly `No Findings` with no additional text.
@@ -109,6 +109,17 @@ Keep schema migrations, adapter behavior, UI copy, and release configuration in 
 11. Record results and any unrun checks, then commit one logical unit.
 
 The reviewer must inspect the diff and source-of-truth contracts directly rather than trusting the implementation summary.
+
+### Reviewer invocation boundary
+
+<!-- flit-reviewer-contract:v1 custom=reviewer nested-codex=forbidden fallback=hash-verified -->
+
+- Use the project custom agent defined by `.codex/agents/reviewer.toml`; Codex selects it by the file's `name = "reviewer"` field.
+- Confirm that the spawned agent uses that custom role and its configured reasoning effort. A generic child whose task label or nickname is merely `reviewer` does not satisfy the gate.
+- Prefer an effective `sandbox_mode = "read-only"` reviewer. If the current client instead reapplies the parent `workspace-write` permission to the selected custom reviewer, record that limitation and use the fallback only with explicit user acceptance: prohibit reviewer writes, freeze the reviewed scope, and compare aggregate tracked-diff and required-local-source hashes before and after the pass. Compare hashes programmatically and report only changed/unchanged; any change invalidates the review.
+- Keep the reviewer independent from the implementing agent's conclusions.
+- Do not launch a nested Codex client with `codex exec` or another shell command to satisfy this gate.
+- Report the review gate as blocked if the custom role or configured reasoning cannot be verified, the user does not accept the sandbox fallback, or the integrity comparison changes. Deterministic validation and the implementing agent's self-review do not count as an independent review.
 
 ## 5. Choose focused validation
 
@@ -128,7 +139,7 @@ Confirm that a test exercises the changed risk instead of relying on a convenien
 
 ## 6. Independent reviewer
 
-The project reviewer role is registered in `.codex/config.toml` and configured by `.codex/agents/reviewer.toml`. Its output contract is `agent-harness/prompts/implementation-review.md`.
+The project custom agent is defined and discovered from `.codex/agents/reviewer.toml`. `.codex/config.toml` contains only global subagent limits. Its output contract is `agent-harness/prompts/implementation-review.md`.
 
 Always provide:
 

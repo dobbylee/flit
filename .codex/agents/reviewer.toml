@@ -1,3 +1,5 @@
+name = "reviewer"
+description = "Read-only independent reviewer for the current Flit commit unit"
 model_reasoning_effort = "xhigh"
 sandbox_mode = "read-only"
 developer_instructions = """

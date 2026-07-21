@@ -35,8 +35,15 @@ const localRequired = [
   "local/docs/delivery/implementation-plan.md",
   "local/docs/delivery/traceability.md",
   "local/docs/decisions/README.md",
+  "local/docs/decisions/0004-native-provider-control-plane.md",
   "local/checklists/implementation-ready.md",
   "local/checklists/release.md",
+  "local/spikes/README.md",
+  "local/spikes/s0-1-native-provider-contract.md",
+  "local/spikes/s0-2-tauri-core-lifecycle.md",
+  "local/spikes/s0-3-terminal-renderer.md",
+  "local/spikes/s0-4-generic-pty.md",
+  "local/spikes/s0-5-event-store.md",
 ];
 
 for (const file of publicRequired) {
@@ -45,6 +52,38 @@ for (const file of publicRequired) {
 
 const gitignore = fs.readFileSync(path.join(repo, ".gitignore"), "utf8");
 if (!/^local\/$/m.test(gitignore)) errors.push(".gitignore must contain an exact local/ rule");
+
+const codexConfig = fs.readFileSync(path.join(repo, ".codex/config.toml"), "utf8");
+if (/^\[agents\.[^\]]+\]/m.test(codexConfig)) {
+  errors.push("custom agents must use standalone .codex/agents TOML files");
+}
+
+const reviewerConfig = fs.readFileSync(path.join(repo, ".codex/agents/reviewer.toml"), "utf8");
+const reviewerHeader = /^name = "reviewer"\ndescription = "[^"\n]+"\nmodel_reasoning_effort = "xhigh"\nsandbox_mode = "read-only"\ndeveloper_instructions = """\n/;
+if (!reviewerHeader.test(reviewerConfig)) {
+  errors.push("reviewer config must start with the required standalone reviewer fields");
+}
+if (!reviewerConfig.trimEnd().endsWith('"""')) {
+  errors.push("reviewer config must end with the multiline developer instructions");
+}
+if (/^\[[^\]]+\]$/m.test(reviewerConfig)) {
+  errors.push("reviewer config must not declare TOML sections");
+}
+
+const workflow = fs.readFileSync(path.join(repo, "agent-harness/workflow.md"), "utf8");
+const reviewerWorkflowMarker =
+  "<!-- flit-reviewer-contract:v1 custom=reviewer nested-codex=forbidden fallback=hash-verified -->";
+if ((workflow.match(new RegExp(reviewerWorkflowMarker, "g")) ?? []).length !== 1) {
+  errors.push("workflow must contain exactly one reviewer contract marker");
+}
+const nestedCodexRule =
+  "- Do not launch a nested Codex client with `codex exec` or another shell command to satisfy this gate.";
+if (!workflow.includes(nestedCodexRule) || (workflow.match(/`codex exec`/g) ?? []).length !== 1) {
+  errors.push("workflow must contain only the canonical nested Codex prohibition");
+}
+if (/registered in `.codex\/config\.toml`/i.test(workflow)) {
+  errors.push("workflow must not claim reviewer registration in .codex/config.toml");
+}
 
 function collectFiles(directory, predicate, skippedNames = new Set()) {
   const results = [];
@@ -119,19 +158,93 @@ if (fs.existsSync(localRoot)) {
 
   const prd = fs.readFileSync(path.join(localRoot, "docs/product/prd.md"), "utf8");
   const traceability = fs.readFileSync(path.join(localRoot, "docs/delivery/traceability.md"), "utf8");
+  const eventProtocol = fs.readFileSync(path.join(localRoot, "docs/design/event-state-protocol.md"), "utf8");
+  const adapterContract = fs.readFileSync(path.join(localRoot, "docs/design/adapter-contract.md"), "utf8");
+  const runtimeArchitecture = fs.readFileSync(
+    path.join(localRoot, "docs/design/runtime-architecture.md"),
+    "utf8",
+  );
   const frIds = new Set([...prd.matchAll(/\*\*(FR-\d{3})\b/g)].map((match) => match[1]));
   const nfrIds = new Set([...prd.matchAll(/\*\*(NFR-\d{3})\b/g)].map((match) => match[1]));
 
   if (frIds.size !== 24) errors.push(`expected 24 local FR definitions, found ${frIds.size}`);
   if (nfrIds.size !== 12) errors.push(`expected 12 local NFR definitions, found ${nfrIds.size}`);
   for (const id of [...frIds, ...nfrIds]) {
-    if (!traceability.includes(`| ${id} `)) errors.push(`missing local traceability row: ${id}`);
+    const rows = [...traceability.matchAll(new RegExp(`^\\| ${id} `, `gm`))];
+    if (rows.length === 0) errors.push(`missing local traceability row: ${id}`);
+    if (rows.length > 1) errors.push(`duplicate local traceability row: ${id}`);
+  }
+
+  const tracedIds = new Set(
+    [...traceability.matchAll(/^\| ((?:FR|NFR)-\d{3}) /gm)].map((match) => match[1]),
+  );
+  for (const id of tracedIds) {
+    if (!frIds.has(id) && !nfrIds.has(id)) errors.push(`unknown local traceability row: ${id}`);
+  }
+
+  for (const eventType of ["question.response_failed", "run.resume_requested", "run.resume_failed"]) {
+    if (!eventProtocol.includes(`\`${eventType}\``)) {
+      errors.push(`missing required local event contract: ${eventType}`);
+    }
+  }
+
+  const resumeContractChecks = [
+    [adapterContract, "async fn resume("],
+    [runtimeArchitecture, "### 7.2 Native Run resume"],
+    [runtimeArchitecture, "run.resume_requested"],
+    [runtimeArchitecture, "run.resume_failed"],
+    [runtimeArchitecture, "session.resumed"],
+    [eventProtocol, "| `run.resume_requested` | UI/Core | resume_intent_id,"],
+    [eventProtocol, "| `session.resumed` | provider adapter/Core | resume_intent_id,"],
+  ];
+  for (const [source, phrase] of resumeContractChecks) {
+    if (!source.includes(phrase)) errors.push(`incomplete local resume contract: ${phrase}`);
+  }
+
+  const requiredTraceabilityPhases = new Map([
+    ["FR-009", "4"],
+    ["FR-010", "4"],
+    ["FR-011", "4"],
+  ]);
+  for (const [id, requiredPhase] of requiredTraceabilityPhases) {
+    const row = traceability.split("\n").find((line) => line.startsWith(`| ${id} `));
+    const phaseCell = row?.split("|").at(-2)?.trim() ?? "";
+    const phases = new Set(phaseCell.split(",").map((phase) => phase.trim()));
+    if (!phases.has(requiredPhase)) {
+      errors.push(`${id} traceability must include Phase ${requiredPhase}`);
+    }
   }
 
   const decisionIndex = fs.readFileSync(path.join(localRoot, "docs/decisions/README.md"), "utf8");
-  const decisionIds = [...decisionIndex.matchAll(/\| (D-\d{3}) \|/g)].map((match) => match[1]);
+  const decisionRows = [
+    ...decisionIndex.matchAll(
+      /\| (D-\d{3}) \| (Accepted|Provisional|Open|Superseded) \|/g,
+    ),
+  ];
+  const decisionIds = decisionRows.map((match) => match[1]);
   if (new Set(decisionIds).size !== decisionIds.length) errors.push("duplicate local decision ID");
-  if (decisionIds.length < 19) errors.push(`expected at least 19 local decisions, found ${decisionIds.length}`);
+  if (decisionIds.length < 26) {
+    errors.push(`expected at least 26 local decisions, found ${decisionIds.length}`);
+  }
+  for (const [index, id] of decisionIds.entries()) {
+    const expected = `D-${String(index + 1).padStart(3, "0")}`;
+    if (id !== expected) errors.push(`non-sequential local decision ID: expected ${expected}, found ${id}`);
+  }
+
+  const phaseZeroSources = [
+    "plan.md",
+    "docs/design/verification-strategy.md",
+    "docs/delivery/implementation-plan.md",
+    "checklists/implementation-ready.md",
+    "spikes/README.md",
+  ];
+  for (const source of phaseZeroSources) {
+    const text = fs.readFileSync(path.join(localRoot, source), "utf8");
+    for (let spike = 1; spike <= 5; spike += 1) {
+      const id = `S0-${spike}`;
+      if (!text.includes(id)) errors.push(`missing ${id} in local/${source}`);
+    }
+  }
 
   localSummary = `${localMarkdown.length} local markdown files, ${frIds.size} FR, ${nfrIds.size} NFR, ${decisionIds.length} decisions`;
 }
