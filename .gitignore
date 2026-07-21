@@ -1,0 +1,10 @@
+.DS_Store
+local/
+target/
+node_modules/
+dist/
+coverage/
+*.log
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm

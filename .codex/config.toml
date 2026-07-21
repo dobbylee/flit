@@ -1,0 +1,3 @@
+[agents.reviewer]
+description = "Read-only independent reviewer for the current Flit commit unit"
+config_file = "agents/reviewer.toml"
