@@ -1,0 +1,18 @@
+[package]
+name = "flit-store"
+description = "SQLite persistence for the embedded Flit Core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+rusqlite = { version = "=0.39.0", default-features = false, features = ["bundled"] }
+sha2 = "=0.10.9"
+
+[dev-dependencies]
+rusqlite = { version = "=0.39.0", default-features = false, features = ["bundled"] }
+
+[lints]
+workspace = true

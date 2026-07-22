@@ -3,6 +3,7 @@ members = [
     "crates/flit-bridge",
     "crates/flit-core",
     "crates/flit-protocol",
+    "crates/flit-store",
     "tools/flit-bindgen",
 ]
 resolver = "3"
