@@ -28,7 +28,7 @@ Detailed product planning, architecture drafts, decision notes, delivery plans, 
 
 ## Current technical direction
 
-The working design uses a macOS-first Tauri 2 desktop shell, a React/TypeScript UI, and a Rust Core that is Flit's single control plane and SQLite writer. Codex and Claude Code remain owned by their documented native session runtimes; provider adapters reconcile those sessions into Flit, while Generic CLI runs use a Flit-owned PTY. The terminal surface defaults provisionally to xterm.js, with a Phase 0 comparison against ghostty-web. These choices remain subject to the documented feasibility spikes before product implementation.
+The working design uses a macOS-first Tauri 2 desktop shell, a React/TypeScript UI, and a Rust Core that is Flit's single control plane and SQLite writer. Codex and Claude Code remain owned by their documented native session runtimes; provider adapters reconcile those sessions into Flit, while Generic CLI runs use a Flit-owned PTY. The terminal renderer remains undecided: the exact xterm.js candidate failed its resource gate, ghostty-web lacked the common contract, and the current commit-pinned native libghostty fork preserved Core-owned I/O but failed the common snapshot/restore entry gate. These choices remain subject to the documented feasibility spikes before product implementation.
 
 ## Validation
 
