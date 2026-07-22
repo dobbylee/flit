@@ -2,8 +2,11 @@
 local/
 target/
 node_modules/
+.pnpm-store/
 dist/
 coverage/
+*.tsbuildinfo
+apps/desktop/src-tauri/gen/
 *.log
 *.sqlite3
 *.sqlite3-wal

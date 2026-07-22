@@ -2,7 +2,7 @@
 
 Flit is a local attention inbox for provider-native coding-agent sessions. It turns structured execution evidence into quiet, inspectable status and raises only the moments that need human attention, without requiring a worktree-centric IDE or an embedded terminal.
 
-Phase 0 feasibility is complete and Phase 1 product implementation is explicitly approved. The first foundation slice is the next separately planned unit; no user-facing agent workflow is implemented yet.
+Phase 0 feasibility is complete and Phase 1 product implementation is underway. The first foundation health shell is implemented; no user-facing agent workflow is implemented yet.
 
 ## Open-source repository boundary
 
@@ -33,10 +33,18 @@ The working design uses a macOS-first Tauri 2 desktop shell, a React/TypeScript 
 ## Validation
 
 ```bash
+CI=true pnpm install --frozen-lockfile
+pnpm check
+pnpm test
+pnpm build
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+pnpm tauri:build
 ./scripts/validate-docs.sh
 ```
 
-The validator works in a fresh public clone without `local/`. Maintainers with the private local planning tree receive additional checks for requirements, decisions, traceability, and internal links.
+The documentation validator works in a fresh public clone without `local/`. Maintainers with the private local planning tree receive additional checks for requirements, decisions, traceability, and internal links.
 
 ## License
 

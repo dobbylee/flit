@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "No frontend permissions are granted before generated commands exist.",
+  "local": true,
+  "windows": ["main"],
+  "permissions": []
+}

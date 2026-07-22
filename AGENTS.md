@@ -51,7 +51,12 @@ The detailed loop and harness-promotion rubric live in `agent-harness/workflow.m
 ## Validation
 
 ```bash
+pnpm check
+pnpm test
+pnpm build
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+pnpm tauri:build
 ./scripts/validate-docs.sh
 ```
-
-After product scaffolding exists, add the actual Rust and frontend commands to the public workflow, CI, and package scripts in the same change.

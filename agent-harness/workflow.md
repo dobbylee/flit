@@ -153,21 +153,16 @@ Each finding must contain severity, file and line, risk, occurrence condition, s
 
 ## 7. Full validation
 
-Current pre-implementation validation:
-
-```bash
-./scripts/validate-docs.sh
-```
-
-Expected validation after scaffolding, activated only when the scripts exist:
+Current implementation validation:
 
 ```bash
 pnpm check
 pnpm test
-pnpm test:e2e
+pnpm build
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
+pnpm tauri:build
 ./scripts/validate-docs.sh
 git diff --check
 ```
