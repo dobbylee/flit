@@ -1,0 +1,8 @@
+{
+  "current": {
+    "version": "1.0",
+    "schema": "schemas/protocol/events/v1.0/event.schema.json",
+    "fixture": "fixtures/protocol/events/v1.0/permission.requested.json"
+  },
+  "previous_minor": null
+}

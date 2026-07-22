@@ -46,13 +46,13 @@ pnpm tauri:build
 
 The documentation validator works in a fresh public clone without `local/`. Maintainers with the private local planning tree receive additional checks for requirements, decisions, traceability, and internal links.
 
-Rust is the source of truth for frontend protocol types. Regenerate the checked-in TypeScript binding after changing a protocol type:
+Rust is the source of truth for frontend protocol types and the current event schema. Regenerate the checked-in TypeScript binding and JSON Schema after changing a protocol type:
 
 ```bash
 pnpm protocol:generate
 ```
 
-`cargo test -p flit-protocol` fails when the checked-in binding or current command fixtures drift from the Rust contract.
+`cargo test -p flit-protocol` fails when the checked-in binding, generated event schema, current fixtures, or current/previous-minor compatibility manifest drift from the Rust contract.
 
 ## License
 

@@ -1,0 +1,29 @@
+{
+  "protocol_version": "1.0",
+  "event_id": "01JZ8Y6BBQ9W2TQFJ19T5A4AXK",
+  "run_id": "run_01JZ8Y60R5M6V3Y2S0VJ3G8K1C",
+  "session_id": "ses_01JZ8Y62E8FVDMZ00HBFV3N6XP",
+  "stream_seq": 42,
+  "ingest_seq": 1842,
+  "occurred_at": "2026-07-21T10:02:33.412Z",
+  "observed_at": "2026-07-21T10:02:33.419Z",
+  "type": "permission.requested",
+  "source": {
+    "kind": "provider_adapter",
+    "provider": "codex",
+    "contract_version": "1.0",
+    "observation_cursor": "provider-cursor-42"
+  },
+  "confidence": 1.0,
+  "evidence_ids": ["evd_01JZ8Y6A7S6KZ0B2E9WP76M44X"],
+  "payload": {
+    "request_id": "prm_01JZ8Y6BBQ9W2TQFJ19T5A4B0",
+    "action_kind": "filesystem.write",
+    "summary": "Write generated files outside the project root",
+    "blocking": true,
+    "future_payload_field": {
+      "kept": true
+    }
+  },
+  "future_envelope_field": "kept"
+}

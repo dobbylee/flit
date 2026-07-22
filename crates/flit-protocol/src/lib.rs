@@ -1,7 +1,23 @@
+use std::collections::BTreeMap;
+
+use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use ts_rs::{Config, TS};
 
 pub const PROTOCOL_VERSION: &str = "1.0";
+pub const EVENT_PROTOCOL_VERSION: &str = "1.0";
+pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+#[must_use]
+pub fn event_schema_relative_path() -> String {
+    format!("schemas/protocol/events/v{EVENT_PROTOCOL_VERSION}/event.schema.json")
+}
+
+#[must_use]
+pub fn event_schema_id() -> String {
+    format!("urn:flit:protocol:event:{EVENT_PROTOCOL_VERSION}")
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -36,6 +52,75 @@ pub struct CommandError {
     pub message_key: String,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize, TS)]
+pub enum EventProtocolVersion {
+    #[serde(rename = "1.0")]
+    V1_0,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum EventSourceKind {
+    Core,
+    ProviderAdapter,
+    GitWatcher,
+    FileWatcher,
+    Classifier,
+    Policy,
+    Ui,
+    Notifier,
+    Recovery,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize, TS)]
+pub struct EventSource {
+    pub kind: EventSourceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract_version: Option<String>,
+    #[serde(default, flatten)]
+    pub extensions: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize, TS)]
+#[serde(untagged)]
+pub enum NullableSessionId {
+    Id(String),
+    Null,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize, TS)]
+pub struct EventEnvelope {
+    pub protocol_version: EventProtocolVersion,
+    #[schemars(length(min = 1))]
+    pub event_id: String,
+    #[schemars(length(min = 1))]
+    pub run_id: String,
+    pub session_id: NullableSessionId,
+    #[schemars(range(min = 1, max = MAX_JSON_SAFE_INTEGER))]
+    #[ts(type = "number")]
+    pub stream_seq: u64,
+    #[schemars(range(min = 1, max = MAX_JSON_SAFE_INTEGER))]
+    #[ts(type = "number")]
+    pub ingest_seq: u64,
+    #[schemars(length(min = 1))]
+    pub occurred_at: String,
+    #[schemars(length(min = 1))]
+    pub observed_at: String,
+    #[serde(rename = "type")]
+    #[schemars(length(min = 1))]
+    pub event_type: String,
+    pub source: EventSource,
+    #[schemars(range(min = 0.0, max = 1.0))]
+    pub confidence: f64,
+    #[schemars(inner(length(min = 1)))]
+    pub evidence_ids: Vec<String>,
+    pub payload: Map<String, Value>,
+    #[serde(default, flatten)]
+    pub extensions: BTreeMap<String, Value>,
+}
+
 impl CommandError {
     #[must_use]
     pub fn protocol_mismatch() -> Self {
@@ -50,11 +135,17 @@ impl CommandError {
 pub fn generated_typescript() -> String {
     let config = Config::default();
     let declarations = [
+        Value::decl(&config),
         HealthStatus::decl(&config),
         SystemHealthRequest::decl(&config),
         SystemHealthResponse::decl(&config),
         CommandErrorCode::decl(&config),
         CommandError::decl(&config),
+        EventProtocolVersion::decl(&config),
+        EventSourceKind::decl(&config),
+        EventSource::decl(&config),
+        NullableSessionId::decl(&config),
+        EventEnvelope::decl(&config),
     ]
     .map(|declaration| format!("export {declaration}"))
     .join("\n\n");
@@ -64,4 +155,21 @@ pub fn generated_typescript() -> String {
          export const PROTOCOL_VERSION = \"{PROTOCOL_VERSION}\" as const;\n\n\
          {declarations}\n"
     )
+}
+
+#[must_use]
+pub fn generated_event_schema() -> String {
+    let schema = SchemaSettings::draft2020_12()
+        .into_generator()
+        .into_root_schema_for::<EventEnvelope>();
+    let mut value = serde_json::to_value(schema).expect("generated event schema should serialize");
+    value
+        .as_object_mut()
+        .expect("generated event schema should be an object")
+        .insert("$id".to_owned(), Value::String(event_schema_id()));
+
+    let mut rendered =
+        serde_json::to_string_pretty(&value).expect("generated event schema should render");
+    rendered.push('\n');
+    rendered
 }

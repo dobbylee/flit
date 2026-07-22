@@ -1,0 +1,138 @@
+{
+  "$defs": {
+    "EventProtocolVersion": {
+      "enum": [
+        "1.0"
+      ],
+      "type": "string"
+    },
+    "EventSource": {
+      "additionalProperties": true,
+      "properties": {
+        "contract_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/EventSourceKind"
+        },
+        "provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    "EventSourceKind": {
+      "enum": [
+        "core",
+        "provider_adapter",
+        "git_watcher",
+        "file_watcher",
+        "classifier",
+        "policy",
+        "ui",
+        "notifier",
+        "recovery"
+      ],
+      "type": "string"
+    },
+    "NullableSessionId": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "$id": "urn:flit:protocol:event:1.0",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "confidence": {
+      "format": "double",
+      "maximum": 1.0,
+      "minimum": 0.0,
+      "type": "number"
+    },
+    "event_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "evidence_ids": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "ingest_seq": {
+      "format": "uint64",
+      "maximum": 9007199254740991,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "observed_at": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "occurred_at": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "payload": {
+      "additionalProperties": true,
+      "type": "object"
+    },
+    "protocol_version": {
+      "$ref": "#/$defs/EventProtocolVersion"
+    },
+    "run_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "session_id": {
+      "$ref": "#/$defs/NullableSessionId"
+    },
+    "source": {
+      "$ref": "#/$defs/EventSource"
+    },
+    "stream_seq": {
+      "format": "uint64",
+      "maximum": 9007199254740991,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "type": {
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "required": [
+    "protocol_version",
+    "event_id",
+    "run_id",
+    "session_id",
+    "stream_seq",
+    "ingest_seq",
+    "occurred_at",
+    "observed_at",
+    "type",
+    "source",
+    "confidence",
+    "evidence_ids",
+    "payload"
+  ],
+  "title": "EventEnvelope",
+  "type": "object"
+}
