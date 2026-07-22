@@ -346,6 +346,11 @@ impl AttentionItem {
         self.updated_at
     }
 
+    #[must_use]
+    pub const fn created_ingest_seq(&self) -> u64 {
+        self.created_ingest_seq
+    }
+
     fn transition(
         &mut self,
         status: AttentionStatus,
@@ -423,6 +428,20 @@ impl AttentionProjection {
         ingest_seq: u64,
         event: AttentionEvent,
     ) -> Result<AttentionDisposition, AttentionError> {
+        let mut dispositions = self.apply_batch(ingest_seq, [event])?;
+        Ok(dispositions
+            .pop()
+            .expect("single-event batch must return one disposition"))
+    }
+
+    pub fn apply_batch<I>(
+        &mut self,
+        ingest_seq: u64,
+        events: I,
+    ) -> Result<Vec<AttentionDisposition>, AttentionError>
+    where
+        I: IntoIterator<Item = AttentionEvent>,
+    {
         if ingest_seq <= self.version {
             return Err(AttentionError::NonMonotonicIngestSequence {
                 current: self.version,
@@ -430,7 +449,17 @@ impl AttentionProjection {
             });
         }
 
-        let disposition = match event {
+        let dispositions = events
+            .into_iter()
+            .map(|event| self.apply_ordered(ingest_seq, event))
+            .collect();
+        self.version = ingest_seq;
+        debug_assert!(self.invariants_hold());
+        Ok(dispositions)
+    }
+
+    fn apply_ordered(&mut self, ingest_seq: u64, event: AttentionEvent) -> AttentionDisposition {
+        match event {
             AttentionEvent::Opened(draft) => self.open(draft, ingest_seq),
             AttentionEvent::ResponseSubmitted {
                 item_id,
@@ -462,10 +491,12 @@ impl AttentionProjection {
                 observed_at,
                 evidence_id,
             } => self.acknowledge(&item_id, ingest_seq, observed_at, evidence_id),
-        };
-        self.version = ingest_seq;
-        debug_assert!(self.invariants_hold());
-        Ok(disposition)
+            AttentionEvent::EvidenceObserved {
+                item_id,
+                observed_at,
+                evidence_id,
+            } => self.observe_evidence(&item_id, ingest_seq, observed_at, evidence_id),
+        }
     }
 
     fn open(&mut self, draft: AttentionItemDraft, ingest_seq: u64) -> AttentionDisposition {
@@ -623,6 +654,20 @@ impl AttentionProjection {
         AttentionDisposition::Applied
     }
 
+    fn observe_evidence(
+        &mut self,
+        item_id: &AttentionItemId,
+        ingest_seq: u64,
+        observed_at: TimestampMs,
+        evidence_id: EvidenceId,
+    ) -> AttentionDisposition {
+        let Some(item) = self.item_mut(item_id) else {
+            return AttentionDisposition::Ignored(IgnoredAttentionReason::ItemNotFound);
+        };
+        item.transition(item.status, ingest_seq, observed_at, evidence_id);
+        AttentionDisposition::Applied
+    }
+
     fn item_mut(&mut self, item_id: &AttentionItemId) -> Option<&mut AttentionItem> {
         self.items.iter_mut().find(|item| item.item_id == *item_id)
     }
@@ -681,6 +726,11 @@ pub enum AttentionEvent {
         evidence_id: EvidenceId,
     },
     Acknowledged {
+        item_id: AttentionItemId,
+        observed_at: TimestampMs,
+        evidence_id: EvidenceId,
+    },
+    EvidenceObserved {
         item_id: AttentionItemId,
         observed_at: TimestampMs,
         evidence_id: EvidenceId,
