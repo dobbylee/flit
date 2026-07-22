@@ -153,16 +153,12 @@ Each finding must contain severity, file and line, risk, occurrence condition, s
 
 ## 7. Full validation
 
-Current tracked migration-baseline validation follows. The native parity change must extend it with real native production scripts while retaining checks for still-tracked legacy code. Remove legacy commands only in the cleanup unit that removes the code they validate; never document a proposed command as current.
+Current native validation follows. Never document a proposed command as current.
 
 ```bash
-pnpm check
-pnpm test
-pnpm build
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-pnpm tauri:build
 ./scripts/test-macos.sh
 ./scripts/validate-docs.sh
 git diff --check

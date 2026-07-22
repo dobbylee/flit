@@ -28,17 +28,6 @@ where
 }
 
 #[test]
-fn checked_in_typescript_matches_the_rust_source() {
-    let generated = fs::read_to_string(repository_path("apps/desktop/src/generated/protocol.ts"))
-        .expect("generated TypeScript should be checked in");
-
-    assert_eq!(generated, flit_protocol::generated_typescript());
-    assert!(generated.contains("export type NullableSessionId = string | null;"));
-    assert!(generated.contains("session_id: NullableSessionId,"));
-    assert!(!generated.contains("session_id?:"));
-}
-
-#[test]
 fn checked_in_event_schema_matches_the_rust_source() {
     let manifest = read_compatibility_manifest();
     assert_eq!(manifest.current.schema, event_schema_relative_path());

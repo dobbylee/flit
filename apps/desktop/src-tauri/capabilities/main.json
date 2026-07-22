@@ -1,8 +1,0 @@
-{
-  "$schema": "../gen/schemas/desktop-schema.json",
-  "identifier": "main",
-  "description": "The main window may read the local foundation health contract.",
-  "local": true,
-  "windows": ["main"],
-  "permissions": ["allow-system-health"]
-}

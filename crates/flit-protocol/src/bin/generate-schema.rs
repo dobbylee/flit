@@ -3,10 +3,6 @@ use std::{fs, path::Path};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     write_if_changed(
-        &repository.join("apps/desktop/src/generated/protocol.ts"),
-        &flit_protocol::generated_typescript(),
-    )?;
-    write_if_changed(
         &repository.join(flit_protocol::event_schema_relative_path()),
         &flit_protocol::generated_event_schema(),
     )?;
