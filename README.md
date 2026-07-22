@@ -2,7 +2,7 @@
 
 Flit is a local attention inbox for provider-native coding-agent sessions. It turns structured execution evidence into quiet, inspectable status and raises only the moments that need human attention, without requiring a worktree-centric IDE or an embedded terminal.
 
-The repository is currently in the **pre-implementation design phase**. Product code will begin only after the feasibility gates are complete and implementation is explicitly approved.
+Phase 0 feasibility is complete and Phase 1 product implementation is explicitly approved. The first foundation slice is the next separately planned unit; no user-facing agent workflow is implemented yet.
 
 ## Open-source repository boundary
 
@@ -28,7 +28,7 @@ Detailed product planning, architecture drafts, decision notes, delivery plans, 
 
 ## Current technical direction
 
-The working design uses a macOS-first Tauri 2 desktop shell, a React/TypeScript UI, and a Rust Core that is Flit's single event-ordering and SQLite-writing control plane. Codex and Claude Code remain owned by their documented native session runtimes, while provider adapters reconcile supported sessions into an evidence-backed attention queue. V1 deliberately excludes a Flit-owned Generic PTY, embedded terminal renderer and input, worktree orchestration, editor, browser, built-in diff, and mobile companion. The bounded read-only attention and event-store feasibility gates are complete. Product implementation has not been approved and will not begin without explicit approval.
+The working design uses a macOS-first Tauri 2 desktop shell, a React/TypeScript UI, and a Rust Core that is Flit's single event-ordering and SQLite-writing control plane. Codex and Claude Code remain owned by their documented native session runtimes, while provider adapters reconcile supported sessions into an evidence-backed attention queue. V1 deliberately excludes a Flit-owned Generic PTY, embedded terminal renderer and input, worktree orchestration, editor, browser, built-in diff, and mobile companion. The bounded read-only attention and event-store feasibility gates are complete, and implementation will proceed as independently reviewed vertical slices.
 
 ## Validation
 

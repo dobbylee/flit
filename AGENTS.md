@@ -13,8 +13,8 @@ Before changing the repository, read `README.md`, this file, and `agent-harness/
 
 ## Current phase
 
-- The repository is in the pre-implementation design phase.
-- Do not add product code or dependency scaffolding until the user explicitly approves implementation and the feasibility gate recorded in `local/` is complete.
+- Phase 0 feasibility is complete and the user explicitly approved Phase 1 product implementation on 2026-07-22.
+- Implement only the current smallest vertical slice recorded in `local/`; do not scaffold adjacent phases speculatively.
 - Feasibility spikes must remain disposable and separate from production modules.
 
 ## Product invariants
