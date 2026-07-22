@@ -131,6 +131,40 @@ pub fn sync_request_attention(
     source: &RequestAttentionSource,
     observation: RequestAttentionObservation,
 ) -> Result<Vec<AttentionDisposition>, RequestAttentionError> {
+    let plan = plan_request_attention(attention, ingest_seq, request, source, observation)?;
+    attention
+        .apply_batch(ingest_seq, plan.events)
+        .map_err(RequestAttentionError::from)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestAttentionPlan {
+    ingest_seq: u64,
+    base_attention_version: u64,
+    events: Vec<AttentionEvent>,
+}
+
+impl RequestAttentionPlan {
+    pub(crate) const fn ingest_seq(&self) -> u64 {
+        self.ingest_seq
+    }
+
+    pub(crate) const fn base_attention_version(&self) -> u64 {
+        self.base_attention_version
+    }
+
+    pub(crate) fn into_events(self) -> Vec<AttentionEvent> {
+        self.events
+    }
+}
+
+pub fn plan_request_attention(
+    attention: &AttentionProjection,
+    ingest_seq: u64,
+    request: &RequestProjection,
+    source: &RequestAttentionSource,
+    observation: RequestAttentionObservation,
+) -> Result<RequestAttentionPlan, RequestAttentionError> {
     validate_binding(ingest_seq, request, source)?;
     let mut events = request_events(attention, request, source, &observation)?;
     if let RequestStatus::Resolved(RequestResolution::ProviderPolicy(resolution)) = request.status()
@@ -148,9 +182,11 @@ pub fn sync_request_attention(
             validate_existing_provider_policy_item(attention, request, resolution)?;
         }
     }
-    attention
-        .apply_batch(ingest_seq, events)
-        .map_err(RequestAttentionError::from)
+    Ok(RequestAttentionPlan {
+        ingest_seq,
+        base_attention_version: attention.version(),
+        events,
+    })
 }
 
 fn validate_binding(

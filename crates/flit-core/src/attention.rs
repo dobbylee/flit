@@ -423,6 +423,18 @@ impl AttentionProjection {
             .map(|item| item.severity)
     }
 
+    #[must_use]
+    pub fn has_active_blocking_request(&self) -> bool {
+        self.items.iter().any(|item| {
+            item.status.is_active()
+                && item.blocking
+                && matches!(
+                    item.category,
+                    AttentionCategory::Permission | AttentionCategory::Question
+                )
+        })
+    }
+
     pub fn apply(
         &mut self,
         ingest_seq: u64,
