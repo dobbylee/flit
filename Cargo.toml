@@ -1,5 +1,5 @@
 [workspace]
-members = ["apps/desktop/src-tauri", "crates/flit-protocol"]
+members = ["apps/desktop/src-tauri", "crates/flit-core", "crates/flit-protocol"]
 resolver = "3"
 
 [workspace.package]

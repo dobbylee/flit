@@ -818,6 +818,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "flit-core"
+version = "0.1.0"
+
+[[package]]
 name = "flit-desktop"
 version = "0.1.0"
 dependencies = [
