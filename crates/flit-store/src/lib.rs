@@ -18,6 +18,7 @@ const INITIAL_MIGRATION_VERSION: i64 = 1;
 const INITIAL_MIGRATION_NAME: &str = "initial";
 const INITIAL_MIGRATION_SQL: &str = include_str!("../migrations/0001_initial.sql");
 const MAX_EVENT_READ_LIMIT: usize = 1_000;
+pub const MAX_EVENT_APPEND_BATCH: usize = 50;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectionPolicy {
@@ -164,71 +165,95 @@ impl Store {
         event: UnsequencedEventEnvelope,
     ) -> Result<AppendEventOutcome, StoreError> {
         validate_event(&event)?;
+        let mut outcomes = self.append_event_batch(vec![event])?;
+        Ok(outcomes
+            .pop()
+            .expect("one event input must produce one append outcome"))
+    }
+
+    pub fn append_event_batch(
+        &mut self,
+        events: Vec<UnsequencedEventEnvelope>,
+    ) -> Result<Vec<AppendEventOutcome>, StoreError> {
+        if !(1..=MAX_EVENT_APPEND_BATCH).contains(&events.len()) {
+            return Err(StoreError::InvalidEventBatchSize {
+                count: events.len(),
+                max: MAX_EVENT_APPEND_BATCH,
+            });
+        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(StoreError::Sqlite)?;
+        let mut outcomes = Vec::with_capacity(events.len());
 
-        if let Some(ingest_seq) = event_ingest_seq(&transaction, &event.event_id)? {
-            let existing = load_event(&transaction, ingest_seq)?;
-            if UnsequencedEventEnvelope::from(existing.clone()) == event {
-                return Ok(AppendEventOutcome::Duplicate(existing));
+        for event in events {
+            validate_event(&event)?;
+            if let Some(ingest_seq) = event_ingest_seq(&transaction, &event.event_id)? {
+                let existing = load_event(&transaction, ingest_seq)?;
+                if UnsequencedEventEnvelope::from(existing.clone()) == event {
+                    outcomes.push(AppendEventOutcome::Duplicate(existing));
+                    continue;
+                }
+                return Err(StoreError::EventIdentityConflict {
+                    event_id: event.event_id,
+                });
             }
-            return Err(StoreError::EventIdentityConflict {
-                event_id: event.event_id,
-            });
-        }
 
-        if let NullableSessionId::Id(session_id) = &event.session_id
-            && let Some(existing_event_id) =
-                event_id_for_stream(&transaction, session_id, event.stream_seq)?
-        {
-            return Err(StoreError::StreamSequenceConflict {
-                session_id: session_id.clone(),
-                stream_seq: event.stream_seq,
-                existing_event_id,
-            });
-        }
+            if let NullableSessionId::Id(session_id) = &event.session_id
+                && let Some(existing_event_id) =
+                    event_id_for_stream(&transaction, session_id, event.stream_seq)?
+            {
+                return Err(StoreError::StreamSequenceConflict {
+                    session_id: session_id.clone(),
+                    stream_seq: event.stream_seq,
+                    existing_event_id,
+                });
+            }
 
-        validate_event_session(&transaction, &event)?;
-        validate_event_evidence(&transaction, &event)?;
-        let source_json = serde_json::to_string(&event.source).map_err(StoreError::Json)?;
-        let payload_json = serde_json::to_string(&event.payload).map_err(StoreError::Json)?;
-        let extensions_json = serde_json::to_string(&event.extensions).map_err(StoreError::Json)?;
-        let session_id = match &event.session_id {
-            NullableSessionId::Id(session_id) => Some(session_id.as_str()),
-            NullableSessionId::Null => None,
-        };
-        transaction
-            .execute(
-                "INSERT INTO events(event_id, protocol_version, event_type, run_id, session_id, stream_seq, occurred_at, observed_at, source_json, confidence, payload_version, payload_json, extensions_json) VALUES(?1, '1.0', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11)",
-                params![
-                    event.event_id,
-                    event.event_type,
-                    event.run_id,
-                    session_id,
-                    event.stream_seq as i64,
-                    event.occurred_at,
-                    event.observed_at,
-                    source_json,
-                    event.confidence,
-                    payload_json,
-                    extensions_json,
-                ],
-            )
-            .map_err(StoreError::Sqlite)?;
-        let ingest_seq = assigned_sequence(transaction.last_insert_rowid())?;
-        for (ordinal, evidence_id) in event.evidence_ids.iter().enumerate() {
+            validate_event_session(&transaction, &event)?;
+            validate_event_evidence(&transaction, &event)?;
+            let source_json = serde_json::to_string(&event.source).map_err(StoreError::Json)?;
+            let payload_json = serde_json::to_string(&event.payload).map_err(StoreError::Json)?;
+            let extensions_json =
+                serde_json::to_string(&event.extensions).map_err(StoreError::Json)?;
+            let session_id = match &event.session_id {
+                NullableSessionId::Id(session_id) => Some(session_id.as_str()),
+                NullableSessionId::Null => None,
+            };
             transaction
                 .execute(
-                    "INSERT INTO event_evidence(event_id, evidence_id, ordinal) VALUES(?1, ?2, ?3)",
-                    params![event.event_id, evidence_id, ordinal as i64],
+                    "INSERT INTO events(event_id, protocol_version, event_type, run_id, session_id, stream_seq, occurred_at, observed_at, source_json, confidence, payload_version, payload_json, extensions_json) VALUES(?1, '1.0', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11)",
+                    params![
+                        event.event_id,
+                        event.event_type,
+                        event.run_id,
+                        session_id,
+                        event.stream_seq as i64,
+                        event.occurred_at,
+                        event.observed_at,
+                        source_json,
+                        event.confidence,
+                        payload_json,
+                        extensions_json,
+                    ],
                 )
                 .map_err(StoreError::Sqlite)?;
+            let ingest_seq = assigned_sequence(transaction.last_insert_rowid())?;
+            for (ordinal, evidence_id) in event.evidence_ids.iter().enumerate() {
+                transaction
+                    .execute(
+                        "INSERT INTO event_evidence(event_id, evidence_id, ordinal) VALUES(?1, ?2, ?3)",
+                        params![event.event_id, evidence_id, ordinal as i64],
+                    )
+                    .map_err(StoreError::Sqlite)?;
+            }
+            outcomes.push(AppendEventOutcome::Inserted(
+                event.with_ingest_seq(ingest_seq),
+            ));
         }
-        let envelope = event.with_ingest_seq(ingest_seq);
         transaction.commit().map_err(StoreError::Sqlite)?;
-        Ok(AppendEventOutcome::Inserted(envelope))
+        Ok(outcomes)
     }
 
     pub fn events_after(
@@ -1225,6 +1250,10 @@ struct SchemaObject {
 
 #[derive(Debug)]
 pub enum StoreError {
+    InvalidEventBatchSize {
+        count: usize,
+        max: usize,
+    },
     InvalidRunSnapshot {
         field: &'static str,
     },
@@ -1337,6 +1366,12 @@ pub enum StoreError {
 impl fmt::Display for StoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidEventBatchSize { count, max } => {
+                write!(
+                    formatter,
+                    "invalid event batch size {count}; expected 1..={max}"
+                )
+            }
             Self::InvalidRunSnapshot { field } => {
                 write!(formatter, "invalid Run snapshot field: {field}")
             }
