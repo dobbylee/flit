@@ -28,7 +28,7 @@ Detailed product planning, architecture drafts, decision notes, delivery plans, 
 
 ## Current technical direction
 
-The working design uses a macOS-first Tauri 2 desktop shell, a React/TypeScript UI, and a Rust Core that is Flit's single event-ordering and SQLite-writing control plane. Codex and Claude Code remain owned by their documented native session runtimes, while provider adapters reconcile supported sessions into an evidence-backed attention queue. V1 deliberately excludes a Flit-owned Generic PTY, embedded terminal renderer and input, worktree orchestration, editor, browser, built-in diff, and mobile companion. The next feasibility gate compares this narrow attention workflow against an established agent environment before product implementation is approved.
+The working design uses a macOS-first Tauri 2 desktop shell, a React/TypeScript UI, and a Rust Core that is Flit's single event-ordering and SQLite-writing control plane. Codex and Claude Code remain owned by their documented native session runtimes, while provider adapters reconcile supported sessions into an evidence-backed attention queue. V1 deliberately excludes a Flit-owned Generic PTY, embedded terminal renderer and input, worktree orchestration, editor, browser, built-in diff, and mobile companion. An actual comparison with an established agent environment found a narrow gap in attention identity and request-policy provenance; the next feasibility gate is a disposable read-only prototype, not product implementation.
 
 ## Validation
 
