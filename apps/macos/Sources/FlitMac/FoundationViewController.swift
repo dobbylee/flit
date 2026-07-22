@@ -77,7 +77,9 @@ final class FoundationViewController: NSViewController {
         )
         identify(footer, as: "flit.foundation.footer")
 
-        [mark, phase, title, summary, host, boundary, footer].forEach(panel.addArrangedSubview)
+        [mark, phase, title, summary, host, boundary, footer].forEach { arrangedView in
+            panel.addArrangedSubview(arrangedView)
+        }
         panel.setCustomSpacing(30, after: mark)
         panel.setCustomSpacing(28, after: summary)
         panel.setCustomSpacing(26, after: boundary)
