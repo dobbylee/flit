@@ -81,7 +81,7 @@ For non-blocking details, use the documented safe default and record the assumpt
 
 Good slices include:
 
-- one event flowing through domain, persistence, IPC, and UI or testkit;
+- one event flowing through domain, persistence, the in-process Core bridge, and UI or testkit;
 - one failure reproduced, fixed, and closed with a regression test;
 - one user action with both success and error states.
 
@@ -126,13 +126,13 @@ The reviewer must inspect the diff and source-of-truth contracts directly rather
 | Change | Minimum focused validation |
 | --- | --- |
 | Pure reducer or policy | Targeted unit tests and property invariants |
-| Event or schema | Schema fixtures and Rust/TypeScript generation drift |
+| Event or schema | Schema fixtures and generated binding drift |
 | SQLite or migration | Temporary DB migration, replay, rollback, and integrity check |
 | PTY or process | Fake-agent integration with timeout and cleanup |
 | Adapter parser | All target fixtures with chunk and resize variations |
 | Permission response | Stale, duplicate, and delivery-failure matrix |
-| React component | Component state matrix, keyboard, and accessibility checks |
-| IPC | Contract, reconnect, and cursor tests |
+| Native UI component | Component state matrix, keyboard, accessibility, and main-actor checks |
+| Core bridge | Contract, ownership/error, reconnect, and bounded cursor tests |
 | Public rules or local design | `./scripts/validate-docs.sh` |
 
 Confirm that a test exercises the changed risk instead of relying on a convenient test name.
@@ -153,7 +153,7 @@ Each finding must contain severity, file and line, risk, occurrence condition, s
 
 ## 7. Full validation
 
-Current implementation validation:
+Current tracked migration-baseline validation follows. The native parity change must extend it with real native production scripts while retaining checks for still-tracked legacy code. Remove legacy commands only in the cleanup unit that removes the code they validate; never document a proposed command as current.
 
 ```bash
 pnpm check

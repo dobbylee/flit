@@ -2,7 +2,7 @@
 
 Flit is a local attention inbox for provider-native coding-agent sessions. It turns structured execution evidence into quiet, inspectable status and raises only the moments that need human attention, without requiring a worktree-centric IDE or an embedded terminal.
 
-Phase 0 feasibility is complete and Phase 1 product implementation is underway. The foundation shell now verifies its generated Rust Core health contract; storage, provider monitoring, and user-facing agent workflows are not implemented yet.
+Phase 0 feasibility is complete and Phase 1 product implementation is underway. The macOS-native architecture gate passed, and the existing foundation health contract is being migrated before storage, provider monitoring, and user-facing agent workflows are implemented.
 
 ## Open-source repository boundary
 
@@ -28,9 +28,13 @@ Detailed product planning, architecture drafts, decision notes, delivery plans, 
 
 ## Current technical direction
 
-The working design uses a macOS-first Tauri 2 desktop shell, a React/TypeScript UI, and a Rust Core that is Flit's single event-ordering and SQLite-writing control plane. Codex and Claude Code remain owned by their documented native session runtimes, while provider adapters reconcile supported sessions into an evidence-backed attention queue. V1 deliberately excludes a Flit-owned Generic PTY, embedded terminal renderer and input, worktree orchestration, editor, browser, built-in diff, and mobile companion. The bounded read-only attention and event-store feasibility gates are complete, and implementation will proceed as independently reviewed vertical slices.
+The accepted design uses an AppKit-first macOS shell, selective SwiftUI for low-cardinality leaves, and an in-process Rust Core linked through a synchronous, coarse-grained UniFFI bridge. Rust remains Flit's sole event-ordering and SQLite-writing authority; Swift owns presentation and native macOS lifecycle, accessibility, and delivery adapters without adding another data writer. Codex and Claude Code remain owned by their documented native session runtimes, while provider adapters reconcile supported sessions into an evidence-backed attention queue. V1 deliberately excludes a separate Flit daemon, XPC service, Flit-owned Generic PTY, embedded terminal renderer and input, worktree orchestration, editor, browser, built-in diff, and mobile companion.
+
+The tracked application is temporarily retaining the Tauri/React health shell only until the native health path reaches contract and CI parity. The following cleanup slice removes the obsolete Tauri, React, Vite, pnpm, TypeScript UI binding, capability, CSP, test, configuration, dependency, lockfile, and build paths; historical feasibility evidence remains documentation rather than production code.
 
 ## Validation
+
+During the parity migration, the current tracked application still uses these existing commands. The native parity change must extend validation with its real Swift/AppKit commands while retaining these legacy checks; only the following cleanup unit may remove the legacy commands with the code they validate.
 
 ```bash
 CI=true pnpm install --frozen-lockfile
@@ -46,7 +50,7 @@ pnpm tauri:build
 
 The documentation validator works in a fresh public clone without `local/`. Maintainers with the private local planning tree receive additional checks for requirements, decisions, traceability, and internal links.
 
-Rust is the source of truth for frontend protocol types and the current event schema. Regenerate the checked-in TypeScript binding and JSON Schema after changing a protocol type:
+Rust is the source of truth for protocol types and the current event schema. Until the native parity and cleanup slices replace the legacy frontend binding, regenerate the checked-in TypeScript binding and JSON Schema after changing a protocol type:
 
 ```bash
 pnpm protocol:generate

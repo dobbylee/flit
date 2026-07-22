@@ -22,7 +22,7 @@ Before changing the repository, read `README.md`, this file, and `agent-harness/
 - Normal progress stays quiet; only moments that need human action are promoted.
 - Every summarized or inferred state must link to raw evidence such as an event, provider-history locator, command, file change, or diagnostic.
 - Keep lifecycle, current activity, and attention level as independent state dimensions.
-- Tauri Rust Core is Flit's sole event-ordering and SQLite writer. Provider-native runtimes own Codex and Claude Code sessions; V1 does not own Generic CLI PTYs or embed a terminal.
+- The app-process embedded Rust Core is Flit's sole event-ordering and SQLite writer. Swift owns presentation and native macOS adapters but does not create domain transitions or another data writer. Provider-native runtimes own Codex and Claude Code sessions; V1 does not own Generic CLI PTYs or embed a terminal.
 - Provider adapters use documented, version-probed surfaces and record source, confidence, capability, and evidence. Uncertain behavior degrades to `Unknown` and exposes only verified provider-open or raw-evidence navigation capabilities.
 - Permission and question responses are bound to request identity and version. Reject stale and duplicate responses.
 - Never create a persistent permission rule for an action, path, or scope the user was not shown.
@@ -33,6 +33,7 @@ Before changing the repository, read `README.md`, this file, and `agent-harness/
 - Keep each change small enough to explain as one commit unit.
 - Record assumptions, success criteria, changed files, focused validation, and full validation before implementation.
 - Build the smallest vertical slice and avoid unrelated refactors.
+- During an approved runtime migration, establish replacement parity first, then remove every obsolete production code path, dependency, configuration, test, generated binding, lockfile, and CI/build entry in a separate explainable unit. Preserve historical evidence as documentation, not executable production scaffolding.
 - Run focused validation, then use the independent review gate defined in `agent-harness/workflow.md` for only the changed scope.
 - Fix findings, re-run the same checks, and repeat until the reviewer returns exactly `No Findings`.
 - Run full validation and `git diff --check` before reporting completion.
