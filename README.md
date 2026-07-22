@@ -2,7 +2,7 @@
 
 Flit is a local attention inbox for provider-native coding-agent sessions. It turns structured execution evidence into quiet, inspectable status and raises only the moments that need human attention, without requiring a worktree-centric IDE or an embedded terminal.
 
-Phase 0 feasibility is complete and Phase 1 product implementation is underway. The first foundation health shell is implemented; no user-facing agent workflow is implemented yet.
+Phase 0 feasibility is complete and Phase 1 product implementation is underway. The foundation shell now verifies its generated Rust Core health contract; storage, provider monitoring, and user-facing agent workflows are not implemented yet.
 
 ## Open-source repository boundary
 
@@ -45,6 +45,14 @@ pnpm tauri:build
 ```
 
 The documentation validator works in a fresh public clone without `local/`. Maintainers with the private local planning tree receive additional checks for requirements, decisions, traceability, and internal links.
+
+Rust is the source of truth for frontend protocol types. Regenerate the checked-in TypeScript binding after changing a protocol type:
+
+```bash
+pnpm protocol:generate
+```
+
+`cargo test -p flit-protocol` fails when the checked-in binding or current command fixtures drift from the Rust contract.
 
 ## License
 

@@ -11,6 +11,7 @@
     "build": "pnpm --filter @flit/desktop build",
     "check": "pnpm --filter @flit/desktop check",
     "dev": "pnpm --filter @flit/desktop dev",
+    "protocol:generate": "cargo run --quiet -p flit-protocol --bin generate-types",
     "tauri": "pnpm --filter @flit/desktop tauri",
     "tauri:build": "pnpm --filter @flit/desktop tauri build --debug --no-bundle",
     "test": "pnpm --filter @flit/desktop test"

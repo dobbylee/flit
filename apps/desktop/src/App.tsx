@@ -1,6 +1,35 @@
+import { useEffect, useState } from "react";
+
 import { copy } from "./copy";
+import { loadSystemHealth } from "./systemHealth";
+
+type FoundationState = "checking" | "ready" | "unavailable";
 
 function App() {
+  const [state, setState] = useState<FoundationState>("checking");
+
+  useEffect(() => {
+    let active = true;
+
+    void loadSystemHealth()
+      .then((health) => {
+        if (!active) return;
+
+        const foundationReady =
+          health.core === "ready" &&
+          health.storage === "not_configured" &&
+          health.providers === "not_configured";
+        setState(foundationReady ? "ready" : "unavailable");
+      })
+      .catch(() => {
+        if (active) setState("unavailable");
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
+
   return (
     <main className="foundation" aria-labelledby="foundation-title">
       <div className="foundation__glow" aria-hidden="true" />
@@ -19,12 +48,15 @@ function App() {
 
         <section className="foundation__status-card" aria-labelledby="foundation-status">
           <div className="foundation__status-line">
-            <span className="foundation__indicator" aria-hidden="true" />
+            <span
+              className={`foundation__indicator foundation__indicator--${state}`}
+              aria-hidden="true"
+            />
             <h2 id="foundation-status" role="status">
-              {copy["foundation.status"]}
+              {copy[`foundation.status.${state}`]}
             </h2>
           </div>
-          <p>{copy["foundation.boundary"]}</p>
+          <p>{copy[`foundation.boundary.${state}`]}</p>
         </section>
 
         <footer className="foundation__footer">

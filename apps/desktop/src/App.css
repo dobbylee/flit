@@ -142,6 +142,18 @@ h1 {
   box-shadow: 0 0 0 4px rgba(49, 138, 97, 0.12);
 }
 
+.foundation__indicator--checking {
+  border-color: #eee4ce;
+  background: #9a7331;
+  box-shadow: 0 0 0 4px rgba(154, 115, 49, 0.12);
+}
+
+.foundation__indicator--unavailable {
+  border-color: #f0dddd;
+  background: #a34b4b;
+  box-shadow: 0 0 0 4px rgba(163, 75, 75, 0.12);
+}
+
 h2 {
   margin-bottom: 0;
   color: #1a4f3a;

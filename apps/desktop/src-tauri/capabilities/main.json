@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main",
-  "description": "No frontend permissions are granted before generated commands exist.",
+  "description": "The main window may read the local foundation health contract.",
   "local": true,
   "windows": ["main"],
-  "permissions": []
+  "permissions": ["allow-system-health"]
 }

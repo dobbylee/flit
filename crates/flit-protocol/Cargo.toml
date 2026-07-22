@@ -1,0 +1,18 @@
+[package]
+name = "flit-protocol"
+description = "Rust source of truth for Flit frontend contracts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+serde = { version = "=1.0.229", features = ["derive"] }
+ts-rs = { version = "=12.0.1", default-features = false, features = ["serde-compat"] }
+
+[dev-dependencies]
+serde_json = "=1.0.151"
+
+[lints]
+workspace = true
