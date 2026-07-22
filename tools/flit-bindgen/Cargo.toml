@@ -1,0 +1,17 @@
+[package]
+name = "flit-bindgen"
+description = "Reproducible Swift binding generator for Flit's UniFFI bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "=1.0.104"
+camino = "=1.2.4"
+flit-protocol = { path = "../../crates/flit-protocol" }
+uniffi_bindgen = { version = "=0.32.0", default-features = false, features = ["cargo-metadata"] }
+
+[lints]
+workspace = true

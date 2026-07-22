@@ -34,6 +34,9 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install 1.93.1 --profile minimal --component clippy,rustfmt
 
+      - name: Install macOS Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
       - name: Install frontend dependencies
         run: CI=true pnpm install --frozen-lockfile
 
@@ -57,6 +60,9 @@ jobs:
 
       - name: Build desktop shell
         run: pnpm tauri:build
+
+      - name: Test native macOS shell
+        run: ./scripts/test-macos.sh
 
       - name: Validate documentation and diff
         run: |

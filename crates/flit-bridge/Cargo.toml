@@ -1,0 +1,20 @@
+[package]
+name = "flit-bridge"
+description = "Synchronous UniFFI boundary for Flit's embedded Rust Core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib", "staticlib"]
+
+[dependencies]
+flit-protocol = { path = "../flit-protocol" }
+serde_json = "=1.0.151"
+thiserror = "=2.0.19"
+uniffi = { version = "=0.32.0", default-features = false }
+
+[lints]
+workspace = true
