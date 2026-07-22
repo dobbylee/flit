@@ -39,6 +39,85 @@ pub enum AppendEventOutcome {
     Duplicate(EventEnvelope),
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunSnapshotDraft {
+    pub run_id: String,
+    pub version: u64,
+    pub lifecycle: String,
+    pub activity: String,
+    pub activity_confidence: f64,
+    pub attention_level: String,
+    pub dashboard_bucket: String,
+    pub last_progress_at: Option<String>,
+    pub last_liveness_at: Option<String>,
+    pub snapshot: Map<String, Value>,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunSnapshot {
+    pub run_id: String,
+    pub version: u64,
+    pub lifecycle: String,
+    pub activity: String,
+    pub activity_confidence: f64,
+    pub attention_level: String,
+    pub dashboard_bucket: String,
+    pub last_progress_at: Option<String>,
+    pub last_liveness_at: Option<String>,
+    pub snapshot: Map<String, Value>,
+    pub updated_at: String,
+}
+
+impl From<RunSnapshotDraft> for RunSnapshot {
+    fn from(snapshot: RunSnapshotDraft) -> Self {
+        Self {
+            run_id: snapshot.run_id,
+            version: snapshot.version,
+            lifecycle: snapshot.lifecycle,
+            activity: snapshot.activity,
+            activity_confidence: snapshot.activity_confidence,
+            attention_level: snapshot.attention_level,
+            dashboard_bucket: snapshot.dashboard_bucket,
+            last_progress_at: snapshot.last_progress_at,
+            last_liveness_at: snapshot.last_liveness_at,
+            snapshot: snapshot.snapshot,
+            updated_at: snapshot.updated_at,
+        }
+    }
+}
+
+impl From<RunSnapshot> for RunSnapshotDraft {
+    fn from(snapshot: RunSnapshot) -> Self {
+        Self {
+            run_id: snapshot.run_id,
+            version: snapshot.version,
+            lifecycle: snapshot.lifecycle,
+            activity: snapshot.activity,
+            activity_confidence: snapshot.activity_confidence,
+            attention_level: snapshot.attention_level,
+            dashboard_bucket: snapshot.dashboard_bucket,
+            last_progress_at: snapshot.last_progress_at,
+            last_liveness_at: snapshot.last_liveness_at,
+            snapshot: snapshot.snapshot,
+            updated_at: snapshot.updated_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum WriteRunSnapshotOutcome {
+    Inserted(RunSnapshot),
+    Replaced(RunSnapshot),
+    Duplicate(RunSnapshot),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunEventPage {
+    pub upper_bound: u64,
+    pub events: Vec<EventEnvelope>,
+}
+
 impl Store {
     pub fn open(path: impl AsRef<Path>, migration_applied_at: &str) -> Result<Self, StoreError> {
         if migration_applied_at.trim().is_empty() {
@@ -177,6 +256,379 @@ impl Store {
             .map(|ingest_seq| load_event(&self.connection, ingest_seq))
             .collect()
     }
+
+    pub fn write_run_snapshot(
+        &mut self,
+        draft: RunSnapshotDraft,
+    ) -> Result<WriteRunSnapshotOutcome, StoreError> {
+        validate_snapshot(&draft)?;
+        let snapshot_json = serde_json::to_string(&draft.snapshot).map_err(StoreError::Json)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+        validate_snapshot_version(&transaction, &draft.run_id, draft.version)?;
+
+        let existing = load_run_snapshot(&transaction, &draft.run_id)?;
+        if let Some(existing) = existing {
+            if draft.version < existing.version {
+                return Err(StoreError::StaleRunSnapshot {
+                    run_id: draft.run_id,
+                    stored_version: existing.version,
+                    received_version: draft.version,
+                });
+            }
+            if draft.version == existing.version {
+                if RunSnapshotDraft::from(existing.clone()) == draft {
+                    return Ok(WriteRunSnapshotOutcome::Duplicate(existing));
+                }
+                return Err(StoreError::RunSnapshotConflict {
+                    run_id: draft.run_id,
+                    version: draft.version,
+                });
+            }
+            let changed = transaction
+                .execute(
+                    "UPDATE run_snapshots SET version = ?2, lifecycle = ?3, activity = ?4, activity_confidence = ?5, attention_level = ?6, dashboard_bucket = ?7, last_progress_at = ?8, last_liveness_at = ?9, snapshot_json = ?10, updated_at = ?11 WHERE run_id = ?1 AND version = ?12",
+                    params![
+                        draft.run_id,
+                        draft.version as i64,
+                        draft.lifecycle,
+                        draft.activity,
+                        draft.activity_confidence,
+                        draft.attention_level,
+                        draft.dashboard_bucket,
+                        draft.last_progress_at,
+                        draft.last_liveness_at,
+                        snapshot_json,
+                        draft.updated_at,
+                        existing.version as i64,
+                    ],
+                )
+                .map_err(StoreError::Sqlite)?;
+            if changed != 1 {
+                return Err(StoreError::RunSnapshotConcurrentChange {
+                    run_id: draft.run_id,
+                });
+            }
+            let snapshot = RunSnapshot::from(draft);
+            transaction.commit().map_err(StoreError::Sqlite)?;
+            return Ok(WriteRunSnapshotOutcome::Replaced(snapshot));
+        }
+
+        transaction
+            .execute(
+                "INSERT INTO run_snapshots(run_id, version, lifecycle, activity, activity_confidence, attention_level, dashboard_bucket, last_progress_at, last_liveness_at, snapshot_json, updated_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    draft.run_id,
+                    draft.version as i64,
+                    draft.lifecycle,
+                    draft.activity,
+                    draft.activity_confidence,
+                    draft.attention_level,
+                    draft.dashboard_bucket,
+                    draft.last_progress_at,
+                    draft.last_liveness_at,
+                    snapshot_json,
+                    draft.updated_at,
+                ],
+            )
+            .map_err(StoreError::Sqlite)?;
+        let snapshot = RunSnapshot::from(draft);
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(WriteRunSnapshotOutcome::Inserted(snapshot))
+    }
+
+    pub fn run_snapshot(&self, run_id: &str) -> Result<Option<RunSnapshot>, StoreError> {
+        if run_id.trim().is_empty() {
+            return Err(StoreError::InvalidRunSnapshot { field: "run_id" });
+        }
+        load_run_snapshot(&self.connection, run_id)
+    }
+
+    pub fn latest_ingest_seq(&self) -> Result<u64, StoreError> {
+        let latest = self
+            .connection
+            .query_row("SELECT MAX(ingest_seq) FROM events", [], |row| {
+                row.get::<_, Option<i64>>(0)
+            })
+            .map_err(StoreError::Sqlite)?;
+        latest.map_or(Ok(0), assigned_sequence)
+    }
+
+    pub fn run_events_through(
+        &self,
+        run_id: &str,
+        cursor: u64,
+        upper_bound: u64,
+        limit: usize,
+    ) -> Result<RunEventPage, StoreError> {
+        if run_id.trim().is_empty()
+            || cursor > upper_bound
+            || upper_bound > MAX_JSON_SAFE_INTEGER
+            || !(1..=MAX_EVENT_READ_LIMIT).contains(&limit)
+        {
+            return Err(StoreError::InvalidRunEventRange {
+                cursor,
+                upper_bound,
+                limit,
+            });
+        }
+        if !run_exists(&self.connection, run_id)? {
+            return Err(StoreError::MissingRun {
+                run_id: run_id.to_owned(),
+            });
+        }
+        let latest = self.latest_ingest_seq()?;
+        if upper_bound > latest {
+            return Err(StoreError::InvalidRunEventRange {
+                cursor,
+                upper_bound,
+                limit,
+            });
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT ingest_seq FROM events WHERE run_id = ?1 AND ingest_seq > ?2 AND ingest_seq <= ?3 ORDER BY ingest_seq LIMIT ?4",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let ingest_sequences = statement
+            .query_map(
+                params![run_id, cursor as i64, upper_bound as i64, limit as i64],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::Sqlite)?
+            .collect::<Result<Vec<i64>, _>>()
+            .map_err(StoreError::Sqlite)?;
+        drop(statement);
+        let events = ingest_sequences
+            .into_iter()
+            .map(|ingest_seq| load_event(&self.connection, ingest_seq))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(RunEventPage {
+            upper_bound,
+            events,
+        })
+    }
+}
+
+fn validate_snapshot(snapshot: &RunSnapshotDraft) -> Result<(), StoreError> {
+    for (field, value) in [
+        ("run_id", snapshot.run_id.as_str()),
+        ("lifecycle", snapshot.lifecycle.as_str()),
+        ("activity", snapshot.activity.as_str()),
+        ("attention_level", snapshot.attention_level.as_str()),
+        ("dashboard_bucket", snapshot.dashboard_bucket.as_str()),
+        ("updated_at", snapshot.updated_at.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(StoreError::InvalidRunSnapshot { field });
+        }
+    }
+    if snapshot.version == 0 || snapshot.version > MAX_JSON_SAFE_INTEGER {
+        return Err(StoreError::InvalidRunSnapshot { field: "version" });
+    }
+    if !snapshot.activity_confidence.is_finite()
+        || !(0.0..=1.0).contains(&snapshot.activity_confidence)
+    {
+        return Err(StoreError::InvalidRunSnapshot {
+            field: "activity_confidence",
+        });
+    }
+    for (field, value) in [
+        ("last_progress_at", snapshot.last_progress_at.as_deref()),
+        ("last_liveness_at", snapshot.last_liveness_at.as_deref()),
+    ] {
+        if value.is_some_and(|value| value.trim().is_empty()) {
+            return Err(StoreError::InvalidRunSnapshot { field });
+        }
+    }
+    validate_snapshot_json(snapshot)
+}
+
+fn validate_snapshot_json(snapshot: &RunSnapshotDraft) -> Result<(), StoreError> {
+    let string_matches = |field: &'static str, expected: &str| {
+        if snapshot.snapshot.get(field).and_then(Value::as_str) == Some(expected) {
+            Ok(())
+        } else {
+            Err(StoreError::InvalidRunSnapshot { field })
+        }
+    };
+    string_matches("run_id", &snapshot.run_id)?;
+    if snapshot.snapshot.get("version").and_then(Value::as_u64) != Some(snapshot.version) {
+        return Err(StoreError::InvalidRunSnapshot { field: "version" });
+    }
+    string_matches("lifecycle", &snapshot.lifecycle)?;
+    let activity = snapshot
+        .snapshot
+        .get("activity")
+        .and_then(Value::as_object)
+        .ok_or(StoreError::InvalidRunSnapshot { field: "activity" })?;
+    if activity.get("kind").and_then(Value::as_str) != Some(snapshot.activity.as_str()) {
+        return Err(StoreError::InvalidRunSnapshot {
+            field: "activity.kind",
+        });
+    }
+    if activity.get("confidence").and_then(Value::as_f64) != Some(snapshot.activity_confidence) {
+        return Err(StoreError::InvalidRunSnapshot {
+            field: "activity.confidence",
+        });
+    }
+    let attention = snapshot
+        .snapshot
+        .get("attention")
+        .and_then(Value::as_object)
+        .ok_or(StoreError::InvalidRunSnapshot { field: "attention" })?;
+    if attention.get("level").and_then(Value::as_str) != Some(snapshot.attention_level.as_str()) {
+        return Err(StoreError::InvalidRunSnapshot {
+            field: "attention.level",
+        });
+    }
+    string_matches("dashboard_bucket", &snapshot.dashboard_bucket)?;
+    validate_optional_snapshot_field(
+        &snapshot.snapshot,
+        "last_progress_at",
+        snapshot.last_progress_at.as_deref(),
+    )?;
+    validate_optional_snapshot_field(
+        &snapshot.snapshot,
+        "last_liveness_at",
+        snapshot.last_liveness_at.as_deref(),
+    )
+}
+
+fn validate_optional_snapshot_field(
+    snapshot: &Map<String, Value>,
+    field: &'static str,
+    expected: Option<&str>,
+) -> Result<(), StoreError> {
+    let matches = match (snapshot.get(field), expected) {
+        (Some(Value::Null), None) => true,
+        (Some(value), Some(expected)) => value.as_str() == Some(expected),
+        _ => false,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidRunSnapshot { field })
+    }
+}
+
+fn validate_snapshot_version(
+    connection: &Connection,
+    run_id: &str,
+    version: u64,
+) -> Result<(), StoreError> {
+    if !run_exists(connection, run_id)? {
+        return Err(StoreError::MissingRun {
+            run_id: run_id.to_owned(),
+        });
+    }
+    let owned = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE run_id = ?1 AND ingest_seq = ?2)",
+            params![run_id, version as i64],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(StoreError::Sqlite)?;
+    if !owned {
+        return Err(StoreError::RunSnapshotVersionNotOwned {
+            run_id: run_id.to_owned(),
+            version,
+        });
+    }
+    Ok(())
+}
+
+fn run_exists(connection: &Connection, run_id: &str) -> Result<bool, StoreError> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM runs WHERE id = ?1)",
+            [run_id],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::Sqlite)
+}
+
+fn load_run_snapshot(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<Option<RunSnapshot>, StoreError> {
+    let stored = connection
+        .query_row(
+            "SELECT version, lifecycle, activity, activity_confidence, attention_level, dashboard_bucket, last_progress_at, last_liveness_at, snapshot_json, updated_at FROM run_snapshots WHERE run_id = ?1",
+            [run_id],
+            |row| {
+                Ok(StoredRunSnapshot {
+                    version: row.get(0)?,
+                    lifecycle: row.get(1)?,
+                    activity: row.get(2)?,
+                    activity_confidence: row.get(3)?,
+                    attention_level: row.get(4)?,
+                    dashboard_bucket: row.get(5)?,
+                    last_progress_at: row.get(6)?,
+                    last_liveness_at: row.get(7)?,
+                    snapshot_json: row.get(8)?,
+                    updated_at: row.get(9)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(StoreError::Sqlite)?;
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    let version =
+        assigned_sequence(stored.version).map_err(|_| StoreError::StoredRunSnapshotInvalid {
+            run_id: run_id.to_owned(),
+            field: "version",
+        })?;
+    let snapshot =
+        serde_json::from_str::<Map<String, Value>>(&stored.snapshot_json).map_err(|source| {
+            StoreError::StoredRunSnapshotJson {
+                run_id: run_id.to_owned(),
+                source,
+            }
+        })?;
+    let record = RunSnapshot {
+        run_id: run_id.to_owned(),
+        version,
+        lifecycle: stored.lifecycle,
+        activity: stored.activity,
+        activity_confidence: stored.activity_confidence,
+        attention_level: stored.attention_level,
+        dashboard_bucket: stored.dashboard_bucket,
+        last_progress_at: stored.last_progress_at,
+        last_liveness_at: stored.last_liveness_at,
+        snapshot,
+        updated_at: stored.updated_at,
+    };
+    let draft = RunSnapshotDraft::from(record.clone());
+    validate_snapshot(&draft).map_err(|_| StoreError::StoredRunSnapshotInvalid {
+        run_id: run_id.to_owned(),
+        field: "snapshot",
+    })?;
+    validate_snapshot_version(connection, run_id, version).map_err(|_| {
+        StoreError::StoredRunSnapshotInvalid {
+            run_id: run_id.to_owned(),
+            field: "version",
+        }
+    })?;
+    Ok(Some(record))
+}
+
+struct StoredRunSnapshot {
+    version: i64,
+    lifecycle: String,
+    activity: String,
+    activity_confidence: f64,
+    attention_level: String,
+    dashboard_bucket: String,
+    last_progress_at: Option<String>,
+    last_liveness_at: Option<String>,
+    snapshot_json: String,
+    updated_at: String,
 }
 
 fn validate_event(event: &UnsequencedEventEnvelope) -> Result<(), StoreError> {
@@ -773,6 +1225,41 @@ struct SchemaObject {
 
 #[derive(Debug)]
 pub enum StoreError {
+    InvalidRunSnapshot {
+        field: &'static str,
+    },
+    MissingRun {
+        run_id: String,
+    },
+    RunSnapshotVersionNotOwned {
+        run_id: String,
+        version: u64,
+    },
+    StaleRunSnapshot {
+        run_id: String,
+        stored_version: u64,
+        received_version: u64,
+    },
+    RunSnapshotConflict {
+        run_id: String,
+        version: u64,
+    },
+    RunSnapshotConcurrentChange {
+        run_id: String,
+    },
+    StoredRunSnapshotInvalid {
+        run_id: String,
+        field: &'static str,
+    },
+    StoredRunSnapshotJson {
+        run_id: String,
+        source: serde_json::Error,
+    },
+    InvalidRunEventRange {
+        cursor: u64,
+        upper_bound: u64,
+        limit: usize,
+    },
     InvalidEvent {
         field: &'static str,
     },
@@ -850,6 +1337,48 @@ pub enum StoreError {
 impl fmt::Display for StoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidRunSnapshot { field } => {
+                write!(formatter, "invalid Run snapshot field: {field}")
+            }
+            Self::MissingRun { run_id } => write!(formatter, "Run does not exist: {run_id}"),
+            Self::RunSnapshotVersionNotOwned { run_id, version } => write!(
+                formatter,
+                "Run snapshot version {version} is not an event owned by {run_id}"
+            ),
+            Self::StaleRunSnapshot {
+                run_id,
+                stored_version,
+                received_version,
+            } => write!(
+                formatter,
+                "Run snapshot {run_id} is stale: stored {stored_version}, received {received_version}"
+            ),
+            Self::RunSnapshotConflict { run_id, version } => write!(
+                formatter,
+                "Run snapshot {run_id} conflicts at version {version}"
+            ),
+            Self::RunSnapshotConcurrentChange { run_id } => write!(
+                formatter,
+                "Run snapshot changed during replacement: {run_id}"
+            ),
+            Self::StoredRunSnapshotInvalid { run_id, field } => write!(
+                formatter,
+                "stored Run snapshot {run_id} has an invalid {field} field"
+            ),
+            Self::StoredRunSnapshotJson { run_id, source } => {
+                write!(
+                    formatter,
+                    "stored Run snapshot {run_id} has invalid JSON: {source}"
+                )
+            }
+            Self::InvalidRunEventRange {
+                cursor,
+                upper_bound,
+                limit,
+            } => write!(
+                formatter,
+                "invalid Run event range: cursor {cursor}, upper bound {upper_bound}, limit {limit}"
+            ),
             Self::InvalidEvent { field } => write!(formatter, "invalid event field: {field}"),
             Self::InvalidEventReadRange { cursor, limit } => write!(
                 formatter,
@@ -959,6 +1488,7 @@ impl Error for StoreError {
         match self {
             Self::Sqlite(error) => Some(error),
             Self::StoredJson { source, .. } => Some(source),
+            Self::StoredRunSnapshotJson { source, .. } => Some(source),
             Self::Json(error) => Some(error),
             _ => None,
         }
