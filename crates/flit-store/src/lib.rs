@@ -1,11 +1,23 @@
-use std::{error::Error, fmt, path::Path, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt,
+    path::Path,
+    time::Duration,
+};
 
-use rusqlite::{Connection, TransactionBehavior, params};
+use flit_protocol::{
+    EventEnvelope, EventProtocolVersion, EventSource, EventSourceKind, MAX_JSON_SAFE_INTEGER,
+    NullableSessionId, UnsequencedEventEnvelope,
+};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 const INITIAL_MIGRATION_VERSION: i64 = 1;
 const INITIAL_MIGRATION_NAME: &str = "initial";
 const INITIAL_MIGRATION_SQL: &str = include_str!("../migrations/0001_initial.sql");
+const MAX_EVENT_READ_LIMIT: usize = 1_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectionPolicy {
@@ -19,6 +31,12 @@ pub struct ConnectionPolicy {
 
 pub struct Store {
     connection: Connection,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum AppendEventOutcome {
+    Inserted(EventEnvelope),
+    Duplicate(EventEnvelope),
 }
 
 impl Store {
@@ -61,6 +79,441 @@ impl Store {
     pub fn quick_check(&self) -> Result<String, StoreError> {
         pragma_string(&self.connection, "quick_check")
     }
+
+    pub fn append_event(
+        &mut self,
+        event: UnsequencedEventEnvelope,
+    ) -> Result<AppendEventOutcome, StoreError> {
+        validate_event(&event)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+
+        if let Some(ingest_seq) = event_ingest_seq(&transaction, &event.event_id)? {
+            let existing = load_event(&transaction, ingest_seq)?;
+            if UnsequencedEventEnvelope::from(existing.clone()) == event {
+                return Ok(AppendEventOutcome::Duplicate(existing));
+            }
+            return Err(StoreError::EventIdentityConflict {
+                event_id: event.event_id,
+            });
+        }
+
+        if let NullableSessionId::Id(session_id) = &event.session_id
+            && let Some(existing_event_id) =
+                event_id_for_stream(&transaction, session_id, event.stream_seq)?
+        {
+            return Err(StoreError::StreamSequenceConflict {
+                session_id: session_id.clone(),
+                stream_seq: event.stream_seq,
+                existing_event_id,
+            });
+        }
+
+        validate_event_session(&transaction, &event)?;
+        validate_event_evidence(&transaction, &event)?;
+        let source_json = serde_json::to_string(&event.source).map_err(StoreError::Json)?;
+        let payload_json = serde_json::to_string(&event.payload).map_err(StoreError::Json)?;
+        let extensions_json = serde_json::to_string(&event.extensions).map_err(StoreError::Json)?;
+        let session_id = match &event.session_id {
+            NullableSessionId::Id(session_id) => Some(session_id.as_str()),
+            NullableSessionId::Null => None,
+        };
+        transaction
+            .execute(
+                "INSERT INTO events(event_id, protocol_version, event_type, run_id, session_id, stream_seq, occurred_at, observed_at, source_json, confidence, payload_version, payload_json, extensions_json) VALUES(?1, '1.0', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11)",
+                params![
+                    event.event_id,
+                    event.event_type,
+                    event.run_id,
+                    session_id,
+                    event.stream_seq as i64,
+                    event.occurred_at,
+                    event.observed_at,
+                    source_json,
+                    event.confidence,
+                    payload_json,
+                    extensions_json,
+                ],
+            )
+            .map_err(StoreError::Sqlite)?;
+        let ingest_seq = assigned_sequence(transaction.last_insert_rowid())?;
+        for (ordinal, evidence_id) in event.evidence_ids.iter().enumerate() {
+            transaction
+                .execute(
+                    "INSERT INTO event_evidence(event_id, evidence_id, ordinal) VALUES(?1, ?2, ?3)",
+                    params![event.event_id, evidence_id, ordinal as i64],
+                )
+                .map_err(StoreError::Sqlite)?;
+        }
+        let envelope = event.with_ingest_seq(ingest_seq);
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(AppendEventOutcome::Inserted(envelope))
+    }
+
+    pub fn events_after(
+        &self,
+        cursor: u64,
+        limit: usize,
+    ) -> Result<Vec<EventEnvelope>, StoreError> {
+        if cursor > MAX_JSON_SAFE_INTEGER || !(1..=MAX_EVENT_READ_LIMIT).contains(&limit) {
+            return Err(StoreError::InvalidEventReadRange { cursor, limit });
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT ingest_seq FROM events WHERE ingest_seq > ?1 ORDER BY ingest_seq LIMIT ?2",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let ingest_sequences = statement
+            .query_map(params![cursor as i64, limit as i64], |row| row.get(0))
+            .map_err(StoreError::Sqlite)?
+            .collect::<Result<Vec<i64>, _>>()
+            .map_err(StoreError::Sqlite)?;
+        drop(statement);
+        ingest_sequences
+            .into_iter()
+            .map(|ingest_seq| load_event(&self.connection, ingest_seq))
+            .collect()
+    }
+}
+
+fn validate_event(event: &UnsequencedEventEnvelope) -> Result<(), StoreError> {
+    for (field, value) in [
+        ("event_id", event.event_id.as_str()),
+        ("run_id", event.run_id.as_str()),
+        ("occurred_at", event.occurred_at.as_str()),
+        ("observed_at", event.observed_at.as_str()),
+        ("type", event.event_type.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(StoreError::InvalidEvent { field });
+        }
+    }
+    if let NullableSessionId::Id(session_id) = &event.session_id
+        && session_id.trim().is_empty()
+    {
+        return Err(StoreError::InvalidEvent {
+            field: "session_id",
+        });
+    }
+    if event.stream_seq == 0 || event.stream_seq > MAX_JSON_SAFE_INTEGER {
+        return Err(StoreError::InvalidEvent {
+            field: "stream_seq",
+        });
+    }
+    if !event.confidence.is_finite() || !(0.0..=1.0).contains(&event.confidence) {
+        return Err(StoreError::InvalidEvent {
+            field: "confidence",
+        });
+    }
+    validate_extension_keys(
+        &event.extensions,
+        &[
+            "protocol_version",
+            "event_id",
+            "run_id",
+            "session_id",
+            "stream_seq",
+            "ingest_seq",
+            "occurred_at",
+            "observed_at",
+            "type",
+            "source",
+            "confidence",
+            "evidence_ids",
+            "payload",
+        ],
+        "extensions",
+    )?;
+    validate_extension_keys(
+        &event.source.extensions,
+        &["kind", "provider", "contract_version"],
+        "source.extensions",
+    )?;
+
+    let mut evidence_ids = BTreeSet::new();
+    for evidence_id in &event.evidence_ids {
+        if evidence_id.trim().is_empty() || !evidence_ids.insert(evidence_id.as_str()) {
+            return Err(StoreError::InvalidEvent {
+                field: "evidence_ids",
+            });
+        }
+    }
+    if event.source.kind == EventSourceKind::Classifier && event.evidence_ids.is_empty() {
+        return Err(StoreError::InvalidEvent {
+            field: "evidence_ids",
+        });
+    }
+    Ok(())
+}
+
+fn validate_extension_keys(
+    extensions: &BTreeMap<String, Value>,
+    reserved: &[&str],
+    field: &'static str,
+) -> Result<(), StoreError> {
+    if extensions
+        .keys()
+        .any(|key| reserved.contains(&key.as_str()))
+    {
+        return Err(StoreError::InvalidEvent { field });
+    }
+    Ok(())
+}
+
+fn event_ingest_seq(connection: &Connection, event_id: &str) -> Result<Option<i64>, StoreError> {
+    connection
+        .query_row(
+            "SELECT ingest_seq FROM events WHERE event_id = ?1",
+            [event_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(StoreError::Sqlite)
+}
+
+fn event_id_for_stream(
+    connection: &Connection,
+    session_id: &str,
+    stream_seq: u64,
+) -> Result<Option<String>, StoreError> {
+    connection
+        .query_row(
+            "SELECT event_id FROM events WHERE session_id = ?1 AND stream_seq = ?2",
+            params![session_id, stream_seq as i64],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(StoreError::Sqlite)
+}
+
+fn validate_event_evidence(
+    connection: &Connection,
+    event: &UnsequencedEventEnvelope,
+) -> Result<(), StoreError> {
+    for evidence_id in &event.evidence_ids {
+        let evidence_run_id = connection
+            .query_row(
+                "SELECT run_id FROM evidence WHERE id = ?1",
+                [evidence_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)?;
+        let Some(evidence_run_id) = evidence_run_id else {
+            return Err(StoreError::MissingEvidence {
+                evidence_id: evidence_id.clone(),
+            });
+        };
+        if evidence_run_id != event.run_id {
+            return Err(StoreError::EvidenceRunMismatch {
+                evidence_id: evidence_id.clone(),
+                event_run_id: event.run_id.clone(),
+                evidence_run_id,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_event_session(
+    connection: &Connection,
+    event: &UnsequencedEventEnvelope,
+) -> Result<(), StoreError> {
+    let NullableSessionId::Id(session_id) = &event.session_id else {
+        return Ok(());
+    };
+    let session_run_id = connection
+        .query_row(
+            "SELECT run_id FROM agent_sessions WHERE id = ?1",
+            [session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(StoreError::Sqlite)?;
+    let Some(session_run_id) = session_run_id else {
+        return Err(StoreError::MissingSession {
+            session_id: session_id.clone(),
+        });
+    };
+    if session_run_id != event.run_id {
+        return Err(StoreError::SessionRunMismatch {
+            session_id: session_id.clone(),
+            event_run_id: event.run_id.clone(),
+            session_run_id,
+        });
+    }
+    Ok(())
+}
+
+fn assigned_sequence(value: i64) -> Result<u64, StoreError> {
+    let sequence =
+        u64::try_from(value).map_err(|_| StoreError::AssignedSequenceOutOfRange(value))?;
+    if sequence == 0 || sequence > MAX_JSON_SAFE_INTEGER {
+        return Err(StoreError::AssignedSequenceOutOfRange(value));
+    }
+    Ok(sequence)
+}
+
+fn load_event(connection: &Connection, ingest_seq: i64) -> Result<EventEnvelope, StoreError> {
+    let stored = connection
+        .query_row(
+            "SELECT protocol_version, event_id, run_id, session_id, stream_seq, occurred_at, observed_at, event_type, source_json, confidence, payload_version, payload_json, extensions_json FROM events WHERE ingest_seq = ?1",
+            [ingest_seq],
+            |row| {
+                Ok(StoredEvent {
+                    protocol_version: row.get(0)?,
+                    event_id: row.get(1)?,
+                    run_id: row.get(2)?,
+                    session_id: row.get(3)?,
+                    stream_seq: row.get(4)?,
+                    occurred_at: row.get(5)?,
+                    observed_at: row.get(6)?,
+                    event_type: row.get(7)?,
+                    source_json: row.get(8)?,
+                    confidence: row.get(9)?,
+                    payload_version: row.get(10)?,
+                    payload_json: row.get(11)?,
+                    extensions_json: row.get(12)?,
+                })
+            },
+        )
+        .map_err(StoreError::Sqlite)?;
+    let assigned_ingest_seq = assigned_sequence(ingest_seq)?;
+    if stored.protocol_version != "1.0" || stored.payload_version != 1 {
+        return Err(StoreError::StoredEventInvalid {
+            ingest_seq: assigned_ingest_seq,
+            field: if stored.protocol_version != "1.0" {
+                "protocol_version"
+            } else {
+                "payload_version"
+            },
+        });
+    }
+    let stream_seq = stored
+        .stream_seq
+        .and_then(|value| u64::try_from(value).ok())
+        .filter(|value| *value > 0 && *value <= MAX_JSON_SAFE_INTEGER)
+        .ok_or(StoreError::StoredEventInvalid {
+            ingest_seq: assigned_ingest_seq,
+            field: "stream_seq",
+        })?;
+    let source =
+        stored_json::<EventSource>(assigned_ingest_seq, "source_json", &stored.source_json)?;
+    let payload = stored_json::<Map<String, Value>>(
+        assigned_ingest_seq,
+        "payload_json",
+        &stored.payload_json,
+    )?;
+    let extensions = stored_json::<BTreeMap<String, Value>>(
+        assigned_ingest_seq,
+        "extensions_json",
+        &stored.extensions_json,
+    )?;
+    let evidence_ids = event_evidence_ids(connection, assigned_ingest_seq, &stored.event_id)?;
+    let envelope = EventEnvelope {
+        protocol_version: EventProtocolVersion::V1_0,
+        event_id: stored.event_id,
+        run_id: stored.run_id,
+        session_id: stored
+            .session_id
+            .map_or(NullableSessionId::Null, NullableSessionId::Id),
+        stream_seq,
+        ingest_seq: assigned_ingest_seq,
+        occurred_at: stored.occurred_at,
+        observed_at: stored.observed_at,
+        event_type: stored.event_type,
+        source,
+        confidence: stored.confidence,
+        evidence_ids,
+        payload,
+        extensions,
+    };
+    let unsequenced = UnsequencedEventEnvelope::from(envelope.clone());
+    validate_event(&unsequenced).map_err(|_| StoreError::StoredEventInvalid {
+        ingest_seq: assigned_ingest_seq,
+        field: "envelope",
+    })?;
+    validate_event_session(connection, &unsequenced).map_err(|error| match error {
+        StoreError::MissingSession { .. } | StoreError::SessionRunMismatch { .. } => {
+            StoreError::StoredEventInvalid {
+                ingest_seq: assigned_ingest_seq,
+                field: "session_id",
+            }
+        }
+        error => error,
+    })?;
+    validate_event_evidence(connection, &unsequenced).map_err(|error| match error {
+        StoreError::MissingEvidence { .. } | StoreError::EvidenceRunMismatch { .. } => {
+            StoreError::StoredEventInvalid {
+                ingest_seq: assigned_ingest_seq,
+                field: "evidence_ids",
+            }
+        }
+        error => error,
+    })?;
+    Ok(envelope)
+}
+
+fn stored_json<T: serde::de::DeserializeOwned>(
+    ingest_seq: u64,
+    field: &'static str,
+    json: &str,
+) -> Result<T, StoreError> {
+    serde_json::from_str(json).map_err(|source| StoreError::StoredJson {
+        ingest_seq,
+        field,
+        source,
+    })
+}
+
+fn event_evidence_ids(
+    connection: &Connection,
+    ingest_seq: u64,
+    event_id: &str,
+) -> Result<Vec<String>, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT evidence_id, ordinal FROM event_evidence WHERE event_id = ?1 ORDER BY ordinal, evidence_id",
+        )
+        .map_err(StoreError::Sqlite)?;
+    let rows = statement
+        .query_map([event_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(StoreError::Sqlite)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::Sqlite)?;
+    rows.into_iter()
+        .enumerate()
+        .map(|(expected, (evidence_id, ordinal))| {
+            if ordinal != expected as i64 {
+                return Err(StoreError::StoredEventInvalid {
+                    ingest_seq,
+                    field: "evidence_ids",
+                });
+            }
+            Ok(evidence_id)
+        })
+        .collect()
+}
+
+struct StoredEvent {
+    protocol_version: String,
+    event_id: String,
+    run_id: String,
+    session_id: Option<String>,
+    stream_seq: Option<i64>,
+    occurred_at: String,
+    observed_at: String,
+    event_type: String,
+    source_json: String,
+    confidence: f64,
+    payload_version: i64,
+    payload_json: String,
+    extensions_json: String,
 }
 
 #[must_use]
@@ -320,6 +773,48 @@ struct SchemaObject {
 
 #[derive(Debug)]
 pub enum StoreError {
+    InvalidEvent {
+        field: &'static str,
+    },
+    InvalidEventReadRange {
+        cursor: u64,
+        limit: usize,
+    },
+    EventIdentityConflict {
+        event_id: String,
+    },
+    StreamSequenceConflict {
+        session_id: String,
+        stream_seq: u64,
+        existing_event_id: String,
+    },
+    MissingEvidence {
+        evidence_id: String,
+    },
+    MissingSession {
+        session_id: String,
+    },
+    SessionRunMismatch {
+        session_id: String,
+        event_run_id: String,
+        session_run_id: String,
+    },
+    EvidenceRunMismatch {
+        evidence_id: String,
+        event_run_id: String,
+        evidence_run_id: String,
+    },
+    AssignedSequenceOutOfRange(i64),
+    StoredEventInvalid {
+        ingest_seq: u64,
+        field: &'static str,
+    },
+    StoredJson {
+        ingest_seq: u64,
+        field: &'static str,
+        source: serde_json::Error,
+    },
+    Json(serde_json::Error),
     InvalidMigrationAppliedAt,
     UnmanagedDatabase {
         objects: Vec<String>,
@@ -355,6 +850,66 @@ pub enum StoreError {
 impl fmt::Display for StoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidEvent { field } => write!(formatter, "invalid event field: {field}"),
+            Self::InvalidEventReadRange { cursor, limit } => write!(
+                formatter,
+                "invalid event read range: cursor {cursor}, limit {limit}"
+            ),
+            Self::EventIdentityConflict { event_id } => {
+                write!(
+                    formatter,
+                    "event identity conflicts with stored event: {event_id}"
+                )
+            }
+            Self::StreamSequenceConflict {
+                session_id,
+                stream_seq,
+                existing_event_id,
+            } => write!(
+                formatter,
+                "session stream sequence {session_id}/{stream_seq} belongs to {existing_event_id}"
+            ),
+            Self::MissingEvidence { evidence_id } => {
+                write!(formatter, "event evidence does not exist: {evidence_id}")
+            }
+            Self::MissingSession { session_id } => {
+                write!(formatter, "event session does not exist: {session_id}")
+            }
+            Self::SessionRunMismatch {
+                session_id,
+                event_run_id,
+                session_run_id,
+            } => write!(
+                formatter,
+                "event session {session_id} belongs to Run {session_run_id}, not {event_run_id}"
+            ),
+            Self::EvidenceRunMismatch {
+                evidence_id,
+                event_run_id,
+                evidence_run_id,
+            } => write!(
+                formatter,
+                "event evidence {evidence_id} belongs to Run {evidence_run_id}, not {event_run_id}"
+            ),
+            Self::AssignedSequenceOutOfRange(sequence) => {
+                write!(
+                    formatter,
+                    "assigned ingest sequence is out of range: {sequence}"
+                )
+            }
+            Self::StoredEventInvalid { ingest_seq, field } => write!(
+                formatter,
+                "stored event {ingest_seq} has an invalid {field} field"
+            ),
+            Self::StoredJson {
+                ingest_seq,
+                field,
+                source,
+            } => write!(
+                formatter,
+                "stored event {ingest_seq} has invalid {field}: {source}"
+            ),
+            Self::Json(error) => write!(formatter, "event JSON error: {error}"),
             Self::InvalidMigrationAppliedAt => {
                 formatter.write_str("migration applied_at must not be empty")
             }
@@ -403,6 +958,8 @@ impl Error for StoreError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Sqlite(error) => Some(error),
+            Self::StoredJson { source, .. } => Some(source),
+            Self::Json(error) => Some(error),
             _ => None,
         }
     }

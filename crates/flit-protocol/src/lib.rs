@@ -118,6 +118,67 @@ pub struct EventEnvelope {
     pub extensions: BTreeMap<String, Value>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct UnsequencedEventEnvelope {
+    pub protocol_version: EventProtocolVersion,
+    pub event_id: String,
+    pub run_id: String,
+    pub session_id: NullableSessionId,
+    pub stream_seq: u64,
+    pub occurred_at: String,
+    pub observed_at: String,
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub source: EventSource,
+    pub confidence: f64,
+    pub evidence_ids: Vec<String>,
+    pub payload: Map<String, Value>,
+    #[serde(default, flatten)]
+    pub extensions: BTreeMap<String, Value>,
+}
+
+impl UnsequencedEventEnvelope {
+    #[must_use]
+    pub fn with_ingest_seq(self, ingest_seq: u64) -> EventEnvelope {
+        EventEnvelope {
+            protocol_version: self.protocol_version,
+            event_id: self.event_id,
+            run_id: self.run_id,
+            session_id: self.session_id,
+            stream_seq: self.stream_seq,
+            ingest_seq,
+            occurred_at: self.occurred_at,
+            observed_at: self.observed_at,
+            event_type: self.event_type,
+            source: self.source,
+            confidence: self.confidence,
+            evidence_ids: self.evidence_ids,
+            payload: self.payload,
+            extensions: self.extensions,
+        }
+    }
+}
+
+impl From<EventEnvelope> for UnsequencedEventEnvelope {
+    fn from(event: EventEnvelope) -> Self {
+        Self {
+            protocol_version: event.protocol_version,
+            event_id: event.event_id,
+            run_id: event.run_id,
+            session_id: event.session_id,
+            stream_seq: event.stream_seq,
+            occurred_at: event.occurred_at,
+            observed_at: event.observed_at,
+            event_type: event.event_type,
+            source: event.source,
+            confidence: event.confidence,
+            evidence_ids: event.evidence_ids,
+            payload: event.payload,
+            extensions: event.extensions,
+        }
+    }
+}
+
 impl CommandError {
     #[must_use]
     pub fn protocol_mismatch() -> Self {

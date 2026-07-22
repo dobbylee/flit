@@ -358,7 +358,10 @@ dependencies = [
 name = "flit-store"
 version = "0.1.0"
 dependencies = [
+ "flit-protocol",
  "rusqlite",
+ "serde",
+ "serde_json",
  "sha2",
 ]
 
