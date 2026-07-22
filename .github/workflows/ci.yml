@@ -17,10 +17,17 @@ jobs:
     name: macOS quality and desktop build
     runs-on: macos-14
     timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.2.app/Contents/Developer
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+
+      - name: Verify Swift 6 toolchain
+        run: |
+          swiftc --version
+          swiftc --version | grep -q '^Apple Swift version 6\.'
 
       - name: Install pnpm
         uses: pnpm/action-setup@v6
