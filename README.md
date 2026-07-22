@@ -1,6 +1,6 @@
 # Flit
 
-Flit is a local Agent Development Environment for running multiple coding agents without continuously watching their terminals. It turns raw execution evidence into quiet, inspectable status and raises only the moments that need human attention.
+Flit is a local attention inbox for provider-native coding-agent sessions. It turns structured execution evidence into quiet, inspectable status and raises only the moments that need human attention, without requiring a worktree-centric IDE or an embedded terminal.
 
 The repository is currently in the **pre-implementation design phase**. Product code will begin only after the feasibility gates are complete and implementation is explicitly approved.
 
@@ -28,7 +28,7 @@ Detailed product planning, architecture drafts, decision notes, delivery plans, 
 
 ## Current technical direction
 
-The working design uses a macOS-first Tauri 2 desktop shell, a React/TypeScript UI, and a Rust Core that is Flit's single control plane and SQLite writer. Codex and Claude Code remain owned by their documented native session runtimes; provider adapters reconcile those sessions into Flit, while Generic CLI runs use a Flit-owned PTY. The terminal renderer remains undecided: the exact xterm.js candidate failed its resource gate, ghostty-web lacked the common contract, and the current commit-pinned native libghostty fork preserved Core-owned I/O but failed the common snapshot/restore entry gate. These choices remain subject to the documented feasibility spikes before product implementation.
+The working design uses a macOS-first Tauri 2 desktop shell, a React/TypeScript UI, and a Rust Core that is Flit's single event-ordering and SQLite-writing control plane. Codex and Claude Code remain owned by their documented native session runtimes, while provider adapters reconcile supported sessions into an evidence-backed attention queue. V1 deliberately excludes a Flit-owned Generic PTY, embedded terminal renderer and input, worktree orchestration, editor, browser, built-in diff, and mobile companion. The next feasibility gate compares this narrow attention workflow against an established agent environment before product implementation is approved.
 
 ## Validation
 
