@@ -1,5 +1,10 @@
 use std::{error::Error, fmt};
 
+use crate::provider_policy::{
+    MissingProviderPolicyField, PolicyViolationReason, ProviderPolicyClassification,
+    ProviderPolicyValue, VerifiedProviderPolicyOutcome,
+};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestId(String);
 
@@ -80,11 +85,54 @@ impl ResponseAttempt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderPolicyResolution {
+    outcome: VerifiedProviderPolicyOutcome,
+    violations: Vec<PolicyViolationReason>,
+}
+
+impl ProviderPolicyResolution {
+    #[must_use]
+    pub const fn outcome(&self) -> &VerifiedProviderPolicyOutcome {
+        &self.outcome
+    }
+
+    #[must_use]
+    pub fn violations(&self) -> &[PolicyViolationReason] {
+        &self.violations
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderOutcomeUnknown {
+    original_request_version: u64,
+    missing: Vec<MissingProviderPolicyField>,
+}
+
+impl ProviderOutcomeUnknown {
+    #[must_use]
+    pub const fn original_request_version(&self) -> u64 {
+        self.original_request_version
+    }
+
+    #[must_use]
+    pub fn missing(&self) -> &[MissingProviderPolicyField] {
+        &self.missing
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RequestResolution {
+    ManualResponse(ResponseAttempt),
+    ProviderPolicy(Box<ProviderPolicyResolution>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RequestStatus {
     Open,
     ResponsePending(ResponseAttempt),
     DeliveryUnknown(ResponseAttempt),
-    Resolved(ResponseAttempt),
+    Resolved(RequestResolution),
+    ProviderOutcomeUnknown(ProviderOutcomeUnknown),
     Expired,
 }
 
@@ -92,7 +140,9 @@ impl RequestStatus {
     fn active_attempt(&self) -> Option<&ResponseAttempt> {
         match self {
             Self::ResponsePending(attempt) | Self::DeliveryUnknown(attempt) => Some(attempt),
-            Self::Open | Self::Resolved(_) | Self::Expired => None,
+            Self::Open | Self::Resolved(_) | Self::ProviderOutcomeUnknown(_) | Self::Expired => {
+                None
+            }
         }
     }
 }
@@ -105,6 +155,7 @@ pub struct RequestProjection {
     last_ingest_seq: u64,
     status: RequestStatus,
     used_attempt_ids: Vec<ResponseAttemptId>,
+    used_provider_decision_ids: Vec<ProviderPolicyValue>,
 }
 
 impl RequestProjection {
@@ -123,6 +174,7 @@ impl RequestProjection {
             last_ingest_seq: requested_ingest_seq,
             status: RequestStatus::Open,
             used_attempt_ids: Vec::new(),
+            used_provider_decision_ids: Vec::new(),
         })
     }
 
@@ -156,6 +208,11 @@ impl RequestProjection {
         &self.used_attempt_ids
     }
 
+    #[must_use]
+    pub fn used_provider_decision_ids(&self) -> &[ProviderPolicyValue] {
+        &self.used_provider_decision_ids
+    }
+
     pub fn apply(
         &mut self,
         ingest_seq: u64,
@@ -186,6 +243,11 @@ impl RequestProjection {
             RequestEvent::ResponseResolved { attempt_id } => self.resolve_response(&attempt_id),
             RequestEvent::ResponseFailed { attempt_id } => self.fail_response(&attempt_id),
             RequestEvent::DeliveryUnknown { attempt_id } => self.mark_delivery_unknown(&attempt_id),
+            RequestEvent::ProviderPolicyClassified {
+                request_id,
+                expected_request_version,
+                classification,
+            } => self.apply_provider_policy(&request_id, expected_request_version, *classification),
             RequestEvent::RequestExpired => self.expire(),
         }
     }
@@ -227,7 +289,8 @@ impl RequestProjection {
             return RequestDisposition::Ignored(IgnoredRequestReason::MismatchedResponseAttempt);
         }
 
-        self.status = RequestStatus::Resolved(active_attempt.clone());
+        self.status =
+            RequestStatus::Resolved(RequestResolution::ManualResponse(active_attempt.clone()));
         RequestDisposition::Applied
     }
 
@@ -266,6 +329,111 @@ impl RequestProjection {
         RequestDisposition::Applied
     }
 
+    fn apply_provider_policy(
+        &mut self,
+        request_id: &RequestId,
+        expected_request_version: u64,
+        classification: ProviderPolicyClassification,
+    ) -> RequestDisposition {
+        if self.kind != RequestKind::Permission {
+            return RequestDisposition::Ignored(
+                IgnoredRequestReason::ProviderPolicyRequiresPermission,
+            );
+        }
+        if request_id != &self.request_id {
+            return RequestDisposition::Ignored(IgnoredRequestReason::MismatchedProviderRequest);
+        }
+        match classification {
+            ProviderPolicyClassification::InformationalResolve(outcome) => {
+                self.resolve_provider_policy(expected_request_version, outcome, Vec::new())
+            }
+            ProviderPolicyClassification::ResolvedWithPolicyViolation { outcome, reasons } => {
+                self.resolve_provider_policy(expected_request_version, outcome, reasons)
+            }
+            ProviderPolicyClassification::ProviderOutcomeUnknown { missing } => {
+                self.lock_provider_outcome_unknown(expected_request_version, missing)
+            }
+            ProviderPolicyClassification::UnboundSessionCapabilityDegrade
+            | ProviderPolicyClassification::AuditOnly(_) => RequestDisposition::Ignored(
+                IgnoredRequestReason::ProviderPolicyClassificationNotApplicable,
+            ),
+        }
+    }
+
+    fn resolve_provider_policy(
+        &mut self,
+        expected_request_version: u64,
+        outcome: VerifiedProviderPolicyOutcome,
+        violations: Vec<PolicyViolationReason>,
+    ) -> RequestDisposition {
+        if outcome.request_id != self.request_id
+            || outcome.request_version != expected_request_version
+        {
+            return RequestDisposition::Ignored(IgnoredRequestReason::MismatchedProviderRequest);
+        }
+        if self
+            .used_provider_decision_ids
+            .contains(&outcome.decision_id)
+        {
+            return RequestDisposition::Ignored(IgnoredRequestReason::ProviderDecisionAlreadyUsed);
+        }
+        let version_matches = match &self.status {
+            RequestStatus::Open => expected_request_version == self.version,
+            RequestStatus::ProviderOutcomeUnknown(unknown) => {
+                expected_request_version == unknown.original_request_version()
+            }
+            _ => {
+                return RequestDisposition::Ignored(
+                    IgnoredRequestReason::ProviderPolicyRequiresOpenOrUnknown,
+                );
+            }
+        };
+        if !version_matches {
+            return RequestDisposition::Ignored(IgnoredRequestReason::StaleExpectedVersion {
+                current: self.version,
+                received: expected_request_version,
+            });
+        }
+
+        self.used_provider_decision_ids
+            .push(outcome.decision_id.clone());
+        self.status = RequestStatus::Resolved(RequestResolution::ProviderPolicy(Box::new(
+            ProviderPolicyResolution {
+                outcome,
+                violations,
+            },
+        )));
+        RequestDisposition::Applied
+    }
+
+    fn lock_provider_outcome_unknown(
+        &mut self,
+        expected_request_version: u64,
+        missing: Vec<MissingProviderPolicyField>,
+    ) -> RequestDisposition {
+        if missing.is_empty() {
+            return RequestDisposition::Ignored(
+                IgnoredRequestReason::ProviderOutcomeUnknownRequiresMissingFields,
+            );
+        }
+        if !matches!(self.status, RequestStatus::Open) {
+            return RequestDisposition::Ignored(
+                IgnoredRequestReason::ProviderPolicyRequiresOpenOrUnknown,
+            );
+        }
+        if expected_request_version != self.version {
+            return RequestDisposition::Ignored(IgnoredRequestReason::StaleExpectedVersion {
+                current: self.version,
+                received: expected_request_version,
+            });
+        }
+        self.status = RequestStatus::ProviderOutcomeUnknown(ProviderOutcomeUnknown {
+            original_request_version: expected_request_version,
+            missing,
+        });
+        RequestDisposition::Applied
+    }
+
     fn invariants_hold(&self) -> bool {
         let attempts_unique = self
             .used_attempt_ids
@@ -273,15 +441,32 @@ impl RequestProjection {
             .enumerate()
             .all(|(index, attempt_id)| !self.used_attempt_ids[..index].contains(attempt_id));
         let active_attempt_known = match &self.status {
-            RequestStatus::ResponsePending(attempt)
-            | RequestStatus::DeliveryUnknown(attempt)
-            | RequestStatus::Resolved(attempt) => {
+            RequestStatus::ResponsePending(attempt) | RequestStatus::DeliveryUnknown(attempt) => {
                 self.used_attempt_ids.contains(attempt.id())
                     && attempt.submitted_request_version() <= self.version
             }
+            RequestStatus::Resolved(RequestResolution::ManualResponse(attempt)) => {
+                self.used_attempt_ids.contains(attempt.id())
+            }
+            RequestStatus::Resolved(RequestResolution::ProviderPolicy(resolution)) => self
+                .used_provider_decision_ids
+                .contains(&resolution.outcome().decision_id),
+            RequestStatus::ProviderOutcomeUnknown(unknown) => {
+                unknown.original_request_version() <= self.version && !unknown.missing().is_empty()
+            }
             RequestStatus::Open | RequestStatus::Expired => true,
         };
-        self.version <= self.last_ingest_seq && attempts_unique && active_attempt_known
+        let provider_decisions_unique =
+            self.used_provider_decision_ids
+                .iter()
+                .enumerate()
+                .all(|(index, decision_id)| {
+                    !self.used_provider_decision_ids[..index].contains(decision_id)
+                });
+        self.version <= self.last_ingest_seq
+            && attempts_unique
+            && provider_decisions_unique
+            && active_attempt_known
     }
 }
 
@@ -299,6 +484,11 @@ pub enum RequestEvent {
     },
     DeliveryUnknown {
         attempt_id: ResponseAttemptId,
+    },
+    ProviderPolicyClassified {
+        request_id: RequestId,
+        expected_request_version: u64,
+        classification: Box<ProviderPolicyClassification>,
     },
     RequestExpired,
 }
@@ -319,6 +509,12 @@ pub enum IgnoredRequestReason {
     DeliveryUnknownRequiresPending,
     MismatchedResponseAttempt,
     ExpirationRequiresOpen,
+    ProviderPolicyRequiresPermission,
+    MismatchedProviderRequest,
+    ProviderDecisionAlreadyUsed,
+    ProviderPolicyClassificationNotApplicable,
+    ProviderPolicyRequiresOpenOrUnknown,
+    ProviderOutcomeUnknownRequiresMissingFields,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
