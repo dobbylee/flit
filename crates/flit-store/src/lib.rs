@@ -14,6 +14,14 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+mod writer;
+
+pub use writer::{
+    DurableEventAck, EVENT_WRITER_QUEUE_CAPACITY, EVENT_WRITER_THREAD_NAME, EventCommitPriority,
+    EventWriteFailure, EventWriteReceipt, EventWriter, EventWriterHandle, EventWriterShutdownError,
+    EventWriterStartError, NORMAL_EVENT_BATCH_WAIT, event_commit_priority,
+};
+
 const INITIAL_MIGRATION_VERSION: i64 = 1;
 const INITIAL_MIGRATION_NAME: &str = "initial";
 const INITIAL_MIGRATION_SQL: &str = include_str!("../migrations/0001_initial.sql");
