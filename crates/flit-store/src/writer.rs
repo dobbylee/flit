@@ -12,7 +12,7 @@ use std::{
 
 use flit_protocol::UnsequencedEventEnvelope;
 
-use crate::{AppendEventOutcome, MAX_EVENT_APPEND_BATCH, Store, StoreError};
+use crate::{AppendEventOutcome, CheckpointReport, MAX_EVENT_APPEND_BATCH, Store, StoreError};
 
 pub const EVENT_WRITER_QUEUE_CAPACITY: usize = 1_000;
 pub const EVENT_WRITER_THREAD_NAME: &str = "flit-store-writer";
@@ -44,6 +44,58 @@ pub struct DurableEventAck {
     pub group_size: usize,
     pub priority: EventCommitPriority,
     pub writer_thread_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointAck {
+    pub report: CheckpointReport,
+    pub writer_thread_name: String,
+}
+
+#[derive(Clone, Debug)]
+pub enum CheckpointFailure {
+    Store(Arc<StoreError>),
+    WriterClosed,
+    TimedOut,
+}
+
+impl fmt::Display for CheckpointFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Store(error) => write!(formatter, "PASSIVE checkpoint failed: {error}"),
+            Self::WriterClosed => formatter.write_str("event writer is closed"),
+            Self::TimedOut => formatter.write_str("checkpoint receipt timed out"),
+        }
+    }
+}
+
+impl Error for CheckpointFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Store(error) => Some(error.as_ref()),
+            Self::WriterClosed | Self::TimedOut => None,
+        }
+    }
+}
+
+pub struct CheckpointReceipt {
+    receiver: Receiver<Result<CheckpointAck, CheckpointFailure>>,
+}
+
+impl CheckpointReceipt {
+    pub fn wait(self) -> Result<CheckpointAck, CheckpointFailure> {
+        self.receiver
+            .recv()
+            .map_err(|_| CheckpointFailure::WriterClosed)?
+    }
+
+    pub fn wait_timeout(&self, timeout: Duration) -> Result<CheckpointAck, CheckpointFailure> {
+        match self.receiver.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => Err(CheckpointFailure::TimedOut),
+            Err(RecvTimeoutError::Disconnected) => Err(CheckpointFailure::WriterClosed),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -124,6 +176,14 @@ impl EventWriterHandle {
         event: UnsequencedEventEnvelope,
     ) -> Result<DurableEventAck, EventWriteFailure> {
         self.submit(event)?.wait()
+    }
+
+    pub fn checkpoint_idle(&self) -> Result<CheckpointReceipt, CheckpointFailure> {
+        let (reply, receiver) = mpsc::sync_channel(1);
+        self.sender
+            .send(WriterCommand::Checkpoint(reply))
+            .map_err(|_| CheckpointFailure::WriterClosed)?;
+        Ok(CheckpointReceipt { receiver })
     }
 }
 
@@ -269,9 +329,12 @@ struct Submission {
 
 enum WriterCommand {
     Append(Box<Submission>),
+    Checkpoint(SyncSender<Result<CheckpointAck, CheckpointFailure>>),
     Shutdown(SyncSender<()>),
     #[cfg(test)]
     Panic,
+    #[cfg(test)]
+    CheckpointFailure(SyncSender<Result<CheckpointAck, CheckpointFailure>>),
 }
 
 fn run_writer(mut store: Store, receiver: Receiver<WriterCommand>) {
@@ -297,12 +360,15 @@ fn run_writer(mut store: Store, receiver: Receiver<WriterCommand>) {
                     return;
                 }
             }
+            Ok(WriterCommand::Checkpoint(reply)) => run_checkpoint(&mut store, reply),
             Ok(WriterCommand::Shutdown(reply)) => {
                 let _ = reply.send(());
                 return;
             }
             #[cfg(test)]
             Ok(WriterCommand::Panic) => panic!("injected event writer failure"),
+            #[cfg(test)]
+            Ok(WriterCommand::CheckpointFailure(reply)) => run_injected_checkpoint_failure(reply),
             Err(_) => return,
         }
     }
@@ -360,8 +426,29 @@ fn collect_normal_group(
                 let _ = reply.send(());
                 return false;
             }
+            Ok(WriterCommand::Checkpoint(reply)) => {
+                flush_group(
+                    store,
+                    pending,
+                    EventCommitPriority::Normal,
+                    next_commit_group,
+                );
+                run_checkpoint(store, reply);
+                return true;
+            }
             #[cfg(test)]
             Ok(WriterCommand::Panic) => panic!("injected event writer failure"),
+            #[cfg(test)]
+            Ok(WriterCommand::CheckpointFailure(reply)) => {
+                flush_group(
+                    store,
+                    pending,
+                    EventCommitPriority::Normal,
+                    next_commit_group,
+                );
+                run_injected_checkpoint_failure(reply);
+                return true;
+            }
             Err(RecvTimeoutError::Timeout) => {
                 flush_group(
                     store,
@@ -382,6 +469,31 @@ fn collect_normal_group(
             }
         }
     }
+}
+
+fn run_checkpoint(store: &mut Store, reply: SyncSender<Result<CheckpointAck, CheckpointFailure>>) {
+    let result = store.passive_checkpoint().map_or_else(
+        |error| Err(CheckpointFailure::Store(Arc::new(error))),
+        |report| {
+            Ok(CheckpointAck {
+                report,
+                writer_thread_name: thread::current().name().unwrap_or_default().to_owned(),
+            })
+        },
+    );
+    let _ = reply.send(result);
+}
+
+#[cfg(test)]
+fn run_injected_checkpoint_failure(reply: SyncSender<Result<CheckpointAck, CheckpointFailure>>) {
+    let report = CheckpointReport {
+        busy: 0,
+        log_frames: -1,
+        checkpointed_frames: 0,
+    };
+    let _ = reply.send(Err(CheckpointFailure::Store(Arc::new(
+        StoreError::InvalidCheckpointReport(report),
+    ))));
 }
 
 fn flush_group(
@@ -436,7 +548,10 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use flit_protocol::{EventEnvelope, UnsequencedEventEnvelope};
+    use flit_protocol::{
+        EventEnvelope, EventSourceKind, NullableSessionId, UnsequencedEventEnvelope,
+    };
+    use rusqlite::{Connection, params};
 
     use super::*;
 
@@ -493,5 +608,90 @@ mod tests {
             writer.shutdown(),
             Err(EventWriterShutdownError::WorkerPanicked)
         ));
+    }
+
+    #[test]
+    fn checkpoint_failure_is_isolated_between_durable_event_writes() {
+        let directory = TestDirectory::new();
+        let path = directory.0.join("flit.sqlite3");
+        let store = Store::open(&path, "2026-07-23T00:00:00.000Z").expect("bootstrap store");
+        drop(store);
+        let connection = Connection::open(&path).expect("seed connection");
+        connection
+            .execute(
+                "INSERT INTO projects(id, display_name, canonical_path, trusted, notification_policy_json, created_at, updated_at) VALUES('project-writer-unit', 'Writer Unit', '/private/tmp/flit-writer-unit', 1, '{}', ?1, ?1)",
+                ["2026-07-23T00:00:00.000Z"],
+            )
+            .expect("seed project");
+        connection
+            .execute(
+                "INSERT INTO runs(id, project_id, title, provider_kind, start_request_json, created_at) VALUES(?1, 'project-writer-unit', 'Writer Unit', 'codex', '{}', ?2)",
+                params!["run-writer-unit", "2026-07-23T00:00:00.000Z"],
+            )
+            .expect("seed run");
+        drop(connection);
+
+        let writer =
+            EventWriter::start(&path, "2026-07-23T00:00:00.000Z").expect("start event writer");
+        let handle = writer.handle();
+        let first = handle
+            .submit(normal_event("event-before-checkpoint-failure", 1))
+            .expect("submit first event");
+        let (reply, receiver) = mpsc::sync_channel(1);
+        writer
+            .sender()
+            .send(WriterCommand::CheckpointFailure(reply))
+            .expect("inject checkpoint failure");
+        let checkpoint = CheckpointReceipt { receiver };
+
+        assert_eq!(
+            first
+                .wait_timeout(Duration::from_secs(2))
+                .map(|ack| match ack.outcome {
+                    AppendEventOutcome::Inserted(event) => event.ingest_seq,
+                    AppendEventOutcome::Duplicate(_) => 0,
+                })
+                .expect("first event remains durable"),
+            1
+        );
+        assert!(matches!(
+            checkpoint.wait_timeout(Duration::from_secs(2)),
+            Err(CheckpointFailure::Store(error))
+                if matches!(error.as_ref(), StoreError::InvalidCheckpointReport(_))
+        ));
+        let second = handle
+            .append(normal_event("event-after-checkpoint-failure", 2))
+            .expect("writer remains usable");
+        assert!(matches!(
+            second.outcome,
+            AppendEventOutcome::Inserted(ref event) if event.ingest_seq == 2
+        ));
+        writer.shutdown().expect("shutdown writer");
+        assert_eq!(
+            Store::open(&path, "2026-07-23T00:00:00.000Z")
+                .expect("reopen store")
+                .events_after(0, 10)
+                .expect("durable events")
+                .len(),
+            2
+        );
+    }
+
+    fn normal_event(event_id: &str, stream_seq: u64) -> UnsequencedEventEnvelope {
+        let mut event: UnsequencedEventEnvelope = serde_json::from_str::<EventEnvelope>(
+            include_str!("../../../fixtures/protocol/events/v1.0/permission.requested.json"),
+        )
+        .map(UnsequencedEventEnvelope::from)
+        .expect("event fixture");
+        event.event_id = event_id.to_owned();
+        event.run_id = "run-writer-unit".to_owned();
+        event.session_id = NullableSessionId::Null;
+        event.stream_seq = stream_seq;
+        event.event_type = "run.event_observed".to_owned();
+        event.source.kind = EventSourceKind::Core;
+        event.source.provider = None;
+        event.source.contract_version = None;
+        event.evidence_ids.clear();
+        event
     }
 }

@@ -17,8 +17,9 @@ use sha2::{Digest, Sha256};
 mod writer;
 
 pub use writer::{
-    DurableEventAck, EVENT_WRITER_QUEUE_CAPACITY, EVENT_WRITER_THREAD_NAME, EventCommitPriority,
-    EventWriteFailure, EventWriteReceipt, EventWriter, EventWriterHandle, EventWriterShutdownError,
+    CheckpointAck, CheckpointFailure, CheckpointReceipt, DurableEventAck,
+    EVENT_WRITER_QUEUE_CAPACITY, EVENT_WRITER_THREAD_NAME, EventCommitPriority, EventWriteFailure,
+    EventWriteReceipt, EventWriter, EventWriterHandle, EventWriterShutdownError,
     EventWriterStartError, NORMAL_EVENT_BATCH_WAIT, event_commit_priority,
 };
 
@@ -36,6 +37,13 @@ pub struct ConnectionPolicy {
     pub busy_timeout_ms: i64,
     pub temp_store: i64,
     pub wal_autocheckpoint_pages: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointReport {
+    pub busy: i64,
+    pub log_frames: i64,
+    pub checkpointed_frames: i64,
 }
 
 pub struct Store {
@@ -166,6 +174,36 @@ impl Store {
 
     pub fn quick_check(&self) -> Result<String, StoreError> {
         pragma_string(&self.connection, "quick_check")
+    }
+
+    pub fn passive_checkpoint(&mut self) -> Result<CheckpointReport, StoreError> {
+        let (busy, log_frames, checkpointed_frames) = self
+            .connection
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(StoreError::Sqlite)?;
+        Self::validated_checkpoint_report(busy, log_frames, checkpointed_frames)
+    }
+
+    fn validated_checkpoint_report(
+        busy: i64,
+        log_frames: i64,
+        checkpointed_frames: i64,
+    ) -> Result<CheckpointReport, StoreError> {
+        let report = CheckpointReport {
+            busy,
+            log_frames,
+            checkpointed_frames,
+        };
+        if report.busy < 0
+            || report.log_frames < 0
+            || report.checkpointed_frames < 0
+            || report.checkpointed_frames > report.log_frames
+        {
+            return Err(StoreError::InvalidCheckpointReport(report));
+        }
+        Ok(report)
     }
 
     pub fn append_event(
@@ -1258,6 +1296,7 @@ struct SchemaObject {
 
 #[derive(Debug)]
 pub enum StoreError {
+    InvalidCheckpointReport(CheckpointReport),
     InvalidEventBatchSize {
         count: usize,
         max: usize,
@@ -1374,6 +1413,11 @@ pub enum StoreError {
 impl fmt::Display for StoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidCheckpointReport(report) => write!(
+                formatter,
+                "invalid PASSIVE checkpoint report: busy {}, log frames {}, checkpointed frames {}",
+                report.busy, report.log_frames, report.checkpointed_frames
+            ),
             Self::InvalidEventBatchSize { count, max } => {
                 write!(
                     formatter,
@@ -1580,6 +1624,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn checkpoint_report_rejects_negative_and_impossible_frame_counts() {
+        for raw in [(-1, 0, 0), (0, -1, 0), (0, 1, -1), (0, 1, 2)] {
+            assert!(matches!(
+                Store::validated_checkpoint_report(raw.0, raw.1, raw.2),
+                Err(StoreError::InvalidCheckpointReport(_))
+            ));
+        }
+        assert_eq!(
+            Store::validated_checkpoint_report(0, 3, 2).expect("valid checkpoint report"),
+            CheckpointReport {
+                busy: 0,
+                log_frames: 3,
+                checkpointed_frames: 2,
+            }
+        );
     }
 
     #[test]
