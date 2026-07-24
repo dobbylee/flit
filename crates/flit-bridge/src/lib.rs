@@ -8,6 +8,8 @@ use std::{
 
 use flit_protocol::{CommandError, HealthStatus, PROTOCOL_VERSION, SystemHealthResponse};
 
+pub mod codex_recovery;
+
 static CORE: OnceLock<FoundationCore> = OnceLock::new();
 static CORE_CONSTRUCTIONS: AtomicU64 = AtomicU64::new(0);
 

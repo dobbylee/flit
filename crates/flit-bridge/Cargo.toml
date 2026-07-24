@@ -11,8 +11,11 @@ publish = false
 crate-type = ["cdylib", "rlib", "staticlib"]
 
 [dependencies]
+flit-providers = { path = "../flit-providers" }
 flit-protocol = { path = "../flit-protocol" }
+flit-store = { path = "../flit-store" }
 serde_json = "=1.0.151"
+sha2 = "=0.10.9"
 thiserror = "=2.0.19"
 uniffi = { version = "=0.32.0", default-features = false }
 
