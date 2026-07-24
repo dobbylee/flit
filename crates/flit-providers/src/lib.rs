@@ -1,13 +1,19 @@
 use std::path::PathBuf;
 
 mod executable;
+mod probe;
 mod process;
+mod profile;
 mod schema;
 mod version;
 
 pub use executable::{
     ExecutableInspection, ExecutableInspectionError, ExecutableSelectionSource,
     MAX_EXECUTABLE_BYTES, inspect_codex_at, inspect_codex_on_path,
+};
+pub use probe::{
+    CodexCompatibilityProbe, CodexCompatibilityProbeError, CodexRuntimeFingerprint,
+    probe_codex_compatibility_at, probe_codex_compatibility_on_path,
 };
 pub use schema::{
     CodexSchemaProbe, CodexSchemaProbeError, MAX_SCHEMA_BYTES, MAX_SCHEMA_OUTPUT_BYTES,

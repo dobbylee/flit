@@ -13,6 +13,9 @@ use rustix::{
     process::{Pid, Signal, kill_process_group},
 };
 
+#[cfg(test)]
+static TEST_PROCESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[derive(Clone, Copy)]
 pub(crate) struct ProcessPolicy {
     pub timeout: Duration,
@@ -39,6 +42,10 @@ pub(crate) fn run_bounded(
     arguments: &[OsString],
     policy: ProcessPolicy,
 ) -> Result<ProcessOutput, ProcessError> {
+    #[cfg(test)]
+    let _test_process_guard = TEST_PROCESS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut command = Command::new(executable);
     command
         .args(arguments)
@@ -249,14 +256,25 @@ fn drain_output(
 
 fn terminate_process_group(child: &mut std::process::Child) -> Result<(), ProcessError> {
     let mut group_error = None;
-    if let Some(pid) = Pid::from_raw(child.id() as i32)
-        && let Err(error) = kill_process_group(pid, Signal::KILL)
-        && error != rustix::io::Errno::SRCH
-    {
-        let child_already_exited = error == rustix::io::Errno::PERM
-            && child.try_wait().map_err(ProcessError::Wait)?.is_some();
-        if !child_already_exited {
-            group_error = Some(error);
+    if let Some(pid) = Pid::from_raw(child.id() as i32) {
+        for attempt in 0..20 {
+            match kill_process_group(pid, Signal::KILL) {
+                Ok(()) | Err(rustix::io::Errno::SRCH) => break,
+                Err(error) if error == rustix::io::Errno::PERM => {
+                    if child.try_wait().map_err(ProcessError::Wait)?.is_some() {
+                        break;
+                    }
+                    if attempt == 19 {
+                        group_error = Some(error);
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => {
+                    group_error = Some(error);
+                    break;
+                }
+            }
         }
     }
     let _ = child.kill();

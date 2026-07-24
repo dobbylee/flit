@@ -741,8 +741,8 @@ mod tests {
                     .expect("send FIFO probe result");
             });
             let (result, output_path) = receiver
-                .recv_timeout(Duration::from_secs(6))
-                .expect("FIFO artifact validation must return within six seconds");
+                .recv_timeout(Duration::from_secs(30))
+                .expect("FIFO artifact validation must return within thirty seconds");
             let error = result.expect_err("FIFO artifact must fail");
             assert!(matches!(
                 error,

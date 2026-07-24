@@ -1,0 +1,15 @@
+client initialize
+client thread/delete
+client thread/list
+client thread/read
+client thread/resume
+client thread/start
+client turn/interrupt
+client turn/start
+client_notification initialized
+notification item/started
+notification serverRequest/resolved
+notification thread/deleted
+notification turn/completed
+server item/fileChange/requestApproval
+server item/tool/requestUserInput

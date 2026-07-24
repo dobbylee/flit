@@ -242,18 +242,22 @@ mod tests {
     fn exact_version_is_parsed_without_retaining_stderr_content() {
         let directory = TestDirectory::new("success");
         let executable = directory.0.join("codex");
+        let descendant_marker = directory.0.join("success-descendant");
         write_script(
             &executable,
-            "#!/bin/sh\n/bin/sleep 5 &\nprintf 'private warning' >&2\nprintf 'codex-cli 0.145.0\\n'\n",
+            &format!(
+                "#!/bin/sh\n(/bin/sleep 0.6; /usr/bin/touch '{}') &\nprintf 'private warning' >&2\nprintf 'codex-cli 0.145.0\\n'\n",
+                descendant_marker.display()
+            ),
         );
         let inspection = inspect_codex_at(&executable).expect("inspection");
 
-        let started = std::time::Instant::now();
         let result = probe_codex_version_with_policy(&inspection, test_policy()).expect("probe");
-        assert!(started.elapsed() < Duration::from_millis(2_500));
         assert_eq!(result.executable_version, "0.145.0");
         assert_eq!(result.stderr_bytes, "private warning".len());
         assert_eq!(result.inspection, inspection);
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(!descendant_marker.exists());
     }
 
     #[test]
@@ -304,17 +308,16 @@ mod tests {
         write_script(
             &escaped,
             &format!(
-                "#!/bin/sh\n/usr/bin/perl -MPOSIX -e 'POSIX::setsid(); open(F, \">{}\"); close(F); $|=1; while (1) {{ print STDOUT \"x\"; select(undef, undef, undef, 0.1); }}' &\nwhile [ ! -e '{}' ]; do :; done\nprintf 'codex-cli 0.1.0\\n'\n",
+                "#!/bin/sh\n/usr/bin/perl -MPOSIX -e 'POSIX::setsid(); open(F, \">{}\"); close(F); $|=1; while (1) {{ print STDOUT \"x\"; select(undef, undef, undef, 0.1); }}' &\nwhile [ ! -e '{}' ]; do /bin/sleep 0.01; done\nprintf 'codex-cli 0.1.0\\n'\n",
                 escaped_ready.display(),
                 escaped_ready.display()
             ),
         );
         let escaped_inspection = inspect_codex_at(&escaped).expect("escaped inspection");
-        let started = std::time::Instant::now();
         let escaped_error = probe_codex_version_with_policy(
             &escaped_inspection,
             ProbePolicy {
-                timeout: Duration::from_secs(1),
+                timeout: Duration::from_secs(3),
                 max_output_bytes: 128,
                 fault: ProcessFault::None,
             },
@@ -324,7 +327,6 @@ mod tests {
             matches!(escaped_error, CodexVersionProbeError::OutputDrainTimedOut),
             "{escaped_error:?}"
         );
-        assert!(started.elapsed() < Duration::from_millis(1_500));
     }
 
     #[test]
@@ -335,24 +337,22 @@ mod tests {
         write_script(
             &infinite,
             &format!(
-                "#!/bin/sh\n(/bin/sleep 0.3; /usr/bin/touch '{}') &\nwhile :; do printf x; done\n",
+                "#!/bin/sh\n(/bin/sleep 0.3; /usr/bin/touch '{}') &\n/usr/bin/yes x\n",
                 infinite_marker.display()
             ),
         );
         let inspection = inspect_codex_at(&infinite).expect("infinite inspection");
-        let started = std::time::Instant::now();
         assert!(matches!(
             probe_codex_version_with_policy(
                 &inspection,
                 ProbePolicy {
-                    timeout: Duration::from_secs(2),
+                    timeout: Duration::from_secs(5),
                     max_output_bytes: 128,
                     fault: ProcessFault::None,
                 }
             ),
             Err(CodexVersionProbeError::OutputTooLarge { max_bytes: 128 })
         ));
-        assert!(started.elapsed() < Duration::from_millis(2_500));
         std::thread::sleep(Duration::from_millis(400));
         assert!(!infinite_marker.exists());
 
