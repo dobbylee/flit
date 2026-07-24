@@ -1,5 +1,12 @@
 use std::path::PathBuf;
 
+mod executable;
+
+pub use executable::{
+    ExecutableInspection, ExecutableInspectionError, ExecutableSelectionSource,
+    MAX_EXECUTABLE_BYTES, inspect_codex_at, inspect_codex_on_path,
+};
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum ProviderKind {
     Codex,
