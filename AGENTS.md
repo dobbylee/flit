@@ -1,60 +1,36 @@
 # Flit Repository Rules
 
-## Read first
+## Before editing
 
-Before changing the repository, read `README.md`, this file, and `agent-harness/workflow.md`. Read the task's directly relevant source and tests. If `local/` exists, also read its index, current plan, decision register, implementation plan, and relevant design documents.
+Read `README.md`, this file, `agent-harness/workflow.md`, and the directly relevant source and tests. When `local/` exists, follow its routing index: read the current plan and decision index, then only the contract documents needed by the current slice.
+
+Inspect the current worktree and preserve user changes. Implement only the current smallest vertical slice; do not scaffold adjacent phases.
 
 ## Repository boundary
 
-- All committed documentation, rules, prompts, code comments, configuration descriptions, and user-facing copy must be written in English.
-- Detailed product planning, architecture drafts, decision notes, delivery plans, and working checklists belong under ignored `local/`.
-- Public files may define durable rules and reproducible harnesses, but must not depend on `local/` being present in a fresh clone.
-- Do not commit files from `local/` or remove `local/` from `.gitignore`.
+- Committed documentation, rules, prompts, comments, configuration descriptions, and user-facing copy are English.
+- Detailed working plans and unpublished product records stay under ignored `local/`. Never commit it or remove it from `.gitignore`.
+- Public source and documentation must remain complete in a fresh clone without `local/`.
+- Feasibility code is disposable and separate from production modules.
 
-## Current phase
+## Product and safety invariants
 
-- Phase 0 feasibility is complete and the user explicitly approved Phase 1 product implementation on 2026-07-22.
-- Implement only the current smallest vertical slice recorded in `local/`; do not scaffold adjacent phases speculatively.
-- Feasibility spikes must remain disposable and separate from production modules.
+- Normal progress stays quiet; promote only moments that need human action.
+- Every summary or inference links to raw evidence or an explicit unavailable reason.
+- Lifecycle, current activity, and attention are independent state dimensions.
+- The app-process Rust Core is the sole event-ordering and SQLite writer. Swift does not create domain transitions or another data writer.
+- Provider-native runtimes own sessions and credentials. V1 has no Flit-owned Generic PTY or embedded terminal.
+- Provider behavior uses documented, version-probed capabilities. Uncertainty degrades to `Unknown`; never invent a fallback.
+- Permission and question responses require the exact current request identity and version. Reject stale and duplicate responses.
+- Never persist a permission rule for an action, path, or scope the user was not shown.
+- Provider history, raw evidence, and logs are local sensitive data; do not retain secrets or raw provider content by default.
 
-## Product invariants
+## Change boundaries
 
-- Normal progress stays quiet; only moments that need human action are promoted.
-- Every summarized or inferred state must link to raw evidence such as an event, provider-history locator, command, file change, or diagnostic.
-- Keep lifecycle, current activity, and attention level as independent state dimensions.
-- The app-process embedded Rust Core is Flit's sole event-ordering and SQLite writer. Swift owns presentation and native macOS adapters but does not create domain transitions or another data writer. Provider-native runtimes own Codex and Claude Code sessions; V1 does not own Generic CLI PTYs or embed a terminal.
-- Provider adapters use documented, version-probed surfaces and record source, confidence, capability, and evidence. Uncertain behavior degrades to `Unknown` and exposes only verified provider-open or raw-evidence navigation capabilities.
-- Permission and question responses are bound to request identity and version. Reject stale and duplicate responses.
-- Never create a persistent permission rule for an action, path, or scope the user was not shown.
-- Treat provider history, raw evidence, and logs as local sensitive data that may contain secrets.
+- Keep one explainable commit unit and avoid unrelated refactors.
+- Preserve replacement parity before removing an approved obsolete runtime, then remove all obsolete production paths in a separate unit.
+- Put each rule or contract in one source of truth and link to it elsewhere.
+- Record unresolved decisions with an owner, safe default, and resolution gate.
+- Preserve out-of-scope files and never report an unrun check as passing.
 
-## Execution rules
-
-- Keep each change small enough to explain as one commit unit.
-- Record assumptions, success criteria, changed files, focused validation, and full validation before implementation.
-- Build the smallest vertical slice and avoid unrelated refactors.
-- During an approved runtime migration, establish replacement parity first, then remove every obsolete production code path, dependency, configuration, test, generated binding, lockfile, and CI/build entry in a separate explainable unit. Preserve historical evidence as documentation, not executable production scaffolding.
-- Run focused validation, then use the independent review gate defined in `agent-harness/workflow.md` for only the changed scope.
-- Fix findings, re-run the same checks, and repeat until the reviewer returns exactly `No Findings`.
-- Run full validation and `git diff --check` before reporting completion.
-- Preserve user changes and do not edit out-of-scope files.
-
-The detailed loop and harness-promotion rubric live in `agent-harness/workflow.md`.
-
-## Documentation rules
-
-- Keep requirement IDs as `FR-*`, non-functional requirements as `NFR-*`, decisions as `D-*`, and risks as `R-*` when local design documents exist.
-- Put each rule in one source of truth and link to it instead of duplicating it.
-- Do not leave unfinished markers. Record unresolved decisions with an owner, safe default, and resolution gate in `local/`.
-- Examples must match the protocol or contract they document.
-- Document commands as current only when the referenced scripts exist and are executable.
-
-## Validation
-
-```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-./scripts/test-macos.sh
-./scripts/validate-docs.sh
-```
+Follow `agent-harness/workflow.md` for task contracts, review, validation, commits, and releases.

@@ -1,76 +1,47 @@
-# Task plan: <short outcome>
+# Current task: <one-sentence outcome>
 
-## User outcome
+## Contract
 
-Describe one user-observable result in one sentence.
-
-## Confirmed facts
-
-- Facts verified from the current code, data, or runtime
-- Applicable requirements, design sections, and decisions when local records exist
-
-## Assumptions
-
-- Safe defaults and their evidence
-- Which decision must reopen if an assumption is false
+- User outcome:
+- Current-state evidence:
+- Applicable requirements and decisions:
+- Assumptions and reopen condition:
 
 ## Scope
 
-Included:
-
-- One vertical slice of behavior
-
-Excluded:
-
-- Adjacent phases, future expansion, and unrelated cleanup
-
-## Change contract
-
-| File or module | Change | Contract to preserve |
-| --- | --- | --- |
-| path | smallest change | invariant or API |
+- Included:
+- Excluded:
+- Changed files or modules:
+- Contracts that must remain unchanged:
 
 ## Success criteria
 
-- [ ] Observable normal-path result
-- [ ] Error and boundary-path result
-- [ ] Security and data invariants
-- [ ] Public rules and local contract/traceability stay synchronized
+- [ ] Normal observable result
+- [ ] Boundary and failure result
+- [ ] Security, privacy, and data invariants
+- [ ] Documentation and generated artifacts remain synchronized
 
 ## Validation
 
-Focused:
-
-```bash
-<command>
-```
-
-Full:
-
-```bash
-<command>
-```
-
-Manual or environment-specific:
-
-- Execution condition and evidence format
+- Focused:
+- Full:
+- Manual or environment-specific:
 
 ## Risk and rollback
 
-- Data and migration impact
-- Process, permission, and security impact
-- Reversible boundary and artifacts to preserve
+- Data or migration impact:
+- Process, permission, and security impact:
+- Exact rollback boundary:
 
-## Review scope
+## Review
 
-- Changed files
-- Risks the reviewer should prioritize
-- Intentionally excluded areas
+- Frozen changed scope:
+- Priority risks:
+- Validation evidence:
 
-## Result record
+## Result
 
 - Focused validation:
 - Reviewer:
 - Full validation:
-- Unrun checks:
-- Next safe slice:
+- Unrun gates:

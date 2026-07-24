@@ -36,14 +36,8 @@ const localRequired = [
   "local/docs/delivery/traceability.md",
   "local/docs/decisions/README.md",
   "local/docs/decisions/0004-native-provider-control-plane.md",
-  "local/checklists/implementation-ready.md",
   "local/checklists/release.md",
   "local/spikes/README.md",
-  "local/spikes/s0-1-native-provider-contract.md",
-  "local/spikes/s0-2-tauri-core-lifecycle.md",
-  "local/spikes/s0-3-terminal-renderer.md",
-  "local/spikes/s0-4-generic-pty.md",
-  "local/spikes/s0-5-event-store.md",
 ];
 
 for (const file of publicRequired) {
@@ -71,6 +65,31 @@ if (/^\[[^\]]+\]$/m.test(reviewerConfig)) {
 }
 
 const workflow = fs.readFileSync(path.join(repo, "agent-harness/workflow.md"), "utf8");
+const compactPublicBudgets = new Map([
+  ["README.md", 60],
+  ["AGENTS.md", 80],
+  ["agent-harness/workflow.md", 150],
+  ["agent-harness/prompts/implementation-review.md", 70],
+  ["agent-harness/templates/task-plan.md", 60],
+]);
+for (const [file, limit] of compactPublicBudgets) {
+  const lineCount = fs.readFileSync(path.join(repo, file), "utf8").split("\n").length;
+  if (lineCount > limit) errors.push(`${file} exceeds the ${limit}-line harness budget`);
+}
+
+for (const command of [
+  "cargo fmt --all -- --check",
+  "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+  "cargo test --workspace --all-features",
+  "./scripts/test-macos.sh",
+]) {
+  const occurrences = publicRequired
+    .filter((file) => file.endsWith(".md"))
+    .map((file) => fs.readFileSync(path.join(repo, file), "utf8"))
+    .reduce((count, text) => count + (text.match(new RegExp(command.replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")) ?? []).length, 0);
+  if (occurrences !== 1) errors.push(`public validation command must have one owner: ${command}`);
+}
+
 const reviewerWorkflowMarker =
   "<!-- flit-reviewer-contract:v1 custom=reviewer nested-codex=forbidden fallback=hash-verified -->";
 if ((workflow.match(new RegExp(reviewerWorkflowMarker, "g")) ?? []).length !== 1) {
@@ -155,7 +174,24 @@ if (fs.existsSync(localRoot)) {
 
   const localMarkdown = collectFiles(localRoot, (file) => file.endsWith(".md"));
   validateMarkdown(localMarkdown);
-
+  for (const [file, limit] of [
+    ["README.md", 80],
+    ["plan.md", 100],
+  ]) {
+    const lineCount = fs.readFileSync(path.join(localRoot, file), "utf8").split("\n").length;
+    if (lineCount > limit) errors.push(`local/${file} exceeds the ${limit}-line active-context budget`);
+  }
+  const legacyTasks = path.join(localRoot, "tasks");
+  if (fs.existsSync(legacyTasks) && collectFiles(legacyTasks, () => true).length > 0) {
+    errors.push("completed task artifacts must not remain under local/tasks");
+  }
+  const spikeResults = path.join(localRoot, "spikes/results");
+  if (
+    fs.existsSync(spikeResults) &&
+    collectFiles(spikeResults, (file) => path.basename(file) === "task-plan.md").length > 0
+  ) {
+    errors.push("completed spike task plans must not remain under local/spikes/results");
+  }
   const prd = fs.readFileSync(path.join(localRoot, "docs/product/prd.md"), "utf8");
   const traceability = fs.readFileSync(path.join(localRoot, "docs/delivery/traceability.md"), "utf8");
   const eventProtocol = fs.readFileSync(path.join(localRoot, "docs/design/event-state-protocol.md"), "utf8");
@@ -215,6 +251,56 @@ if (fs.existsSync(localRoot)) {
     }
   }
 
+  const nativeSpikeRoot = path.join(
+    localRoot,
+    "spikes/results/s0-8/2026-07-23-arm64-04adae1-appkit-uniffi",
+  );
+  const nativeMeasurements = JSON.parse(
+    fs.readFileSync(path.join(nativeSpikeRoot, "measurements.json"), "utf8"),
+  );
+  const nativeLocators = [
+    ["architecture", nativeMeasurements.architecture.source],
+    ["bridge", nativeMeasurements.bridge.source],
+    ["lifecycle", nativeMeasurements.lifecycle.source],
+    ...nativeMeasurements.resource.foreground.source_directories.map((locator) => [
+      "foreground resource",
+      locator,
+    ]),
+    ...nativeMeasurements.resource.foreground.normal_rendering_screenshots.map((locator) => [
+      "foreground screenshot",
+      locator,
+    ]),
+    ...nativeMeasurements.resource.hidden.source_directories.map((locator) => [
+      "hidden resource",
+      locator,
+    ]),
+  ];
+  for (const [label, locator] of nativeLocators) {
+    const relative = locator.split("#", 1)[0];
+    if (!fs.existsSync(path.join(nativeSpikeRoot, relative))) {
+      errors.push(`missing retained S0-8 ${label} evidence: ${locator}`);
+    }
+  }
+  if (
+    nativeMeasurements.failure_and_ownership_paths.binding_mismatch_source !== null ||
+    !nativeMeasurements.failure_and_ownership_paths.binding_mismatch_unavailable_reason
+  ) {
+    errors.push("pruned S0-8 binding mismatch evidence needs a null locator and unavailable reason");
+  }
+  const nativeManifest = fs.readFileSync(path.join(nativeSpikeRoot, "manifest.yaml"), "utf8");
+  for (const phrase of [
+    "canonical_reproduction: pruned_after_decision",
+    "canonical_summary: measurements.json",
+    "reproduction_script: source/reproduce.sh",
+  ]) {
+    if (!nativeManifest.includes(phrase)) errors.push(`incomplete S0-8 retention manifest: ${phrase}`);
+  }
+  for (const relative of ["measurements.json", "source/reproduce.sh"]) {
+    if (!fs.existsSync(path.join(nativeSpikeRoot, relative))) {
+      errors.push(`missing S0-8 retained reproduction record: ${relative}`);
+    }
+  }
+
   const decisionIndex = fs.readFileSync(path.join(localRoot, "docs/decisions/README.md"), "utf8");
   const decisionRows = [
     ...decisionIndex.matchAll(
@@ -229,21 +315,6 @@ if (fs.existsSync(localRoot)) {
   for (const [index, id] of decisionIds.entries()) {
     const expected = `D-${String(index + 1).padStart(3, "0")}`;
     if (id !== expected) errors.push(`non-sequential local decision ID: expected ${expected}, found ${id}`);
-  }
-
-  const phaseZeroSources = [
-    "plan.md",
-    "docs/design/verification-strategy.md",
-    "docs/delivery/implementation-plan.md",
-    "checklists/implementation-ready.md",
-    "spikes/README.md",
-  ];
-  for (const source of phaseZeroSources) {
-    const text = fs.readFileSync(path.join(localRoot, source), "utf8");
-    for (let spike = 1; spike <= 5; spike += 1) {
-      const id = `S0-${spike}`;
-      if (!text.includes(id)) errors.push(`missing ${id} in local/${source}`);
-    }
   }
 
   localSummary = `${localMarkdown.length} local markdown files, ${frIds.size} FR, ${nfrIds.size} NFR, ${decisionIds.length} decisions`;

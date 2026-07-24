@@ -1,161 +1,69 @@
-# Flit Execution Harness
+# Flit Delivery Workflow
 
-This document defines the repeatable loop for design, feasibility, implementation, and release work. `AGENTS.md` owns short repository-wide invariants. Detailed product contracts and working plans live in ignored `local/` when available.
+This file is the single source of truth for planning, review, validation, and commit execution. Repository and product invariants live in `AGENTS.md`; reviewer finding format lives in the review prompt.
 
-## 1. Gate types
+## 1. Select the gate
 
-### Design gate
+- **Design:** change the relevant requirement, decision, traceability row, and contract before implementation.
+- **Feasibility:** freeze the question and hard stop, use disposable code, record only decision-grade evidence, and never copy spike code into production.
+- **Implementation:** deliver one observable vertical behavior after its decisions and feasibility gates are satisfied.
+- **Release:** complete the release checklist and obtain explicit approval before publishing or changing external state.
 
-Use this gate when a requirement or contract changes.
+## 2. Preflight and task contract
 
-- Update the affected product, design, decision, and traceability records under `local/`.
-- Change the contract before its implementation.
-- Validate examples and schema consistency.
-- Run documentation validation and independent review.
+1. Inspect `git status --short --branch`; preserve user and out-of-scope changes.
+2. Read the files required by `AGENTS.md` and verify the actual code/runtime path.
+3. Confirm authorization and that no applicable decision is unresolved.
+4. Create one ignored current-task record from `agent-harness/templates/task-plan.md`.
 
-### Feasibility gate
+The task record fixes the outcome, evidence-backed assumptions, included and excluded scope, changed contracts, success criteria, focused/full/manual validation, risks, rollback, and review scope. Split the task if its outcome needs more than one sentence.
 
-Use this gate for disposable experiments that reduce architecture uncertainty.
+Do not guess through an unresolved decision, unverified provider capability, unprovable response acknowledgement, inexact destructive target, or success condition that cannot be observed. Use a documented safe default for non-blocking details.
 
-- Record the question and pass/fail criteria before writing the spike.
-- Keep the spike separate from production crates and packages.
-- Record the environment, exact commands, measurements, and outcome.
-- Update the relevant decision and delivery gate.
-- Do not copy spike code into production code.
+Delete the task record after the commit; Git history, tests, and normative contracts own completed work.
 
-### Implementation gate
-
-Use this gate only after explicit implementation approval and the applicable feasibility gate.
-
-- Deliver one user-observable result as the smallest vertical slice.
-- Run focused validation, independent review, and full validation.
-- Update the affected contract and traceability records in the same unit.
-
-### Release gate
-
-Use this gate for signing, packaging, deployment, or any external state change.
-
-- Complete the release checklist under `local/` when it exists.
-- Run independent security, data-side-effect, and rollback review.
-- Obtain explicit user approval before publishing.
-
-## 2. Start a task
-
-### 2.1 Preflight
-
-1. Inspect `git status --short --branch` and preserve user changes.
-2. Read `README.md`, `AGENTS.md`, this workflow, and the directly relevant source and tests.
-3. If `local/` exists, read its index, current plan, decision register, implementation plan, and relevant design documents.
-4. Verify the current code and runtime path instead of inferring behavior from nearby state or prior summaries.
-5. Confirm that the required gate and user authorization are satisfied.
-6. Identify out-of-scope files and possible overlap with user work.
-
-### 2.2 Plan contract
-
-Copy `agent-harness/templates/task-plan.md` into an ignored working plan and fix:
-
-- one user-observable outcome;
-- confirmed facts and explicit assumptions;
-- included and excluded scope;
-- changed files and affected contracts;
-- success and failure criteria;
-- focused and full validation;
-- security, data, migration, and rollback impact;
-- documentation and traceability updates.
-
-If the change cannot be explained in one sentence, split it again.
-
-### 2.3 Blocking conditions
-
-Do not guess through these conditions:
-
-- an applicable decision is unresolved before the current gate;
-- an agent adapter capability has not been verified against the real supported CLI;
-- a permission response cannot verify request identity and delivery acknowledgement;
-- a migration, deletion, or force-kill target is not exact;
-- success cannot be expressed as an executable check or direct observation.
-
-For non-blocking details, use the documented safe default and record the assumption.
-
-## 3. Smallest vertical slice
-
-Good slices include:
-
-- one event flowing through domain, persistence, the in-process Core bridge, and UI or testkit;
-- one failure reproduced, fixed, and closed with a regression test;
-- one user action with both success and error states.
-
-Bad slices include:
-
-- abstractions added only for hypothetical future use;
-- several delivery phases scaffolded together;
-- unrelated renames, formatting, or refactors;
-- interfaces and mocks without an observable behavior.
-
-Keep schema migrations, adapter behavior, UI copy, and release configuration in separate commit units when practical. Keep a behavior and the tests that directly prove it together.
-
-## 4. Implementation loop
+## 3. Commit-unit loop
 
 1. Add the smallest failing test or direct observable criterion.
-2. Implement the minimum change that satisfies it.
-3. Re-read the changed files for scope and invariant drift.
-4. Run focused validation.
-5. Delegate to the project-scoped custom agent whose configured `name` is `reviewer`, with the plan, success criteria, changed files, and validation evidence.
-6. Fix each finding with the smallest relevant change.
-7. Re-run the same focused checks and review.
-8. Continue until the reviewer returns exactly `No Findings` with no additional text.
-9. Run impact-appropriate full validation and `git diff --check`.
-10. Check public English-only rules and local contract/traceability drift.
-11. Record results and any unrun checks, then commit one logical unit.
+2. Implement only the behavior required by the task contract.
+3. Re-read the changed scope and run focused validation.
+4. Invoke the project custom `reviewer` with the task, exact scope, contracts, and validation evidence.
+5. Fix every finding, rerun the same checks, and repeat review until the response is exactly `No Findings`.
+6. Run full validation and `git diff --check`.
+7. Confirm generated artifacts, public English, local contract/traceability, and staged scope.
+8. Record unrun environment-specific checks, then commit one logical unit.
 
-The reviewer must inspect the diff and source-of-truth contracts directly rather than trusting the implementation summary.
+Schema migrations, provider side effects, UI behavior, and release configuration should remain separate units unless one observable behavior requires them together.
 
 ### Reviewer invocation boundary
 
 <!-- flit-reviewer-contract:v1 custom=reviewer nested-codex=forbidden fallback=hash-verified -->
 
-- Use the project custom agent defined by `.codex/agents/reviewer.toml`; Codex selects it by the file's `name = "reviewer"` field.
-- Confirm that the spawned agent uses that custom role and its configured reasoning effort. A generic child whose task label or nickname is merely `reviewer` does not satisfy the gate.
-- Prefer an effective `sandbox_mode = "read-only"` reviewer. If the current client instead reapplies the parent `workspace-write` permission to the selected custom reviewer, record that limitation and use the fallback only with explicit user acceptance: prohibit reviewer writes, freeze the reviewed scope, and compare aggregate tracked-diff and required-local-source hashes before and after the pass. Compare hashes programmatically and report only changed/unchanged; any change invalidates the review.
-- Keep the reviewer independent from the implementing agent's conclusions.
+- Use the custom role defined by `.codex/agents/reviewer.toml`; a generically named child is not the configured reviewer.
+- The reviewer inspects the diff and source contracts independently and follows `agent-harness/prompts/implementation-review.md`.
+- Prefer effective read-only isolation. If the client reapplies workspace-write, use the hash-verified no-write fallback only with explicit user acceptance: freeze every reviewed tracked and required local file, prohibit writes, and compare hashes before and after. Any change invalidates the review.
 - Do not launch a nested Codex client with `codex exec` or another shell command to satisfy this gate.
-- Report the review gate as blocked if the custom role or configured reasoning cannot be verified, the user does not accept the sandbox fallback, or the integrity comparison changes. Deterministic validation and the implementing agent's self-review do not count as an independent review.
+- Treat an unverifiable custom role, reasoning configuration, isolation fallback, or changed frozen scope as a blocked review gate.
 
-## 5. Choose focused validation
+## 4. Validation
 
-| Change | Minimum focused validation |
+Choose focused checks that execute the changed risk:
+
+| Change | Minimum focused evidence |
 | --- | --- |
-| Pure reducer or policy | Targeted unit tests and property invariants |
-| Event or schema | Schema fixtures and generated binding drift |
-| SQLite or migration | Temporary DB migration, replay, rollback, and integrity check |
-| PTY or process | Fake-agent integration with timeout and cleanup |
-| Adapter parser | All target fixtures with chunk and resize variations |
+| Reducer or policy | Targeted tests and invariants |
+| Event or generated contract | Fixtures, schema, and binding drift |
+| SQLite or migration | Temporary DB migration, replay, rollback, and integrity |
+| Provider/process | Fake integration, bounds, timeout, and cleanup |
 | Permission response | Stale, duplicate, and delivery-failure matrix |
-| Native UI component | Component state matrix, keyboard, accessibility, and main-actor checks |
+| Native UI | State matrix, keyboard, accessibility, and main-actor checks |
 | Core bridge | Contract, ownership/error, reconnect, and bounded cursor tests |
-| Public rules or local design | `./scripts/validate-docs.sh` |
+| Rules or design | `./scripts/validate-docs.sh` |
 
-Confirm that a test exercises the changed risk instead of relying on a convenient test name.
-
-## 6. Independent reviewer
-
-The project custom agent is defined and discovered from `.codex/agents/reviewer.toml`. `.codex/config.toml` contains only global subagent limits. Its output contract is `agent-harness/prompts/implementation-review.md`.
-
-Always provide:
-
-- task outcome and success criteria;
-- exact changed files or base-to-head diff;
-- applicable public rules and local contracts;
-- validation commands and results;
-- intentionally excluded scope.
-
-Each finding must contain severity, file and line, risk, occurrence condition, smallest fix, and required validation. A clean review returns exactly `No Findings`.
-
-## 7. Full validation
-
-Current native validation follows. Never document a proposed command as current.
+Full native validation:
 
 ```bash
+cargo run --locked -p flit-protocol --bin generate-schema
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
@@ -164,36 +72,26 @@ cargo test --workspace --all-features
 git diff --check
 ```
 
-Never record a nonexistent script or an unrun manual check as passing. Record the exact reason, risk, and next execution condition for any skipped validation.
+Never claim a command, manual check, or external gate that was not run. Record the reason, risk, and next execution condition for omissions.
 
-## 8. Promote failures into the harness
+## 5. Keep the harness small
 
-Do not turn every one-off issue into a permanent rule. Score a failure first.
+Promote a failure only when a durable guard is cheaper than recurrence:
 
-| Factor | Score |
-| --- | ---: |
-| Impact: cosmetic / local failure / data or security risk | 0 / 1 / 3 |
-| Recurrence: once / twice / three or more times | 0 / 1 / 2 |
-| Detection: immediate / focused test / dogfood or release | 0 / 1 / 2 |
-| Automation fit: low / partial / high | 0 / 1 / 3 |
+| Factor | 0 | 1 | 2 | 3 |
+| --- | --- | --- | --- | --- |
+| Impact | cosmetic | local failure | — | data/security |
+| Recurrence | once | twice | three or more | — |
+| Detection | immediate | focused test | dogfood/release | — |
+| Automation fit | low | partial | — | high |
 
-Promotion target:
+- 7+: regression test or CI gate
+- 5–6: test, otherwise reviewer/checklist
+- 3–4: current task or local contract
+- 0–2: fix without a durable rule
 
-- 7 or more: regression test and, when appropriate, CI gate;
-- 5–6: test first, otherwise review prompt or checklist;
-- 3–4: task plan edge case or local design note;
-- 0–2: fix the current change without a permanent rule.
+`AGENTS.md` receives only short cross-task invariants. Remove a rule when code, types, or automated validation fully enforce it.
 
-Promote only short, cross-task invariants into `AGENTS.md`. Keep detailed procedures here, product contracts under `local/`, and mechanically verifiable behavior in tests or CI.
+## 6. Completion
 
-## 9. Completion report
-
-Lead with the outcome and include:
-
-- user-visible behavior or contract that changed;
-- key changed files;
-- validation commands and reviewer result;
-- remaining decisions, unrun checks, and known limitations;
-- the next safe phase or slice.
-
-Do not call a spike a completed product feature, and do not call incomplete work complete.
+Report the changed outcome, key files, validation and reviewer result, unrun gates, and next safe slice. A phase is complete only when its own acceptance evidence is current; a spike is never product completion.
