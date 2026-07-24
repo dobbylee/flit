@@ -10,9 +10,11 @@ use flit_protocol::{
     EventProtocolVersion, EventSource, EventSourceKind, NullableSessionId, UnsequencedEventEnvelope,
 };
 use flit_store::{
-    InitialManagedSessionConnection, InitialManagedSessionOutcome, ManagedRunIntent,
-    ManagedRunIntentOutcome, ManagedSessionTermination, ManagedSessionTerminationOutcome,
-    ManagedTurnTerminalOutcome, ProjectRegistration, ProjectTrustConfirmation, Store, StoreError,
+    InitialManagedSessionConnection, InitialManagedSessionOutcome, MAX_LIVE_MANAGED_SESSIONS,
+    ManagedReconciliationState, ManagedRunIntent, ManagedRunIntentOutcome,
+    ManagedSessionReconciliation, ManagedSessionReconciliationOutcome, ManagedSessionTermination,
+    ManagedSessionTerminationOutcome, ManagedTurnTerminalOutcome, ProjectRegistration,
+    ProjectTrustConfirmation, Store, StoreError,
 };
 use serde_json::{Map, Value, json};
 
@@ -783,6 +785,410 @@ fn managed_terminal_conflicts_preserve_first_result_and_roll_back_late_failure()
     );
 }
 
+#[test]
+fn live_managed_sessions_are_stable_bounded_and_exclude_terminal_rows() {
+    let directory = TestDirectory::new("live-sessions");
+    let (mut store, _database, project_path) = trusted_store(&directory);
+    for (run, session, thread) in [
+        ("run-z", "session-z", "thread-z"),
+        ("run-a", "session-a", "thread-a"),
+    ] {
+        store
+            .create_managed_run_intent(run_intent(
+                run,
+                &format!("event-{run}-created"),
+                &format!("event-{run}-requested"),
+            ))
+            .expect("managed Run");
+        store
+            .connect_initial_managed_session(session_connection(
+                session,
+                run,
+                thread,
+                &project_path,
+            ))
+            .expect("managed session");
+    }
+    assert_eq!(
+        store
+            .live_managed_sessions(2)
+            .expect("live managed sessions")
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect::<Vec<_>>(),
+        ["session-a", "session-z"]
+    );
+    assert_eq!(
+        store
+            .live_managed_sessions(1)
+            .expect("bounded live session")
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect::<Vec<_>>(),
+        ["session-a"]
+    );
+    for limit in [0, MAX_LIVE_MANAGED_SESSIONS + 1] {
+        assert!(matches!(
+            store.live_managed_sessions(limit),
+            Err(StoreError::InvalidLiveManagedSessionLimit { .. })
+        ));
+    }
+
+    store
+        .terminate_managed_session(session_termination(
+            "run-a",
+            "session-a",
+            "thread-a",
+            "turn-a",
+            "event-run-a-completed",
+            2,
+            ManagedTurnTerminalOutcome::Completed,
+        ))
+        .expect("terminal Run");
+    assert_eq!(
+        store
+            .live_managed_sessions(2)
+            .expect("remaining live session")
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect::<Vec<_>>(),
+        ["session-z"]
+    );
+}
+
+#[test]
+fn gap_only_reconciliation_is_explicit_idempotent_and_never_closes_rows() {
+    let directory = TestDirectory::new("reconcile-gaps");
+    let (mut store, _database, project_path) = trusted_store(&directory);
+    store
+        .create_managed_run_intent(run_intent(
+            "run-gap",
+            "event-gap-created",
+            "event-gap-requested",
+        ))
+        .expect("managed Run");
+    store
+        .connect_initial_managed_session(session_connection(
+            "session-gap",
+            "run-gap",
+            "thread-gap",
+            &project_path,
+        ))
+        .expect("managed session");
+
+    for (index, state, latest_turn_id, result) in [
+        (0_u64, ManagedReconciliationState::NoTurns, None, "no_turns"),
+        (
+            1,
+            ManagedReconciliationState::Unknown,
+            Some("turn-unknown"),
+            "unknown",
+        ),
+        (2, ManagedReconciliationState::Missing, None, "missing"),
+        (
+            3,
+            ManagedReconciliationState::ScopeConflict,
+            None,
+            "scope_conflict",
+        ),
+    ] {
+        let reconciliation = session_reconciliation(
+            "run-gap",
+            "session-gap",
+            "thread-gap",
+            state,
+            latest_turn_id,
+            &format!("event-gap-reconcile-{index}"),
+            None,
+        );
+        let outcome = store
+            .reconcile_managed_session(reconciliation.clone())
+            .expect("record gap reconciliation");
+        let events = match outcome {
+            ManagedSessionReconciliationOutcome::Recorded { events, .. } => events,
+            other => panic!("unexpected reconciliation outcome: {other:?}"),
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "diagnostic.sequence_gap");
+        assert_eq!(events[0].stream_seq, index + 2);
+        assert_eq!(events[0].payload["reconciliation_result"], result);
+        assert_eq!(
+            events[0].payload["gap_reason"],
+            "provider_notifications_unavailable_after_restart"
+        );
+        assert_eq!(events[0].payload["provider_session_key"], "thread-gap");
+        match latest_turn_id {
+            Some(turn_id) => assert_eq!(events[0].payload["latest_provider_turn_id"], turn_id),
+            None => assert!(events[0].payload["latest_provider_turn_id"].is_null()),
+        }
+        assert!(matches!(
+            store
+                .reconcile_managed_session(reconciliation)
+                .expect("exact gap retry"),
+            ManagedSessionReconciliationOutcome::Duplicate {
+                events: duplicate,
+                ..
+            } if duplicate == events
+        ));
+        assert_terminal_rows_open(&store, "run-gap", "session-gap");
+    }
+    assert_eq!(store.latest_ingest_seq().expect("gap cursor"), 7);
+
+    let invalid_terminal = session_reconciliation(
+        "run-gap",
+        "session-gap",
+        "thread-gap",
+        ManagedReconciliationState::Completed,
+        None,
+        "event-invalid-terminal-gap",
+        Some("event-invalid-terminal"),
+    );
+    assert!(matches!(
+        store.reconcile_managed_session(invalid_terminal),
+        Err(StoreError::InvalidManagedSessionReconciliation { field: "state" })
+    ));
+    let invalid_nonterminal = session_reconciliation(
+        "run-gap",
+        "session-gap",
+        "thread-gap",
+        ManagedReconciliationState::Missing,
+        Some("invented-turn"),
+        "event-invalid-missing-gap",
+        None,
+    );
+    assert!(matches!(
+        store.reconcile_managed_session(invalid_nonterminal),
+        Err(StoreError::InvalidManagedSessionReconciliation { field: "state" })
+    ));
+    assert_eq!(store.latest_ingest_seq().expect("invalid cursor"), 7);
+}
+
+#[test]
+fn exact_terminal_reconciliation_maps_all_states_atomically_and_reopens() {
+    let directory = TestDirectory::new("reconcile-terminal");
+    let (mut store, database, project_path) = trusted_store(&directory);
+    for (index, state, event_type, end_reason) in [
+        (
+            0,
+            ManagedReconciliationState::Completed,
+            "run.completed",
+            "completed",
+        ),
+        (
+            1,
+            ManagedReconciliationState::Failed,
+            "run.failed",
+            "failed",
+        ),
+        (
+            2,
+            ManagedReconciliationState::Interrupted,
+            "run.interrupted",
+            "interrupted",
+        ),
+    ] {
+        let run_id = format!("run-reconciled-{index}");
+        let session_id = format!("session-reconciled-{index}");
+        let thread_id = format!("thread-reconciled-{index}");
+        let turn_id = format!("turn-reconciled-{index}");
+        store
+            .create_managed_run_intent(run_intent(
+                &run_id,
+                &format!("event-{run_id}-created"),
+                &format!("event-{run_id}-requested"),
+            ))
+            .expect("managed Run");
+        store
+            .connect_initial_managed_session(session_connection(
+                &session_id,
+                &run_id,
+                &thread_id,
+                &project_path,
+            ))
+            .expect("managed session");
+        let reconciliation = session_reconciliation(
+            &run_id,
+            &session_id,
+            &thread_id,
+            state,
+            Some(&turn_id),
+            &format!("event-{run_id}-gap"),
+            Some(&format!("event-{run_id}-terminal")),
+        );
+        let outcome = store
+            .reconcile_managed_session(reconciliation.clone())
+            .expect("terminal reconciliation");
+        let (run, session, events) = match outcome {
+            ManagedSessionReconciliationOutcome::Recorded {
+                run,
+                session,
+                events,
+            } => (run, session, events),
+            other => panic!("unexpected reconciliation outcome: {other:?}"),
+        };
+        assert_eq!(run.ended_at.as_deref(), Some(ENDED_AT));
+        assert_eq!(session.ended_at.as_deref(), Some(ENDED_AT));
+        assert_eq!(session.end_reason.as_deref(), Some(end_reason));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "diagnostic.sequence_gap");
+        assert_eq!(events[0].stream_seq, 2);
+        assert_eq!(events[1].event_type, event_type);
+        assert_eq!(events[1].stream_seq, 3);
+        assert_eq!(events[1].payload["provider_turn_id"], turn_id);
+        assert_eq!(events[1].payload["reconciled_after_gap"], true);
+        assert!(matches!(
+            store
+                .reconcile_managed_session(reconciliation)
+                .expect("exact terminal retry"),
+            ManagedSessionReconciliationOutcome::Duplicate {
+                events: duplicate,
+                ..
+            } if duplicate == events
+        ));
+    }
+
+    let cursor = store.latest_ingest_seq().expect("terminal cursor");
+    drop(store);
+    let reopened = Store::open(&database, CREATED_AT).expect("reopen Store");
+    assert_eq!(
+        reopened.latest_ingest_seq().expect("reopened cursor"),
+        cursor
+    );
+    assert!(
+        reopened
+            .live_managed_sessions(10)
+            .expect("no live reconciled sessions")
+            .is_empty()
+    );
+    assert_eq!(
+        reopened
+            .managed_session("session-reconciled-1")
+            .expect("reopened failed session")
+            .expect("failed session")
+            .end_reason
+            .as_deref(),
+        Some("failed")
+    );
+}
+
+#[test]
+fn reconciliation_identity_terminal_and_late_event_conflicts_fail_closed() {
+    let directory = TestDirectory::new("reconcile-conflicts");
+    let (mut store, _database, project_path) = trusted_store(&directory);
+    for (run, session, thread) in [
+        (
+            "run-reconcile-late",
+            "session-reconcile-late",
+            "thread-late",
+        ),
+        (
+            "run-reconcile-first",
+            "session-reconcile-first",
+            "thread-first",
+        ),
+    ] {
+        store
+            .create_managed_run_intent(run_intent(
+                run,
+                &format!("event-{run}-created"),
+                &format!("event-{run}-requested"),
+            ))
+            .expect("managed Run");
+        store
+            .connect_initial_managed_session(session_connection(
+                session,
+                run,
+                thread,
+                &project_path,
+            ))
+            .expect("managed session");
+    }
+    let initial_cursor = store.latest_ingest_seq().expect("initial cursor");
+    assert!(matches!(
+        store.reconcile_managed_session(session_reconciliation(
+            "run-reconcile-late",
+            "session-reconcile-late",
+            "wrong-thread",
+            ManagedReconciliationState::Unknown,
+            None,
+            "event-wrong-thread-gap",
+            None,
+        )),
+        Err(StoreError::ManagedSessionIdentityConflict { .. })
+    ));
+    assert_eq!(
+        store.latest_ingest_seq().expect("identity cursor"),
+        initial_cursor
+    );
+
+    store
+        .append_event(session_event(
+            "event-late-reconcile-gap",
+            "run-reconcile-late",
+            "session-reconcile-late",
+            2,
+            "command.started",
+        ))
+        .expect("conflicting prior event");
+    let late_cursor = store.latest_ingest_seq().expect("late cursor");
+    assert!(matches!(
+        store.reconcile_managed_session(session_reconciliation(
+            "run-reconcile-late",
+            "session-reconcile-late",
+            "thread-late",
+            ManagedReconciliationState::Failed,
+            Some("turn-late"),
+            "event-late-reconcile-gap",
+            Some("event-late-reconcile-terminal"),
+        )),
+        Err(StoreError::EventIdentityConflict { .. })
+    ));
+    assert_terminal_rows_open(&store, "run-reconcile-late", "session-reconcile-late");
+    assert_eq!(
+        store.latest_ingest_seq().expect("rollback cursor"),
+        late_cursor
+    );
+
+    let first = session_reconciliation(
+        "run-reconcile-first",
+        "session-reconcile-first",
+        "thread-first",
+        ManagedReconciliationState::Completed,
+        Some("turn-first"),
+        "event-first-reconcile-gap",
+        Some("event-first-reconcile-terminal"),
+    );
+    store
+        .reconcile_managed_session(first)
+        .expect("first terminal reconciliation");
+    let first_cursor = store.latest_ingest_seq().expect("first cursor");
+    assert!(matches!(
+        store.reconcile_managed_session(session_reconciliation(
+            "run-reconcile-first",
+            "session-reconcile-first",
+            "thread-first",
+            ManagedReconciliationState::Failed,
+            Some("turn-later"),
+            "event-later-reconcile-gap",
+            Some("event-later-reconcile-terminal"),
+        )),
+        Err(StoreError::ManagedRunTerminalConflict { .. })
+    ));
+    assert_eq!(
+        store.latest_ingest_seq().expect("preserved first cursor"),
+        first_cursor
+    );
+    assert_eq!(
+        store
+            .managed_session("session-reconcile-first")
+            .expect("first session")
+            .expect("first session")
+            .end_reason
+            .as_deref(),
+        Some("completed")
+    );
+}
+
 fn trusted_store(directory: &TestDirectory) -> (Store, PathBuf, PathBuf) {
     let database = directory.0.join("flit.sqlite3");
     let project_path = directory.0.join("project");
@@ -882,6 +1288,28 @@ fn session_termination(
         ended_at: ENDED_AT.to_owned(),
         terminal_event_id: terminal_event_id.to_owned(),
         outcome,
+    }
+}
+
+fn session_reconciliation(
+    run_id: &str,
+    session_id: &str,
+    external_session_key: &str,
+    state: ManagedReconciliationState,
+    latest_turn_id: Option<&str>,
+    gap_event_id: &str,
+    terminal_event_id: Option<&str>,
+) -> ManagedSessionReconciliation {
+    ManagedSessionReconciliation {
+        run_id: run_id.to_owned(),
+        session_id: session_id.to_owned(),
+        external_session_key: external_session_key.to_owned(),
+        state,
+        latest_turn_id: latest_turn_id.map(str::to_owned),
+        contract_version: "codex-app-server/0.144.6".to_owned(),
+        observed_at: ENDED_AT.to_owned(),
+        gap_event_id: gap_event_id.to_owned(),
+        terminal_event_id: terminal_event_id.map(str::to_owned),
     }
 }
 

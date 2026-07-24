@@ -7,6 +7,7 @@ pub const MANAGED_PROVIDER_KIND_CODEX: &str = "codex";
 pub const MAX_MANAGED_METADATA_JSON_BYTES: usize = 256 * 1024;
 pub const MAX_MANAGED_METADATA_JSON_DEPTH: usize = 32;
 pub const MAX_MANAGED_METADATA_JSON_VALUES: usize = 4_096;
+pub const MAX_LIVE_MANAGED_SESSIONS: usize = 100;
 const MAX_MANAGED_ID_BYTES: usize = 256;
 const MAX_MANAGED_TITLE_BYTES: usize = 4 * 1024;
 const MAX_MANAGED_GOAL_BYTES: usize = 64 * 1024;
@@ -147,6 +148,76 @@ pub enum ManagedSessionTerminationOutcome {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedReconciliationState {
+    NoTurns,
+    Completed,
+    Failed,
+    Interrupted,
+    Unknown,
+    Missing,
+    ScopeConflict,
+}
+
+impl ManagedReconciliationState {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoTurns => "no_turns",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+            Self::Unknown => "unknown",
+            Self::Missing => "missing",
+            Self::ScopeConflict => "scope_conflict",
+        }
+    }
+
+    pub(crate) const fn terminal_event_type(self) -> Option<&'static str> {
+        match self {
+            Self::Completed => Some("run.completed"),
+            Self::Failed => Some("run.failed"),
+            Self::Interrupted => Some("run.interrupted"),
+            Self::NoTurns | Self::Unknown | Self::Missing | Self::ScopeConflict => None,
+        }
+    }
+
+    pub(crate) const fn end_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Completed => Some("completed"),
+            Self::Failed => Some("failed"),
+            Self::Interrupted => Some("interrupted"),
+            Self::NoTurns | Self::Unknown | Self::Missing | Self::ScopeConflict => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedSessionReconciliation {
+    pub run_id: String,
+    pub session_id: String,
+    pub external_session_key: String,
+    pub state: ManagedReconciliationState,
+    pub latest_turn_id: Option<String>,
+    pub contract_version: String,
+    pub observed_at: String,
+    pub gap_event_id: String,
+    pub terminal_event_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ManagedSessionReconciliationOutcome {
+    Recorded {
+        run: ManagedRun,
+        session: ManagedSession,
+        events: Vec<EventEnvelope>,
+    },
+    Duplicate {
+        run: ManagedRun,
+        session: ManagedSession,
+        events: Vec<EventEnvelope>,
+    },
+}
+
 pub(crate) fn validate_run_intent(intent: &ManagedRunIntent) -> Result<(), &'static str> {
     validate_id(&intent.id).map_err(|()| "id")?;
     validate_id(&intent.project_id).map_err(|()| "project_id")?;
@@ -204,6 +275,55 @@ pub(crate) fn validate_session_termination(
     }
     validate_timestamp(&termination.ended_at).map_err(|()| "ended_at")?;
     validate_id(&termination.terminal_event_id).map_err(|()| "terminal_event_id")
+}
+
+pub(crate) fn validate_session_reconciliation(
+    reconciliation: &ManagedSessionReconciliation,
+) -> Result<(), &'static str> {
+    validate_id(&reconciliation.run_id).map_err(|()| "run_id")?;
+    validate_id(&reconciliation.session_id).map_err(|()| "session_id")?;
+    validate_id(&reconciliation.external_session_key).map_err(|()| "external_session_key")?;
+    validate_optional_token(
+        reconciliation.latest_turn_id.as_deref(),
+        MAX_MANAGED_ID_BYTES,
+    )
+    .map_err(|()| "latest_turn_id")?;
+    validate_token(&reconciliation.contract_version, MAX_MANAGED_ID_BYTES)
+        .map_err(|()| "contract_version")?;
+    validate_timestamp(&reconciliation.observed_at).map_err(|()| "observed_at")?;
+    validate_id(&reconciliation.gap_event_id).map_err(|()| "gap_event_id")?;
+    validate_optional_token(
+        reconciliation.terminal_event_id.as_deref(),
+        MAX_MANAGED_ID_BYTES,
+    )
+    .map_err(|()| "terminal_event_id")?;
+    if reconciliation
+        .terminal_event_id
+        .as_ref()
+        .is_some_and(|event_id| event_id == &reconciliation.gap_event_id)
+    {
+        return Err("event_ids");
+    }
+
+    let terminal = reconciliation.state.terminal_event_type().is_some();
+    if terminal
+        && (reconciliation.latest_turn_id.is_none() || reconciliation.terminal_event_id.is_none())
+    {
+        return Err("state");
+    }
+    if !terminal && reconciliation.terminal_event_id.is_some() {
+        return Err("state");
+    }
+    if matches!(
+        reconciliation.state,
+        ManagedReconciliationState::NoTurns
+            | ManagedReconciliationState::Missing
+            | ManagedReconciliationState::ScopeConflict
+    ) && reconciliation.latest_turn_id.is_some()
+    {
+        return Err("state");
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_stored_run(run: &ManagedRun) -> Result<(), &'static str> {

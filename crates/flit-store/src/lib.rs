@@ -20,10 +20,11 @@ mod writer;
 
 pub use managed_runs::{
     InitialManagedSessionConnection, InitialManagedSessionOutcome, MANAGED_PROVIDER_KIND_CODEX,
-    MAX_MANAGED_METADATA_JSON_BYTES, MAX_MANAGED_METADATA_JSON_DEPTH,
-    MAX_MANAGED_METADATA_JSON_VALUES, ManagedRun, ManagedRunIntent, ManagedRunIntentOutcome,
-    ManagedSession, ManagedSessionTermination, ManagedSessionTerminationOutcome,
-    ManagedTurnTerminalOutcome,
+    MAX_LIVE_MANAGED_SESSIONS, MAX_MANAGED_METADATA_JSON_BYTES, MAX_MANAGED_METADATA_JSON_DEPTH,
+    MAX_MANAGED_METADATA_JSON_VALUES, ManagedReconciliationState, ManagedRun, ManagedRunIntent,
+    ManagedRunIntentOutcome, ManagedSession, ManagedSessionReconciliation,
+    ManagedSessionReconciliationOutcome, ManagedSessionTermination,
+    ManagedSessionTerminationOutcome, ManagedTurnTerminalOutcome,
 };
 pub use projects::{
     Project, ProjectDirectoryInspection, ProjectIdentity, ProjectInspectionError,
@@ -862,6 +863,223 @@ impl Store {
         })
     }
 
+    pub fn reconcile_managed_session(
+        &mut self,
+        reconciliation: ManagedSessionReconciliation,
+    ) -> Result<ManagedSessionReconciliationOutcome, StoreError> {
+        managed_runs::validate_session_reconciliation(&reconciliation)
+            .map_err(|field| StoreError::InvalidManagedSessionReconciliation { field })?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+        let run = load_managed_run(&transaction, &reconciliation.run_id)?.ok_or_else(|| {
+            StoreError::MissingRun {
+                run_id: reconciliation.run_id.clone(),
+            }
+        })?;
+        if run.provider_kind != MANAGED_PROVIDER_KIND_CODEX {
+            return Err(StoreError::ManagedRunProviderMismatch {
+                run_id: reconciliation.run_id,
+            });
+        }
+        let session =
+            load_managed_session(&transaction, &reconciliation.session_id)?.ok_or_else(|| {
+                StoreError::MissingSession {
+                    session_id: reconciliation.session_id.clone(),
+                }
+            })?;
+        if session.run_id != reconciliation.run_id
+            || session.provider_kind != MANAGED_PROVIDER_KIND_CODEX
+            || session.external_session_key != reconciliation.external_session_key
+        {
+            return Err(StoreError::ManagedSessionIdentityConflict {
+                session_id: reconciliation.session_id,
+            });
+        }
+
+        let stored_gap = load_event_by_id(&transaction, &reconciliation.gap_event_id)?;
+        let stored_terminal = reconciliation
+            .terminal_event_id
+            .as_deref()
+            .map(|event_id| load_event_by_id(&transaction, event_id))
+            .transpose()?
+            .flatten();
+        if let Some(stored_gap) = stored_gap {
+            let expected = managed_reconciliation_events(&reconciliation, stored_gap.stream_seq)?;
+            if UnsequencedEventEnvelope::from(stored_gap.clone()) != expected[0] {
+                return Err(StoreError::EventIdentityConflict {
+                    event_id: reconciliation.gap_event_id,
+                });
+            }
+            let mut stored_events = vec![stored_gap];
+            if expected.len() == 2 {
+                let stored_terminal =
+                    stored_terminal.ok_or_else(|| StoreError::ManagedReconciliationConflict {
+                        run_id: reconciliation.run_id.clone(),
+                    })?;
+                if UnsequencedEventEnvelope::from(stored_terminal.clone()) != expected[1] {
+                    return Err(StoreError::EventIdentityConflict {
+                        event_id: reconciliation
+                            .terminal_event_id
+                            .clone()
+                            .expect("validated terminal event ID"),
+                    });
+                }
+                let terminal_events =
+                    load_managed_run_terminal_events(&transaction, &reconciliation.run_id)?;
+                let exact_rows = run.ended_at.as_deref()
+                    == Some(reconciliation.observed_at.as_str())
+                    && session.ended_at.as_deref() == Some(reconciliation.observed_at.as_str())
+                    && session.end_reason.as_deref() == reconciliation.state.end_reason();
+                if !exact_rows
+                    || terminal_events.len() != 1
+                    || terminal_events[0] != stored_terminal
+                {
+                    return Err(StoreError::ManagedRunTerminalConflict {
+                        run_id: reconciliation.run_id,
+                    });
+                }
+                stored_events.push(stored_terminal);
+            } else if stored_terminal.is_some() {
+                return Err(StoreError::ManagedReconciliationConflict {
+                    run_id: reconciliation.run_id,
+                });
+            }
+            return Ok(ManagedSessionReconciliationOutcome::Duplicate {
+                run,
+                session,
+                events: stored_events,
+            });
+        }
+        if let Some(stored_terminal) = stored_terminal {
+            return Err(StoreError::EventIdentityConflict {
+                event_id: stored_terminal.event_id,
+            });
+        }
+
+        let stored_terminal_events =
+            load_managed_run_terminal_events(&transaction, &reconciliation.run_id)?;
+        if run.ended_at.is_some()
+            || session.ended_at.is_some()
+            || session.end_reason.is_some()
+            || !stored_terminal_events.is_empty()
+        {
+            return Err(StoreError::ManagedRunTerminalConflict {
+                run_id: reconciliation.run_id,
+            });
+        }
+        if run.started_at.is_none() {
+            return Err(StoreError::ManagedRunNotStarted {
+                run_id: reconciliation.run_id,
+            });
+        }
+        let live_session_id = transaction
+            .query_row(
+                "SELECT id FROM agent_sessions WHERE run_id = ?1 AND ended_at IS NULL",
+                [&reconciliation.run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)?;
+        if live_session_id.as_deref() != Some(reconciliation.session_id.as_str()) {
+            return Err(StoreError::ManagedSessionNotLive {
+                session_id: reconciliation.session_id,
+            });
+        }
+        let first_stream_seq =
+            next_managed_session_stream_seq(&transaction, &reconciliation.session_id)?;
+        let events = managed_reconciliation_events(&reconciliation, first_stream_seq)?;
+
+        if let Some(end_reason) = reconciliation.state.end_reason() {
+            let closed_session = transaction
+                .execute(
+                    "UPDATE agent_sessions SET ended_at = ?1, end_reason = ?2 WHERE id = ?3 AND run_id = ?4 AND ended_at IS NULL AND end_reason IS NULL",
+                    params![
+                        reconciliation.observed_at,
+                        end_reason,
+                        reconciliation.session_id,
+                        reconciliation.run_id,
+                    ],
+                )
+                .map_err(StoreError::Sqlite)?;
+            if closed_session != 1 {
+                return Err(StoreError::ManagedSessionNotLive {
+                    session_id: reconciliation.session_id,
+                });
+            }
+            let closed_run = transaction
+                .execute(
+                    "UPDATE runs SET ended_at = ?1 WHERE id = ?2 AND ended_at IS NULL",
+                    params![reconciliation.observed_at, reconciliation.run_id],
+                )
+                .map_err(StoreError::Sqlite)?;
+            if closed_run != 1 {
+                return Err(StoreError::ManagedRunTerminalConflict {
+                    run_id: reconciliation.run_id,
+                });
+            }
+        }
+
+        let events = append_event_batch_in_transaction(&transaction, events)?
+            .into_iter()
+            .map(|outcome| match outcome {
+                AppendEventOutcome::Inserted(event) | AppendEventOutcome::Duplicate(event) => event,
+            })
+            .collect();
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        let run = load_managed_run(&self.connection, &reconciliation.run_id)?.ok_or_else(|| {
+            StoreError::MissingRun {
+                run_id: reconciliation.run_id.clone(),
+            }
+        })?;
+        let session = load_managed_session(&self.connection, &reconciliation.session_id)?
+            .ok_or_else(|| StoreError::MissingSession {
+                session_id: reconciliation.session_id,
+            })?;
+        Ok(ManagedSessionReconciliationOutcome::Recorded {
+            run,
+            session,
+            events,
+        })
+    }
+
+    pub fn live_managed_sessions(&self, limit: usize) -> Result<Vec<ManagedSession>, StoreError> {
+        if limit == 0 || limit > MAX_LIVE_MANAGED_SESSIONS {
+            return Err(StoreError::InvalidLiveManagedSessionLimit {
+                limit,
+                max: MAX_LIVE_MANAGED_SESSIONS,
+            });
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT agent_sessions.id
+                 FROM agent_sessions
+                 JOIN runs ON runs.id = agent_sessions.run_id
+                 WHERE agent_sessions.ended_at IS NULL AND runs.ended_at IS NULL
+                 ORDER BY agent_sessions.started_at, agent_sessions.id
+                 LIMIT ?1",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let session_ids = statement
+            .query_map([limit as i64], |row| row.get::<_, String>(0))
+            .map_err(StoreError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::Sqlite)?;
+        drop(statement);
+        session_ids
+            .into_iter()
+            .map(|session_id| {
+                load_managed_session(&self.connection, &session_id)?.ok_or_else(|| {
+                    StoreError::MissingSession {
+                        session_id: session_id.clone(),
+                    }
+                })
+            })
+            .collect()
+    }
+
     pub fn managed_run(&self, run_id: &str) -> Result<Option<ManagedRun>, StoreError> {
         if run_id.trim().is_empty() {
             return Err(StoreError::InvalidManagedRunIntent { field: "id" });
@@ -1274,6 +1492,106 @@ fn managed_session_terminal_event(
     }
 }
 
+fn managed_reconciliation_events(
+    reconciliation: &ManagedSessionReconciliation,
+    first_stream_seq: u64,
+) -> Result<Vec<UnsequencedEventEnvelope>, StoreError> {
+    if first_stream_seq == 0 || first_stream_seq > flit_protocol::MAX_JSON_SAFE_INTEGER {
+        return Err(StoreError::ManagedSessionStreamSequenceExhausted {
+            session_id: reconciliation.session_id.clone(),
+        });
+    }
+    let source = EventSource {
+        kind: EventSourceKind::Recovery,
+        provider: Some(MANAGED_PROVIDER_KIND_CODEX.to_owned()),
+        contract_version: Some(reconciliation.contract_version.clone()),
+        extensions: BTreeMap::new(),
+    };
+    let gap_payload = json!({
+        "gap_reason": "provider_notifications_unavailable_after_restart",
+        "latest_provider_turn_id": reconciliation.latest_turn_id,
+        "provider_session_key": reconciliation.external_session_key,
+        "reconciliation_result": reconciliation.state.as_str(),
+    })
+    .as_object()
+    .expect("object literal")
+    .clone();
+    let mut events = vec![UnsequencedEventEnvelope {
+        protocol_version: EventProtocolVersion::V1_0,
+        event_id: reconciliation.gap_event_id.clone(),
+        run_id: reconciliation.run_id.clone(),
+        session_id: NullableSessionId::Id(reconciliation.session_id.clone()),
+        stream_seq: first_stream_seq,
+        occurred_at: reconciliation.observed_at.clone(),
+        observed_at: reconciliation.observed_at.clone(),
+        event_type: "diagnostic.sequence_gap".to_owned(),
+        source: source.clone(),
+        confidence: 1.0,
+        evidence_ids: Vec::new(),
+        payload: gap_payload,
+        extensions: BTreeMap::new(),
+    }];
+    let Some(event_type) = reconciliation.state.terminal_event_type() else {
+        return Ok(events);
+    };
+    let terminal_stream_seq = first_stream_seq
+        .checked_add(1)
+        .filter(|sequence| *sequence <= flit_protocol::MAX_JSON_SAFE_INTEGER);
+    let Some(terminal_stream_seq) = terminal_stream_seq else {
+        return Err(StoreError::ManagedSessionStreamSequenceExhausted {
+            session_id: reconciliation.session_id.clone(),
+        });
+    };
+    let terminal_payload = match reconciliation.state {
+        ManagedReconciliationState::Completed => json!({
+            "outcome": "completed",
+            "provider_session_key": reconciliation.external_session_key,
+            "provider_turn_id": reconciliation.latest_turn_id,
+            "reconciled_after_gap": true,
+        }),
+        ManagedReconciliationState::Failed => json!({
+            "provider_session_key": reconciliation.external_session_key,
+            "provider_turn_id": reconciliation.latest_turn_id,
+            "reason": "provider_thread_failed",
+            "reconciled_after_gap": true,
+        }),
+        ManagedReconciliationState::Interrupted => json!({
+            "provider_session_key": reconciliation.external_session_key,
+            "provider_turn_id": reconciliation.latest_turn_id,
+            "reason": "provider_thread_interrupted",
+            "reconciled_after_gap": true,
+        }),
+        ManagedReconciliationState::NoTurns
+        | ManagedReconciliationState::Unknown
+        | ManagedReconciliationState::Missing
+        | ManagedReconciliationState::ScopeConflict => {
+            unreachable!("terminal event type is present only for terminal states")
+        }
+    }
+    .as_object()
+    .expect("object literal")
+    .clone();
+    events.push(UnsequencedEventEnvelope {
+        protocol_version: EventProtocolVersion::V1_0,
+        event_id: reconciliation
+            .terminal_event_id
+            .clone()
+            .expect("validated terminal event ID"),
+        run_id: reconciliation.run_id.clone(),
+        session_id: NullableSessionId::Id(reconciliation.session_id.clone()),
+        stream_seq: terminal_stream_seq,
+        occurred_at: reconciliation.observed_at.clone(),
+        observed_at: reconciliation.observed_at.clone(),
+        event_type: event_type.to_owned(),
+        source,
+        confidence: 1.0,
+        evidence_ids: Vec::new(),
+        payload: terminal_payload,
+        extensions: BTreeMap::new(),
+    });
+    Ok(events)
+}
+
 fn managed_run_matches_intent(run: &ManagedRun, intent: &ManagedRunIntent) -> bool {
     run.id == intent.id
         && run.project_id == intent.project_id
@@ -1403,6 +1721,15 @@ fn load_managed_run_terminal_events(
         .into_iter()
         .map(|ingest_seq| load_event(connection, ingest_seq))
         .collect()
+}
+
+fn load_event_by_id(
+    connection: &Connection,
+    event_id: &str,
+) -> Result<Option<EventEnvelope>, StoreError> {
+    event_ingest_seq(connection, event_id)?
+        .map(|ingest_seq| load_event(connection, ingest_seq))
+        .transpose()
 }
 
 fn load_managed_session(
@@ -2520,6 +2847,16 @@ pub enum StoreError {
     ManagedSessionStreamSequenceExhausted {
         session_id: String,
     },
+    InvalidManagedSessionReconciliation {
+        field: &'static str,
+    },
+    ManagedReconciliationConflict {
+        run_id: String,
+    },
+    InvalidLiveManagedSessionLimit {
+        limit: usize,
+        max: usize,
+    },
     InvalidCheckpointReport(CheckpointReport),
     InvalidEventBatchSize {
         count: usize,
@@ -2762,6 +3099,20 @@ impl fmt::Display for StoreError {
             Self::ManagedSessionStreamSequenceExhausted { session_id } => write!(
                 formatter,
                 "managed session stream sequence is exhausted: {session_id}"
+            ),
+            Self::InvalidManagedSessionReconciliation { field } => write!(
+                formatter,
+                "invalid managed session reconciliation field: {field}"
+            ),
+            Self::ManagedReconciliationConflict { run_id } => {
+                write!(
+                    formatter,
+                    "managed session reconciliation conflicts: {run_id}"
+                )
+            }
+            Self::InvalidLiveManagedSessionLimit { limit, max } => write!(
+                formatter,
+                "invalid live managed session limit {limit}; expected 1..={max}"
             ),
             Self::InvalidCheckpointReport(report) => write!(
                 formatter,
