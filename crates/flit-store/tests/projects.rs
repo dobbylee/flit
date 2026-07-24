@@ -141,6 +141,84 @@ fn registration_persists_an_untrusted_project_and_reopens_it() {
 }
 
 #[test]
+fn active_project_list_is_stable_preserves_rows_and_excludes_archived_history() {
+    let workspace = TestWorkspace::new("list");
+    let mut store = workspace.open();
+    assert_eq!(store.list_projects().expect("empty Project list"), []);
+
+    let alpha_one_path = workspace.directory.join("alpha-one");
+    let alpha_two_path = workspace.directory.join("alpha-two");
+    let archived_path = workspace.directory.join("archived");
+    let beta_path = workspace.directory.join("beta");
+    for path in [&alpha_one_path, &alpha_two_path, &archived_path, &beta_path] {
+        fs::create_dir(path).expect("Project directory");
+    }
+    for (id, display_name, path) in [
+        ("beta", "Beta", &beta_path),
+        ("alpha-two", "Alpha", &alpha_two_path),
+        ("alpha-one", "Alpha", &alpha_one_path),
+        ("archived", "Archived", &archived_path),
+    ] {
+        assert!(matches!(
+            store
+                .register_project(registration(id, display_name, path))
+                .expect("register Project"),
+            ProjectRegistrationOutcome::Registered(_)
+        ));
+    }
+    let trusted_alpha = match store
+        .confirm_project_trust(ProjectTrustConfirmation {
+            project_id: "alpha-one".to_owned(),
+            selected_path: alpha_one_path,
+            confirmed_at: "2026-07-24T02:00:00.000Z".to_owned(),
+        })
+        .expect("trust Project")
+    {
+        ProjectTrustOutcome::Trusted(project) => project,
+        outcome => panic!("unexpected trust outcome: {outcome:?}"),
+    };
+    let alpha_two = store
+        .project("alpha-two")
+        .expect("read Project")
+        .expect("Project");
+    let archived = store
+        .project("archived")
+        .expect("read Project")
+        .expect("Project");
+    let beta = store
+        .project("beta")
+        .expect("read Project")
+        .expect("Project");
+    drop(store);
+
+    let connection = Connection::open(&workspace.database_path).expect("archive connection");
+    connection
+        .execute(
+            "UPDATE projects SET archived_at = ?1 WHERE id = 'archived'",
+            [APPLIED_AT],
+        )
+        .expect("archive Project");
+    drop(connection);
+
+    let reopened = workspace.open();
+    let active = reopened.list_projects().expect("active Project list");
+    assert_eq!(active, [trusted_alpha, alpha_two, beta]);
+    assert_eq!(
+        reopened.project("archived").expect("read archived Project"),
+        Some(archived)
+    );
+    drop(reopened);
+
+    assert_eq!(
+        workspace
+            .open()
+            .list_projects()
+            .expect("reopened active Project list"),
+        active
+    );
+}
+
+#[test]
 fn explicit_trust_requires_the_current_project_identity_and_is_idempotent() {
     let workspace = TestWorkspace::new("trust");
     let mut store = workspace.open();

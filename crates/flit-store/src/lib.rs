@@ -10,7 +10,7 @@ use flit_protocol::{
     EventEnvelope, EventProtocolVersion, EventSource, EventSourceKind, MAX_JSON_SAFE_INTEGER,
     NullableSessionId, UnsequencedEventEnvelope,
 };
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -225,23 +225,25 @@ fn project_by_id(connection: &Connection, project_id: &str) -> Result<Option<Pro
         .query_row(
             "SELECT id, display_name, canonical_path, filesystem_id, trusted, default_provider, notification_policy_json, created_at, updated_at FROM projects WHERE id = ?1",
             [project_id],
-            |row| {
-                let trusted: i64 = row.get(4)?;
-                Ok(Project {
-                    id: row.get(0)?,
-                    display_name: row.get(1)?,
-                    canonical_path: PathBuf::from(row.get::<_, String>(2)?),
-                    filesystem_id: row.get(3)?,
-                    trusted: trusted == 1,
-                    default_provider: row.get(5)?,
-                    notification_policy_json: row.get(6)?,
-                    created_at: row.get(7)?,
-                    updated_at: row.get(8)?,
-                })
-            },
+            project_from_row,
         )
         .optional()
         .map_err(StoreError::Sqlite)
+}
+
+fn project_from_row(row: &Row<'_>) -> rusqlite::Result<Project> {
+    let trusted: i64 = row.get(4)?;
+    Ok(Project {
+        id: row.get(0)?,
+        display_name: row.get(1)?,
+        canonical_path: PathBuf::from(row.get::<_, String>(2)?),
+        filesystem_id: row.get(3)?,
+        trusted: trusted == 1,
+        default_provider: row.get(5)?,
+        notification_policy_json: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -371,6 +373,23 @@ impl Store {
 
     pub fn project(&self, project_id: &str) -> Result<Option<Project>, StoreError> {
         project_by_id(&self.connection, project_id)
+    }
+
+    pub fn list_projects(&self) -> Result<Vec<Project>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, display_name, canonical_path, filesystem_id, trusted, default_provider, notification_policy_json, created_at, updated_at
+                 FROM projects
+                 WHERE archived_at IS NULL
+                 ORDER BY display_name COLLATE BINARY, id COLLATE BINARY",
+            )
+            .map_err(StoreError::Sqlite)?;
+        statement
+            .query_map([], project_from_row)
+            .map_err(StoreError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::Sqlite)
     }
 
     pub fn confirm_project_trust(
