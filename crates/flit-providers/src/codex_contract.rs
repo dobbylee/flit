@@ -9,7 +9,9 @@ use serde_json::{Value, json};
 
 pub const MAX_CODEX_APP_SERVER_FRAME_BYTES: usize = 256 * 1024;
 pub const MAX_CODEX_MANAGED_THREADS: usize = 256;
+pub const MAX_CODEX_TURN_PROMPT_BYTES: usize = 64 * 1024;
 const MAX_CODEX_THREAD_ID_BYTES: usize = 256;
+const MAX_CODEX_TURN_ITEM_COUNT: usize = 256;
 const MAX_CODEX_CURSOR_BYTES: usize = 4 * 1024;
 const MAX_CODEX_CWD_BYTES: usize = 16 * 1024;
 const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
@@ -26,6 +28,36 @@ impl CodexManagedThreadId {
         {
             return Err(CodexContractError::InvalidThreadId);
         }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct CodexManagedTurnId(String);
+
+impl CodexManagedTurnId {
+    pub fn new(value: impl Into<String>) -> Result<Self, CodexContractError> {
+        let value = value.into();
+        validate_provider_identity(&value).map_err(|_| CodexContractError::InvalidTurnId)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct CodexManagedItemId(String);
+
+impl CodexManagedItemId {
+    pub fn new(value: impl Into<String>) -> Result<Self, CodexContractError> {
+        let value = value.into();
+        validate_provider_identity(&value).map_err(|_| CodexContractError::InvalidItemId)?;
         Ok(Self(value))
     }
 
@@ -108,6 +140,38 @@ pub struct CodexThreadRead {
     pub thread_id: CodexManagedThreadId,
     pub latest_turn_id: Option<String>,
     pub state: CodexThreadState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodexStartedTurn {
+    pub thread_id: CodexManagedThreadId,
+    pub turn_id: CodexManagedTurnId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodexInterruptRequested {
+    pub thread_id: CodexManagedThreadId,
+    pub turn_id: CodexManagedTurnId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodexTurnTerminalOutcome {
+    Completed,
+    Interrupted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CodexTurnObservation {
+    CommandStarted {
+        thread_id: CodexManagedThreadId,
+        turn_id: CodexManagedTurnId,
+        item_id: CodexManagedItemId,
+    },
+    Terminal {
+        thread_id: CodexManagedThreadId,
+        turn_id: CodexManagedTurnId,
+        outcome: CodexTurnTerminalOutcome,
+    },
 }
 
 pub fn codex_initialize_request(request_id: u64) -> Result<Vec<u8>, CodexContractError> {
@@ -195,6 +259,51 @@ pub fn codex_read_request(
             "params": {
                 "threadId": thread_id.as_str(),
                 "includeTurns": true,
+            },
+        }),
+    )
+}
+
+pub fn codex_turn_start_request(
+    request_id: u64,
+    thread_id: &CodexManagedThreadId,
+    prompt: &str,
+) -> Result<Vec<u8>, CodexContractError> {
+    if prompt.trim().is_empty()
+        || prompt.len() > MAX_CODEX_TURN_PROMPT_BYTES
+        || prompt.contains('\0')
+    {
+        return Err(CodexContractError::InvalidTurnPrompt);
+    }
+    encode_client_frame(
+        request_id,
+        json!({
+            "id": request_id,
+            "method": "turn/start",
+            "params": {
+                "threadId": thread_id.as_str(),
+                "input": [{
+                    "type": "text",
+                    "text": prompt,
+                }],
+            },
+        }),
+    )
+}
+
+pub fn codex_turn_interrupt_request(
+    request_id: u64,
+    thread_id: &CodexManagedThreadId,
+    turn_id: &CodexManagedTurnId,
+) -> Result<Vec<u8>, CodexContractError> {
+    encode_client_frame(
+        request_id,
+        json!({
+            "id": request_id,
+            "method": "turn/interrupt",
+            "params": {
+                "threadId": thread_id.as_str(),
+                "turnId": turn_id.as_str(),
             },
         }),
     )
@@ -332,6 +441,106 @@ pub fn decode_codex_read_response(
     })
 }
 
+pub fn decode_codex_turn_start_response(
+    frame: &[u8],
+    expected_request_id: u64,
+    expected_thread_id: &CodexManagedThreadId,
+) -> Result<CodexStartedTurn, CodexContractError> {
+    let result = response_result(frame, expected_request_id)?;
+    let turn = required_object(&result, "turn")?;
+    let turn_id = CodexManagedTurnId::new(required_string(turn, "id")?)?;
+    Ok(CodexStartedTurn {
+        thread_id: expected_thread_id.clone(),
+        turn_id,
+    })
+}
+
+pub fn decode_codex_turn_interrupt_response(
+    frame: &[u8],
+    expected_request_id: u64,
+    expected_thread_id: &CodexManagedThreadId,
+    expected_turn_id: &CodexManagedTurnId,
+) -> Result<CodexInterruptRequested, CodexContractError> {
+    let _ = response_result(frame, expected_request_id)?;
+    Ok(CodexInterruptRequested {
+        thread_id: expected_thread_id.clone(),
+        turn_id: expected_turn_id.clone(),
+    })
+}
+
+pub fn decode_codex_turn_notification(
+    frame: &[u8],
+    expected_thread_id: &CodexManagedThreadId,
+    expected_turn_id: &CodexManagedTurnId,
+) -> Result<Option<CodexTurnObservation>, CodexContractError> {
+    if frame.len() > MAX_CODEX_APP_SERVER_FRAME_BYTES {
+        return Err(CodexContractError::FrameTooLarge);
+    }
+    let value: Value =
+        serde_json::from_slice(frame).map_err(|_| CodexContractError::MalformedJson)?;
+    let notification = value
+        .as_object()
+        .ok_or(CodexContractError::InvalidNotification)?;
+    let method = notification
+        .get("method")
+        .and_then(Value::as_str)
+        .ok_or(CodexContractError::InvalidNotification)?;
+    if !matches!(method, "item/started" | "turn/completed") {
+        return Ok(None);
+    }
+    let params = required_object(notification, "params")?;
+    let observed_thread_id = CodexManagedThreadId::new(required_string(params, "threadId")?)?;
+    if &observed_thread_id != expected_thread_id {
+        return Err(CodexContractError::UnexpectedThreadId);
+    }
+
+    match method {
+        "item/started" => {
+            let observed_turn_id = CodexManagedTurnId::new(required_string(params, "turnId")?)?;
+            if &observed_turn_id != expected_turn_id {
+                return Err(CodexContractError::UnexpectedTurnId);
+            }
+            let item = required_object(params, "item")?;
+            if required_string(item, "type")? != "commandExecution"
+                || required_string(item, "status")? != "inProgress"
+            {
+                return Err(CodexContractError::UnexpectedItemVariant);
+            }
+            let _ = required_string(item, "command")?;
+            let _ = required_array(item, "commandActions")?;
+            let _ = required_string(item, "cwd")?;
+            let _ = required_u64(params, "startedAtMs")?;
+            Ok(Some(CodexTurnObservation::CommandStarted {
+                thread_id: observed_thread_id,
+                turn_id: observed_turn_id,
+                item_id: CodexManagedItemId::new(required_string(item, "id")?)?,
+            }))
+        }
+        "turn/completed" => {
+            let turn = required_object(params, "turn")?;
+            let observed_turn_id = CodexManagedTurnId::new(required_string(turn, "id")?)?;
+            if &observed_turn_id != expected_turn_id {
+                return Err(CodexContractError::UnexpectedTurnId);
+            }
+            let items = required_array(turn, "items")?;
+            if items.len() > MAX_CODEX_TURN_ITEM_COUNT {
+                return Err(CodexContractError::TooManyTurnItems);
+            }
+            let outcome = match required_string(turn, "status")? {
+                "completed" => CodexTurnTerminalOutcome::Completed,
+                "interrupted" => CodexTurnTerminalOutcome::Interrupted,
+                _ => return Err(CodexContractError::UnexpectedTurnStatus),
+            };
+            Ok(Some(CodexTurnObservation::Terminal {
+                thread_id: observed_thread_id,
+                turn_id: observed_turn_id,
+                outcome,
+            }))
+        }
+        _ => unreachable!("selected methods are matched above"),
+    }
+}
+
 fn encode_client_frame(request_id: u64, value: Value) -> Result<Vec<u8>, CodexContractError> {
     validate_request_id(request_id)?;
     let frame = encode_value(value);
@@ -423,6 +632,16 @@ fn required_bool(
         .ok_or(CodexContractError::InvalidField { field })
 }
 
+fn required_u64(
+    object: &serde_json::Map<String, Value>,
+    field: &'static str,
+) -> Result<u64, CodexContractError> {
+    object
+        .get(field)
+        .and_then(Value::as_u64)
+        .ok_or(CodexContractError::InvalidField { field })
+}
+
 fn optional_cursor(
     object: &serde_json::Map<String, Value>,
 ) -> Result<Option<String>, CodexContractError> {
@@ -472,26 +691,44 @@ fn validate_request_id(request_id: u64) -> Result<(), CodexContractError> {
     Ok(())
 }
 
+fn validate_provider_identity(value: &str) -> Result<(), ()> {
+    if value.trim().is_empty()
+        || value.len() > MAX_CODEX_THREAD_ID_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CodexContractError {
     InvalidRequestId,
     InvalidCanonicalCwd,
     InvalidThreadId,
+    InvalidTurnId,
+    InvalidItemId,
+    InvalidTurnPrompt,
     InvalidManagedScope,
     InvalidCursor,
     FrameTooLarge,
     MalformedJson,
     InvalidResponse,
+    InvalidNotification,
     UnexpectedRequestId,
     ServerError,
     MissingResult,
     InvalidField { field: &'static str },
     MismatchedSessionIdentity,
     UnexpectedThreadId,
+    UnexpectedTurnId,
     UnexpectedEffectivePolicy,
+    UnexpectedItemVariant,
+    UnexpectedTurnStatus,
     DuplicateThreadId,
     TooManyThreads,
     TooManyTurns,
+    TooManyTurnItems,
 }
 
 impl fmt::Display for CodexContractError {
@@ -500,11 +737,17 @@ impl fmt::Display for CodexContractError {
             Self::InvalidRequestId => formatter.write_str("invalid Codex request ID"),
             Self::InvalidCanonicalCwd => formatter.write_str("invalid canonical Project cwd"),
             Self::InvalidThreadId => formatter.write_str("invalid Codex managed thread ID"),
+            Self::InvalidTurnId => formatter.write_str("invalid Codex managed turn ID"),
+            Self::InvalidItemId => formatter.write_str("invalid Codex managed item ID"),
+            Self::InvalidTurnPrompt => formatter.write_str("invalid Codex turn prompt"),
             Self::InvalidManagedScope => formatter.write_str("invalid Codex managed scope"),
             Self::InvalidCursor => formatter.write_str("invalid Codex list cursor"),
             Self::FrameTooLarge => formatter.write_str("Codex app-server frame exceeded its limit"),
             Self::MalformedJson => formatter.write_str("malformed Codex app-server JSON"),
             Self::InvalidResponse => formatter.write_str("invalid Codex app-server response"),
+            Self::InvalidNotification => {
+                formatter.write_str("invalid Codex app-server notification")
+            }
             Self::UnexpectedRequestId => {
                 formatter.write_str("Codex response request ID did not match")
             }
@@ -519,14 +762,26 @@ impl fmt::Display for CodexContractError {
             Self::UnexpectedThreadId => {
                 formatter.write_str("Codex response returned an unmanaged thread ID")
             }
+            Self::UnexpectedTurnId => {
+                formatter.write_str("Codex notification returned an unmanaged turn ID")
+            }
             Self::UnexpectedEffectivePolicy => {
                 formatter.write_str("Codex start response did not confirm the read-only policy")
+            }
+            Self::UnexpectedItemVariant => {
+                formatter.write_str("Codex notification returned an unvalidated item variant")
+            }
+            Self::UnexpectedTurnStatus => {
+                formatter.write_str("Codex notification returned an unvalidated terminal status")
             }
             Self::DuplicateThreadId => {
                 formatter.write_str("Codex list response contained a duplicate thread ID")
             }
             Self::TooManyThreads => formatter.write_str("Codex list response had too many threads"),
             Self::TooManyTurns => formatter.write_str("Codex read response had too many turns"),
+            Self::TooManyTurnItems => {
+                formatter.write_str("Codex terminal notification had too many items")
+            }
         }
     }
 }

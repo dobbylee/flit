@@ -10,16 +10,21 @@ mod schema;
 mod version;
 
 pub use codex_contract::{
-    CodexContractError, CodexManagedListPage, CodexManagedScope, CodexManagedThreadConflict,
-    CodexManagedThreadId, CodexStartedThread, CodexThreadRead, CodexThreadState,
-    MAX_CODEX_APP_SERVER_FRAME_BYTES, MAX_CODEX_MANAGED_THREADS, codex_initialize_request,
-    codex_initialized_notification, codex_read_only_start_request, codex_read_request,
-    codex_thread_list_request, decode_codex_initialize_response, decode_codex_read_response,
-    decode_codex_start_response, decode_codex_thread_list_response,
+    CodexContractError, CodexInterruptRequested, CodexManagedItemId, CodexManagedListPage,
+    CodexManagedScope, CodexManagedThreadConflict, CodexManagedThreadId, CodexManagedTurnId,
+    CodexStartedThread, CodexStartedTurn, CodexThreadRead, CodexThreadState, CodexTurnObservation,
+    CodexTurnTerminalOutcome, MAX_CODEX_APP_SERVER_FRAME_BYTES, MAX_CODEX_MANAGED_THREADS,
+    MAX_CODEX_TURN_PROMPT_BYTES, codex_initialize_request, codex_initialized_notification,
+    codex_read_only_start_request, codex_read_request, codex_thread_list_request,
+    codex_turn_interrupt_request, codex_turn_start_request, decode_codex_initialize_response,
+    decode_codex_read_response, decode_codex_start_response, decode_codex_thread_list_response,
+    decode_codex_turn_interrupt_response, decode_codex_turn_notification,
+    decode_codex_turn_start_response,
 };
 pub use codex_transport::{
     CODEX_APP_SERVER_REQUEST_TIMEOUT, CodexAppServer, CodexAppServerError, CodexManagedThreads,
-    MAX_CODEX_APP_SERVER_STDERR_BYTES, MAX_CODEX_LIST_PAGES, MAX_CODEX_PENDING_NOTIFICATION_BYTES,
+    MAX_CODEX_APP_SERVER_STDERR_BYTES, MAX_CODEX_COMMAND_STARTS_PER_TURN, MAX_CODEX_LIST_PAGES,
+    MAX_CODEX_OBSERVATION_FRAMES, MAX_CODEX_PENDING_NOTIFICATION_BYTES,
     MAX_CODEX_PENDING_NOTIFICATIONS,
 };
 pub use executable::{

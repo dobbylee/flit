@@ -13,7 +13,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -23,13 +23,16 @@ use serde_json::Value;
 
 use crate::{
     CapabilityStatus, CodexCompatibilityProbe, CodexCompatibilityProbeError, CodexContractError,
-    CodexManagedScope, CodexManagedThreadConflict, CodexManagedThreadId, CodexStartedThread,
-    CodexThreadRead, ExecutableInspection, ExecutableInspectionError, ProviderCapability,
-    ProviderCompatibility, ProviderFingerprint, codex_initialize_request,
-    codex_initialized_notification, codex_read_only_start_request, codex_read_request,
-    codex_thread_list_request, decode_codex_initialize_response, decode_codex_read_response,
-    decode_codex_start_response, decode_codex_thread_list_response, inspect_codex_at,
-    probe_codex_compatibility_at, probe_codex_compatibility_on_path,
+    CodexInterruptRequested, CodexManagedScope, CodexManagedThreadConflict, CodexManagedThreadId,
+    CodexStartedThread, CodexStartedTurn, CodexThreadRead, CodexTurnObservation,
+    ExecutableInspection, ExecutableInspectionError, ProviderCapability, ProviderCompatibility,
+    ProviderFingerprint, codex_initialize_request, codex_initialized_notification,
+    codex_read_only_start_request, codex_read_request, codex_thread_list_request,
+    codex_turn_interrupt_request, codex_turn_start_request, decode_codex_initialize_response,
+    decode_codex_read_response, decode_codex_start_response, decode_codex_thread_list_response,
+    decode_codex_turn_interrupt_response, decode_codex_turn_notification,
+    decode_codex_turn_start_response, inspect_codex_at, probe_codex_compatibility_at,
+    probe_codex_compatibility_on_path,
     process::{set_nonblocking, terminate_process_group},
 };
 
@@ -38,6 +41,8 @@ pub const MAX_CODEX_APP_SERVER_STDERR_BYTES: usize = 64 * 1024;
 pub const MAX_CODEX_PENDING_NOTIFICATIONS: usize = 64;
 pub const MAX_CODEX_PENDING_NOTIFICATION_BYTES: usize = 1024 * 1024;
 pub const MAX_CODEX_LIST_PAGES: usize = 16;
+pub const MAX_CODEX_OBSERVATION_FRAMES: usize = 256;
+pub const MAX_CODEX_COMMAND_STARTS_PER_TURN: usize = 256;
 const INBOUND_FRAME_QUEUE_CAPACITY: usize = 16;
 const RECEIVE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const IO_POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -55,6 +60,12 @@ pub struct CodexManagedThreads {
 struct StagedExecutable {
     directory: PathBuf,
     path: PathBuf,
+}
+
+struct ActiveTurn {
+    started: CodexStartedTurn,
+    command_item_ids: BTreeSet<crate::CodexManagedItemId>,
+    interrupt_requested: bool,
 }
 
 impl Drop for StagedExecutable {
@@ -79,6 +90,8 @@ pub struct CodexAppServer {
     request_timeout: Duration,
     validated_profile: Option<ProviderFingerprint>,
     staged_executable: Option<StagedExecutable>,
+    active_turn: Option<ActiveTurn>,
+    last_terminal_turn: Option<CodexStartedTurn>,
 }
 
 impl CodexAppServer {
@@ -183,6 +196,111 @@ impl CodexAppServer {
             codex_read_request(request_id, thread_id).map_err(CodexAppServerError::Contract)?;
         let response = self.exchange(request)?;
         self.decode_or_close(decode_codex_read_response(&response, request_id, thread_id))
+    }
+
+    pub fn start_turn(
+        &mut self,
+        thread_id: &CodexManagedThreadId,
+        prompt: &str,
+    ) -> Result<CodexStartedTurn, CodexAppServerError> {
+        if self.active_turn.is_some() {
+            return Err(CodexAppServerError::ActiveTurnExists);
+        }
+        self.reject_pending_terminal_observations()?;
+        self.last_terminal_turn.take();
+        let request_id = self.take_request_id()?;
+        let request = codex_turn_start_request(request_id, thread_id, prompt)
+            .map_err(CodexAppServerError::Contract)?;
+        let response = self.exchange(request)?;
+        let started = self.decode_or_close(decode_codex_turn_start_response(
+            &response, request_id, thread_id,
+        ))?;
+        self.active_turn = Some(ActiveTurn {
+            started: started.clone(),
+            command_item_ids: BTreeSet::new(),
+            interrupt_requested: false,
+        });
+        Ok(started)
+    }
+
+    pub fn wait_for_turn_observation(
+        &mut self,
+    ) -> Result<CodexTurnObservation, CodexAppServerError> {
+        let Some(active) = self.active_turn.as_ref() else {
+            self.reject_pending_terminal_observations()?;
+            return Err(CodexAppServerError::NoActiveTurn);
+        };
+        let expected_thread_id = active.started.thread_id.clone();
+        let expected_turn_id = active.started.turn_id.clone();
+        let deadline = Instant::now() + self.request_timeout;
+
+        for _ in 0..MAX_CODEX_OBSERVATION_FRAMES {
+            let frame = self.next_notification_until(deadline)?;
+            let decoded =
+                decode_codex_turn_notification(&frame, &expected_thread_id, &expected_turn_id);
+            self.release_retained_bytes(frame.len());
+            let observation = match decoded {
+                Ok(Some(observation)) => observation,
+                Ok(None) => continue,
+                Err(error) => {
+                    return self.close_with(CodexAppServerError::Contract(error));
+                }
+            };
+            match &observation {
+                CodexTurnObservation::CommandStarted { item_id, .. } => {
+                    let active = self
+                        .active_turn
+                        .as_mut()
+                        .ok_or(CodexAppServerError::NoActiveTurn)?;
+                    if active.command_item_ids.contains(item_id) {
+                        return self.close_with(CodexAppServerError::DuplicateTurnObservation);
+                    }
+                    if active.command_item_ids.len() >= MAX_CODEX_COMMAND_STARTS_PER_TURN {
+                        return self.close_with(CodexAppServerError::CommandObservationLimit);
+                    }
+                    active.command_item_ids.insert(item_id.clone());
+                }
+                CodexTurnObservation::Terminal {
+                    thread_id, turn_id, ..
+                } => {
+                    self.active_turn.take();
+                    self.last_terminal_turn = Some(CodexStartedTurn {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                    });
+                    self.reject_pending_terminal_observations()?;
+                }
+            }
+            return Ok(observation);
+        }
+
+        self.close_with(CodexAppServerError::ObservationFrameLimit)
+    }
+
+    pub fn interrupt_active_turn(
+        &mut self,
+    ) -> Result<CodexInterruptRequested, CodexAppServerError> {
+        let Some(active) = self.active_turn.as_ref() else {
+            return Err(CodexAppServerError::NoActiveTurn);
+        };
+        if active.interrupt_requested {
+            return Err(CodexAppServerError::InterruptAlreadyRequested);
+        }
+        let thread_id = active.started.thread_id.clone();
+        let turn_id = active.started.turn_id.clone();
+        let request_id = self.take_request_id()?;
+        let request = codex_turn_interrupt_request(request_id, &thread_id, &turn_id)
+            .map_err(CodexAppServerError::Contract)?;
+        let response = self.exchange(request)?;
+        let receipt = self.decode_or_close(decode_codex_turn_interrupt_response(
+            &response, request_id, &thread_id, &turn_id,
+        ))?;
+        let active = self
+            .active_turn
+            .as_mut()
+            .ok_or(CodexAppServerError::NoActiveTurn)?;
+        active.interrupt_requested = true;
+        Ok(receipt)
     }
 
     pub fn pending_notification_count(&self) -> usize {
@@ -310,6 +428,8 @@ impl CodexAppServer {
             request_timeout,
             validated_profile: None,
             staged_executable: None,
+            active_turn: None,
+            last_terminal_turn: None,
         };
         let request_id = server.take_request_id()?;
         let request =
@@ -430,6 +550,131 @@ impl CodexAppServer {
         }
         self.notifications.push_back(frame);
         Ok(())
+    }
+
+    fn next_notification_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, CodexAppServerError> {
+        if let Some(frame) = self.notifications.pop_front() {
+            return Ok(frame);
+        }
+        loop {
+            if self.stderr_overflowed.load(Ordering::Acquire) {
+                return self.close_with(CodexAppServerError::StderrTooLarge);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return self.close_with(CodexAppServerError::TimedOut);
+            }
+            let wait = deadline
+                .saturating_duration_since(now)
+                .min(RECEIVE_POLL_INTERVAL);
+            let inbound = self
+                .inbound
+                .as_ref()
+                .ok_or(CodexAppServerError::ConnectionClosed)?;
+            match inbound.recv_timeout(wait) {
+                Ok(InboundFrame::Frame(frame)) => {
+                    let envelope = match classify_envelope(&frame) {
+                        Ok(envelope) => envelope,
+                        Err(error) => {
+                            self.release_retained_bytes(frame.len());
+                            return self.close_with(error);
+                        }
+                    };
+                    match envelope {
+                        EnvelopeKind::Notification => return Ok(frame),
+                        EnvelopeKind::Response(_) => {
+                            self.release_retained_bytes(frame.len());
+                            return self.close_with(CodexAppServerError::UnexpectedResponseId);
+                        }
+                    }
+                }
+                Ok(InboundFrame::FrameTooLarge) => {
+                    return self.close_with(CodexAppServerError::StdoutFrameTooLarge);
+                }
+                Ok(InboundFrame::UnterminatedFrame) => {
+                    return self.close_with(CodexAppServerError::UnterminatedStdoutFrame);
+                }
+                Ok(InboundFrame::ReadFailed) => {
+                    return self.close_with(CodexAppServerError::ReadStdout);
+                }
+                Ok(InboundFrame::RetainedBytesExceeded) => {
+                    return self.close_with(CodexAppServerError::NotificationBufferFull);
+                }
+                Ok(InboundFrame::Eof) | Err(RecvTimeoutError::Disconnected) => {
+                    return self.close_with(CodexAppServerError::UnexpectedEof);
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
+
+    fn reject_pending_terminal_observations(&mut self) -> Result<(), CodexAppServerError> {
+        let Some(terminal) = self.last_terminal_turn.clone() else {
+            return Ok(());
+        };
+        for _ in 0..MAX_CODEX_OBSERVATION_FRAMES {
+            let Some(frame) = self.try_next_notification()? else {
+                return Ok(());
+            };
+            let decoded =
+                decode_codex_turn_notification(&frame, &terminal.thread_id, &terminal.turn_id);
+            self.release_retained_bytes(frame.len());
+            match decoded {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    return self.close_with(CodexAppServerError::DuplicateTurnObservation);
+                }
+                Err(error) => {
+                    return self.close_with(CodexAppServerError::Contract(error));
+                }
+            }
+        }
+        self.close_with(CodexAppServerError::ObservationFrameLimit)
+    }
+
+    fn try_next_notification(&mut self) -> Result<Option<Vec<u8>>, CodexAppServerError> {
+        if let Some(frame) = self.notifications.pop_front() {
+            return Ok(Some(frame));
+        }
+        let inbound = self
+            .inbound
+            .as_ref()
+            .ok_or(CodexAppServerError::ConnectionClosed)?;
+        match inbound.try_recv() {
+            Ok(InboundFrame::Frame(frame)) => {
+                let envelope = match classify_envelope(&frame) {
+                    Ok(envelope) => envelope,
+                    Err(error) => {
+                        self.release_retained_bytes(frame.len());
+                        return self.close_with(error);
+                    }
+                };
+                match envelope {
+                    EnvelopeKind::Notification => Ok(Some(frame)),
+                    EnvelopeKind::Response(_) => {
+                        self.release_retained_bytes(frame.len());
+                        self.close_with(CodexAppServerError::UnexpectedResponseId)
+                    }
+                }
+            }
+            Ok(InboundFrame::FrameTooLarge) => {
+                self.close_with(CodexAppServerError::StdoutFrameTooLarge)
+            }
+            Ok(InboundFrame::UnterminatedFrame) => {
+                self.close_with(CodexAppServerError::UnterminatedStdoutFrame)
+            }
+            Ok(InboundFrame::ReadFailed) => self.close_with(CodexAppServerError::ReadStdout),
+            Ok(InboundFrame::RetainedBytesExceeded) => {
+                self.close_with(CodexAppServerError::NotificationBufferFull)
+            }
+            Ok(InboundFrame::Eof) | Err(TryRecvError::Disconnected) => {
+                self.close_with(CodexAppServerError::UnexpectedEof)
+            }
+            Err(TryRecvError::Empty) => Ok(None),
+        }
     }
 
     fn release_retained_bytes(&self, bytes: usize) {
@@ -776,6 +1021,12 @@ pub enum CodexAppServerError {
     PaginationCycle,
     PaginationLimit,
     DuplicateManagedThread,
+    ActiveTurnExists,
+    NoActiveTurn,
+    InterruptAlreadyRequested,
+    DuplicateTurnObservation,
+    CommandObservationLimit,
+    ObservationFrameLimit,
     RequestIdExhausted,
     ConnectionClosed,
     Contract(CodexContractError),
@@ -853,6 +1104,22 @@ impl fmt::Display for CodexAppServerError {
             Self::PaginationLimit => formatter.write_str("Codex list exceeded its page limit"),
             Self::DuplicateManagedThread => {
                 formatter.write_str("Codex repeated an exact managed thread across pages")
+            }
+            Self::ActiveTurnExists => {
+                formatter.write_str("Codex connection already owns an active turn")
+            }
+            Self::NoActiveTurn => formatter.write_str("Codex connection has no active turn"),
+            Self::InterruptAlreadyRequested => {
+                formatter.write_str("Codex active turn already has an interrupt request")
+            }
+            Self::DuplicateTurnObservation => {
+                formatter.write_str("Codex repeated an exact turn observation")
+            }
+            Self::CommandObservationLimit => {
+                formatter.write_str("Codex turn exceeded its command observation limit")
+            }
+            Self::ObservationFrameLimit => {
+                formatter.write_str("Codex turn observation exceeded its frame limit")
             }
             Self::RequestIdExhausted => formatter.write_str("Codex request IDs are exhausted"),
             Self::ConnectionClosed => formatter.write_str("Codex app-server connection is closed"),
@@ -983,6 +1250,327 @@ done
         assert_eq!(server.stderr_bytes(), 0);
         assert!(server.validated_profile().is_none());
         server.shutdown().expect("clean shutdown");
+        assert_process_group_gone(&executable);
+    }
+
+    #[test]
+    fn fake_turn_promotes_only_exact_command_start_and_terminal() {
+        let _process_guard = test_process_guard();
+        let directory = TestDirectory::new("turn-completion");
+        let executable = directory.0.join("codex");
+        write_script(
+            &executable,
+            &format!(
+                r#"#!/bin/sh
+printf '%s' "$$" > "$0.pgid"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{{"id":1,"result":{{}}}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"managed-1","sessionId":"managed-1"}},"sandbox":{{"type":"readOnly","networkAccess":false}},"approvalPolicy":"never"}}}}' ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{{"method":"turn/started","params":{{"threadId":"managed-1","turn":{{"id":"turn-1"}}}}}}'
+      printf '%s\n' '{{"method":"item/started","params":{{"item":{{"id":"item-1","type":"commandExecution","command":"secret command","commandActions":[],"cwd":"{TEST_CWD}","status":"inProgress"}},"startedAtMs":0,"threadId":"managed-1","turnId":"turn-1"}}}}'
+      printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"turn-1"}}}}}}'
+      printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"managed-1","turn":{{"id":"turn-1","items":[],"status":"completed"}}}}}}'
+      ;;
+  esac
+done
+"#
+            ),
+        );
+        let mut server = connect_fake(&executable, Duration::from_secs(1)).expect("turn handshake");
+        let thread = server.start_read_only(TEST_CWD).expect("managed thread");
+        let started = server
+            .start_turn(&thread.thread_id, "Respond without tools.")
+            .expect("turn start");
+        assert_eq!(started.turn_id, turn_id("turn-1"));
+        assert!(matches!(
+            server
+                .wait_for_turn_observation()
+                .expect("command observation"),
+            CodexTurnObservation::CommandStarted {
+                ref thread_id,
+                ref turn_id,
+                ref item_id,
+            } if thread_id == &thread.thread_id
+                && turn_id == &started.turn_id
+                && item_id.as_str() == "item-1"
+        ));
+        assert_eq!(
+            server
+                .wait_for_turn_observation()
+                .expect("terminal observation"),
+            CodexTurnObservation::Terminal {
+                thread_id: thread.thread_id,
+                turn_id: started.turn_id,
+                outcome: crate::CodexTurnTerminalOutcome::Completed,
+            }
+        );
+        assert!(matches!(
+            server.wait_for_turn_observation(),
+            Err(CodexAppServerError::NoActiveTurn)
+        ));
+        server.shutdown().expect("turn shutdown");
+        assert_process_group_gone(&executable);
+    }
+
+    #[test]
+    fn interrupt_receipt_waits_for_exact_interrupted_terminal() {
+        let _process_guard = test_process_guard();
+        let directory = TestDirectory::new("turn-interrupt");
+        let executable = directory.0.join("codex");
+        write_script(
+            &executable,
+            r#"#!/bin/sh
+printf '%s' "$$" > "$0.pgid"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"managed-1","sessionId":"managed-1"},"sandbox":{"type":"readOnly","networkAccess":false},"approvalPolicy":"never"}}' ;;
+    *'"method":"turn/start"'*) printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-1"}}}' ;;
+    *'"method":"turn/interrupt"'*)
+      printf '%s\n' '{"id":4,"result":{}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"managed-1","turn":{"id":"turn-1","items":[],"status":"interrupted"}}}'
+      ;;
+  esac
+done
+"#,
+        );
+        let mut server =
+            connect_fake(&executable, Duration::from_secs(1)).expect("interrupt handshake");
+        let thread = server.start_read_only(TEST_CWD).expect("managed thread");
+        let started = server
+            .start_turn(&thread.thread_id, "Wait.")
+            .expect("turn start");
+        let receipt = server
+            .interrupt_active_turn()
+            .expect("interrupt request receipt");
+        assert_eq!(receipt.thread_id, thread.thread_id);
+        assert_eq!(receipt.turn_id, started.turn_id);
+        assert!(matches!(
+            server.interrupt_active_turn(),
+            Err(CodexAppServerError::InterruptAlreadyRequested)
+        ));
+        assert_eq!(
+            server
+                .wait_for_turn_observation()
+                .expect("interrupted terminal"),
+            CodexTurnObservation::Terminal {
+                thread_id: receipt.thread_id,
+                turn_id: receipt.turn_id,
+                outcome: crate::CodexTurnTerminalOutcome::Interrupted,
+            }
+        );
+        server.shutdown().expect("interrupt shutdown");
+        assert_process_group_gone(&executable);
+    }
+
+    #[test]
+    fn duplicate_or_mismatched_turn_observation_closes_the_connection() {
+        let _process_guard = test_process_guard();
+        for (label, second_thread, expected) in [
+            (
+                "duplicate-command",
+                "managed-1",
+                ErrorKind::DuplicateTurnObservation,
+            ),
+            (
+                "mismatched-command",
+                "unmanaged",
+                ErrorKind::UnexpectedThreadId,
+            ),
+        ] {
+            let directory = TestDirectory::new(label);
+            let executable = directory.0.join("codex");
+            write_script(
+                &executable,
+                &format!(
+                    r#"#!/bin/sh
+printf '%s' "$$" > "$0.pgid"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{{"id":1,"result":{{}}}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"managed-1","sessionId":"managed-1"}},"sandbox":{{"type":"readOnly","networkAccess":false}},"approvalPolicy":"never"}}}}' ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{{"method":"item/started","params":{{"item":{{"id":"item-1","type":"commandExecution","command":"hidden","commandActions":[],"cwd":"{TEST_CWD}","status":"inProgress"}},"startedAtMs":0,"threadId":"managed-1","turnId":"turn-1"}}}}'
+      printf '%s\n' '{{"method":"item/started","params":{{"item":{{"id":"item-1","type":"commandExecution","command":"hidden","commandActions":[],"cwd":"{TEST_CWD}","status":"inProgress"}},"startedAtMs":1,"threadId":"{second_thread}","turnId":"turn-1"}}}}'
+      printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"turn-1"}}}}}}'
+      ;;
+  esac
+done
+"#
+                ),
+            );
+            let mut server =
+                connect_fake(&executable, Duration::from_secs(1)).expect("observation handshake");
+            let thread = server.start_read_only(TEST_CWD).expect("managed thread");
+            server
+                .start_turn(&thread.thread_id, "Wait.")
+                .expect("turn start");
+            server
+                .wait_for_turn_observation()
+                .expect("first command observation");
+            let error = server
+                .wait_for_turn_observation()
+                .expect_err("second observation must fail");
+            assert!(expected.matches(&error), "{label}: {error:?}");
+            assert_process_group_gone(&executable);
+        }
+    }
+
+    #[test]
+    fn command_observation_count_is_bounded_across_repeated_waits() {
+        let _process_guard = test_process_guard();
+        let directory = TestDirectory::new("command-observation-limit");
+        let executable = directory.0.join("codex");
+        let payload = directory.0.join("commands.jsonl");
+        let mut frames = Vec::new();
+        for index in 0..=MAX_CODEX_COMMAND_STARTS_PER_TURN {
+            frames.extend_from_slice(
+                format!(
+                    "{{\"method\":\"item/started\",\"params\":{{\"item\":{{\"id\":\"item-{index}\",\"type\":\"commandExecution\",\"command\":\"hidden\",\"commandActions\":[],\"cwd\":\"{TEST_CWD}\",\"status\":\"inProgress\"}},\"startedAtMs\":{index},\"threadId\":\"managed-1\",\"turnId\":\"turn-1\"}}}}\n"
+                )
+                .as_bytes(),
+            );
+        }
+        fs::write(&payload, frames).expect("command observation payload");
+        write_script(
+            &executable,
+            &format!(
+                r#"#!/bin/sh
+printf '%s' "$$" > "$0.pgid"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{{"id":1,"result":{{}}}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"managed-1","sessionId":"managed-1"}},"sandbox":{{"type":"readOnly","networkAccess":false}},"approvalPolicy":"never"}}}}' ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"turn-1"}}}}}}'
+      /bin/cat '{}'
+      ;;
+  esac
+done
+"#,
+                payload.display()
+            ),
+        );
+        let mut server =
+            connect_fake(&executable, Duration::from_secs(1)).expect("limit handshake");
+        let thread = server.start_read_only(TEST_CWD).expect("managed thread");
+        server
+            .start_turn(&thread.thread_id, "Wait.")
+            .expect("turn start");
+        for index in 0..MAX_CODEX_COMMAND_STARTS_PER_TURN {
+            assert!(matches!(
+                server
+                    .wait_for_turn_observation()
+                    .expect("bounded command observation"),
+                CodexTurnObservation::CommandStarted { ref item_id, .. }
+                    if item_id.as_str() == format!("item-{index}")
+            ));
+        }
+        let error = server
+            .wait_for_turn_observation()
+            .expect_err("over-limit command must fail");
+        assert!(
+            ErrorKind::CommandObservationLimit.matches(&error),
+            "{error:?}"
+        );
+        assert_process_group_gone(&executable);
+    }
+
+    #[test]
+    fn queued_duplicate_completion_and_interruption_fail_before_promotion() {
+        let _process_guard = test_process_guard();
+        for (label, terminal_status, interrupt) in [
+            ("duplicate-completion", "completed", false),
+            ("duplicate-interruption", "interrupted", true),
+        ] {
+            let directory = TestDirectory::new(label);
+            let executable = directory.0.join("codex");
+            let terminal = format!(
+                "{{\"method\":\"turn/completed\",\"params\":{{\"threadId\":\"managed-1\",\"turn\":{{\"id\":\"turn-1\",\"items\":[],\"status\":\"{terminal_status}\"}}}}}}"
+            );
+            let turn_start_behavior = if interrupt {
+                "printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-1\"}}}'".to_owned()
+            } else {
+                format!(
+                    "printf '%s\\n' '{terminal}'\nprintf '%s\\n' '{terminal}'\nprintf '%s\\n' '{{\"id\":3,\"result\":{{\"turn\":{{\"id\":\"turn-1\"}}}}}}'"
+                )
+            };
+            let interrupt_behavior = if interrupt {
+                format!(
+                    "printf '%s\\n' '{terminal}'\nprintf '%s\\n' '{terminal}'\nprintf '%s\\n' '{{\"id\":4,\"result\":{{}}}}'"
+                )
+            } else {
+                ":".to_owned()
+            };
+            write_script(
+                &executable,
+                &format!(
+                    r#"#!/bin/sh
+printf '%s' "$$" > "$0.pgid"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{{"id":1,"result":{{}}}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"managed-1","sessionId":"managed-1"}},"sandbox":{{"type":"readOnly","networkAccess":false}},"approvalPolicy":"never"}}}}' ;;
+    *'"method":"turn/start"'*) {turn_start_behavior} ;;
+    *'"method":"turn/interrupt"'*) {interrupt_behavior} ;;
+  esac
+done
+"#
+                ),
+            );
+            let mut server =
+                connect_fake(&executable, Duration::from_secs(1)).expect("duplicate handshake");
+            let thread = server.start_read_only(TEST_CWD).expect("managed thread");
+            server
+                .start_turn(&thread.thread_id, "Wait.")
+                .expect("turn start");
+            if interrupt {
+                server
+                    .interrupt_active_turn()
+                    .expect("interrupt request receipt");
+            }
+            let error = server
+                .wait_for_turn_observation()
+                .expect_err("duplicate terminal must fail closed");
+            assert!(
+                ErrorKind::DuplicateTurnObservation.matches(&error),
+                "{label}: {error:?}"
+            );
+            assert_process_group_gone(&executable);
+        }
+    }
+
+    #[test]
+    fn turn_observation_timeout_closes_the_connection() {
+        let _process_guard = test_process_guard();
+        let directory = TestDirectory::new("turn-observation-timeout");
+        let executable = directory.0.join("codex");
+        write_script(
+            &executable,
+            r#"#!/bin/sh
+printf '%s' "$$" > "$0.pgid"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"managed-1","sessionId":"managed-1"},"sandbox":{"type":"readOnly","networkAccess":false},"approvalPolicy":"never"}}' ;;
+    *'"method":"turn/start"'*) printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-1"}}}' ;;
+  esac
+done
+"#,
+        );
+        let mut server =
+            connect_fake(&executable, Duration::from_secs(1)).expect("timeout handshake");
+        let thread = server.start_read_only(TEST_CWD).expect("managed thread");
+        server
+            .start_turn(&thread.thread_id, "Wait.")
+            .expect("turn start");
+        server.request_timeout = Duration::from_millis(200);
+        let error = server
+            .wait_for_turn_observation()
+            .expect_err("observation must time out");
+        assert!(ErrorKind::TimedOut.matches(&error), "{error:?}");
         assert_process_group_gone(&executable);
     }
 
@@ -1555,6 +2143,10 @@ exit 9
         CodexManagedThreadId::new(value).expect("valid test thread ID")
     }
 
+    fn turn_id(value: &str) -> crate::CodexManagedTurnId {
+        crate::CodexManagedTurnId::new(value).expect("valid test turn ID")
+    }
+
     enum ErrorKind {
         TimedOut,
         StdoutTooLarge,
@@ -1564,6 +2156,9 @@ exit 9
         UnexpectedEof,
         UnterminatedFrame,
         NotificationBufferFull,
+        DuplicateTurnObservation,
+        CommandObservationLimit,
+        UnexpectedThreadId,
     }
 
     impl ErrorKind {
@@ -1576,9 +2171,13 @@ exit 9
                 | (Self::StderrTooLarge, CodexAppServerError::StderrTooLarge)
                 | (Self::UnexpectedEof, CodexAppServerError::UnexpectedEof)
                 | (Self::UnterminatedFrame, CodexAppServerError::UnterminatedStdoutFrame)
-                | (Self::NotificationBufferFull, CodexAppServerError::NotificationBufferFull) => {
-                    true
-                }
+                | (Self::NotificationBufferFull, CodexAppServerError::NotificationBufferFull)
+                | (Self::DuplicateTurnObservation, CodexAppServerError::DuplicateTurnObservation)
+                | (Self::CommandObservationLimit, CodexAppServerError::CommandObservationLimit)
+                | (
+                    Self::UnexpectedThreadId,
+                    CodexAppServerError::Contract(CodexContractError::UnexpectedThreadId),
+                ) => true,
                 (_, CodexAppServerError::CleanupAfterFailure { operation, .. }) => {
                     self.matches(operation)
                 }
