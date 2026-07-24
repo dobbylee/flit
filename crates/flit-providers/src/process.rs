@@ -14,7 +14,7 @@ use rustix::{
 };
 
 #[cfg(test)]
-static TEST_PROCESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static TEST_PROCESS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Clone, Copy)]
 pub(crate) struct ProcessPolicy {
@@ -215,7 +215,7 @@ struct CapturedOutput {
     eof: bool,
 }
 
-fn set_nonblocking(fd: &impl std::os::fd::AsFd) -> Result<(), ProcessError> {
+pub(crate) fn set_nonblocking(fd: &impl std::os::fd::AsFd) -> Result<(), ProcessError> {
     let flags = fcntl_getfl(fd).map_err(|error| ProcessError::ConfigureOutput {
         message: error.to_string(),
     })?;
@@ -254,7 +254,7 @@ fn drain_output(
     }
 }
 
-fn terminate_process_group(child: &mut std::process::Child) -> Result<(), ProcessError> {
+pub(crate) fn terminate_process_group(child: &mut std::process::Child) -> Result<(), ProcessError> {
     let mut group_error = None;
     if let Some(pid) = Pid::from_raw(child.id() as i32) {
         for attempt in 0..20 {

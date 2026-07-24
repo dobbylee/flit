@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 mod codex_contract;
+mod codex_transport;
 mod executable;
 mod probe;
 mod process;
@@ -13,8 +14,13 @@ pub use codex_contract::{
     CodexManagedThreadId, CodexStartedThread, CodexThreadRead, CodexThreadState,
     MAX_CODEX_APP_SERVER_FRAME_BYTES, MAX_CODEX_MANAGED_THREADS, codex_initialize_request,
     codex_initialized_notification, codex_read_only_start_request, codex_read_request,
-    codex_thread_list_request, decode_codex_read_response, decode_codex_start_response,
-    decode_codex_thread_list_response,
+    codex_thread_list_request, decode_codex_initialize_response, decode_codex_read_response,
+    decode_codex_start_response, decode_codex_thread_list_response,
+};
+pub use codex_transport::{
+    CODEX_APP_SERVER_REQUEST_TIMEOUT, CodexAppServer, CodexAppServerError, CodexManagedThreads,
+    MAX_CODEX_APP_SERVER_STDERR_BYTES, MAX_CODEX_LIST_PAGES, MAX_CODEX_PENDING_NOTIFICATION_BYTES,
+    MAX_CODEX_PENDING_NOTIFICATIONS,
 };
 pub use executable::{
     ExecutableInspection, ExecutableInspectionError, ExecutableSelectionSource,

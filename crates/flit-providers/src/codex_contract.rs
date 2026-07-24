@@ -223,6 +223,14 @@ pub fn decode_codex_start_response(
     })
 }
 
+pub fn decode_codex_initialize_response(
+    frame: &[u8],
+    expected_request_id: u64,
+) -> Result<(), CodexContractError> {
+    let _ = response_result(frame, expected_request_id)?;
+    Ok(())
+}
+
 pub fn decode_codex_thread_list_response(
     frame: &[u8],
     expected_request_id: u64,
