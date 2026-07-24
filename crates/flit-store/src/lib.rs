@@ -11,12 +11,19 @@ use flit_protocol::{
     NullableSessionId, UnsequencedEventEnvelope,
 };
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
+mod managed_runs;
 mod projects;
 mod writer;
 
+pub use managed_runs::{
+    InitialManagedSessionConnection, InitialManagedSessionOutcome, MANAGED_PROVIDER_KIND_CODEX,
+    MAX_MANAGED_METADATA_JSON_BYTES, MAX_MANAGED_METADATA_JSON_DEPTH,
+    MAX_MANAGED_METADATA_JSON_VALUES, ManagedRun, ManagedRunIntent, ManagedRunIntentOutcome,
+    ManagedSession,
+};
 pub use projects::{
     Project, ProjectDirectoryInspection, ProjectIdentity, ProjectInspectionError,
     ProjectRegistration, ProjectRegistrationOutcome, ProjectTrustConfirmation, ProjectTrustOutcome,
@@ -462,6 +469,267 @@ impl Store {
         Ok(ProjectTrustOutcome::Trusted(project))
     }
 
+    pub fn create_managed_run_intent(
+        &mut self,
+        intent: ManagedRunIntent,
+    ) -> Result<ManagedRunIntentOutcome, StoreError> {
+        managed_runs::validate_run_intent(&intent)
+            .map_err(|field| StoreError::InvalidManagedRunIntent { field })?;
+        let start_request_json =
+            serde_json::to_string(&intent.start_request).map_err(StoreError::Json)?;
+        let events = managed_run_intent_events(&intent, start_request_json.as_bytes());
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+        let existing = load_managed_run(&transaction, &intent.id)?;
+        let duplicate = if let Some(existing) = &existing {
+            let stored_events = load_managed_run_intent_events(&transaction, &intent.id)?;
+            if !managed_run_matches_intent(existing, &intent) || stored_events != events {
+                return Err(StoreError::ManagedRunIdentityConflict { run_id: intent.id });
+            }
+            true
+        } else {
+            let project = transaction
+                .query_row(
+                    "SELECT trusted, archived_at FROM projects WHERE id = ?1",
+                    [&intent.project_id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .optional()
+                .map_err(StoreError::Sqlite)?
+                .ok_or_else(|| StoreError::MissingProject {
+                    project_id: intent.project_id.clone(),
+                })?;
+            if project.1.is_some() {
+                return Err(StoreError::ArchivedProject {
+                    project_id: intent.project_id,
+                });
+            }
+            if project.0 != 1 {
+                return Err(StoreError::UntrustedProject {
+                    project_id: intent.project_id,
+                });
+            }
+            transaction
+                .execute(
+                    "INSERT INTO runs(id, project_id, title, goal, provider_kind, start_request_json, baseline_head, created_at) VALUES(?1, ?2, ?3, ?4, 'codex', ?5, ?6, ?7)",
+                    params![
+                        intent.id,
+                        intent.project_id,
+                        intent.title,
+                        intent.goal,
+                        start_request_json,
+                        intent.baseline_head,
+                        intent.created_at,
+                    ],
+                )
+                .map_err(StoreError::Sqlite)?;
+            false
+        };
+
+        let outcomes = append_event_batch_in_transaction(&transaction, events)?;
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        let run = load_managed_run(&self.connection, &intent.id)?.ok_or_else(|| {
+            StoreError::MissingRun {
+                run_id: intent.id.clone(),
+            }
+        })?;
+        let events = outcomes
+            .into_iter()
+            .map(|outcome| match outcome {
+                AppendEventOutcome::Inserted(event) | AppendEventOutcome::Duplicate(event) => event,
+            })
+            .collect();
+        if duplicate {
+            Ok(ManagedRunIntentOutcome::Duplicate { run, events })
+        } else {
+            Ok(ManagedRunIntentOutcome::Created { run, events })
+        }
+    }
+
+    pub fn connect_initial_managed_session(
+        &mut self,
+        connection: InitialManagedSessionConnection,
+    ) -> Result<InitialManagedSessionOutcome, StoreError> {
+        managed_runs::validate_initial_session(&connection)
+            .map_err(|field| StoreError::InvalidInitialManagedSession { field })?;
+        let capabilities_json =
+            serde_json::to_string(&connection.capabilities).map_err(StoreError::Json)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+        let run = load_managed_run(&transaction, &connection.run_id)?.ok_or_else(|| {
+            StoreError::MissingRun {
+                run_id: connection.run_id.clone(),
+            }
+        })?;
+        if run.provider_kind != MANAGED_PROVIDER_KIND_CODEX {
+            return Err(StoreError::ManagedRunProviderMismatch {
+                run_id: connection.run_id,
+            });
+        }
+        let project = transaction
+            .query_row(
+                "SELECT canonical_path, trusted, archived_at FROM projects WHERE id = ?1",
+                [&run.project_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)?
+            .ok_or_else(|| StoreError::MissingProject {
+                project_id: run.project_id.clone(),
+            })?;
+        if project.2.is_some() {
+            return Err(StoreError::ArchivedProject {
+                project_id: run.project_id,
+            });
+        }
+        if project.1 != 1 {
+            return Err(StoreError::UntrustedProject {
+                project_id: run.project_id,
+            });
+        }
+        if connection.cwd.to_str() != Some(project.0.as_str()) {
+            return Err(StoreError::ManagedSessionCwdMismatch {
+                run_id: connection.run_id,
+            });
+        }
+
+        let existing = load_managed_session(&transaction, &connection.id)?;
+        let duplicate = if let Some(existing) = &existing {
+            if !managed_session_matches_connection(existing, &connection) {
+                return Err(StoreError::ManagedSessionIdentityConflict {
+                    session_id: connection.id,
+                });
+            }
+            if run.started_at.as_deref() != Some(connection.started_at.as_str()) {
+                return Err(StoreError::StoredManagedRunInvalid {
+                    run_id: connection.run_id,
+                    field: "started_at",
+                });
+            }
+            true
+        } else {
+            if let Some((claimed_run_id, claimed_session_id)) = transaction
+                .query_row(
+                    "SELECT run_id, id FROM agent_sessions WHERE provider_kind = 'codex' AND external_session_key = ?1 ORDER BY ordinal LIMIT 1",
+                    [&connection.external_session_key],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+                .map_err(StoreError::Sqlite)?
+            {
+                return Err(StoreError::ExternalSessionAlreadyClaimed {
+                    external_session_key: connection.external_session_key,
+                    claimed_run_id,
+                    claimed_session_id,
+                });
+            }
+            if let Some(live_session_id) = transaction
+                .query_row(
+                    "SELECT id FROM agent_sessions WHERE run_id = ?1 AND ended_at IS NULL",
+                    [&connection.run_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(StoreError::Sqlite)?
+            {
+                return Err(StoreError::LiveManagedSessionExists {
+                    run_id: connection.run_id,
+                    session_id: live_session_id,
+                });
+            }
+            if run.started_at.is_some() {
+                return Err(StoreError::ManagedRunAlreadyStarted {
+                    run_id: connection.run_id,
+                });
+            }
+            let executable_path = connection
+                .executable_path
+                .as_deref()
+                .map(|path| {
+                    path.to_str()
+                        .ok_or(StoreError::InvalidInitialManagedSession {
+                            field: "executable_path",
+                        })
+                })
+                .transpose()?;
+            transaction
+                .execute(
+                    "INSERT INTO agent_sessions(id, run_id, ordinal, provider_kind, external_session_key, session_fingerprint, executable_path, executable_version, cwd, capabilities_json, started_at) VALUES(?1, ?2, 1, 'codex', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        connection.id,
+                        connection.run_id,
+                        connection.external_session_key,
+                        connection.session_fingerprint,
+                        executable_path,
+                        connection.executable_version,
+                        connection
+                            .cwd
+                            .to_str()
+                            .ok_or(StoreError::InvalidInitialManagedSession { field: "cwd" })?,
+                        capabilities_json,
+                        connection.started_at,
+                    ],
+                )
+                .map_err(StoreError::Sqlite)?;
+            let updated = transaction
+                .execute(
+                    "UPDATE runs SET started_at = ?1 WHERE id = ?2 AND started_at IS NULL",
+                    params![connection.started_at, connection.run_id],
+                )
+                .map_err(StoreError::Sqlite)?;
+            if updated != 1 {
+                return Err(StoreError::ManagedRunAlreadyStarted {
+                    run_id: connection.run_id,
+                });
+            }
+            false
+        };
+
+        let event = managed_session_connected_event(&connection);
+        let mut outcomes = append_event_batch_in_transaction(&transaction, vec![event])?;
+        let outcome = outcomes
+            .pop()
+            .expect("one session event must produce one append outcome");
+        let event = match outcome {
+            AppendEventOutcome::Inserted(event) | AppendEventOutcome::Duplicate(event) => event,
+        };
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        let session = load_managed_session(&self.connection, &connection.id)?.ok_or_else(|| {
+            StoreError::MissingSession {
+                session_id: connection.id.clone(),
+            }
+        })?;
+        if duplicate {
+            Ok(InitialManagedSessionOutcome::Duplicate { session, event })
+        } else {
+            Ok(InitialManagedSessionOutcome::Connected { session, event })
+        }
+    }
+
+    pub fn managed_run(&self, run_id: &str) -> Result<Option<ManagedRun>, StoreError> {
+        if run_id.trim().is_empty() {
+            return Err(StoreError::InvalidManagedRunIntent { field: "id" });
+        }
+        load_managed_run(&self.connection, run_id)
+    }
+
+    pub fn managed_session(&self, session_id: &str) -> Result<Option<ManagedSession>, StoreError> {
+        if session_id.trim().is_empty() {
+            return Err(StoreError::InvalidInitialManagedSession { field: "id" });
+        }
+        load_managed_session(&self.connection, session_id)
+    }
+
     fn validated_checkpoint_report(
         busy: i64,
         log_frames: i64,
@@ -507,73 +775,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(StoreError::Sqlite)?;
-        let mut outcomes = Vec::with_capacity(events.len());
-
-        for event in events {
-            validate_event(&event)?;
-            if let Some(ingest_seq) = event_ingest_seq(&transaction, &event.event_id)? {
-                let existing = load_event(&transaction, ingest_seq)?;
-                if UnsequencedEventEnvelope::from(existing.clone()) == event {
-                    outcomes.push(AppendEventOutcome::Duplicate(existing));
-                    continue;
-                }
-                return Err(StoreError::EventIdentityConflict {
-                    event_id: event.event_id,
-                });
-            }
-
-            if let NullableSessionId::Id(session_id) = &event.session_id
-                && let Some(existing_event_id) =
-                    event_id_for_stream(&transaction, session_id, event.stream_seq)?
-            {
-                return Err(StoreError::StreamSequenceConflict {
-                    session_id: session_id.clone(),
-                    stream_seq: event.stream_seq,
-                    existing_event_id,
-                });
-            }
-
-            validate_event_session(&transaction, &event)?;
-            validate_event_evidence(&transaction, &event)?;
-            let source_json = serde_json::to_string(&event.source).map_err(StoreError::Json)?;
-            let payload_json = serde_json::to_string(&event.payload).map_err(StoreError::Json)?;
-            let extensions_json =
-                serde_json::to_string(&event.extensions).map_err(StoreError::Json)?;
-            let session_id = match &event.session_id {
-                NullableSessionId::Id(session_id) => Some(session_id.as_str()),
-                NullableSessionId::Null => None,
-            };
-            transaction
-                .execute(
-                    "INSERT INTO events(event_id, protocol_version, event_type, run_id, session_id, stream_seq, occurred_at, observed_at, source_json, confidence, payload_version, payload_json, extensions_json) VALUES(?1, '1.0', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11)",
-                    params![
-                        event.event_id,
-                        event.event_type,
-                        event.run_id,
-                        session_id,
-                        event.stream_seq as i64,
-                        event.occurred_at,
-                        event.observed_at,
-                        source_json,
-                        event.confidence,
-                        payload_json,
-                        extensions_json,
-                    ],
-                )
-                .map_err(StoreError::Sqlite)?;
-            let ingest_seq = assigned_sequence(transaction.last_insert_rowid())?;
-            for (ordinal, evidence_id) in event.evidence_ids.iter().enumerate() {
-                transaction
-                    .execute(
-                        "INSERT INTO event_evidence(event_id, evidence_id, ordinal) VALUES(?1, ?2, ?3)",
-                        params![event.event_id, evidence_id, ordinal as i64],
-                    )
-                    .map_err(StoreError::Sqlite)?;
-            }
-            outcomes.push(AppendEventOutcome::Inserted(
-                event.with_ingest_seq(ingest_seq),
-            ));
-        }
+        let outcomes = append_event_batch_in_transaction(&transaction, events)?;
         transaction.commit().map_err(StoreError::Sqlite)?;
         Ok(outcomes)
     }
@@ -792,6 +994,350 @@ fn validate_snapshot(snapshot: &RunSnapshotDraft) -> Result<(), StoreError> {
         }
     }
     validate_snapshot_json(snapshot)
+}
+
+fn managed_run_intent_events(
+    intent: &ManagedRunIntent,
+    start_request_json: &[u8],
+) -> Vec<UnsequencedEventEnvelope> {
+    let source = EventSource {
+        kind: EventSourceKind::Core,
+        provider: None,
+        contract_version: None,
+        extensions: BTreeMap::new(),
+    };
+    let created_payload = json!({
+        "goal": intent.goal,
+        "project_id": intent.project_id,
+        "provider": MANAGED_PROVIDER_KIND_CODEX,
+    })
+    .as_object()
+    .expect("object literal")
+    .clone();
+    let requested_payload = json!({
+        "provider": MANAGED_PROVIDER_KIND_CODEX,
+        "request_sha256": sha256_hex(start_request_json),
+    })
+    .as_object()
+    .expect("object literal")
+    .clone();
+    vec![
+        UnsequencedEventEnvelope {
+            protocol_version: EventProtocolVersion::V1_0,
+            event_id: intent.run_created_event_id.clone(),
+            run_id: intent.id.clone(),
+            session_id: NullableSessionId::Null,
+            stream_seq: 1,
+            occurred_at: intent.created_at.clone(),
+            observed_at: intent.created_at.clone(),
+            event_type: "run.created".to_owned(),
+            source: source.clone(),
+            confidence: 1.0,
+            evidence_ids: Vec::new(),
+            payload: created_payload,
+            extensions: BTreeMap::new(),
+        },
+        UnsequencedEventEnvelope {
+            protocol_version: EventProtocolVersion::V1_0,
+            event_id: intent.start_requested_event_id.clone(),
+            run_id: intent.id.clone(),
+            session_id: NullableSessionId::Null,
+            stream_seq: 2,
+            occurred_at: intent.created_at.clone(),
+            observed_at: intent.created_at.clone(),
+            event_type: "run.start_requested".to_owned(),
+            source,
+            confidence: 1.0,
+            evidence_ids: Vec::new(),
+            payload: requested_payload,
+            extensions: BTreeMap::new(),
+        },
+    ]
+}
+
+fn managed_session_connected_event(
+    connection: &InitialManagedSessionConnection,
+) -> UnsequencedEventEnvelope {
+    let payload = json!({
+        "capabilities": connection.capabilities,
+        "provider_session_key": connection.external_session_key,
+        "session_fingerprint": connection.session_fingerprint,
+    })
+    .as_object()
+    .expect("object literal")
+    .clone();
+    UnsequencedEventEnvelope {
+        protocol_version: EventProtocolVersion::V1_0,
+        event_id: connection.connected_event_id.clone(),
+        run_id: connection.run_id.clone(),
+        session_id: NullableSessionId::Id(connection.id.clone()),
+        stream_seq: 1,
+        occurred_at: connection.started_at.clone(),
+        observed_at: connection.started_at.clone(),
+        event_type: "session.connected".to_owned(),
+        source: EventSource {
+            kind: EventSourceKind::ProviderAdapter,
+            provider: Some(MANAGED_PROVIDER_KIND_CODEX.to_owned()),
+            contract_version: Some(connection.contract_version.clone()),
+            extensions: BTreeMap::new(),
+        },
+        confidence: 1.0,
+        evidence_ids: Vec::new(),
+        payload,
+        extensions: BTreeMap::new(),
+    }
+}
+
+fn managed_run_matches_intent(run: &ManagedRun, intent: &ManagedRunIntent) -> bool {
+    run.id == intent.id
+        && run.project_id == intent.project_id
+        && run.title == intent.title
+        && run.goal == intent.goal
+        && run.provider_kind == MANAGED_PROVIDER_KIND_CODEX
+        && run.start_request == intent.start_request
+        && run.baseline_head == intent.baseline_head
+        && run.created_at == intent.created_at
+}
+
+fn managed_session_matches_connection(
+    session: &ManagedSession,
+    connection: &InitialManagedSessionConnection,
+) -> bool {
+    session.id == connection.id
+        && session.run_id == connection.run_id
+        && session.ordinal == 1
+        && session.provider_kind == MANAGED_PROVIDER_KIND_CODEX
+        && session.external_session_key == connection.external_session_key
+        && session.session_fingerprint == connection.session_fingerprint
+        && session.executable_path == connection.executable_path
+        && session.executable_version == connection.executable_version
+        && session.cwd == connection.cwd
+        && session.capabilities == connection.capabilities
+        && session.started_at == connection.started_at
+}
+
+fn load_managed_run(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<Option<ManagedRun>, StoreError> {
+    let stored = connection
+        .query_row(
+            "SELECT id, project_id, title, goal, provider_kind, start_request_json, baseline_head, created_at, started_at, ended_at FROM runs WHERE id = ?1",
+            [run_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(StoreError::Sqlite)?;
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    let start_request =
+        serde_json::from_str::<Map<String, Value>>(&stored.5).map_err(|source| {
+            StoreError::StoredManagedRunJson {
+                run_id: run_id.to_owned(),
+                source,
+            }
+        })?;
+    let run = ManagedRun {
+        id: stored.0,
+        project_id: stored.1,
+        title: stored.2,
+        goal: stored.3,
+        provider_kind: stored.4,
+        start_request,
+        baseline_head: stored.6,
+        created_at: stored.7,
+        started_at: stored.8,
+        ended_at: stored.9,
+    };
+    managed_runs::validate_stored_run(&run).map_err(|field| {
+        StoreError::StoredManagedRunInvalid {
+            run_id: run_id.to_owned(),
+            field,
+        }
+    })?;
+    Ok(Some(run))
+}
+
+fn load_managed_run_intent_events(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<Vec<UnsequencedEventEnvelope>, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT ingest_seq FROM events
+             WHERE run_id = ?1 AND event_type IN ('run.created', 'run.start_requested')
+             ORDER BY ingest_seq",
+        )
+        .map_err(StoreError::Sqlite)?;
+    let ingest_sequences = statement
+        .query_map([run_id], |row| row.get::<_, i64>(0))
+        .map_err(StoreError::Sqlite)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::Sqlite)?;
+    drop(statement);
+    ingest_sequences
+        .into_iter()
+        .map(|ingest_seq| load_event(connection, ingest_seq).map(UnsequencedEventEnvelope::from))
+        .collect()
+}
+
+fn load_managed_session(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Option<ManagedSession>, StoreError> {
+    let stored = connection
+        .query_row(
+            "SELECT id, run_id, ordinal, provider_kind, external_session_key, session_fingerprint, executable_path, executable_version, cwd, capabilities_json, provider_cursor, started_at, ended_at, end_reason FROM agent_sessions WHERE id = ?1",
+            [session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(StoreError::Sqlite)?;
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    let ordinal = u64::try_from(stored.2).map_err(|_| StoreError::StoredManagedSessionInvalid {
+        session_id: session_id.to_owned(),
+        field: "ordinal",
+    })?;
+    let capabilities = serde_json::from_str::<Map<String, Value>>(&stored.9).map_err(|source| {
+        StoreError::StoredManagedSessionJson {
+            session_id: session_id.to_owned(),
+            source,
+        }
+    })?;
+    let session = ManagedSession {
+        id: stored.0,
+        run_id: stored.1,
+        ordinal,
+        provider_kind: stored.3,
+        external_session_key: stored.4,
+        session_fingerprint: stored.5,
+        executable_path: stored.6.map(PathBuf::from),
+        executable_version: stored.7,
+        cwd: PathBuf::from(stored.8),
+        capabilities,
+        provider_cursor: stored.10,
+        started_at: stored.11,
+        ended_at: stored.12,
+        end_reason: stored.13,
+    };
+    managed_runs::validate_stored_session(&session).map_err(|field| {
+        StoreError::StoredManagedSessionInvalid {
+            session_id: session_id.to_owned(),
+            field,
+        }
+    })?;
+    Ok(Some(session))
+}
+
+fn append_event_batch_in_transaction(
+    transaction: &Transaction<'_>,
+    events: Vec<UnsequencedEventEnvelope>,
+) -> Result<Vec<AppendEventOutcome>, StoreError> {
+    let mut outcomes = Vec::with_capacity(events.len());
+    for event in events {
+        validate_event(&event)?;
+        if let Some(ingest_seq) = event_ingest_seq(transaction, &event.event_id)? {
+            let existing = load_event(transaction, ingest_seq)?;
+            if UnsequencedEventEnvelope::from(existing.clone()) == event {
+                outcomes.push(AppendEventOutcome::Duplicate(existing));
+                continue;
+            }
+            return Err(StoreError::EventIdentityConflict {
+                event_id: event.event_id,
+            });
+        }
+
+        if let NullableSessionId::Id(session_id) = &event.session_id
+            && let Some(existing_event_id) =
+                event_id_for_stream(transaction, session_id, event.stream_seq)?
+        {
+            return Err(StoreError::StreamSequenceConflict {
+                session_id: session_id.clone(),
+                stream_seq: event.stream_seq,
+                existing_event_id,
+            });
+        }
+
+        validate_event_session(transaction, &event)?;
+        validate_event_evidence(transaction, &event)?;
+        let source_json = serde_json::to_string(&event.source).map_err(StoreError::Json)?;
+        let payload_json = serde_json::to_string(&event.payload).map_err(StoreError::Json)?;
+        let extensions_json = serde_json::to_string(&event.extensions).map_err(StoreError::Json)?;
+        let session_id = match &event.session_id {
+            NullableSessionId::Id(session_id) => Some(session_id.as_str()),
+            NullableSessionId::Null => None,
+        };
+        transaction
+            .execute(
+                "INSERT INTO events(event_id, protocol_version, event_type, run_id, session_id, stream_seq, occurred_at, observed_at, source_json, confidence, payload_version, payload_json, extensions_json) VALUES(?1, '1.0', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11)",
+                params![
+                    event.event_id,
+                    event.event_type,
+                    event.run_id,
+                    session_id,
+                    event.stream_seq as i64,
+                    event.occurred_at,
+                    event.observed_at,
+                    source_json,
+                    event.confidence,
+                    payload_json,
+                    extensions_json,
+                ],
+            )
+            .map_err(StoreError::Sqlite)?;
+        let ingest_seq = assigned_sequence(transaction.last_insert_rowid())?;
+        for (ordinal, evidence_id) in event.evidence_ids.iter().enumerate() {
+            transaction
+                .execute(
+                    "INSERT INTO event_evidence(event_id, evidence_id, ordinal) VALUES(?1, ?2, ?3)",
+                    params![event.event_id, evidence_id, ordinal as i64],
+                )
+                .map_err(StoreError::Sqlite)?;
+        }
+        outcomes.push(AppendEventOutcome::Inserted(
+            event.with_ingest_seq(ingest_seq),
+        ));
+    }
+    Ok(outcomes)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(bytes);
+    format!("{:x}", digest.finalize())
 }
 
 fn validate_snapshot_json(snapshot: &RunSnapshotDraft) -> Result<(), StoreError> {
@@ -1667,6 +2213,58 @@ pub enum StoreError {
     MissingProject {
         project_id: String,
     },
+    ArchivedProject {
+        project_id: String,
+    },
+    UntrustedProject {
+        project_id: String,
+    },
+    InvalidManagedRunIntent {
+        field: &'static str,
+    },
+    ManagedRunIdentityConflict {
+        run_id: String,
+    },
+    ManagedRunProviderMismatch {
+        run_id: String,
+    },
+    ManagedRunAlreadyStarted {
+        run_id: String,
+    },
+    StoredManagedRunInvalid {
+        run_id: String,
+        field: &'static str,
+    },
+    StoredManagedRunJson {
+        run_id: String,
+        source: serde_json::Error,
+    },
+    InvalidInitialManagedSession {
+        field: &'static str,
+    },
+    ManagedSessionIdentityConflict {
+        session_id: String,
+    },
+    ManagedSessionCwdMismatch {
+        run_id: String,
+    },
+    ExternalSessionAlreadyClaimed {
+        external_session_key: String,
+        claimed_run_id: String,
+        claimed_session_id: String,
+    },
+    LiveManagedSessionExists {
+        run_id: String,
+        session_id: String,
+    },
+    StoredManagedSessionInvalid {
+        session_id: String,
+        field: &'static str,
+    },
+    StoredManagedSessionJson {
+        session_id: String,
+        source: serde_json::Error,
+    },
     InvalidCheckpointReport(CheckpointReport),
     InvalidEventBatchSize {
         count: usize,
@@ -1821,6 +2419,68 @@ impl fmt::Display for StoreError {
                     "Project does not exist after registration: {project_id}"
                 )
             }
+            Self::ArchivedProject { project_id } => {
+                write!(formatter, "Project is archived: {project_id}")
+            }
+            Self::UntrustedProject { project_id } => {
+                write!(formatter, "Project is not trusted: {project_id}")
+            }
+            Self::InvalidManagedRunIntent { field } => {
+                write!(formatter, "invalid managed Run intent field: {field}")
+            }
+            Self::ManagedRunIdentityConflict { run_id } => {
+                write!(formatter, "managed Run identity conflicts: {run_id}")
+            }
+            Self::ManagedRunProviderMismatch { run_id } => {
+                write!(formatter, "managed Run provider does not match: {run_id}")
+            }
+            Self::ManagedRunAlreadyStarted { run_id } => {
+                write!(formatter, "managed Run already started: {run_id}")
+            }
+            Self::StoredManagedRunInvalid { run_id, field } => {
+                write!(formatter, "stored managed Run {run_id} has invalid {field}")
+            }
+            Self::StoredManagedRunJson { run_id, source } => {
+                write!(
+                    formatter,
+                    "stored managed Run {run_id} has invalid JSON: {source}"
+                )
+            }
+            Self::InvalidInitialManagedSession { field } => {
+                write!(formatter, "invalid initial managed session field: {field}")
+            }
+            Self::ManagedSessionIdentityConflict { session_id } => {
+                write!(
+                    formatter,
+                    "managed session identity conflicts: {session_id}"
+                )
+            }
+            Self::ManagedSessionCwdMismatch { run_id } => {
+                write!(
+                    formatter,
+                    "managed session cwd does not match Run: {run_id}"
+                )
+            }
+            Self::ExternalSessionAlreadyClaimed {
+                external_session_key,
+                claimed_run_id,
+                claimed_session_id,
+            } => write!(
+                formatter,
+                "external session {external_session_key} is already claimed by Run {claimed_run_id} session {claimed_session_id}"
+            ),
+            Self::LiveManagedSessionExists { run_id, session_id } => write!(
+                formatter,
+                "managed Run {run_id} already has live session {session_id}"
+            ),
+            Self::StoredManagedSessionInvalid { session_id, field } => write!(
+                formatter,
+                "stored managed session {session_id} has invalid {field}"
+            ),
+            Self::StoredManagedSessionJson { session_id, source } => write!(
+                formatter,
+                "stored managed session {session_id} has invalid JSON: {source}"
+            ),
             Self::InvalidCheckpointReport(report) => write!(
                 formatter,
                 "invalid PASSIVE checkpoint report: busy {}, log frames {}, checkpointed frames {}",
@@ -1985,6 +2645,8 @@ impl Error for StoreError {
             Self::Sqlite(error) => Some(error),
             Self::StoredJson { source, .. } => Some(source),
             Self::StoredRunSnapshotJson { source, .. } => Some(source),
+            Self::StoredManagedRunJson { source, .. } => Some(source),
+            Self::StoredManagedSessionJson { source, .. } => Some(source),
             Self::Json(error) => Some(error),
             _ => None,
         }
