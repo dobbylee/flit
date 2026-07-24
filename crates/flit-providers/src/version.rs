@@ -1,19 +1,11 @@
-use std::{
-    error::Error,
-    fmt,
-    io::{self, Read},
-    os::unix::process::CommandExt,
-    process::{Command, ExitStatus, Stdio},
-    thread,
-    time::{Duration, Instant},
-};
+use std::{error::Error, ffi::OsString, fmt, io, time::Duration};
 
-use rustix::{
-    fs::{OFlags, fcntl_getfl, fcntl_setfl},
-    process::{Pid, Signal, kill_process_group},
+#[cfg(test)]
+use crate::process::ProcessFault;
+use crate::{
+    ExecutableInspection, ExecutableInspectionError, inspect_codex_at,
+    process::{ProcessError, ProcessPolicy, run_bounded},
 };
-
-use crate::{ExecutableInspection, ExecutableInspectionError, inspect_codex_at};
 
 pub const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const MAX_VERSION_OUTPUT_BYTES: usize = 64 * 1024;
@@ -34,7 +26,7 @@ pub fn probe_codex_version(
             timeout: VERSION_PROBE_TIMEOUT,
             max_output_bytes: MAX_VERSION_OUTPUT_BYTES,
             #[cfg(test)]
-            fault: ProbeFault::None,
+            fault: ProcessFault::None,
         },
     )
 }
@@ -44,15 +36,7 @@ struct ProbePolicy {
     timeout: Duration,
     max_output_bytes: usize,
     #[cfg(test)]
-    fault: ProbeFault,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy)]
-enum ProbeFault {
-    None,
-    ConfigureOutput,
-    ReadOutput,
+    fault: ProcessFault,
 }
 
 fn probe_codex_version_with_policy(
@@ -65,238 +49,35 @@ fn probe_codex_version_with_policy(
         return Err(CodexVersionProbeError::ExecutableIdentityChanged);
     }
 
-    let mut child = Command::new(&before.canonical_path)
-        .arg("--version")
-        .env_clear()
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .map_err(CodexVersionProbeError::Spawn)?;
-    let Some(mut stdout) = child.stdout.take() else {
-        terminate_process_group(&mut child)?;
-        return Err(CodexVersionProbeError::MissingOutputPipe);
-    };
-    let Some(mut stderr) = child.stderr.take() else {
-        terminate_process_group(&mut child)?;
-        return Err(CodexVersionProbeError::MissingOutputPipe);
-    };
-    let configuration = if inject_configuration_failure(&policy) {
-        Err(CodexVersionProbeError::ConfigureOutput {
-            message: "injected failure".to_owned(),
-        })
-    } else {
-        set_nonblocking(&stdout).and_then(|()| set_nonblocking(&stderr))
-    };
-    if let Err(error) = configuration {
-        terminate_process_group(&mut child)?;
-        return Err(error);
-    }
-    let mut stdout_capture = CapturedOutput::default();
-    let mut stderr_capture = CapturedOutput::default();
-    let mut combined_bytes = 0_usize;
-    let mut exit_status = None;
-    let started = Instant::now();
-    let outcome = loop {
-        let stdout_result = drain_output(
-            &mut stdout,
-            &mut stdout_capture,
-            &mut combined_bytes,
-            policy.max_output_bytes,
-        );
-        if let Err(error) = stdout_result {
-            terminate_process_group(&mut child)?;
-            return Err(error);
-        }
-        if combined_bytes > policy.max_output_bytes {
-            terminate_process_group(&mut child)?;
-            break ProcessOutcome::OutputExceeded;
-        }
-        let stderr_result = if inject_read_failure(&policy) {
-            Err(CodexVersionProbeError::ReadOutput(io::Error::other(
-                "injected failure",
-            )))
-        } else {
-            drain_output(
-                &mut stderr,
-                &mut stderr_capture,
-                &mut combined_bytes,
-                policy.max_output_bytes,
-            )
-        };
-        if let Err(error) = stderr_result {
-            terminate_process_group(&mut child)?;
-            return Err(error);
-        }
-        if combined_bytes > policy.max_output_bytes {
-            terminate_process_group(&mut child)?;
-            break ProcessOutcome::OutputExceeded;
-        }
-        if exit_status.is_none() {
-            match child.try_wait() {
-                Err(error) => {
-                    terminate_process_group(&mut child)?;
-                    break ProcessOutcome::WaitFailed(error);
-                }
-                Ok(Some(status)) => {
-                    terminate_process_group(&mut child)?;
-                    exit_status = Some(status);
-                }
-                Ok(None) => {}
-            }
-        }
-        if stdout_capture.eof
-            && stderr_capture.eof
-            && let Some(status) = exit_status
-        {
-            break ProcessOutcome::Exited(status);
-        }
-        if started.elapsed() >= policy.timeout {
-            terminate_process_group(&mut child)?;
-            break if exit_status.is_some() {
-                ProcessOutcome::OutputDrainTimedOut
-            } else {
-                ProcessOutcome::TimedOut
-            };
-        }
-        thread::sleep(Duration::from_millis(5));
-    };
-
-    match outcome {
-        ProcessOutcome::TimedOut => return Err(CodexVersionProbeError::TimedOut),
-        ProcessOutcome::OutputDrainTimedOut => {
-            return Err(CodexVersionProbeError::OutputDrainTimedOut);
-        }
-        ProcessOutcome::OutputExceeded => {
-            return Err(CodexVersionProbeError::OutputTooLarge {
-                max_bytes: policy.max_output_bytes,
-            });
-        }
-        ProcessOutcome::WaitFailed(error) => return Err(CodexVersionProbeError::Wait(error)),
-        ProcessOutcome::Exited(status) if !status.success() => {
-            return Err(CodexVersionProbeError::UnsuccessfulExit {
-                code: status.code(),
-            });
-        }
-        ProcessOutcome::Exited(_) => {}
-    }
+    let output = run_bounded(
+        &before.canonical_path,
+        &[OsString::from("--version")],
+        ProcessPolicy {
+            timeout: policy.timeout,
+            max_output_bytes: policy.max_output_bytes,
+            #[cfg(test)]
+            fault: policy.fault,
+        },
+    )
+    .map_err(CodexVersionProbeError::from)?;
     let after =
         inspect_codex_at(&expected.selected_path).map_err(CodexVersionProbeError::Inspection)?;
     if !same_identity(&before, &after) {
         return Err(CodexVersionProbeError::ExecutableIdentityChanged);
     }
-    let executable_version = parse_version(&stdout_capture.bytes)?;
+    let executable_version = parse_version(&output.stdout)?;
 
     Ok(CodexVersionProbe {
         inspection: expected.clone(),
         executable_version,
-        stderr_bytes: stderr_capture.total_bytes,
+        stderr_bytes: output.stderr_bytes,
     })
-}
-
-fn inject_configuration_failure(policy: &ProbePolicy) -> bool {
-    #[cfg(test)]
-    {
-        matches!(policy.fault, ProbeFault::ConfigureOutput)
-    }
-    #[cfg(not(test))]
-    {
-        let _ = policy;
-        false
-    }
-}
-
-fn inject_read_failure(policy: &ProbePolicy) -> bool {
-    #[cfg(test)]
-    {
-        matches!(policy.fault, ProbeFault::ReadOutput)
-    }
-    #[cfg(not(test))]
-    {
-        let _ = policy;
-        false
-    }
 }
 
 fn same_identity(left: &ExecutableInspection, right: &ExecutableInspection) -> bool {
     left.canonical_path == right.canonical_path
         && left.filesystem_id == right.filesystem_id
         && left.sha256 == right.sha256
-}
-
-enum ProcessOutcome {
-    Exited(ExitStatus),
-    TimedOut,
-    OutputDrainTimedOut,
-    OutputExceeded,
-    WaitFailed(io::Error),
-}
-
-#[derive(Default)]
-struct CapturedOutput {
-    bytes: Vec<u8>,
-    total_bytes: usize,
-    eof: bool,
-}
-
-fn set_nonblocking(fd: &impl std::os::fd::AsFd) -> Result<(), CodexVersionProbeError> {
-    let flags = fcntl_getfl(fd).map_err(|error| CodexVersionProbeError::ConfigureOutput {
-        message: error.to_string(),
-    })?;
-    fcntl_setfl(fd, flags | OFlags::NONBLOCK).map_err(|error| {
-        CodexVersionProbeError::ConfigureOutput {
-            message: error.to_string(),
-        }
-    })
-}
-
-fn drain_output(
-    reader: &mut impl Read,
-    captured: &mut CapturedOutput,
-    combined_bytes: &mut usize,
-    max_bytes: usize,
-) -> Result<(), CodexVersionProbeError> {
-    let mut buffer = [0_u8; 4096];
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => {
-                captured.eof = true;
-                return Ok(());
-            }
-            Ok(read) => {
-                captured.total_bytes = captured.total_bytes.saturating_add(read);
-                let available = max_bytes.saturating_sub(*combined_bytes);
-                captured
-                    .bytes
-                    .extend_from_slice(&buffer[..read.min(available)]);
-                *combined_bytes = combined_bytes.saturating_add(read);
-                if *combined_bytes > max_bytes {
-                    return Ok(());
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-            Err(error) => return Err(CodexVersionProbeError::ReadOutput(error)),
-        }
-    }
-}
-
-fn terminate_process_group(child: &mut std::process::Child) -> Result<(), CodexVersionProbeError> {
-    let mut group_error = None;
-    if let Some(pid) = Pid::from_raw(child.id() as i32)
-        && let Err(error) = kill_process_group(pid, Signal::KILL)
-        && error != rustix::io::Errno::SRCH
-    {
-        group_error = Some(error);
-    }
-    let _ = child.kill();
-    child.wait().map_err(CodexVersionProbeError::Wait)?;
-    if let Some(error) = group_error {
-        return Err(CodexVersionProbeError::TerminateProcessGroup {
-            message: error.to_string(),
-        });
-    }
-    Ok(())
 }
 
 fn parse_version(stdout: &[u8]) -> Result<String, CodexVersionProbeError> {
@@ -339,6 +120,25 @@ pub enum CodexVersionProbeError {
     UnsuccessfulExit { code: Option<i32> },
     InvalidUtf8Output,
     InvalidVersionOutput,
+}
+
+impl From<ProcessError> for CodexVersionProbeError {
+    fn from(error: ProcessError) -> Self {
+        match error {
+            ProcessError::Spawn(error) => Self::Spawn(error),
+            ProcessError::MissingOutputPipe => Self::MissingOutputPipe,
+            ProcessError::Wait(error) => Self::Wait(error),
+            ProcessError::ReadOutput(error) => Self::ReadOutput(error),
+            ProcessError::ConfigureOutput { message } => Self::ConfigureOutput { message },
+            ProcessError::TerminateProcessGroup { message } => {
+                Self::TerminateProcessGroup { message }
+            }
+            ProcessError::TimedOut => Self::TimedOut,
+            ProcessError::OutputDrainTimedOut => Self::OutputDrainTimedOut,
+            ProcessError::OutputTooLarge { max_bytes } => Self::OutputTooLarge { max_bytes },
+            ProcessError::UnsuccessfulExit { code } => Self::UnsuccessfulExit { code },
+        }
+    }
 }
 
 impl fmt::Display for CodexVersionProbeError {
@@ -412,7 +212,9 @@ mod tests {
 
     use crate::inspect_codex_at;
 
-    use super::{CodexVersionProbeError, ProbeFault, ProbePolicy, probe_codex_version_with_policy};
+    use crate::process::ProcessFault;
+
+    use super::{CodexVersionProbeError, ProbePolicy, probe_codex_version_with_policy};
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
@@ -462,7 +264,7 @@ mod tests {
         write_script(
             &timeout,
             &format!(
-                "#!/bin/sh\n(/bin/sleep 0.3; /usr/bin/touch '{}') &\nwhile :; do :; done\n",
+                "#!/bin/sh\n(/bin/sleep 0.3; /usr/bin/touch '{}') &\n/bin/sleep 5\n",
                 descendant_marker.display()
             ),
         );
@@ -514,7 +316,7 @@ mod tests {
             ProbePolicy {
                 timeout: Duration::from_secs(1),
                 max_output_bytes: 128,
-                fault: ProbeFault::None,
+                fault: ProcessFault::None,
             },
         )
         .expect_err("escaped pipe must fail");
@@ -545,7 +347,7 @@ mod tests {
                 ProbePolicy {
                     timeout: Duration::from_secs(2),
                     max_output_bytes: 128,
-                    fault: ProbeFault::None,
+                    fault: ProcessFault::None,
                 }
             ),
             Err(CodexVersionProbeError::OutputTooLarge { max_bytes: 128 })
@@ -557,17 +359,17 @@ mod tests {
         for (name, fault, expected) in [
             (
                 "configure",
-                ProbeFault::ConfigureOutput,
+                ProcessFault::ConfigureOutput,
                 FailureKind::ConfigureOutput,
             ),
-            ("read", ProbeFault::ReadOutput, FailureKind::ReadOutput),
+            ("read", ProcessFault::ReadOutput, FailureKind::ReadOutput),
         ] {
             let executable = directory.0.join(name);
             let marker = directory.0.join(format!("{name}-marker"));
             write_script(
                 &executable,
                 &format!(
-                    "#!/bin/sh\n(/bin/sleep 0.3; /usr/bin/touch '{}') &\nwhile :; do :; done\n",
+                    "#!/bin/sh\n(/bin/sleep 0.3; /usr/bin/touch '{}') &\n/bin/sleep 5\n",
                     marker.display()
                 ),
             );
@@ -653,9 +455,9 @@ mod tests {
 
     fn test_policy() -> ProbePolicy {
         ProbePolicy {
-            timeout: Duration::from_secs(2),
+            timeout: Duration::from_secs(5),
             max_output_bytes: 128,
-            fault: ProbeFault::None,
+            fault: ProcessFault::None,
         }
     }
 
@@ -663,7 +465,7 @@ mod tests {
         ProbePolicy {
             timeout: Duration::from_millis(100),
             max_output_bytes: 128,
-            fault: ProbeFault::None,
+            fault: ProcessFault::None,
         }
     }
 

@@ -1,11 +1,17 @@
 use std::path::PathBuf;
 
 mod executable;
+mod process;
+mod schema;
 mod version;
 
 pub use executable::{
     ExecutableInspection, ExecutableInspectionError, ExecutableSelectionSource,
     MAX_EXECUTABLE_BYTES, inspect_codex_at, inspect_codex_on_path,
+};
+pub use schema::{
+    CodexSchemaProbe, CodexSchemaProbeError, MAX_SCHEMA_BYTES, MAX_SCHEMA_OUTPUT_BYTES,
+    SCHEMA_PROBE_TIMEOUT, SchemaArtifact, probe_codex_schema,
 };
 pub use version::{
     CodexVersionProbe, CodexVersionProbeError, MAX_VERSION_OUTPUT_BYTES, VERSION_PROBE_TIMEOUT,
