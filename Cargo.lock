@@ -355,6 +355,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "flit-providers"
+version = "0.1.0"
+
+[[package]]
 name = "flit-store"
 version = "0.1.0"
 dependencies = [
