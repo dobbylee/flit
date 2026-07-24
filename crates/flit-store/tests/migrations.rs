@@ -5,7 +5,10 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use flit_store::{ConnectionPolicy, Store, StoreError, initial_migration_checksum};
+use flit_store::{
+    ConnectionPolicy, Store, StoreError, initial_migration_checksum,
+    project_filesystem_identity_migration_checksum,
+};
 use rusqlite::{Connection, params};
 
 const APPLIED_AT: &str = "2026-07-23T00:00:00.000Z";
@@ -41,7 +44,7 @@ impl Drop for TestDatabase {
 fn fresh_database_applies_full_initial_schema_and_reopens() {
     let database = TestDatabase::new("fresh");
     let store = Store::open(database.path(), APPLIED_AT).expect("fresh store opens");
-    assert_eq!(store.schema_version().expect("schema version"), 1);
+    assert_eq!(store.schema_version().expect("schema version"), 2);
     assert_eq!(store.quick_check().expect("quick check"), "ok");
     assert_eq!(
         store.connection_policy().expect("connection policy"),
@@ -58,7 +61,7 @@ fn fresh_database_applies_full_initial_schema_and_reopens() {
 
     let reopened = Store::open(database.path(), "different-time-is-not-reapplied")
         .expect("existing store reopens");
-    assert_eq!(reopened.schema_version().expect("schema version"), 1);
+    assert_eq!(reopened.schema_version().expect("schema version"), 2);
 
     let connection = Connection::open(database.path()).expect("inspect database");
     let stored: (String, String, String) = connection
@@ -71,6 +74,16 @@ fn fresh_database_applies_full_initial_schema_and_reopens() {
     assert_eq!(stored.0, "initial");
     assert_eq!(stored.1, initial_migration_checksum());
     assert_eq!(stored.2, APPLIED_AT);
+    let second: (String, String, String) = connection
+        .query_row(
+            "SELECT name, checksum, applied_at FROM schema_migrations WHERE version = 2",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("second migration row");
+    assert_eq!(second.0, "project_filesystem_identity");
+    assert_eq!(second.1, project_filesystem_identity_migration_checksum());
+    assert_eq!(second.2, APPLIED_AT);
 
     let names = schema_names(&connection);
     for required in [
@@ -91,6 +104,7 @@ fn fresh_database_applies_full_initial_schema_and_reopens() {
         "events_by_run_seq",
         "events_by_type_time",
         "snapshots_by_bucket_progress",
+        "projects_by_filesystem_id",
     ] {
         assert!(
             names.iter().any(|name| name == required),
@@ -166,6 +180,116 @@ fn migration_registry_mismatches_fail_closed() {
 }
 
 #[test]
+fn version_one_schema_drift_is_rejected_before_pending_migrations_change_the_database() {
+    let database = TestDatabase::new("version-one-drift");
+    let connection = Connection::open(database.path()).expect("version one database");
+    connection
+        .execute_batch(include_str!("../migrations/0001_initial.sql"))
+        .expect("version one schema");
+    connection
+        .execute(
+            "INSERT INTO schema_migrations(version, name, checksum, applied_at) VALUES(1, 'initial', ?1, ?2)",
+            params![initial_migration_checksum(), APPLIED_AT],
+        )
+        .expect("version one registry");
+    connection
+        .execute(
+            "CREATE TABLE drifted_project_data(id TEXT PRIMARY KEY) STRICT",
+            [],
+        )
+        .expect("schema drift");
+    let before = schema_names(&connection);
+    drop(connection);
+
+    assert!(matches!(
+        Store::open(database.path(), APPLIED_AT),
+        Err(StoreError::SchemaDrift { .. })
+    ));
+    let connection = Connection::open(database.path()).expect("inspect rejected database");
+    assert_eq!(schema_names(&connection), before);
+    assert_eq!(migration_versions(&connection), [1]);
+}
+
+#[test]
+fn malformed_legacy_filesystem_identity_blocks_the_identity_index_migration() {
+    let database = TestDatabase::new("invalid-filesystem-identity");
+    let connection = Connection::open(database.path()).expect("version one database");
+    connection
+        .execute_batch(include_str!("../migrations/0001_initial.sql"))
+        .expect("version one schema");
+    connection
+        .execute(
+            "INSERT INTO schema_migrations(version, name, checksum, applied_at) VALUES(1, 'initial', ?1, ?2)",
+            params![initial_migration_checksum(), APPLIED_AT],
+        )
+        .expect("version one registry");
+    connection
+        .execute(
+            "INSERT INTO projects(id, display_name, canonical_path, filesystem_id, trusted, notification_policy_json, created_at, updated_at) VALUES('invalid-project', 'Invalid', '/private/tmp/flit-invalid-project', '', 0, '{}', ?1, ?1)",
+            [APPLIED_AT],
+        )
+        .expect("invalid legacy Project");
+    drop(connection);
+
+    assert!(matches!(
+        Store::open(database.path(), APPLIED_AT),
+        Err(StoreError::InvalidStoredProjectFilesystemIdentity { project_id })
+            if project_id == "invalid-project"
+    ));
+    let connection = Connection::open(database.path()).expect("inspect rejected database");
+    assert_eq!(migration_versions(&connection), [1]);
+    assert!(
+        !schema_names(&connection)
+            .iter()
+            .any(|name| name == "projects_by_filesystem_id")
+    );
+}
+
+#[test]
+fn noncanonical_legacy_filesystem_identity_blocks_duplicate_protection_bypass() {
+    let database = TestDatabase::new("noncanonical-filesystem-identity");
+    let connection = Connection::open(database.path()).expect("version one database");
+    connection
+        .execute_batch(include_str!("../migrations/0001_initial.sql"))
+        .expect("version one schema");
+    connection
+        .execute(
+            "INSERT INTO schema_migrations(version, name, checksum, applied_at) VALUES(1, 'initial', ?1, ?2)",
+            params![initial_migration_checksum(), APPLIED_AT],
+        )
+        .expect("version one registry");
+    for (id, path, filesystem_id) in [
+        ("canonical", "/private/tmp/flit-canonical", "unix:1:2"),
+        (
+            "noncanonical",
+            "/private/tmp/flit-noncanonical",
+            "unix:01:02",
+        ),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO projects(id, display_name, canonical_path, filesystem_id, trusted, notification_policy_json, created_at, updated_at) VALUES(?1, ?1, ?2, ?3, 0, '{}', ?4, ?4)",
+                params![id, path, filesystem_id, APPLIED_AT],
+            )
+            .expect("legacy Project");
+    }
+    drop(connection);
+
+    assert!(matches!(
+        Store::open(database.path(), APPLIED_AT),
+        Err(StoreError::InvalidStoredProjectFilesystemIdentity { project_id })
+            if project_id == "noncanonical"
+    ));
+    let connection = Connection::open(database.path()).expect("inspect rejected database");
+    assert_eq!(migration_versions(&connection), [1]);
+    assert!(
+        !schema_names(&connection)
+            .iter()
+            .any(|name| name == "projects_by_filesystem_id")
+    );
+}
+
+#[test]
 fn unknown_newer_migration_and_schema_drift_are_rejected() {
     let newer = TestDatabase::new("newer");
     Store::open(newer.path(), APPLIED_AT).expect("bootstrap store");
@@ -173,13 +297,13 @@ fn unknown_newer_migration_and_schema_drift_are_rejected() {
     connection
         .execute(
             "INSERT INTO schema_migrations(version, name, checksum, applied_at) VALUES(?1, ?2, ?3, ?4)",
-            params![2_i64, "future", "future", APPLIED_AT],
+            params![3_i64, "future", "future", APPLIED_AT],
         )
         .expect("future migration row");
     drop(connection);
     assert!(matches!(
         Store::open(newer.path(), APPLIED_AT),
-        Err(StoreError::UnsupportedMigration { version: 2 })
+        Err(StoreError::UnsupportedMigration { version: 3 })
     ));
 
     let drift = TestDatabase::new("drift");
@@ -279,6 +403,16 @@ fn schema_names(connection: &Connection) -> Vec<String> {
         .expect("schema rows")
         .collect::<Result<Vec<_>, _>>()
         .expect("schema names")
+}
+
+fn migration_versions(connection: &Connection) -> Vec<i64> {
+    connection
+        .prepare("SELECT version FROM schema_migrations ORDER BY version")
+        .expect("migration version statement")
+        .query_map([], |row| row.get(0))
+        .expect("migration version rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("migration versions")
 }
 
 fn sidecar(path: &Path, suffix: &str) -> PathBuf {

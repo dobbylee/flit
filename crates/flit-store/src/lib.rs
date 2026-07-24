@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
-    path::Path,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -10,11 +10,17 @@ use flit_protocol::{
     EventEnvelope, EventProtocolVersion, EventSource, EventSourceKind, MAX_JSON_SAFE_INTEGER,
     NullableSessionId, UnsequencedEventEnvelope,
 };
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+mod projects;
 mod writer;
+
+pub use projects::{
+    Project, ProjectDirectoryInspection, ProjectIdentity, ProjectInspectionError,
+    ProjectRegistration, ProjectRegistrationOutcome,
+};
 
 pub use writer::{
     CheckpointAck, CheckpointFailure, CheckpointReceipt, DurableEventAck,
@@ -26,6 +32,10 @@ pub use writer::{
 const INITIAL_MIGRATION_VERSION: i64 = 1;
 const INITIAL_MIGRATION_NAME: &str = "initial";
 const INITIAL_MIGRATION_SQL: &str = include_str!("../migrations/0001_initial.sql");
+const PROJECT_FILESYSTEM_IDENTITY_MIGRATION_VERSION: i64 = 2;
+const PROJECT_FILESYSTEM_IDENTITY_MIGRATION_NAME: &str = "project_filesystem_identity";
+const PROJECT_FILESYSTEM_IDENTITY_MIGRATION_SQL: &str =
+    include_str!("../migrations/0002_project_filesystem_identity.sql");
 const MAX_EVENT_READ_LIMIT: usize = 1_000;
 pub const MAX_EVENT_APPEND_BATCH: usize = 50;
 
@@ -122,6 +132,97 @@ impl From<RunSnapshot> for RunSnapshotDraft {
     }
 }
 
+fn validate_project_registration(registration: &ProjectRegistration) -> Result<(), StoreError> {
+    if registration.id.trim().is_empty() {
+        return Err(StoreError::InvalidProjectRegistration { field: "id" });
+    }
+    if registration.display_name.trim().is_empty() {
+        return Err(StoreError::InvalidProjectRegistration {
+            field: "display_name",
+        });
+    }
+    if registration.created_at.trim().is_empty() {
+        return Err(StoreError::InvalidProjectRegistration {
+            field: "created_at",
+        });
+    }
+    if registration.selected_path.as_os_str().is_empty() {
+        return Err(StoreError::InvalidProjectRegistration {
+            field: "selected_path",
+        });
+    }
+    Ok(())
+}
+
+fn transaction_project_id_for_canonical_path(
+    transaction: &Transaction<'_>,
+    canonical_path: &Path,
+) -> Result<Option<String>, StoreError> {
+    transaction
+        .query_row(
+            "SELECT id FROM projects WHERE canonical_path = ?1",
+            [canonical_path
+                .to_str()
+                .ok_or(StoreError::InvalidProjectRegistration {
+                    field: "canonical_path",
+                })?],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(StoreError::Sqlite)
+}
+
+fn transaction_project_id_for_filesystem_id(
+    transaction: &Transaction<'_>,
+    filesystem_id: &str,
+) -> Result<Option<String>, StoreError> {
+    transaction
+        .query_row(
+            "SELECT id FROM projects WHERE filesystem_id = ?1",
+            [filesystem_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(StoreError::Sqlite)
+}
+
+fn transaction_project_exists(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+) -> Result<bool, StoreError> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+            [project_id],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::Sqlite)
+}
+
+fn project_by_id(connection: &Connection, project_id: &str) -> Result<Option<Project>, StoreError> {
+    connection
+        .query_row(
+            "SELECT id, display_name, canonical_path, filesystem_id, trusted, default_provider, notification_policy_json, created_at, updated_at FROM projects WHERE id = ?1",
+            [project_id],
+            |row| {
+                let trusted: i64 = row.get(4)?;
+                Ok(Project {
+                    id: row.get(0)?,
+                    display_name: row.get(1)?,
+                    canonical_path: PathBuf::from(row.get::<_, String>(2)?),
+                    filesystem_id: row.get(3)?,
+                    trusted: trusted == 1,
+                    default_provider: row.get(5)?,
+                    notification_policy_json: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(StoreError::Sqlite)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum WriteRunSnapshotOutcome {
     Inserted(RunSnapshot),
@@ -144,12 +245,15 @@ impl Store {
         let mut connection = Connection::open(path).map_err(StoreError::Sqlite)?;
         let needs_bootstrap = preflight_database(&connection)?;
         configure_connection(&connection)?;
-        validate_connection_policy(&connection)?;
         if needs_bootstrap {
-            apply_initial_migration(&mut connection, migration_applied_at)?;
+            apply_pending_migrations(&mut connection, migration_applied_at, 0)?;
+        } else {
+            let applied_count = applied_migration_count(&connection)?;
+            apply_pending_migrations(&mut connection, migration_applied_at, applied_count)?;
         }
         validate_schema(&connection)?;
         validate_integrity(&connection)?;
+        validate_connection_policy(&connection)?;
         Ok(Self { connection })
     }
 
@@ -184,6 +288,68 @@ impl Store {
             })
             .map_err(StoreError::Sqlite)?;
         Self::validated_checkpoint_report(busy, log_frames, checkpointed_frames)
+    }
+
+    pub fn register_project(
+        &mut self,
+        registration: ProjectRegistration,
+    ) -> Result<ProjectRegistrationOutcome, StoreError> {
+        validate_project_registration(&registration)?;
+        let inspection = ProjectDirectoryInspection::inspect(&registration.selected_path)
+            .map_err(StoreError::ProjectInspection)?;
+        let identity = inspection.identity;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+        if let Some(existing_project_id) =
+            transaction_project_id_for_canonical_path(&transaction, &identity.canonical_path)?
+        {
+            return Ok(ProjectRegistrationOutcome::DuplicateCanonicalPath {
+                existing_project_id,
+            });
+        }
+        if let Some(existing_project_id) =
+            transaction_project_id_for_filesystem_id(&transaction, &identity.filesystem_id)?
+        {
+            return Ok(ProjectRegistrationOutcome::DuplicateFilesystemIdentity {
+                existing_project_id,
+            });
+        }
+        if transaction_project_exists(&transaction, &registration.id)? {
+            return Err(StoreError::ProjectIdConflict {
+                project_id: registration.id,
+            });
+        }
+
+        transaction
+            .execute(
+                "INSERT INTO projects(id, display_name, canonical_path, filesystem_id, trusted, notification_policy_json, created_at, updated_at) VALUES(?1, ?2, ?3, ?4, 0, '{}', ?5, ?5)",
+                params![
+                    registration.id,
+                    registration.display_name,
+                    identity
+                        .canonical_path
+                        .to_str()
+                        .ok_or(StoreError::InvalidProjectRegistration {
+                            field: "canonical_path",
+                        })?,
+                    identity.filesystem_id,
+                    registration.created_at,
+                ],
+            )
+            .map_err(StoreError::Sqlite)?;
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        let project = project_by_id(&self.connection, &registration.id)?.ok_or_else(|| {
+            StoreError::MissingProject {
+                project_id: registration.id,
+            }
+        })?;
+        Ok(ProjectRegistrationOutcome::Registered(project))
+    }
+
+    pub fn project(&self, project_id: &str) -> Result<Option<Project>, StoreError> {
+        project_by_id(&self.connection, project_id)
     }
 
     fn validated_checkpoint_report(
@@ -1041,8 +1207,17 @@ struct StoredEvent {
 
 #[must_use]
 pub fn initial_migration_checksum() -> String {
+    migration_checksum(INITIAL_MIGRATION_SQL)
+}
+
+#[must_use]
+pub fn project_filesystem_identity_migration_checksum() -> String {
+    migration_checksum(PROJECT_FILESYSTEM_IDENTITY_MIGRATION_SQL)
+}
+
+fn migration_checksum(sql: &str) -> String {
     let mut digest = Sha256::new();
-    digest.update(INITIAL_MIGRATION_SQL.as_bytes());
+    digest.update(sql.as_bytes());
     format!("{:x}", digest.finalize())
 }
 
@@ -1086,23 +1261,30 @@ fn preflight_database(connection: &Connection) -> Result<bool, StoreError> {
     }
 
     validate_migration_registry(connection)?;
-    validate_schema(connection)?;
+    validate_schema_for_migration_count(connection, applied_migration_count(connection)?)?;
     validate_integrity(connection)?;
     Ok(false)
 }
 
-fn apply_initial_migration(
+fn apply_pending_migrations(
     connection: &mut Connection,
     applied_at: &str,
+    applied_count: usize,
 ) -> Result<(), StoreError> {
-    apply_migration(
-        connection,
-        INITIAL_MIGRATION_VERSION,
-        INITIAL_MIGRATION_NAME,
-        &initial_migration_checksum(),
-        applied_at,
-        INITIAL_MIGRATION_SQL,
-    )
+    for migration in migrations().iter().skip(applied_count) {
+        if migration.version == PROJECT_FILESYSTEM_IDENTITY_MIGRATION_VERSION {
+            validate_legacy_project_filesystem_ids(connection)?;
+        }
+        apply_migration(
+            connection,
+            migration.version,
+            migration.name,
+            &migration_checksum(migration.sql),
+            applied_at,
+            migration.sql,
+        )?;
+    }
+    Ok(())
 }
 
 fn apply_migration(
@@ -1142,50 +1324,86 @@ fn validate_migration_registry(connection: &Connection) -> Result<(), StoreError
         .collect::<Result<Vec<_>, _>>()
         .map_err(StoreError::Sqlite)?;
 
-    let Some(initial) = records.first() else {
+    if records.is_empty() {
         return Err(StoreError::MissingMigration {
             version: INITIAL_MIGRATION_VERSION,
         });
-    };
-    if initial.version != INITIAL_MIGRATION_VERSION {
-        return if initial.version > INITIAL_MIGRATION_VERSION {
-            Err(StoreError::UnsupportedMigration {
-                version: initial.version,
-            })
-        } else {
-            Err(StoreError::MissingMigration {
-                version: INITIAL_MIGRATION_VERSION,
-            })
+    }
+    let known = migrations();
+    for (index, record) in records.iter().enumerate() {
+        let Some(expected) = known.get(index) else {
+            return Err(StoreError::UnsupportedMigration {
+                version: record.version,
+            });
         };
-    }
-    if initial.name != INITIAL_MIGRATION_NAME {
-        return Err(StoreError::MigrationNameMismatch {
-            version: initial.version,
-            expected: INITIAL_MIGRATION_NAME.to_owned(),
-            actual: initial.name.clone(),
-        });
-    }
-    let expected_checksum = initial_migration_checksum();
-    if initial.checksum != expected_checksum {
-        return Err(StoreError::MigrationChecksumMismatch {
-            version: initial.version,
-            expected: expected_checksum,
-            actual: initial.checksum.clone(),
-        });
-    }
-    if let Some(unsupported) = records.get(1) {
-        return Err(StoreError::UnsupportedMigration {
-            version: unsupported.version,
-        });
+        if record.version != expected.version {
+            return Err(StoreError::MissingMigration {
+                version: expected.version,
+            });
+        }
+        if record.name != expected.name {
+            return Err(StoreError::MigrationNameMismatch {
+                version: record.version,
+                expected: expected.name.to_owned(),
+                actual: record.name.clone(),
+            });
+        }
+        let expected_checksum = migration_checksum(expected.sql);
+        if record.checksum != expected_checksum {
+            return Err(StoreError::MigrationChecksumMismatch {
+                version: record.version,
+                expected: expected_checksum,
+                actual: record.checksum.clone(),
+            });
+        }
     }
     Ok(())
 }
 
+fn applied_migration_count(connection: &Connection) -> Result<usize, StoreError> {
+    connection
+        .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map(|count| count as usize)
+        .map_err(StoreError::Sqlite)
+}
+
+struct Migration {
+    version: i64,
+    name: &'static str,
+    sql: &'static str,
+}
+
+fn migrations() -> [Migration; 2] {
+    [
+        Migration {
+            version: INITIAL_MIGRATION_VERSION,
+            name: INITIAL_MIGRATION_NAME,
+            sql: INITIAL_MIGRATION_SQL,
+        },
+        Migration {
+            version: PROJECT_FILESYSTEM_IDENTITY_MIGRATION_VERSION,
+            name: PROJECT_FILESYSTEM_IDENTITY_MIGRATION_NAME,
+            sql: PROJECT_FILESYSTEM_IDENTITY_MIGRATION_SQL,
+        },
+    ]
+}
+
 fn validate_schema(connection: &Connection) -> Result<(), StoreError> {
+    validate_schema_for_migration_count(connection, migrations().len())
+}
+
+fn validate_schema_for_migration_count(
+    connection: &Connection,
+    migration_count: usize,
+) -> Result<(), StoreError> {
     let expected_connection = Connection::open_in_memory().map_err(StoreError::Sqlite)?;
-    expected_connection
-        .execute_batch(INITIAL_MIGRATION_SQL)
-        .map_err(StoreError::Sqlite)?;
+    for migration in migrations().iter().take(migration_count) {
+        expected_connection
+            .execute_batch(migration.sql)
+            .map_err(StoreError::Sqlite)?;
+    }
     let expected = schema_objects(&expected_connection)?;
     let actual = schema_objects(connection)?;
     if actual != expected {
@@ -1193,6 +1411,27 @@ fn validate_schema(connection: &Connection) -> Result<(), StoreError> {
             expected: schema_signature(&expected),
             actual: schema_signature(&actual),
         });
+    }
+    Ok(())
+}
+
+fn validate_legacy_project_filesystem_ids(connection: &Connection) -> Result<(), StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT id, filesystem_id FROM projects WHERE filesystem_id IS NOT NULL ORDER BY id",
+        )
+        .map_err(StoreError::Sqlite)?;
+    let records = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(StoreError::Sqlite)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::Sqlite)?;
+    for (project_id, filesystem_id) in records {
+        if !projects::is_valid_filesystem_id(&filesystem_id) {
+            return Err(StoreError::InvalidStoredProjectFilesystemIdentity { project_id });
+        }
     }
     Ok(())
 }
@@ -1296,6 +1535,19 @@ struct SchemaObject {
 
 #[derive(Debug)]
 pub enum StoreError {
+    InvalidStoredProjectFilesystemIdentity {
+        project_id: String,
+    },
+    ProjectInspection(ProjectInspectionError),
+    InvalidProjectRegistration {
+        field: &'static str,
+    },
+    ProjectIdConflict {
+        project_id: String,
+    },
+    MissingProject {
+        project_id: String,
+    },
     InvalidCheckpointReport(CheckpointReport),
     InvalidEventBatchSize {
         count: usize,
@@ -1413,6 +1665,25 @@ pub enum StoreError {
 impl fmt::Display for StoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidStoredProjectFilesystemIdentity { project_id } => write!(
+                formatter,
+                "stored Project has an invalid filesystem identity: {project_id}"
+            ),
+            Self::ProjectInspection(error) => {
+                write!(formatter, "Project inspection failed: {error}")
+            }
+            Self::InvalidProjectRegistration { field } => {
+                write!(formatter, "invalid Project registration field: {field}")
+            }
+            Self::ProjectIdConflict { project_id } => {
+                write!(formatter, "Project ID already exists: {project_id}")
+            }
+            Self::MissingProject { project_id } => {
+                write!(
+                    formatter,
+                    "Project does not exist after registration: {project_id}"
+                )
+            }
             Self::InvalidCheckpointReport(report) => write!(
                 formatter,
                 "invalid PASSIVE checkpoint report: busy {}, log frames {}, checkpointed frames {}",
@@ -1573,6 +1844,7 @@ impl fmt::Display for StoreError {
 impl Error for StoreError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::ProjectInspection(error) => Some(error),
             Self::Sqlite(error) => Some(error),
             Self::StoredJson { source, .. } => Some(source),
             Self::StoredRunSnapshotJson { source, .. } => Some(source),
@@ -1674,7 +1946,7 @@ mod tests {
             "ok"
         );
 
-        apply_initial_migration(&mut connection, "now").expect("clean retry");
+        apply_pending_migrations(&mut connection, "now", 0).expect("clean retry");
         validate_migration_registry(&connection).expect("migration registry");
         validate_schema(&connection).expect("initial schema");
     }
