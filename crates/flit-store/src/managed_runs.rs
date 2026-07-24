@@ -98,6 +98,55 @@ pub enum InitialManagedSessionOutcome {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedTurnTerminalOutcome {
+    Completed,
+    Interrupted,
+}
+
+impl ManagedTurnTerminalOutcome {
+    pub(crate) const fn event_type(self) -> &'static str {
+        match self {
+            Self::Completed => "run.completed",
+            Self::Interrupted => "run.interrupted",
+        }
+    }
+
+    pub(crate) const fn end_reason(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedSessionTermination {
+    pub run_id: String,
+    pub session_id: String,
+    pub external_session_key: String,
+    pub provider_turn_id: String,
+    pub contract_version: String,
+    pub stream_seq: u64,
+    pub ended_at: String,
+    pub terminal_event_id: String,
+    pub outcome: ManagedTurnTerminalOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ManagedSessionTerminationOutcome {
+    Terminated {
+        run: ManagedRun,
+        session: ManagedSession,
+        event: EventEnvelope,
+    },
+    Duplicate {
+        run: ManagedRun,
+        session: ManagedSession,
+        event: EventEnvelope,
+    },
+}
+
 pub(crate) fn validate_run_intent(intent: &ManagedRunIntent) -> Result<(), &'static str> {
     validate_id(&intent.id).map_err(|()| "id")?;
     validate_id(&intent.project_id).map_err(|()| "project_id")?;
@@ -140,6 +189,23 @@ pub(crate) fn validate_initial_session(
     validate_id(&connection.connected_event_id).map_err(|()| "connected_event_id")
 }
 
+pub(crate) fn validate_session_termination(
+    termination: &ManagedSessionTermination,
+) -> Result<(), &'static str> {
+    validate_id(&termination.run_id).map_err(|()| "run_id")?;
+    validate_id(&termination.session_id).map_err(|()| "session_id")?;
+    validate_id(&termination.external_session_key).map_err(|()| "external_session_key")?;
+    validate_id(&termination.provider_turn_id).map_err(|()| "provider_turn_id")?;
+    validate_token(&termination.contract_version, MAX_MANAGED_ID_BYTES)
+        .map_err(|()| "contract_version")?;
+    if termination.stream_seq <= 1 || termination.stream_seq > flit_protocol::MAX_JSON_SAFE_INTEGER
+    {
+        return Err("stream_seq");
+    }
+    validate_timestamp(&termination.ended_at).map_err(|()| "ended_at")?;
+    validate_id(&termination.terminal_event_id).map_err(|()| "terminal_event_id")
+}
+
 pub(crate) fn validate_stored_run(run: &ManagedRun) -> Result<(), &'static str> {
     validate_id(&run.id).map_err(|()| "id")?;
     validate_id(&run.project_id).map_err(|()| "project_id")?;
@@ -178,7 +244,11 @@ pub(crate) fn validate_stored_session(session: &ManagedSession) -> Result<(), &'
     validate_timestamp(&session.started_at).map_err(|()| "started_at")?;
     validate_optional_timestamp(session.ended_at.as_deref()).map_err(|()| "ended_at")?;
     validate_optional_token(session.end_reason.as_deref(), MAX_MANAGED_ID_BYTES)
-        .map_err(|()| "end_reason")
+        .map_err(|()| "end_reason")?;
+    if session.ended_at.is_some() != session.end_reason.is_some() {
+        return Err("termination");
+    }
+    Ok(())
 }
 
 fn validate_id(value: &str) -> Result<(), ()> {

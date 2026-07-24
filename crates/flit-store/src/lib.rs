@@ -22,7 +22,8 @@ pub use managed_runs::{
     InitialManagedSessionConnection, InitialManagedSessionOutcome, MANAGED_PROVIDER_KIND_CODEX,
     MAX_MANAGED_METADATA_JSON_BYTES, MAX_MANAGED_METADATA_JSON_DEPTH,
     MAX_MANAGED_METADATA_JSON_VALUES, ManagedRun, ManagedRunIntent, ManagedRunIntentOutcome,
-    ManagedSession,
+    ManagedSession, ManagedSessionTermination, ManagedSessionTerminationOutcome,
+    ManagedTurnTerminalOutcome,
 };
 pub use projects::{
     Project, ProjectDirectoryInspection, ProjectIdentity, ProjectInspectionError,
@@ -716,6 +717,151 @@ impl Store {
         }
     }
 
+    pub fn terminate_managed_session(
+        &mut self,
+        termination: ManagedSessionTermination,
+    ) -> Result<ManagedSessionTerminationOutcome, StoreError> {
+        managed_runs::validate_session_termination(&termination)
+            .map_err(|field| StoreError::InvalidManagedSessionTermination { field })?;
+        let terminal_event = managed_session_terminal_event(&termination);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+        let run = load_managed_run(&transaction, &termination.run_id)?.ok_or_else(|| {
+            StoreError::MissingRun {
+                run_id: termination.run_id.clone(),
+            }
+        })?;
+        if run.provider_kind != MANAGED_PROVIDER_KIND_CODEX {
+            return Err(StoreError::ManagedRunProviderMismatch {
+                run_id: termination.run_id,
+            });
+        }
+        let session =
+            load_managed_session(&transaction, &termination.session_id)?.ok_or_else(|| {
+                StoreError::MissingSession {
+                    session_id: termination.session_id.clone(),
+                }
+            })?;
+        if session.run_id != termination.run_id
+            || session.provider_kind != MANAGED_PROVIDER_KIND_CODEX
+            || session.external_session_key != termination.external_session_key
+        {
+            return Err(StoreError::ManagedSessionIdentityConflict {
+                session_id: termination.session_id,
+            });
+        }
+
+        let stored_terminal_events =
+            load_managed_run_terminal_events(&transaction, &termination.run_id)?;
+        let exact_rows = run.ended_at.as_deref() == Some(termination.ended_at.as_str())
+            && session.ended_at.as_deref() == Some(termination.ended_at.as_str())
+            && session.end_reason.as_deref() == Some(termination.outcome.end_reason());
+        if exact_rows
+            && stored_terminal_events.len() == 1
+            && UnsequencedEventEnvelope::from(stored_terminal_events[0].clone()) == terminal_event
+        {
+            return Ok(ManagedSessionTerminationOutcome::Duplicate {
+                run,
+                session,
+                event: stored_terminal_events
+                    .into_iter()
+                    .next()
+                    .expect("one exact terminal event"),
+            });
+        }
+        if run.ended_at.is_some()
+            || session.ended_at.is_some()
+            || session.end_reason.is_some()
+            || !stored_terminal_events.is_empty()
+        {
+            return Err(StoreError::ManagedRunTerminalConflict {
+                run_id: termination.run_id,
+            });
+        }
+        if run.started_at.is_none() {
+            return Err(StoreError::ManagedRunNotStarted {
+                run_id: termination.run_id,
+            });
+        }
+
+        let live_session_id = transaction
+            .query_row(
+                "SELECT id FROM agent_sessions WHERE run_id = ?1 AND ended_at IS NULL",
+                [&termination.run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)?;
+        if live_session_id.as_deref() != Some(termination.session_id.as_str()) {
+            return Err(StoreError::ManagedSessionNotLive {
+                session_id: termination.session_id,
+            });
+        }
+        let expected_stream_seq =
+            next_managed_session_stream_seq(&transaction, &termination.session_id)?;
+        if termination.stream_seq != expected_stream_seq {
+            return Err(StoreError::ManagedSessionStreamSequenceMismatch {
+                session_id: termination.session_id,
+                expected: expected_stream_seq,
+                received: termination.stream_seq,
+            });
+        }
+
+        let closed_session = transaction
+            .execute(
+                "UPDATE agent_sessions SET ended_at = ?1, end_reason = ?2 WHERE id = ?3 AND run_id = ?4 AND ended_at IS NULL AND end_reason IS NULL",
+                params![
+                    termination.ended_at,
+                    termination.outcome.end_reason(),
+                    termination.session_id,
+                    termination.run_id,
+                ],
+            )
+            .map_err(StoreError::Sqlite)?;
+        if closed_session != 1 {
+            return Err(StoreError::ManagedSessionNotLive {
+                session_id: termination.session_id,
+            });
+        }
+        let closed_run = transaction
+            .execute(
+                "UPDATE runs SET ended_at = ?1 WHERE id = ?2 AND ended_at IS NULL",
+                params![termination.ended_at, termination.run_id],
+            )
+            .map_err(StoreError::Sqlite)?;
+        if closed_run != 1 {
+            return Err(StoreError::ManagedRunTerminalConflict {
+                run_id: termination.run_id,
+            });
+        }
+        let mut outcomes = append_event_batch_in_transaction(&transaction, vec![terminal_event])?;
+        let event = match outcomes
+            .pop()
+            .expect("one terminal event must produce one append outcome")
+        {
+            AppendEventOutcome::Inserted(event) | AppendEventOutcome::Duplicate(event) => event,
+        };
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        let run = load_managed_run(&self.connection, &termination.run_id)?.ok_or_else(|| {
+            StoreError::MissingRun {
+                run_id: termination.run_id.clone(),
+            }
+        })?;
+        let session =
+            load_managed_session(&self.connection, &termination.session_id)?.ok_or_else(|| {
+                StoreError::MissingSession {
+                    session_id: termination.session_id,
+                }
+            })?;
+        Ok(ManagedSessionTerminationOutcome::Terminated {
+            run,
+            session,
+            event,
+        })
+    }
+
     pub fn managed_run(&self, run_id: &str) -> Result<Option<ManagedRun>, StoreError> {
         if run_id.trim().is_empty() {
             return Err(StoreError::InvalidManagedRunIntent { field: "id" });
@@ -1088,6 +1234,46 @@ fn managed_session_connected_event(
     }
 }
 
+fn managed_session_terminal_event(
+    termination: &ManagedSessionTermination,
+) -> UnsequencedEventEnvelope {
+    let payload = match termination.outcome {
+        ManagedTurnTerminalOutcome::Completed => json!({
+            "outcome": "completed",
+            "provider_session_key": termination.external_session_key,
+            "provider_turn_id": termination.provider_turn_id,
+        }),
+        ManagedTurnTerminalOutcome::Interrupted => json!({
+            "provider_session_key": termination.external_session_key,
+            "provider_turn_id": termination.provider_turn_id,
+            "reason": "provider_turn_interrupted",
+        }),
+    }
+    .as_object()
+    .expect("object literal")
+    .clone();
+    UnsequencedEventEnvelope {
+        protocol_version: EventProtocolVersion::V1_0,
+        event_id: termination.terminal_event_id.clone(),
+        run_id: termination.run_id.clone(),
+        session_id: NullableSessionId::Id(termination.session_id.clone()),
+        stream_seq: termination.stream_seq,
+        occurred_at: termination.ended_at.clone(),
+        observed_at: termination.ended_at.clone(),
+        event_type: termination.outcome.event_type().to_owned(),
+        source: EventSource {
+            kind: EventSourceKind::ProviderAdapter,
+            provider: Some(MANAGED_PROVIDER_KIND_CODEX.to_owned()),
+            contract_version: Some(termination.contract_version.clone()),
+            extensions: BTreeMap::new(),
+        },
+        confidence: 1.0,
+        evidence_ids: Vec::new(),
+        payload,
+        extensions: BTreeMap::new(),
+    }
+}
+
 fn managed_run_matches_intent(run: &ManagedRun, intent: &ManagedRunIntent) -> bool {
     run.id == intent.id
         && run.project_id == intent.project_id
@@ -1195,6 +1381,30 @@ fn load_managed_run_intent_events(
         .collect()
 }
 
+fn load_managed_run_terminal_events(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<Vec<EventEnvelope>, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT ingest_seq FROM events
+             WHERE run_id = ?1
+               AND event_type IN ('run.completed', 'run.failed', 'run.stopped', 'run.interrupted')
+             ORDER BY ingest_seq",
+        )
+        .map_err(StoreError::Sqlite)?;
+    let ingest_sequences = statement
+        .query_map([run_id], |row| row.get::<_, i64>(0))
+        .map_err(StoreError::Sqlite)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::Sqlite)?;
+    drop(statement);
+    ingest_sequences
+        .into_iter()
+        .map(|ingest_seq| load_event(connection, ingest_seq))
+        .collect()
+}
+
 fn load_managed_session(
     connection: &Connection,
     session_id: &str,
@@ -1260,6 +1470,31 @@ fn load_managed_session(
         }
     })?;
     Ok(Some(session))
+}
+
+fn next_managed_session_stream_seq(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<u64, StoreError> {
+    let current = connection
+        .query_row(
+            "SELECT MAX(stream_seq) FROM events WHERE session_id = ?1",
+            [session_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .map_err(StoreError::Sqlite)?
+        .unwrap_or(0);
+    let current = u64::try_from(current).map_err(|_| StoreError::StoredManagedSessionInvalid {
+        session_id: session_id.to_owned(),
+        field: "stream_seq",
+    })?;
+    let next = current
+        .checked_add(1)
+        .filter(|next| *next <= flit_protocol::MAX_JSON_SAFE_INTEGER)
+        .ok_or_else(|| StoreError::ManagedSessionStreamSequenceExhausted {
+            session_id: session_id.to_owned(),
+        })?;
+    Ok(next)
 }
 
 fn append_event_batch_in_transaction(
@@ -2265,6 +2500,26 @@ pub enum StoreError {
         session_id: String,
         source: serde_json::Error,
     },
+    InvalidManagedSessionTermination {
+        field: &'static str,
+    },
+    ManagedRunNotStarted {
+        run_id: String,
+    },
+    ManagedRunTerminalConflict {
+        run_id: String,
+    },
+    ManagedSessionNotLive {
+        session_id: String,
+    },
+    ManagedSessionStreamSequenceMismatch {
+        session_id: String,
+        expected: u64,
+        received: u64,
+    },
+    ManagedSessionStreamSequenceExhausted {
+        session_id: String,
+    },
     InvalidCheckpointReport(CheckpointReport),
     InvalidEventBatchSize {
         count: usize,
@@ -2480,6 +2735,33 @@ impl fmt::Display for StoreError {
             Self::StoredManagedSessionJson { session_id, source } => write!(
                 formatter,
                 "stored managed session {session_id} has invalid JSON: {source}"
+            ),
+            Self::InvalidManagedSessionTermination { field } => {
+                write!(
+                    formatter,
+                    "invalid managed session termination field: {field}"
+                )
+            }
+            Self::ManagedRunNotStarted { run_id } => {
+                write!(formatter, "managed Run is not started: {run_id}")
+            }
+            Self::ManagedRunTerminalConflict { run_id } => {
+                write!(formatter, "managed Run terminal state conflicts: {run_id}")
+            }
+            Self::ManagedSessionNotLive { session_id } => {
+                write!(formatter, "managed session is not live: {session_id}")
+            }
+            Self::ManagedSessionStreamSequenceMismatch {
+                session_id,
+                expected,
+                received,
+            } => write!(
+                formatter,
+                "managed session {session_id} expected stream sequence {expected}, received {received}"
+            ),
+            Self::ManagedSessionStreamSequenceExhausted { session_id } => write!(
+                formatter,
+                "managed session stream sequence is exhausted: {session_id}"
             ),
             Self::InvalidCheckpointReport(report) => write!(
                 formatter,
