@@ -11,7 +11,8 @@ use std::{
 
 use flit_store::{
     ProjectDirectoryInspection, ProjectInspectionError, ProjectRegistration,
-    ProjectRegistrationOutcome, Store, StoreError, initial_migration_checksum,
+    ProjectRegistrationOutcome, ProjectTrustConfirmation, ProjectTrustOutcome, Store, StoreError,
+    initial_migration_checksum,
 };
 use rusqlite::{Connection, ErrorCode, params};
 
@@ -137,6 +138,171 @@ fn registration_persists_an_untrusted_project_and_reopens_it() {
         reopened.project("project-one").expect("read Project"),
         Some(registered)
     );
+}
+
+#[test]
+fn explicit_trust_requires_the_current_project_identity_and_is_idempotent() {
+    let workspace = TestWorkspace::new("trust");
+    let mut store = workspace.open();
+    assert!(matches!(
+        store
+            .register_project(registration("project", "Project", &workspace.project_path))
+            .expect("register"),
+        ProjectRegistrationOutcome::Registered(_)
+    ));
+    let confirmation = ProjectTrustConfirmation {
+        project_id: "project".to_owned(),
+        selected_path: workspace.project_path.clone(),
+        confirmed_at: "2026-07-24T01:00:00.000Z".to_owned(),
+    };
+    let trusted = match store
+        .confirm_project_trust(confirmation.clone())
+        .expect("trust")
+    {
+        ProjectTrustOutcome::Trusted(project) => project,
+        outcome => panic!("unexpected trust outcome: {outcome:?}"),
+    };
+    assert!(trusted.trusted);
+    assert_eq!(trusted.updated_at, confirmation.confirmed_at);
+    assert!(matches!(
+        store
+            .confirm_project_trust(confirmation)
+            .expect("repeat trust"),
+        ProjectTrustOutcome::AlreadyTrusted(_)
+    ));
+
+    let other = workspace.directory.join("other");
+    fs::create_dir(&other).expect("other directory");
+    assert!(matches!(
+        store
+            .register_project(registration("untrusted", "Untrusted", &other))
+            .expect("register untrusted"),
+        ProjectRegistrationOutcome::Registered(_)
+    ));
+    assert!(matches!(
+        store.confirm_project_trust(ProjectTrustConfirmation {
+            project_id: "untrusted".to_owned(),
+            selected_path: workspace.project_path.clone(),
+            confirmed_at: "2026-07-24T02:00:00.000Z".to_owned(),
+        }),
+        Err(StoreError::ProjectIdentityMismatch { .. })
+    ));
+    assert!(
+        !store
+            .project("untrusted")
+            .expect("read untrusted")
+            .expect("untrusted Project")
+            .trusted
+    );
+}
+
+#[test]
+fn trust_rejects_missing_projects_missing_paths_and_legacy_identity_without_mutation() {
+    let workspace = TestWorkspace::new("trust-negative");
+    let mut store = workspace.open();
+    assert!(matches!(
+        store
+            .register_project(registration("project", "Project", &workspace.project_path))
+            .expect("register"),
+        ProjectRegistrationOutcome::Registered(_)
+    ));
+    assert!(matches!(
+        store.confirm_project_trust(ProjectTrustConfirmation {
+            project_id: "missing".to_owned(),
+            selected_path: workspace.project_path.clone(),
+            confirmed_at: APPLIED_AT.to_owned(),
+        }),
+        Err(StoreError::MissingProject { .. })
+    ));
+    assert!(matches!(
+        store.confirm_project_trust(ProjectTrustConfirmation {
+            project_id: "project".to_owned(),
+            selected_path: workspace.directory.join("missing"),
+            confirmed_at: APPLIED_AT.to_owned(),
+        }),
+        Err(StoreError::ProjectInspection(
+            ProjectInspectionError::Canonicalize { .. }
+        ))
+    ));
+    drop(store);
+    let connection = Connection::open(&workspace.database_path).expect("legacy connection");
+    connection
+        .execute(
+            "INSERT INTO projects(id, display_name, canonical_path, filesystem_id, trusted, notification_policy_json, created_at, updated_at) VALUES('legacy', 'Legacy', '/private/tmp/flit-legacy-trust', NULL, 0, '{}', ?1, ?1)",
+            [APPLIED_AT],
+        )
+        .expect("legacy Project");
+    drop(connection);
+
+    let mut reopened = workspace.open();
+    assert!(matches!(
+        reopened.confirm_project_trust(ProjectTrustConfirmation {
+            project_id: "legacy".to_owned(),
+            selected_path: workspace.project_path.clone(),
+            confirmed_at: APPLIED_AT.to_owned(),
+        }),
+        Err(StoreError::ProjectFilesystemIdentityUnavailable { .. })
+    ));
+    assert!(
+        !reopened
+            .project("project")
+            .expect("read Project")
+            .expect("Project")
+            .trusted
+    );
+}
+
+#[test]
+fn trust_rejects_each_identity_axis_when_the_other_still_matches() {
+    let workspace = TestWorkspace::new("trust-identity-axes");
+    let canonical_source = workspace.directory.join("canonical-source");
+    let canonical_destination = workspace.directory.join("canonical-destination");
+    let replacement_path = workspace.directory.join("replacement-path");
+    let replacement_old_path = workspace.directory.join("replacement-old");
+    fs::create_dir(&canonical_source).expect("canonical source");
+    fs::create_dir(&replacement_path).expect("replacement source");
+    let mut store = workspace.open();
+    for (id, path) in [
+        ("canonical", &canonical_source),
+        ("filesystem", &replacement_path),
+    ] {
+        assert!(matches!(
+            store
+                .register_project(registration(id, id, path))
+                .expect("register"),
+            ProjectRegistrationOutcome::Registered(_)
+        ));
+    }
+
+    fs::rename(&canonical_source, &canonical_destination).expect("rename Project directory");
+    assert!(matches!(
+        store.confirm_project_trust(ProjectTrustConfirmation {
+            project_id: "canonical".to_owned(),
+            selected_path: canonical_destination,
+            confirmed_at: APPLIED_AT.to_owned(),
+        }),
+        Err(StoreError::ProjectIdentityMismatch { .. })
+    ));
+
+    fs::rename(&replacement_path, &replacement_old_path).expect("move original directory");
+    fs::create_dir(&replacement_path).expect("replace Project directory");
+    assert!(matches!(
+        store.confirm_project_trust(ProjectTrustConfirmation {
+            project_id: "filesystem".to_owned(),
+            selected_path: replacement_path,
+            confirmed_at: APPLIED_AT.to_owned(),
+        }),
+        Err(StoreError::ProjectIdentityMismatch { .. })
+    ));
+    for id in ["canonical", "filesystem"] {
+        assert!(
+            !store
+                .project(id)
+                .expect("read Project")
+                .expect("Project")
+                .trusted
+        );
+    }
 }
 
 #[test]

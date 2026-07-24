@@ -19,7 +19,7 @@ mod writer;
 
 pub use projects::{
     Project, ProjectDirectoryInspection, ProjectIdentity, ProjectInspectionError,
-    ProjectRegistration, ProjectRegistrationOutcome,
+    ProjectRegistration, ProjectRegistrationOutcome, ProjectTrustConfirmation, ProjectTrustOutcome,
 };
 
 pub use writer::{
@@ -149,6 +149,27 @@ fn validate_project_registration(registration: &ProjectRegistration) -> Result<(
     if registration.selected_path.as_os_str().is_empty() {
         return Err(StoreError::InvalidProjectRegistration {
             field: "selected_path",
+        });
+    }
+    Ok(())
+}
+
+fn validate_project_trust_confirmation(
+    confirmation: &ProjectTrustConfirmation,
+) -> Result<(), StoreError> {
+    if confirmation.project_id.trim().is_empty() {
+        return Err(StoreError::InvalidProjectTrustConfirmation {
+            field: "project_id",
+        });
+    }
+    if confirmation.selected_path.as_os_str().is_empty() {
+        return Err(StoreError::InvalidProjectTrustConfirmation {
+            field: "selected_path",
+        });
+    }
+    if confirmation.confirmed_at.trim().is_empty() {
+        return Err(StoreError::InvalidProjectTrustConfirmation {
+            field: "confirmed_at",
         });
     }
     Ok(())
@@ -350,6 +371,76 @@ impl Store {
 
     pub fn project(&self, project_id: &str) -> Result<Option<Project>, StoreError> {
         project_by_id(&self.connection, project_id)
+    }
+
+    pub fn confirm_project_trust(
+        &mut self,
+        confirmation: ProjectTrustConfirmation,
+    ) -> Result<ProjectTrustOutcome, StoreError> {
+        validate_project_trust_confirmation(&confirmation)?;
+        let inspection = ProjectDirectoryInspection::inspect(&confirmation.selected_path)
+            .map_err(StoreError::ProjectInspection)?;
+        let canonical_path = inspection.identity.canonical_path.to_str().ok_or(
+            StoreError::InvalidProjectTrustConfirmation {
+                field: "canonical_path",
+            },
+        )?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+        let stored = transaction
+            .query_row(
+                "SELECT canonical_path, filesystem_id, trusted FROM projects WHERE id = ?1",
+                [&confirmation.project_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)?
+            .ok_or_else(|| StoreError::MissingProject {
+                project_id: confirmation.project_id.clone(),
+            })?;
+        let filesystem_id =
+            stored
+                .1
+                .ok_or_else(|| StoreError::ProjectFilesystemIdentityUnavailable {
+                    project_id: confirmation.project_id.clone(),
+                })?;
+        if stored.0 != canonical_path || filesystem_id != inspection.identity.filesystem_id {
+            return Err(StoreError::ProjectIdentityMismatch {
+                project_id: confirmation.project_id,
+            });
+        }
+        if stored.2 == 1 {
+            drop(transaction);
+            let project =
+                project_by_id(&self.connection, &confirmation.project_id)?.ok_or_else(|| {
+                    StoreError::MissingProject {
+                        project_id: confirmation.project_id,
+                    }
+                })?;
+            return Ok(ProjectTrustOutcome::AlreadyTrusted(project));
+        }
+        transaction
+            .execute(
+                "UPDATE projects SET trusted = 1, updated_at = ?1 WHERE id = ?2",
+                params![confirmation.confirmed_at, confirmation.project_id],
+            )
+            .map_err(StoreError::Sqlite)?;
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        let project =
+            project_by_id(&self.connection, &confirmation.project_id)?.ok_or_else(|| {
+                StoreError::MissingProject {
+                    project_id: confirmation.project_id,
+                }
+            })?;
+        Ok(ProjectTrustOutcome::Trusted(project))
     }
 
     fn validated_checkpoint_report(
@@ -1535,6 +1626,15 @@ struct SchemaObject {
 
 #[derive(Debug)]
 pub enum StoreError {
+    InvalidProjectTrustConfirmation {
+        field: &'static str,
+    },
+    ProjectFilesystemIdentityUnavailable {
+        project_id: String,
+    },
+    ProjectIdentityMismatch {
+        project_id: String,
+    },
     InvalidStoredProjectFilesystemIdentity {
         project_id: String,
     },
@@ -1665,6 +1765,24 @@ pub enum StoreError {
 impl fmt::Display for StoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidProjectTrustConfirmation { field } => {
+                write!(
+                    formatter,
+                    "invalid Project trust confirmation field: {field}"
+                )
+            }
+            Self::ProjectFilesystemIdentityUnavailable { project_id } => {
+                write!(
+                    formatter,
+                    "Project has no filesystem identity: {project_id}"
+                )
+            }
+            Self::ProjectIdentityMismatch { project_id } => {
+                write!(
+                    formatter,
+                    "Project identity no longer matches: {project_id}"
+                )
+            }
             Self::InvalidStoredProjectFilesystemIdentity { project_id } => write!(
                 formatter,
                 "stored Project has an invalid filesystem identity: {project_id}"

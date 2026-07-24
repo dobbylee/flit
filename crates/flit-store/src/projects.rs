@@ -180,6 +180,13 @@ pub struct ProjectRegistration {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectTrustConfirmation {
+    pub project_id: String,
+    pub selected_path: PathBuf,
+    pub confirmed_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Project {
     pub id: String,
     pub display_name: String,
@@ -197,4 +204,10 @@ pub enum ProjectRegistrationOutcome {
     Registered(Project),
     DuplicateCanonicalPath { existing_project_id: String },
     DuplicateFilesystemIdentity { existing_project_id: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProjectTrustOutcome {
+    Trusted(Project),
+    AlreadyTrusted(Project),
 }
