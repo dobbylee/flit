@@ -106,6 +106,11 @@ struct NativeHealthTests {
         }
 
         let client = SystemHealthClient()
+        let retainedV11BridgeError: BridgeError = .ProjectResponseTooLarge
+        try require(
+            retainedV11BridgeError == .ProjectResponseTooLarge,
+            "protocol 1.2 must retain the generated 1.1 Project response error case"
+        )
         let outgoingRequest = try JSONSerialization.data(
             withJSONObject: ["client_protocol_version": client.clientProtocolVersion],
             options: [.sortedKeys]
@@ -113,6 +118,23 @@ struct NativeHealthTests {
         try require(
             outgoingRequest == requestData,
             "native client request must match the repository fixture"
+        )
+        let providerReadyHealth = try String(
+            contentsOfFile: "\(fixtureRoot)/system_health.providers_ready.response.json",
+            encoding: .utf8
+        )
+        let providerUnavailableHealth = try String(
+            contentsOfFile: "\(fixtureRoot)/system_health.providers_unavailable.response.json",
+            encoding: .utf8
+        )
+        guard case .ready = client.classify(providerReadyHealth) else {
+            throw NativeHealthTestFailure.failed(
+                "native health must remain ready after a supported provider probe"
+            )
+        }
+        try require(
+            client.classify(providerUnavailableHealth) == .unavailable(messageKey: nil),
+            "native health must become unavailable after a failed or unknown provider probe"
         )
 
         let projectErrors = try decodeFixture(
@@ -135,6 +157,11 @@ struct NativeHealthTests {
                 limit: 1,
                 clientProtocolVersion: requestVersion
             ),
+            code: .storageUnavailable,
+            fixtures: commandErrors
+        )
+        try requireCommandError(
+            try providerDiagnosticsJson(clientProtocolVersion: requestVersion),
             code: .storageUnavailable,
             fixtures: commandErrors
         )
@@ -246,6 +273,34 @@ struct NativeHealthTests {
             FlitProjectsListResponse.self,
             at: "\(fixtureRoot)/projects_list.response.json"
         )
+        _ = try decodeFixture(
+            FlitProviderDiagnosticsRequest.self,
+            at: "\(fixtureRoot)/provider_diagnostics.request.json"
+        )
+        for (name, compatibility) in [
+            (
+                "provider_diagnostics.supported.response.json",
+                FlitProviderCompatibility.supported
+            ),
+            (
+                "provider_diagnostics.unknown.response.json",
+                FlitProviderCompatibility.unknown
+            ),
+            (
+                "provider_diagnostics.unavailable.response.json",
+                FlitProviderCompatibility.unavailable
+            ),
+        ] {
+            let response = try decodeFixture(
+                FlitProviderDiagnosticsResponse.self,
+                at: "\(fixtureRoot)/\(name)"
+            )
+            try require(
+                response.compatibility == compatibility
+                    && response.capabilities.count == 16,
+                "generated provider diagnostics must decode \(compatibility)"
+            )
+        }
         let driftedInspection = Data(
             """
             {
@@ -274,6 +329,23 @@ struct NativeHealthTests {
             FlitProjectRegistrationResponse.self,
             from: driftedRegistration,
             "generated Project decoding must reject an unknown status"
+        )
+        let driftedDiagnostics = Data(
+            """
+            {
+              "protocol_version": "\(flitClientProtocolVersion)",
+              "provider": "codex",
+              "compatibility": "unknown",
+              "executable_version": "9.9.9",
+              "fingerprint_mismatches": [],
+              "unavailable_reason": null
+            }
+            """.utf8
+        )
+        try requireDecodingFailure(
+            FlitProviderDiagnosticsResponse.self,
+            from: driftedDiagnostics,
+            "generated provider diagnostics must reject a missing capability list"
         )
 
         let projectDirectory = "\(root)/target/flit-macos/native-project"

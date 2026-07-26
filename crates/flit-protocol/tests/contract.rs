@@ -1,11 +1,12 @@
-use std::{fs, path::PathBuf};
+use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use flit_protocol::{
-    CommandError, EVENT_PROTOCOL_VERSION, EventEnvelope, EventProtocolVersion,
+    CapabilityStatus, CommandError, EVENT_PROTOCOL_VERSION, EventEnvelope, EventProtocolVersion,
     MAX_JSON_SAFE_INTEGER, PROTOCOL_VERSION, ProjectInspectionRequest, ProjectInspectionResponse,
     ProjectRegistrationRequest, ProjectRegistrationResponse, ProjectTrustRequest,
-    ProjectTrustResponse, ProjectsListRequest, ProjectsListResponse, SystemHealthRequest,
-    SystemHealthResponse, event_schema_id, event_schema_relative_path,
+    ProjectTrustResponse, ProjectsListRequest, ProjectsListResponse, ProviderCompatibility,
+    ProviderDiagnosticsRequest, ProviderDiagnosticsResponse, ProviderUnavailableReason,
+    SystemHealthRequest, SystemHealthResponse, event_schema_id, event_schema_relative_path,
     generated_swift_command_contract,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -76,6 +77,14 @@ fn current_system_health_fixtures_round_trip() {
     assert_fixture_round_trip::<SystemHealthResponse>(&command_fixture(
         &manifest.current,
         "system_health.response.json",
+    ));
+    assert_fixture_round_trip::<SystemHealthResponse>(&command_fixture(
+        &manifest.current,
+        "system_health.providers_ready.response.json",
+    ));
+    assert_fixture_round_trip::<SystemHealthResponse>(&command_fixture(
+        &manifest.current,
+        "system_health.providers_unavailable.response.json",
     ));
     assert_fixture_round_trip::<CommandError>(&command_fixture(
         &manifest.current,
@@ -167,6 +176,100 @@ fn current_project_command_fixtures_round_trip_every_shape() {
 }
 
 #[test]
+fn current_provider_diagnostics_fixtures_are_exhaustive_and_path_free() {
+    let manifest = read_command_compatibility_manifest();
+    let current = &manifest.current;
+    assert_fixture_round_trip::<ProviderDiagnosticsRequest>(&command_fixture(
+        current,
+        "provider_diagnostics.request.json",
+    ));
+    for name in [
+        "provider_diagnostics.supported.response.json",
+        "provider_diagnostics.unknown.response.json",
+        "provider_diagnostics.unavailable.response.json",
+    ] {
+        assert_fixture_round_trip::<ProviderDiagnosticsResponse>(&command_fixture(current, name));
+    }
+
+    let read = |name: &str| -> ProviderDiagnosticsResponse {
+        serde_json::from_str(
+            &fs::read_to_string(repository_path(&command_fixture(current, name)))
+                .expect("provider diagnostics fixture should be readable"),
+        )
+        .expect("provider diagnostics fixture should match Rust types")
+    };
+    let supported = read("provider_diagnostics.supported.response.json");
+    let unknown = read("provider_diagnostics.unknown.response.json");
+    let unavailable = read("provider_diagnostics.unavailable.response.json");
+
+    for response in [&supported, &unknown, &unavailable] {
+        assert_eq!(response.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(response.capabilities.len(), 16);
+        assert_eq!(
+            response
+                .capabilities
+                .iter()
+                .map(|entry| entry.capability)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            16
+        );
+    }
+    assert_eq!(supported.compatibility, ProviderCompatibility::Supported);
+    assert!(
+        supported
+            .capabilities
+            .iter()
+            .any(|entry| entry.status == CapabilityStatus::Degraded)
+    );
+    assert!(
+        supported
+            .capabilities
+            .iter()
+            .any(|entry| entry.status == CapabilityStatus::Unsupported)
+    );
+    assert_eq!(unknown.compatibility, ProviderCompatibility::Unknown);
+    assert_eq!(unknown.fingerprint_mismatches.len(), 8);
+    assert!(
+        unknown
+            .capabilities
+            .iter()
+            .all(|entry| entry.status == CapabilityStatus::Unknown)
+    );
+    assert_eq!(
+        unavailable.compatibility,
+        ProviderCompatibility::Unavailable
+    );
+    assert_eq!(
+        unavailable.unavailable_reason,
+        Some(ProviderUnavailableReason::ExecutableNotFound)
+    );
+    assert!(
+        unavailable
+            .capabilities
+            .iter()
+            .all(|entry| entry.status == CapabilityStatus::Unavailable)
+    );
+
+    let rendered =
+        serde_json::to_string(&[supported, unknown, unavailable]).expect("diagnostics serialize");
+    for forbidden in [
+        "canonical_path",
+        "selected_path",
+        "stderr",
+        "stdout",
+        "combined_schema_sha256\":",
+        "v2_schema_sha256\":",
+        "executable_sha256\":",
+    ] {
+        assert!(
+            !rendered.contains(forbidden),
+            "diagnostics response must not expose {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn command_manifest_retains_the_exact_previous_minor_health_contract() {
     let manifest = read_command_compatibility_manifest();
     assert_eq!(manifest.current.version, PROTOCOL_VERSION);
@@ -205,6 +308,47 @@ fn command_manifest_retains_the_exact_previous_minor_health_contract() {
         &previous,
         "protocol_mismatch.error.json",
     ));
+    assert_fixture_round_trip::<ProjectInspectionRequest>(&command_fixture(
+        &previous,
+        "project_inspect.request.json",
+    ));
+    assert_fixture_round_trip::<ProjectInspectionResponse>(&command_fixture(
+        &previous,
+        "project_inspect.response.json",
+    ));
+    assert_fixture_round_trip::<ProjectRegistrationRequest>(&command_fixture(
+        &previous,
+        "project_register.request.json",
+    ));
+    for name in [
+        "project_register.registered.response.json",
+        "project_register.duplicate_canonical_path.response.json",
+        "project_register.duplicate_filesystem_identity.response.json",
+    ] {
+        assert_fixture_round_trip::<ProjectRegistrationResponse>(&command_fixture(&previous, name));
+    }
+    assert_fixture_round_trip::<ProjectTrustRequest>(&command_fixture(
+        &previous,
+        "project_trust.request.json",
+    ));
+    for name in [
+        "project_trust.trusted.response.json",
+        "project_trust.already_trusted.response.json",
+    ] {
+        assert_fixture_round_trip::<ProjectTrustResponse>(&command_fixture(&previous, name));
+    }
+    assert_fixture_round_trip::<ProjectsListRequest>(&command_fixture(
+        &previous,
+        "projects_list.request.json",
+    ));
+    assert_fixture_round_trip::<ProjectsListResponse>(&command_fixture(
+        &previous,
+        "projects_list.response.json",
+    ));
+    assert_fixture_round_trip::<Vec<CommandError>>(&command_fixture(
+        &previous,
+        "project_errors.json",
+    ));
 }
 
 #[test]
@@ -223,6 +367,8 @@ fn generated_swift_project_contract_is_current_and_required_fields_fail_closed()
         "FlitProjectsListRequest",
         "FlitProjectsListResponse",
         "FlitCommandError",
+        "FlitProviderDiagnosticsRequest",
+        "FlitProviderDiagnosticsResponse",
     ] {
         assert!(
             generated.contains(type_name),

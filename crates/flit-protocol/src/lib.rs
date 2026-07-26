@@ -4,7 +4,7 @@ use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: &str = "1.1";
+pub const PROTOCOL_VERSION: &str = "1.2";
 pub const EVENT_PROTOCOL_VERSION: &str = "1.0";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -130,6 +130,97 @@ pub struct ProjectsListResponse {
     pub protocol_version: String,
     pub projects: Vec<ProjectRecord>,
     pub next_cursor: Option<ProjectListCursor>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProviderDiagnosticsRequest {
+    pub client_protocol_version: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    Codex,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderCompatibility {
+    Supported,
+    Degraded,
+    Unknown,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderCapability {
+    Launch,
+    ListManaged,
+    Resume,
+    Reconcile,
+    StructuredActivity,
+    PermissionDetect,
+    PermissionRespond,
+    PermissionPolicyConfigure,
+    PermissionPolicyObserve,
+    QuestionDetect,
+    QuestionRespond,
+    CompletionDetect,
+    History,
+    OpenInProvider,
+    ContinueAfterQuit,
+    Stop,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityStatus {
+    Supported,
+    Degraded,
+    Unsupported,
+    Unknown,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProviderCapabilityEntry {
+    pub capability: ProviderCapability,
+    pub status: CapabilityStatus,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FingerprintAxis {
+    CanonicalExecutable,
+    ExecutableVersion,
+    ExecutableSha256,
+    CombinedSchemaSha256,
+    V2SchemaSha256,
+    MethodAllowlistSha256,
+    FixtureSha256,
+    SmokeRunId,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderUnavailableReason {
+    ExecutableNotFound,
+    ExecutableUnavailable,
+    VersionProbeFailed,
+    SchemaProbeFailed,
+    BundledEvidenceMismatch,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProviderDiagnosticsResponse {
+    pub protocol_version: String,
+    pub provider: ProviderKind,
+    pub compatibility: ProviderCompatibility,
+    pub executable_version: Option<String>,
+    pub capabilities: Vec<ProviderCapabilityEntry>,
+    pub fingerprint_mismatches: Vec<FingerprintAxis>,
+    pub unavailable_reason: Option<ProviderUnavailableReason>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -474,6 +565,96 @@ struct FlitCommandError: Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case code
         case messageKey = "message_key"
+    }
+}
+
+struct FlitProviderDiagnosticsRequest: Codable, Equatable, Sendable {
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+enum FlitProviderKind: String, Codable, Sendable {
+    case codex
+}
+
+enum FlitProviderCompatibility: String, Codable, Sendable {
+    case supported
+    case degraded
+    case unknown
+    case unavailable
+}
+
+enum FlitProviderCapability: String, Codable, Sendable {
+    case launch
+    case listManaged = "list_managed"
+    case resume
+    case reconcile
+    case structuredActivity = "structured_activity"
+    case permissionDetect = "permission_detect"
+    case permissionRespond = "permission_respond"
+    case permissionPolicyConfigure = "permission_policy_configure"
+    case permissionPolicyObserve = "permission_policy_observe"
+    case questionDetect = "question_detect"
+    case questionRespond = "question_respond"
+    case completionDetect = "completion_detect"
+    case history
+    case openInProvider = "open_in_provider"
+    case continueAfterQuit = "continue_after_quit"
+    case stop
+}
+
+enum FlitCapabilityStatus: String, Codable, Sendable {
+    case supported
+    case degraded
+    case unsupported
+    case unknown
+    case unavailable
+}
+
+struct FlitProviderCapabilityEntry: Codable, Equatable, Sendable {
+    let capability: FlitProviderCapability
+    let status: FlitCapabilityStatus
+}
+
+enum FlitFingerprintAxis: String, Codable, Sendable {
+    case canonicalExecutable = "canonical_executable"
+    case executableVersion = "executable_version"
+    case executableSha256 = "executable_sha256"
+    case combinedSchemaSha256 = "combined_schema_sha256"
+    case v2SchemaSha256 = "v2_schema_sha256"
+    case methodAllowlistSha256 = "method_allowlist_sha256"
+    case fixtureSha256 = "fixture_sha256"
+    case smokeRunId = "smoke_run_id"
+}
+
+enum FlitProviderUnavailableReason: String, Codable, Sendable {
+    case executableNotFound = "executable_not_found"
+    case executableUnavailable = "executable_unavailable"
+    case versionProbeFailed = "version_probe_failed"
+    case schemaProbeFailed = "schema_probe_failed"
+    case bundledEvidenceMismatch = "bundled_evidence_mismatch"
+}
+
+struct FlitProviderDiagnosticsResponse: Codable, Equatable, Sendable {
+    let protocolVersion: String
+    let provider: FlitProviderKind
+    let compatibility: FlitProviderCompatibility
+    let executableVersion: String?
+    let capabilities: [FlitProviderCapabilityEntry]
+    let fingerprintMismatches: [FlitFingerprintAxis]
+    let unavailableReason: FlitProviderUnavailableReason?
+
+    private enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case provider
+        case compatibility
+        case executableVersion = "executable_version"
+        case capabilities
+        case fingerprintMismatches = "fingerprint_mismatches"
+        case unavailableReason = "unavailable_reason"
     }
 }
 "#;

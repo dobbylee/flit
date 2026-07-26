@@ -45,21 +45,25 @@ struct SystemHealthClient: Sendable {
     func load() -> FoundationHealth {
         do {
             let rendered = try systemHealthJson(clientProtocolVersion: clientProtocolVersion)
-            let data = Data(rendered.utf8)
-
-            if let health = try? JSONDecoder().decode(SystemHealthPayload.self, from: data),
-                health.protocolVersion == clientProtocolVersion,
-                health.core == .ready,
-                health.storage == .ready,
-                health.providers == .notConfigured
-            {
-                return .ready(health)
-            }
-
-            let failure = try? JSONDecoder().decode(CommandFailurePayload.self, from: data)
-            return .unavailable(messageKey: failure?.messageKey)
+            return classify(rendered)
         } catch {
             return .unavailable(messageKey: nil)
         }
+    }
+
+    func classify(_ rendered: String) -> FoundationHealth {
+        let data = Data(rendered.utf8)
+
+        if let health = try? JSONDecoder().decode(SystemHealthPayload.self, from: data),
+            health.protocolVersion == clientProtocolVersion,
+            health.core == .ready,
+            health.storage == .ready,
+            health.providers != .unavailable
+        {
+            return .ready(health)
+        }
+
+        let failure = try? JSONDecoder().decode(CommandFailurePayload.self, from: data)
+        return .unavailable(messageKey: failure?.messageKey)
     }
 }

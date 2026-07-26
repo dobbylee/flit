@@ -9,10 +9,19 @@ use std::{
 };
 
 use flit_protocol::{
-    CommandError, CommandErrorCode, HealthStatus, PROTOCOL_VERSION, ProjectInspectionResponse,
-    ProjectListCursor as ProjectListCursorResponse, ProjectRecord, ProjectRegistrationResponse,
-    ProjectRegistrationStatus, ProjectTrustResponse, ProjectTrustStatus, ProjectsListResponse,
+    CapabilityStatus as ProtocolCapabilityStatus, CommandError, CommandErrorCode,
+    FingerprintAxis as ProtocolFingerprintAxis, HealthStatus, PROTOCOL_VERSION,
+    ProjectInspectionResponse, ProjectListCursor as ProjectListCursorResponse, ProjectRecord,
+    ProjectRegistrationResponse, ProjectRegistrationStatus, ProjectTrustResponse,
+    ProjectTrustStatus, ProjectsListResponse, ProviderCapability as ProtocolProviderCapability,
+    ProviderCapabilityEntry, ProviderCompatibility as ProtocolProviderCompatibility,
+    ProviderDiagnosticsResponse, ProviderKind as ProtocolProviderKind, ProviderUnavailableReason,
     SystemHealthResponse,
+};
+use flit_providers::{
+    CapabilityStatus, CodexCompatibilityProbe, CodexCompatibilityProbeError,
+    ExecutableInspectionError, FingerprintAxis, ProviderCapability, ProviderCapabilitySnapshot,
+    ProviderCompatibility, probe_codex_compatibility_on_path,
 };
 use flit_store::{
     MAX_PROJECT_PAGE_SIZE, Project, ProjectDirectoryInspection,
@@ -33,8 +42,10 @@ const MAX_PROJECT_DISPLAY_NAME_BYTES: usize = 256;
 const MAX_PROJECT_PATH_BYTES: usize = 4_096;
 const MAX_TIMESTAMP_BYTES: usize = 64;
 const MAX_PROJECT_RESPONSE_BYTES: usize = 1_048_576;
+const MAX_PROVIDER_DIAGNOSTICS_RESPONSE_BYTES: usize = 65_536;
 
 static CORE: LazyLock<CoreManager> = LazyLock::new(CoreManager::default);
+static PROVIDER_DIAGNOSTIC_LOCK: LazyLock<Mutex<()>> = LazyLock::new(Mutex::default);
 static CORE_CONSTRUCTIONS: AtomicU64 = AtomicU64::new(0);
 
 uniffi::setup_scaffolding!();
@@ -67,6 +78,8 @@ pub enum BridgeError {
     ProjectIdentityMismatch,
     #[error("the Project response exceeds the native bridge limit")]
     ProjectResponseTooLarge,
+    #[error("the provider diagnostics response exceeds the native bridge limit")]
+    ProviderDiagnosticsResponseTooLarge,
     #[error("the embedded Rust Core could not serialize the response")]
     SerializationFailure,
 }
@@ -76,6 +89,7 @@ struct FoundationCore {
     canonical_data_directory: PathBuf,
     // Rust drops fields in declaration order, so close SQLite before releasing the guard.
     store: Store,
+    provider_health: HealthStatus,
     _guard: File,
 }
 
@@ -153,6 +167,30 @@ impl CoreManager {
         }
     }
 
+    fn provider_health(&self) -> HealthStatus {
+        match &*self.lock_state() {
+            CoreState::Ready(core) => core.provider_health.clone(),
+            CoreState::Uninitialized { .. } => HealthStatus::NotConfigured,
+        }
+    }
+
+    fn require_ready(&self) -> Result<(), BridgeError> {
+        match &*self.lock_state() {
+            CoreState::Ready(_) => Ok(()),
+            CoreState::Uninitialized { .. } => Err(BridgeError::StorageFailure),
+        }
+    }
+
+    fn set_provider_health(&self, provider_health: HealthStatus) -> Result<(), BridgeError> {
+        match &mut *self.lock_state() {
+            CoreState::Ready(core) => {
+                core.provider_health = provider_health;
+                Ok(())
+            }
+            CoreState::Uninitialized { .. } => Err(BridgeError::StorageFailure),
+        }
+    }
+
     fn with_ready_core<T>(
         &self,
         operation: impl FnOnce(&mut FoundationCore) -> Result<T, BridgeError>,
@@ -219,6 +257,7 @@ impl FoundationCore {
             requested_data_directory,
             canonical_data_directory,
             store,
+            provider_health: HealthStatus::NotConfigured,
             _guard: guard,
         })
     }
@@ -330,13 +369,14 @@ fn protect<T>(operation: impl FnOnce() -> Result<T, BridgeError>) -> Result<T, B
 fn health_json(
     client_protocol_version: &str,
     storage: HealthStatus,
+    providers: HealthStatus,
 ) -> Result<String, BridgeError> {
     let payload = if client_protocol_version == PROTOCOL_VERSION {
         serde_json::to_value(SystemHealthResponse {
             protocol_version: PROTOCOL_VERSION.to_owned(),
             core: HealthStatus::Ready,
             storage,
-            providers: HealthStatus::NotConfigured,
+            providers,
         })
     } else {
         serde_json::to_value(CommandError::protocol_mismatch())
@@ -378,13 +418,25 @@ fn project_record(project: Project) -> Result<ProjectRecord, BridgeError> {
     })
 }
 
-fn project_json<T: serde::Serialize>(response: &T) -> Result<String, BridgeError> {
+fn bounded_json<T: serde::Serialize>(
+    response: &T,
+    max_bytes: usize,
+    response_too_large: BridgeError,
+) -> Result<String, BridgeError> {
     let rendered =
         serde_json::to_string(response).map_err(|_| BridgeError::SerializationFailure)?;
-    if rendered.len() > MAX_PROJECT_RESPONSE_BYTES {
-        return Err(BridgeError::ProjectResponseTooLarge);
+    if rendered.len() > max_bytes {
+        return Err(response_too_large);
     }
     Ok(rendered)
+}
+
+fn project_json<T: serde::Serialize>(response: &T) -> Result<String, BridgeError> {
+    bounded_json(
+        response,
+        MAX_PROJECT_RESPONSE_BYTES,
+        BridgeError::ProjectResponseTooLarge,
+    )
 }
 
 fn project_command_error(error: &BridgeError) -> Option<CommandError> {
@@ -402,6 +454,7 @@ fn project_command_error(error: &BridgeError) -> Option<CommandError> {
         | BridgeError::CoreAlreadyRunning
         | BridgeError::CoreLockFailure
         | BridgeError::ProjectResponseTooLarge
+        | BridgeError::ProviderDiagnosticsResponseTooLarge
         | BridgeError::SerializationFailure => return None,
     };
     Some(CommandError::for_code(code))
@@ -433,6 +486,145 @@ fn map_project_store_error(error: StoreError) -> BridgeError {
     }
 }
 
+fn protocol_capability(capability: ProviderCapability) -> ProtocolProviderCapability {
+    match capability {
+        ProviderCapability::Launch => ProtocolProviderCapability::Launch,
+        ProviderCapability::ListManaged => ProtocolProviderCapability::ListManaged,
+        ProviderCapability::Resume => ProtocolProviderCapability::Resume,
+        ProviderCapability::Reconcile => ProtocolProviderCapability::Reconcile,
+        ProviderCapability::StructuredActivity => ProtocolProviderCapability::StructuredActivity,
+        ProviderCapability::PermissionDetect => ProtocolProviderCapability::PermissionDetect,
+        ProviderCapability::PermissionRespond => ProtocolProviderCapability::PermissionRespond,
+        ProviderCapability::PermissionPolicyConfigure => {
+            ProtocolProviderCapability::PermissionPolicyConfigure
+        }
+        ProviderCapability::PermissionPolicyObserve => {
+            ProtocolProviderCapability::PermissionPolicyObserve
+        }
+        ProviderCapability::QuestionDetect => ProtocolProviderCapability::QuestionDetect,
+        ProviderCapability::QuestionRespond => ProtocolProviderCapability::QuestionRespond,
+        ProviderCapability::CompletionDetect => ProtocolProviderCapability::CompletionDetect,
+        ProviderCapability::History => ProtocolProviderCapability::History,
+        ProviderCapability::OpenInProvider => ProtocolProviderCapability::OpenInProvider,
+        ProviderCapability::ContinueAfterQuit => ProtocolProviderCapability::ContinueAfterQuit,
+        ProviderCapability::Stop => ProtocolProviderCapability::Stop,
+    }
+}
+
+fn protocol_capability_status(status: CapabilityStatus) -> ProtocolCapabilityStatus {
+    match status {
+        CapabilityStatus::Supported => ProtocolCapabilityStatus::Supported,
+        CapabilityStatus::Degraded => ProtocolCapabilityStatus::Degraded,
+        CapabilityStatus::Unsupported => ProtocolCapabilityStatus::Unsupported,
+        CapabilityStatus::Unknown => ProtocolCapabilityStatus::Unknown,
+        CapabilityStatus::Unavailable => ProtocolCapabilityStatus::Unavailable,
+    }
+}
+
+fn protocol_compatibility(compatibility: ProviderCompatibility) -> ProtocolProviderCompatibility {
+    match compatibility {
+        ProviderCompatibility::Supported => ProtocolProviderCompatibility::Supported,
+        ProviderCompatibility::Degraded => ProtocolProviderCompatibility::Degraded,
+        ProviderCompatibility::Unknown => ProtocolProviderCompatibility::Unknown,
+        ProviderCompatibility::Unavailable => ProtocolProviderCompatibility::Unavailable,
+    }
+}
+
+fn protocol_fingerprint_axis(axis: FingerprintAxis) -> ProtocolFingerprintAxis {
+    match axis {
+        FingerprintAxis::CanonicalExecutable => ProtocolFingerprintAxis::CanonicalExecutable,
+        FingerprintAxis::ExecutableVersion => ProtocolFingerprintAxis::ExecutableVersion,
+        FingerprintAxis::ExecutableSha256 => ProtocolFingerprintAxis::ExecutableSha256,
+        FingerprintAxis::CombinedSchemaSha256 => ProtocolFingerprintAxis::CombinedSchemaSha256,
+        FingerprintAxis::V2SchemaSha256 => ProtocolFingerprintAxis::V2SchemaSha256,
+        FingerprintAxis::MethodAllowlistSha256 => ProtocolFingerprintAxis::MethodAllowlistSha256,
+        FingerprintAxis::FixtureSha256 => ProtocolFingerprintAxis::FixtureSha256,
+        FingerprintAxis::SmokeRunId => ProtocolFingerprintAxis::SmokeRunId,
+    }
+}
+
+fn protocol_capability_entries(
+    snapshot: ProviderCapabilitySnapshot,
+) -> Vec<ProviderCapabilityEntry> {
+    snapshot
+        .capabilities
+        .into_iter()
+        .map(|entry| ProviderCapabilityEntry {
+            capability: protocol_capability(entry.capability),
+            status: protocol_capability_status(entry.status),
+        })
+        .collect()
+}
+
+fn unavailable_capabilities() -> Vec<ProviderCapabilityEntry> {
+    ProviderCapability::ALL
+        .map(|capability| ProviderCapabilityEntry {
+            capability: protocol_capability(capability),
+            status: ProtocolCapabilityStatus::Unavailable,
+        })
+        .to_vec()
+}
+
+fn provider_unavailable_reason(error: &CodexCompatibilityProbeError) -> ProviderUnavailableReason {
+    match error {
+        CodexCompatibilityProbeError::Inspection(ExecutableInspectionError::NotFoundOnPath {
+            ..
+        }) => ProviderUnavailableReason::ExecutableNotFound,
+        CodexCompatibilityProbeError::Inspection(_) => {
+            ProviderUnavailableReason::ExecutableUnavailable
+        }
+        CodexCompatibilityProbeError::Version(_) => ProviderUnavailableReason::VersionProbeFailed,
+        CodexCompatibilityProbeError::Schema(_) => ProviderUnavailableReason::SchemaProbeFailed,
+        CodexCompatibilityProbeError::BundledEvidenceMismatch => {
+            ProviderUnavailableReason::BundledEvidenceMismatch
+        }
+    }
+}
+
+fn provider_diagnostics_response(
+    probe: Result<CodexCompatibilityProbe, CodexCompatibilityProbeError>,
+) -> ProviderDiagnosticsResponse {
+    match probe {
+        Ok(probe) => {
+            let compatibility = protocol_compatibility(probe.capability_snapshot.compatibility);
+            ProviderDiagnosticsResponse {
+                protocol_version: PROTOCOL_VERSION.to_owned(),
+                provider: ProtocolProviderKind::Codex,
+                compatibility,
+                executable_version: Some(probe.runtime_fingerprint.executable_version),
+                capabilities: protocol_capability_entries(probe.capability_snapshot.clone()),
+                fingerprint_mismatches: probe
+                    .capability_snapshot
+                    .fingerprint_mismatches
+                    .into_iter()
+                    .map(protocol_fingerprint_axis)
+                    .collect(),
+                unavailable_reason: None,
+            }
+        }
+        Err(error) => ProviderDiagnosticsResponse {
+            protocol_version: PROTOCOL_VERSION.to_owned(),
+            provider: ProtocolProviderKind::Codex,
+            compatibility: ProtocolProviderCompatibility::Unavailable,
+            executable_version: None,
+            capabilities: unavailable_capabilities(),
+            fingerprint_mismatches: Vec::new(),
+            unavailable_reason: Some(provider_unavailable_reason(&error)),
+        },
+    }
+}
+
+fn provider_health_for(response: &ProviderDiagnosticsResponse) -> HealthStatus {
+    match response.compatibility {
+        ProtocolProviderCompatibility::Supported | ProtocolProviderCompatibility::Degraded => {
+            HealthStatus::Ready
+        }
+        ProtocolProviderCompatibility::Unknown | ProtocolProviderCompatibility::Unavailable => {
+            HealthStatus::Unavailable
+        }
+    }
+}
+
 #[uniffi::export]
 pub fn initialize_core(
     data_directory: String,
@@ -451,7 +643,47 @@ pub fn initialize_core(
 
 #[uniffi::export]
 pub fn system_health_json(client_protocol_version: String) -> Result<String, BridgeError> {
-    protect(|| health_json(&client_protocol_version, CORE.storage_health()))
+    protect(|| {
+        health_json(
+            &client_protocol_version,
+            CORE.storage_health(),
+            CORE.provider_health(),
+        )
+    })
+}
+
+#[uniffi::export]
+pub fn provider_diagnostics_json(client_protocol_version: String) -> Result<String, BridgeError> {
+    protect(|| {
+        let validation = || {
+            validate_project_protocol(&client_protocol_version)?;
+            CORE.require_ready()?;
+            Ok(())
+        };
+        match validation() {
+            Ok(()) => with_provider_diagnostic_lock(|| {
+                let path_environment = std::env::var_os("PATH");
+                let response = provider_diagnostics_response(probe_codex_compatibility_on_path(
+                    path_environment.as_deref(),
+                ));
+                let rendered = bounded_json(
+                    &response,
+                    MAX_PROVIDER_DIAGNOSTICS_RESPONSE_BYTES,
+                    BridgeError::ProviderDiagnosticsResponseTooLarge,
+                )?;
+                CORE.set_provider_health(provider_health_for(&response))?;
+                Ok(rendered)
+            }),
+            Err(error) => project_command_json::<ProviderDiagnosticsResponse>(|| Err(error)),
+        }
+    })
+}
+
+fn with_provider_diagnostic_lock<T>(operation: impl FnOnce() -> T) -> T {
+    let _diagnostic_guard = PROVIDER_DIAGNOSTIC_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    operation()
 }
 
 #[uniffi::export]
@@ -631,9 +863,22 @@ pub fn core_construction_count() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
+        thread,
+        time::Duration,
+    };
 
     use flit_protocol::SystemHealthRequest;
+    use flit_providers::{
+        CodexRuntimeFingerprint, classify_codex, validated_codex_0_144_6_fingerprint,
+    };
 
     use super::*;
 
@@ -660,16 +905,21 @@ mod tests {
             request_fixture
         );
         let normal: serde_json::Value = serde_json::from_str(
-            &health_json(&request.client_protocol_version, HealthStatus::Ready)
-                .expect("matching protocol should return health"),
+            &health_json(
+                &request.client_protocol_version,
+                HealthStatus::Ready,
+                HealthStatus::NotConfigured,
+            )
+            .expect("matching protocol should return health"),
         )
         .expect("normal bridge payload should be valid JSON");
         let previous_request: SystemHealthRequest =
-            serde_json::from_value(fixture_at("1.0", "system_health.request.json"))
+            serde_json::from_value(fixture_at("1.1", "system_health.request.json"))
                 .expect("previous health request should remain readable");
         let mismatch: serde_json::Value = serde_json::from_str(
             &health_json(
                 &previous_request.client_protocol_version,
+                HealthStatus::NotConfigured,
                 HealthStatus::NotConfigured,
             )
             .expect("protocol mismatch should return the typed command payload"),
@@ -678,6 +928,114 @@ mod tests {
 
         assert_eq!(normal, fixture("system_health.response.json"));
         assert_eq!(mismatch, fixture("protocol_mismatch.error.json"));
+    }
+
+    #[test]
+    fn supported_and_unavailable_diagnostics_match_protocol_fixtures_and_health() {
+        let profile = validated_codex_0_144_6_fingerprint();
+        let supported = provider_diagnostics_response(Ok(CodexCompatibilityProbe {
+            runtime_fingerprint: CodexRuntimeFingerprint {
+                canonical_executable: profile.canonical_executable.clone(),
+                executable_version: profile.executable_version.clone(),
+                executable_sha256: profile.executable_sha256.clone(),
+                combined_schema_sha256: profile.combined_schema_sha256.clone(),
+                v2_schema_sha256: profile.v2_schema_sha256.clone(),
+            },
+            validated_profile: Some(profile.clone()),
+            capability_snapshot: classify_codex(&profile),
+            version_stderr_bytes: 0,
+            schema_stdout_bytes: 0,
+            schema_stderr_bytes: 0,
+        }));
+        assert_eq!(
+            serde_json::to_value(&supported).expect("supported diagnostics serialize"),
+            fixture("provider_diagnostics.supported.response.json")
+        );
+        assert_eq!(provider_health_for(&supported), HealthStatus::Ready);
+        let ready_health: serde_json::Value = serde_json::from_str(
+            &health_json(
+                PROTOCOL_VERSION,
+                HealthStatus::Ready,
+                provider_health_for(&supported),
+            )
+            .expect("ready provider health"),
+        )
+        .expect("ready provider health JSON");
+        assert_eq!(
+            ready_health,
+            fixture("system_health.providers_ready.response.json")
+        );
+
+        let unavailable = provider_diagnostics_response(Err(
+            CodexCompatibilityProbeError::Inspection(ExecutableInspectionError::NotFoundOnPath {
+                searched_directories: Vec::new(),
+            }),
+        ));
+        assert_eq!(
+            serde_json::to_value(&unavailable).expect("unavailable diagnostics serialize"),
+            fixture("provider_diagnostics.unavailable.response.json")
+        );
+        assert_eq!(provider_health_for(&unavailable), HealthStatus::Unavailable);
+    }
+
+    #[test]
+    fn concurrent_diagnostics_serialize_probe_through_health_commit() {
+        let active_operations = Arc::new(AtomicUsize::new(0));
+        let maximum_active = Arc::new(AtomicUsize::new(0));
+        let committed_health = Arc::new(AtomicUsize::new(0));
+        let (first_entered_tx, first_entered_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let (second_attempted_tx, second_attempted_rx) = mpsc::channel();
+        let (second_entered_tx, second_entered_rx) = mpsc::channel();
+
+        let first_active = Arc::clone(&active_operations);
+        let first_maximum = Arc::clone(&maximum_active);
+        let first_health = Arc::clone(&committed_health);
+        let first = thread::spawn(move || {
+            with_provider_diagnostic_lock(|| {
+                record_active(&first_active, &first_maximum);
+                first_entered_tx.send(()).expect("signal first entry");
+                release_first_rx.recv().expect("release first operation");
+                first_health.store(1, Ordering::SeqCst);
+                first_active.fetch_sub(1, Ordering::SeqCst);
+            });
+        });
+        first_entered_rx.recv().expect("first operation enters");
+
+        let second_active = Arc::clone(&active_operations);
+        let second_maximum = Arc::clone(&maximum_active);
+        let second_health = Arc::clone(&committed_health);
+        let second = thread::spawn(move || {
+            second_attempted_tx
+                .send(())
+                .expect("signal second lock attempt");
+            with_provider_diagnostic_lock(|| {
+                record_active(&second_active, &second_maximum);
+                second_entered_tx.send(()).expect("signal second entry");
+                second_health.store(2, Ordering::SeqCst);
+                second_active.fetch_sub(1, Ordering::SeqCst);
+            });
+        });
+        second_attempted_rx
+            .recv()
+            .expect("second operation attempts lock");
+        assert!(
+            second_entered_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "second probe must not enter before the first health commit"
+        );
+
+        release_first_tx.send(()).expect("release first operation");
+        first.join().expect("join first diagnostics operation");
+        second.join().expect("join second diagnostics operation");
+        assert_eq!(maximum_active.load(Ordering::SeqCst), 1);
+        assert_eq!(committed_health.load(Ordering::SeqCst), 2);
+    }
+
+    fn record_active(active: &AtomicUsize, maximum: &AtomicUsize) {
+        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+        maximum.fetch_max(current, Ordering::SeqCst);
     }
 
     #[test]
