@@ -50,7 +50,7 @@ struct SystemHealthClient: Sendable {
             if let health = try? JSONDecoder().decode(SystemHealthPayload.self, from: data),
                 health.protocolVersion == clientProtocolVersion,
                 health.core == .ready,
-                health.storage == .notConfigured,
+                health.storage == .ready,
                 health.providers == .notConfigured
             {
                 return .ready(health)

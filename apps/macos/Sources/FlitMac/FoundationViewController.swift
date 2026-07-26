@@ -9,7 +9,7 @@ final class FoundationViewController: NSViewController {
     private var boundaryLabel: NSTextField?
     private var foundationPanel: NSStackView?
 
-    init(client: SystemHealthClient = SystemHealthClient()) {
+    init(client: SystemHealthClient) {
         self.client = client
         super.init(nibName: nil, bundle: nil)
     }

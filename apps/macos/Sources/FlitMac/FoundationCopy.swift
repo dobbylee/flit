@@ -17,16 +17,16 @@ enum FoundationCopyKey: String {
 enum FoundationCopy {
     private static let values: [FoundationCopyKey: String] = [
         .boundaryChecking:
-            "Verifying the local Core contract. Storage and provider monitoring have not started.",
+            "Verifying the local Core and Store. Provider monitoring has not started.",
         .boundaryReady:
-            "The local Core contract is ready. Storage and provider monitoring have not started.",
+            "The local Core and Store are ready. Provider monitoring has not started.",
         .boundaryUnavailable:
-            "Flit could not verify the expected foundation state. No agent controls are available.",
+            "Flit could not open its local Core and Store safely. No agent controls are available.",
         .local: "Local by design",
         .noControls: "No agent controls yet",
-        .phase: "Flit · Phase 1",
+        .phase: "Flit · Phase 2",
         .statusChecking: "Checking foundation",
-        .statusReady: "Core contract verified",
+        .statusReady: "Core and Store ready",
         .statusUnavailable: "Foundation unavailable",
         .summary: "A quiet home for the moments that need your attention.",
         .title: "Flit foundation",

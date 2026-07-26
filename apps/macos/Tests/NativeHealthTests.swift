@@ -60,6 +60,7 @@ struct NativeHealthTests {
         }
         let root = CommandLine.arguments[1]
         let fixtureRoot = "\(root)/fixtures/protocol/commands/v1.0"
+        let dataDirectory = "\(root)/target/flit-macos/native-health-data"
 
         let requestData = try canonicalJSON(
             at: "\(fixtureRoot)/system_health.request.json"
@@ -82,6 +83,15 @@ struct NativeHealthTests {
             "native client request must match the repository fixture"
         )
 
+        try initializeCore(
+            dataDirectory: dataDirectory,
+            clientProtocolVersion: requestVersion
+        )
+        guard case .ready = client.load() else {
+            throw NativeHealthTestFailure.failed(
+                "native client must observe validated storage"
+            )
+        }
         let normal = try systemHealthJson(clientProtocolVersion: requestVersion)
         let mismatch = try systemHealthJson(clientProtocolVersion: "2.0")
         let expectedNormal = try canonicalJSON(
@@ -103,7 +113,7 @@ struct NativeHealthTests {
         try require(coreConstructionCount() == 1, "bridge calls must share one Core construction")
 
         guard case .ready = client.load() else {
-            throw NativeHealthTestFailure.failed("native client must accept matching health")
+            throw NativeHealthTestFailure.failed("repeated native health must remain ready")
         }
         try require(
             SystemHealthClient(clientProtocolVersion: "2.0").load()

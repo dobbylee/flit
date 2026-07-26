@@ -114,6 +114,25 @@ fn fresh_database_applies_full_initial_schema_and_reopens() {
 }
 
 #[test]
+fn system_time_open_records_a_utc_migration_timestamp() {
+    let database = TestDatabase::new("system-time");
+    Store::open_with_system_time(database.path()).expect("fresh store opens with system time");
+
+    let connection = Connection::open(database.path()).expect("inspect database");
+    let applied_at: String = connection
+        .query_row(
+            "SELECT applied_at FROM schema_migrations WHERE version = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("migration timestamp");
+    assert!(
+        applied_at.contains('T') && applied_at.ends_with('Z'),
+        "migration timestamp must be UTC RFC 3339-like text: {applied_at}"
+    );
+}
+
+#[test]
 fn invalid_applied_at_is_rejected_before_a_database_file_is_created() {
     let database = TestDatabase::new("invalid-time");
     assert!(matches!(

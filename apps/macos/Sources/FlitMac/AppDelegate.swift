@@ -30,7 +30,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let content = FoundationViewController()
+        let client = SystemHealthClient()
+        do {
+            try initializeCore(
+                dataDirectory: applicationDataDirectory(),
+                clientProtocolVersion: client.clientProtocolVersion
+            )
+        } catch {
+            // The generated health command reports the failed initialization without path details.
+        }
+        let content = FoundationViewController(client: client)
         let window = NSWindow(contentViewController: content)
         window.title = "Flit"
         window.identifier = NSUserInterfaceItemIdentifier("flit.mainWindow")
@@ -43,6 +52,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let controller = NSWindowController(window: window)
         windowController = controller
         controller.showWindow(nil)
+    }
+
+    private func applicationDataDirectory() -> String {
+        guard
+            let applicationSupport = FileManager.default.urls(
+                for: .applicationSupportDirectory,
+                in: .userDomainMask
+            ).first
+        else {
+            return ""
+        }
+        return applicationSupport.appendingPathComponent("Flit", isDirectory: true).path
     }
 
     private func configureMainMenu() {
