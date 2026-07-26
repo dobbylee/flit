@@ -14,6 +14,7 @@ crate-type = ["cdylib", "rlib", "staticlib"]
 flit-providers = { path = "../flit-providers" }
 flit-protocol = { path = "../flit-protocol" }
 flit-store = { path = "../flit-store" }
+serde = "=1.0.229"
 serde_json = "=1.0.151"
 sha2 = "=0.10.9"
 thiserror = "=2.0.19"

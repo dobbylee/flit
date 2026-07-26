@@ -199,6 +199,20 @@ pub struct Project {
     pub updated_at: String,
 }
 
+pub const MAX_PROJECT_PAGE_SIZE: usize = 50;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectListCursor {
+    pub display_name: String,
+    pub project_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectPage {
+    pub projects: Vec<Project>,
+    pub next_cursor: Option<ProjectListCursor>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProjectRegistrationOutcome {
     Registered(Project),

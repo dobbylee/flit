@@ -10,9 +10,9 @@ use std::{
 };
 
 use flit_store::{
-    ProjectDirectoryInspection, ProjectInspectionError, ProjectRegistration,
-    ProjectRegistrationOutcome, ProjectTrustConfirmation, ProjectTrustOutcome, Store, StoreError,
-    initial_migration_checksum,
+    MAX_PROJECT_PAGE_SIZE, ProjectDirectoryInspection, ProjectInspectionError, ProjectListCursor,
+    ProjectRegistration, ProjectRegistrationOutcome, ProjectTrustConfirmation, ProjectTrustOutcome,
+    Store, StoreError, initial_migration_checksum,
 };
 use rusqlite::{Connection, ErrorCode, params};
 
@@ -144,7 +144,13 @@ fn registration_persists_an_untrusted_project_and_reopens_it() {
 fn active_project_list_is_stable_preserves_rows_and_excludes_archived_history() {
     let workspace = TestWorkspace::new("list");
     let mut store = workspace.open();
-    assert_eq!(store.list_projects().expect("empty Project list"), []);
+    assert_eq!(
+        store
+            .list_projects_page(None, MAX_PROJECT_PAGE_SIZE)
+            .expect("empty Project list")
+            .projects,
+        []
+    );
 
     let alpha_one_path = workspace.directory.join("alpha-one");
     let alpha_two_path = workspace.directory.join("alpha-two");
@@ -201,20 +207,75 @@ fn active_project_list_is_stable_preserves_rows_and_excludes_archived_history() 
     drop(connection);
 
     let reopened = workspace.open();
-    let active = reopened.list_projects().expect("active Project list");
-    assert_eq!(active, [trusted_alpha, alpha_two, beta]);
+    let active = reopened
+        .list_projects_page(None, MAX_PROJECT_PAGE_SIZE)
+        .expect("active Project list");
+    assert_eq!(active.projects, [trusted_alpha, alpha_two, beta]);
+    assert_eq!(active.next_cursor, None);
     assert_eq!(
         reopened.project("archived").expect("read archived Project"),
         Some(archived)
     );
     drop(reopened);
 
+    let reopened_active = workspace
+        .open()
+        .list_projects_page(None, MAX_PROJECT_PAGE_SIZE)
+        .expect("reopened active Project list");
+    assert_eq!(reopened_active, active);
+}
+
+#[test]
+fn project_pages_bound_each_query_and_resume_in_stable_order() {
+    let workspace = TestWorkspace::new("paged-list");
+    let mut store = workspace.open();
+    let project_count = MAX_PROJECT_PAGE_SIZE + 3;
+    for index in (0..project_count).rev() {
+        let project_path = workspace.directory.join(format!("project-{index:03}"));
+        fs::create_dir(&project_path).expect("Project directory");
+        assert!(matches!(
+            store
+                .register_project(registration(
+                    &format!("project-{index:03}"),
+                    &format!("Project {index:03}"),
+                    &project_path,
+                ))
+                .expect("register Project"),
+            ProjectRegistrationOutcome::Registered(_)
+        ));
+    }
+
+    assert!(matches!(
+        store.list_projects_page(None, 0),
+        Err(StoreError::InvalidProjectPageLimit { .. })
+    ));
+    assert!(matches!(
+        store.list_projects_page(None, MAX_PROJECT_PAGE_SIZE + 1),
+        Err(StoreError::InvalidProjectPageLimit { .. })
+    ));
+
+    let mut cursor: Option<ProjectListCursor> = None;
+    let mut project_ids = Vec::new();
+    let mut page_sizes = Vec::new();
+    loop {
+        let page = store
+            .list_projects_page(cursor.as_ref(), MAX_PROJECT_PAGE_SIZE)
+            .expect("bounded Project page");
+        page_sizes.push(page.projects.len());
+        project_ids.extend(page.projects.into_iter().map(|project| project.id));
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+
+    assert_eq!(page_sizes, [MAX_PROJECT_PAGE_SIZE, 3]);
+    assert_eq!(project_ids.len(), project_count);
     assert_eq!(
-        workspace
-            .open()
-            .list_projects()
-            .expect("reopened active Project list"),
-        active
+        project_ids,
+        (0..project_count)
+            .map(|index| format!("project-{index:03}"))
+            .collect::<Vec<_>>()
     );
 }
 

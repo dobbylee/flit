@@ -27,8 +27,9 @@ pub use managed_runs::{
     ManagedSessionTerminationOutcome, ManagedTurnTerminalOutcome,
 };
 pub use projects::{
-    Project, ProjectDirectoryInspection, ProjectIdentity, ProjectInspectionError,
-    ProjectRegistration, ProjectRegistrationOutcome, ProjectTrustConfirmation, ProjectTrustOutcome,
+    MAX_PROJECT_PAGE_SIZE, Project, ProjectDirectoryInspection, ProjectIdentity,
+    ProjectInspectionError, ProjectListCursor, ProjectPage, ProjectRegistration,
+    ProjectRegistrationOutcome, ProjectTrustConfirmation, ProjectTrustOutcome,
 };
 
 pub use writer::{
@@ -394,21 +395,54 @@ impl Store {
         project_by_id(&self.connection, project_id)
     }
 
-    pub fn list_projects(&self) -> Result<Vec<Project>, StoreError> {
+    pub fn list_projects_page(
+        &self,
+        after: Option<&ProjectListCursor>,
+        limit: usize,
+    ) -> Result<ProjectPage, StoreError> {
+        if !(1..=MAX_PROJECT_PAGE_SIZE).contains(&limit) {
+            return Err(StoreError::InvalidProjectPageLimit {
+                limit,
+                max: MAX_PROJECT_PAGE_SIZE,
+            });
+        }
+        let fetch_limit = i64::try_from(limit).expect("Project page limit fits in i64");
         let mut statement = self
             .connection
             .prepare(
                 "SELECT id, display_name, canonical_path, filesystem_id, trusted, default_provider, notification_policy_json, created_at, updated_at
                  FROM projects
                  WHERE archived_at IS NULL
-                 ORDER BY display_name COLLATE BINARY, id COLLATE BINARY",
+                   AND (?1 IS NULL
+                     OR display_name COLLATE BINARY > ?1 COLLATE BINARY
+                     OR (display_name COLLATE BINARY = ?1 COLLATE BINARY
+                       AND id COLLATE BINARY > ?2 COLLATE BINARY))
+                 ORDER BY display_name COLLATE BINARY, id COLLATE BINARY
+                 LIMIT ?3",
             )
             .map_err(StoreError::Sqlite)?;
-        statement
-            .query_map([], project_from_row)
+        let display_name = after.map(|cursor| cursor.display_name.as_str());
+        let project_id = after.map(|cursor| cursor.project_id.as_str());
+        let projects = statement
+            .query_map(
+                params![display_name, project_id, fetch_limit],
+                project_from_row,
+            )
             .map_err(StoreError::Sqlite)?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(StoreError::Sqlite)
+            .map_err(StoreError::Sqlite)?;
+        let next_cursor = if projects.len() == limit {
+            projects.last().map(|project| ProjectListCursor {
+                display_name: project.display_name.clone(),
+                project_id: project.id.clone(),
+            })
+        } else {
+            None
+        };
+        Ok(ProjectPage {
+            projects,
+            next_cursor,
+        })
     }
 
     pub fn confirm_project_trust(
@@ -2763,6 +2797,10 @@ struct SchemaObject {
 
 #[derive(Debug)]
 pub enum StoreError {
+    InvalidProjectPageLimit {
+        limit: usize,
+        max: usize,
+    },
     InvalidProjectTrustConfirmation {
         field: &'static str,
     },
@@ -2984,6 +3022,10 @@ pub enum StoreError {
 impl fmt::Display for StoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidProjectPageLimit { limit, max } => write!(
+                formatter,
+                "invalid Project page limit {limit}; expected 1..={max}"
+            ),
             Self::InvalidProjectTrustConfirmation { field } => {
                 write!(
                     formatter,

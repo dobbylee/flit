@@ -4,7 +4,7 @@ use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: &str = "1.0";
+pub const PROTOCOL_VERSION: &str = "1.1";
 pub const EVENT_PROTOCOL_VERSION: &str = "1.0";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -40,9 +40,108 @@ pub struct SystemHealthResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProjectInspectionRequest {
+    pub selected_path: String,
+    pub client_protocol_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProjectInspectionResponse {
+    pub protocol_version: String,
+    pub canonical_path: String,
+    pub filesystem_id: String,
+    pub selected_via_symlink: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProjectRegistrationRequest {
+    pub project_id: String,
+    pub display_name: String,
+    pub selected_path: String,
+    pub created_at: String,
+    pub client_protocol_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProjectRecord {
+    pub id: String,
+    pub display_name: String,
+    pub canonical_path: String,
+    pub filesystem_id: Option<String>,
+    pub trusted: bool,
+    pub default_provider: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectRegistrationStatus {
+    Registered,
+    DuplicateCanonicalPath,
+    DuplicateFilesystemIdentity,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProjectRegistrationResponse {
+    pub protocol_version: String,
+    pub status: ProjectRegistrationStatus,
+    pub project: Option<ProjectRecord>,
+    pub existing_project_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProjectTrustRequest {
+    pub project_id: String,
+    pub selected_path: String,
+    pub confirmed_at: String,
+    pub client_protocol_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectTrustStatus {
+    Trusted,
+    AlreadyTrusted,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProjectTrustResponse {
+    pub protocol_version: String,
+    pub status: ProjectTrustStatus,
+    pub project: ProjectRecord,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProjectListCursor {
+    pub display_name: String,
+    pub project_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProjectsListRequest {
+    pub after: Option<ProjectListCursor>,
+    pub limit: u32,
+    pub client_protocol_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProjectsListResponse {
+    pub protocol_version: String,
+    pub projects: Vec<ProjectRecord>,
+    pub next_cursor: Option<ProjectListCursor>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CommandErrorCode {
     ProtocolMismatch,
+    InvalidProjectRequest,
+    ProjectInspectionFailure,
+    ProjectConflict,
+    ProjectNotFound,
+    ProjectIdentityMismatch,
+    StorageUnavailable,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -181,13 +280,203 @@ impl From<EventEnvelope> for UnsequencedEventEnvelope {
 
 impl CommandError {
     #[must_use]
-    pub fn protocol_mismatch() -> Self {
+    pub fn for_code(code: CommandErrorCode) -> Self {
+        let message_key = match code {
+            CommandErrorCode::ProtocolMismatch => "errors.protocolMismatch",
+            CommandErrorCode::InvalidProjectRequest => "errors.invalidProjectRequest",
+            CommandErrorCode::ProjectInspectionFailure => "errors.projectInspectionFailure",
+            CommandErrorCode::ProjectConflict => "errors.projectConflict",
+            CommandErrorCode::ProjectNotFound => "errors.projectNotFound",
+            CommandErrorCode::ProjectIdentityMismatch => "errors.projectIdentityMismatch",
+            CommandErrorCode::StorageUnavailable => "errors.storageUnavailable",
+        };
         Self {
-            code: CommandErrorCode::ProtocolMismatch,
-            message_key: "errors.protocolMismatch".to_owned(),
+            code,
+            message_key: message_key.to_owned(),
         }
     }
+
+    #[must_use]
+    pub fn protocol_mismatch() -> Self {
+        Self::for_code(CommandErrorCode::ProtocolMismatch)
+    }
 }
+
+#[must_use]
+pub fn generated_swift_command_contract() -> String {
+    SWIFT_COMMAND_CONTRACT_TEMPLATE.replace("__PROTOCOL_VERSION__", PROTOCOL_VERSION)
+}
+
+const SWIFT_COMMAND_CONTRACT_TEMPLATE: &str = r#"// Generated from flit_protocol command contracts. Do not edit.
+let flitClientProtocolVersion = "__PROTOCOL_VERSION__"
+
+struct FlitProjectInspectionRequest: Codable, Equatable, Sendable {
+    let selectedPath: String
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case selectedPath = "selected_path"
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+struct FlitProjectInspectionResponse: Codable, Equatable, Sendable {
+    let protocolVersion: String
+    let canonicalPath: String
+    let filesystemId: String
+    let selectedViaSymlink: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case canonicalPath = "canonical_path"
+        case filesystemId = "filesystem_id"
+        case selectedViaSymlink = "selected_via_symlink"
+    }
+}
+
+struct FlitProjectRegistrationRequest: Codable, Equatable, Sendable {
+    let projectId: String
+    let displayName: String
+    let selectedPath: String
+    let createdAt: String
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case displayName = "display_name"
+        case selectedPath = "selected_path"
+        case createdAt = "created_at"
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+enum FlitProjectRegistrationStatus: String, Codable, Sendable {
+    case registered
+    case duplicateCanonicalPath = "duplicate_canonical_path"
+    case duplicateFilesystemIdentity = "duplicate_filesystem_identity"
+}
+
+struct FlitProjectRecord: Codable, Equatable, Sendable {
+    let id: String
+    let displayName: String
+    let canonicalPath: String
+    let filesystemId: String?
+    let trusted: Bool
+    let defaultProvider: String?
+    let createdAt: String
+    let updatedAt: String
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case displayName = "display_name"
+        case canonicalPath = "canonical_path"
+        case filesystemId = "filesystem_id"
+        case trusted
+        case defaultProvider = "default_provider"
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+    }
+}
+
+struct FlitProjectRegistrationResponse: Codable, Equatable, Sendable {
+    let protocolVersion: String
+    let status: FlitProjectRegistrationStatus
+    let project: FlitProjectRecord?
+    let existingProjectId: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case status
+        case project
+        case existingProjectId = "existing_project_id"
+    }
+}
+
+struct FlitProjectTrustRequest: Codable, Equatable, Sendable {
+    let projectId: String
+    let selectedPath: String
+    let confirmedAt: String
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case selectedPath = "selected_path"
+        case confirmedAt = "confirmed_at"
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+enum FlitProjectTrustStatus: String, Codable, Sendable {
+    case trusted
+    case alreadyTrusted = "already_trusted"
+}
+
+struct FlitProjectTrustResponse: Codable, Equatable, Sendable {
+    let protocolVersion: String
+    let status: FlitProjectTrustStatus
+    let project: FlitProjectRecord
+
+    private enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case status
+        case project
+    }
+}
+
+struct FlitProjectListCursor: Codable, Equatable, Sendable {
+    let displayName: String
+    let projectId: String
+
+    private enum CodingKeys: String, CodingKey {
+        case displayName = "display_name"
+        case projectId = "project_id"
+    }
+}
+
+struct FlitProjectsListRequest: Codable, Equatable, Sendable {
+    let after: FlitProjectListCursor?
+    let limit: UInt32
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case after
+        case limit
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+struct FlitProjectsListResponse: Codable, Equatable, Sendable {
+    let protocolVersion: String
+    let projects: [FlitProjectRecord]
+    let nextCursor: FlitProjectListCursor?
+
+    private enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case projects
+        case nextCursor = "next_cursor"
+    }
+}
+
+enum FlitCommandErrorCode: String, Codable, Sendable {
+    case protocolMismatch = "PROTOCOL_MISMATCH"
+    case invalidProjectRequest = "INVALID_PROJECT_REQUEST"
+    case projectInspectionFailure = "PROJECT_INSPECTION_FAILURE"
+    case projectConflict = "PROJECT_CONFLICT"
+    case projectNotFound = "PROJECT_NOT_FOUND"
+    case projectIdentityMismatch = "PROJECT_IDENTITY_MISMATCH"
+    case storageUnavailable = "STORAGE_UNAVAILABLE"
+}
+
+struct FlitCommandError: Codable, Equatable, Sendable {
+    let code: FlitCommandErrorCode
+    let messageKey: String
+
+    private enum CodingKeys: String, CodingKey {
+        case code
+        case messageKey = "message_key"
+    }
+}
+"#;
 
 #[must_use]
 pub fn generated_event_schema() -> String {

@@ -2,8 +2,11 @@ use std::{fs, path::PathBuf};
 
 use flit_protocol::{
     CommandError, EVENT_PROTOCOL_VERSION, EventEnvelope, EventProtocolVersion,
-    MAX_JSON_SAFE_INTEGER, PROTOCOL_VERSION, SystemHealthRequest, SystemHealthResponse,
-    event_schema_id, event_schema_relative_path,
+    MAX_JSON_SAFE_INTEGER, PROTOCOL_VERSION, ProjectInspectionRequest, ProjectInspectionResponse,
+    ProjectRegistrationRequest, ProjectRegistrationResponse, ProjectTrustRequest,
+    ProjectTrustResponse, ProjectsListRequest, ProjectsListResponse, SystemHealthRequest,
+    SystemHealthResponse, event_schema_id, event_schema_relative_path,
+    generated_swift_command_contract,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -27,6 +30,32 @@ where
     assert_eq!(actual, expected);
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct CommandCompatibilityManifest {
+    current: CommandFixtureReference,
+    previous_minor: Option<CommandFixtureReference>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct CommandFixtureReference {
+    version: String,
+    directory: String,
+}
+
+fn read_command_compatibility_manifest() -> CommandCompatibilityManifest {
+    serde_json::from_str(
+        &fs::read_to_string(repository_path(
+            "fixtures/protocol/commands/compatibility.json",
+        ))
+        .expect("command compatibility manifest should be readable"),
+    )
+    .expect("command compatibility manifest should contain valid JSON")
+}
+
+fn command_fixture(reference: &CommandFixtureReference, name: &str) -> String {
+    format!("{}/{name}", reference.directory)
+}
+
 #[test]
 fn checked_in_event_schema_matches_the_rust_source() {
     let manifest = read_compatibility_manifest();
@@ -39,36 +68,193 @@ fn checked_in_event_schema_matches_the_rust_source() {
 
 #[test]
 fn current_system_health_fixtures_round_trip() {
-    assert_fixture_round_trip::<SystemHealthRequest>(
-        "fixtures/protocol/commands/v1.0/system_health.request.json",
-    );
-    assert_fixture_round_trip::<SystemHealthResponse>(
-        "fixtures/protocol/commands/v1.0/system_health.response.json",
-    );
-    assert_fixture_round_trip::<CommandError>(
-        "fixtures/protocol/commands/v1.0/protocol_mismatch.error.json",
-    );
+    let manifest = read_command_compatibility_manifest();
+    assert_fixture_round_trip::<SystemHealthRequest>(&command_fixture(
+        &manifest.current,
+        "system_health.request.json",
+    ));
+    assert_fixture_round_trip::<SystemHealthResponse>(&command_fixture(
+        &manifest.current,
+        "system_health.response.json",
+    ));
+    assert_fixture_round_trip::<CommandError>(&command_fixture(
+        &manifest.current,
+        "protocol_mismatch.error.json",
+    ));
 }
 
 #[test]
 fn fixtures_are_bound_to_the_current_protocol_version() {
+    let manifest = read_command_compatibility_manifest();
     let request: SystemHealthRequest = serde_json::from_str(
-        &fs::read_to_string(repository_path(
-            "fixtures/protocol/commands/v1.0/system_health.request.json",
-        ))
+        &fs::read_to_string(repository_path(&command_fixture(
+            &manifest.current,
+            "system_health.request.json",
+        )))
         .expect("request fixture should be readable"),
     )
     .expect("request fixture should match Rust type");
     let response: SystemHealthResponse = serde_json::from_str(
-        &fs::read_to_string(repository_path(
-            "fixtures/protocol/commands/v1.0/system_health.response.json",
-        ))
+        &fs::read_to_string(repository_path(&command_fixture(
+            &manifest.current,
+            "system_health.response.json",
+        )))
         .expect("response fixture should be readable"),
     )
     .expect("response fixture should match Rust type");
 
+    assert_eq!(manifest.current.version, PROTOCOL_VERSION);
     assert_eq!(request.client_protocol_version, PROTOCOL_VERSION);
     assert_eq!(response.protocol_version, PROTOCOL_VERSION);
+}
+
+#[test]
+fn current_project_command_fixtures_round_trip_every_shape() {
+    let manifest = read_command_compatibility_manifest();
+    let current = &manifest.current;
+    assert_fixture_round_trip::<ProjectInspectionRequest>(&command_fixture(
+        current,
+        "project_inspect.request.json",
+    ));
+    assert_fixture_round_trip::<ProjectInspectionResponse>(&command_fixture(
+        current,
+        "project_inspect.response.json",
+    ));
+    assert_fixture_round_trip::<ProjectRegistrationRequest>(&command_fixture(
+        current,
+        "project_register.request.json",
+    ));
+    for name in [
+        "project_register.registered.response.json",
+        "project_register.duplicate_canonical_path.response.json",
+        "project_register.duplicate_filesystem_identity.response.json",
+    ] {
+        assert_fixture_round_trip::<ProjectRegistrationResponse>(&command_fixture(current, name));
+    }
+    assert_fixture_round_trip::<ProjectTrustRequest>(&command_fixture(
+        current,
+        "project_trust.request.json",
+    ));
+    for name in [
+        "project_trust.trusted.response.json",
+        "project_trust.already_trusted.response.json",
+    ] {
+        assert_fixture_round_trip::<ProjectTrustResponse>(&command_fixture(current, name));
+    }
+    assert_fixture_round_trip::<ProjectsListRequest>(&command_fixture(
+        current,
+        "projects_list.request.json",
+    ));
+    assert_fixture_round_trip::<ProjectsListResponse>(&command_fixture(
+        current,
+        "projects_list.response.json",
+    ));
+    assert_fixture_round_trip::<Vec<CommandError>>(&command_fixture(
+        current,
+        "project_errors.json",
+    ));
+    let errors: Vec<CommandError> = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "project_errors.json",
+        )))
+        .expect("Project error fixture should be readable"),
+    )
+    .expect("Project error fixture should match Rust types");
+    for error in errors {
+        assert_eq!(error, CommandError::for_code(error.code));
+    }
+}
+
+#[test]
+fn command_manifest_retains_the_exact_previous_minor_health_contract() {
+    let manifest = read_command_compatibility_manifest();
+    assert_eq!(manifest.current.version, PROTOCOL_VERSION);
+    assert_eq!(
+        manifest.current.directory,
+        format!("fixtures/protocol/commands/v{PROTOCOL_VERSION}")
+    );
+    let (major, minor) = PROTOCOL_VERSION
+        .split_once('.')
+        .expect("command protocol version should be major.minor");
+    let expected_previous = format!(
+        "{major}.{}",
+        minor
+            .parse::<u64>()
+            .expect("minor should be numeric")
+            .checked_sub(1)
+            .expect("current command protocol should have a previous minor")
+    );
+    let previous = manifest
+        .previous_minor
+        .expect("non-initial command minor should retain its predecessor");
+    assert_eq!(previous.version, expected_previous);
+    assert_eq!(
+        previous.directory,
+        format!("fixtures/protocol/commands/v{expected_previous}")
+    );
+    assert_fixture_round_trip::<SystemHealthRequest>(&command_fixture(
+        &previous,
+        "system_health.request.json",
+    ));
+    assert_fixture_round_trip::<SystemHealthResponse>(&command_fixture(
+        &previous,
+        "system_health.response.json",
+    ));
+    assert_fixture_round_trip::<CommandError>(&command_fixture(
+        &previous,
+        "protocol_mismatch.error.json",
+    ));
+}
+
+#[test]
+fn generated_swift_project_contract_is_current_and_required_fields_fail_closed() {
+    let generated = generated_swift_command_contract();
+    assert!(generated.contains(&format!(
+        "let flitClientProtocolVersion = \"{PROTOCOL_VERSION}\""
+    )));
+    for type_name in [
+        "FlitProjectInspectionRequest",
+        "FlitProjectInspectionResponse",
+        "FlitProjectRegistrationRequest",
+        "FlitProjectRegistrationResponse",
+        "FlitProjectTrustRequest",
+        "FlitProjectTrustResponse",
+        "FlitProjectsListRequest",
+        "FlitProjectsListResponse",
+        "FlitCommandError",
+    ] {
+        assert!(
+            generated.contains(type_name),
+            "generated Swift contract should contain {type_name}"
+        );
+    }
+
+    let manifest = read_command_compatibility_manifest();
+    let mut drifted: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            &manifest.current,
+            "project_inspect.response.json",
+        )))
+        .expect("inspection fixture should be readable"),
+    )
+    .expect("inspection fixture should be JSON");
+    drifted
+        .as_object_mut()
+        .expect("inspection response should be an object")
+        .remove("filesystem_id");
+    assert!(serde_json::from_value::<ProjectInspectionResponse>(drifted).is_err());
+
+    let mut unknown_status: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            &manifest.current,
+            "project_register.registered.response.json",
+        )))
+        .expect("registration fixture should be readable"),
+    )
+    .expect("registration fixture should be JSON");
+    unknown_status["status"] = serde_json::json!("silently_invented");
+    assert!(serde_json::from_value::<ProjectRegistrationResponse>(unknown_status).is_err());
 }
 
 #[test]

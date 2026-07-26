@@ -337,6 +337,7 @@ dependencies = [
  "flit-protocol",
  "flit-providers",
  "flit-store",
+ "serde",
  "serde_json",
  "sha2",
  "thiserror",

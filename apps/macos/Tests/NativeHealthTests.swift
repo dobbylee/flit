@@ -24,6 +24,37 @@ private func canonicalJSON(from text: String) throws -> Data {
     return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
 }
 
+private func decodeFixture<T: Decodable>(_ type: T.Type, at path: String) throws -> T {
+    try JSONDecoder().decode(type, from: Data(contentsOf: URL(fileURLWithPath: path)))
+}
+
+@MainActor
+private func requireDecodingFailure<T: Decodable>(
+    _ type: T.Type,
+    from data: Data,
+    _ message: String
+) throws {
+    do {
+        _ = try JSONDecoder().decode(type, from: data)
+    } catch {
+        return
+    }
+    throw NativeHealthTestFailure.failed(message)
+}
+
+@MainActor
+private func requireCommandError(
+    _ text: String,
+    code: FlitCommandErrorCode,
+    fixtures: [FlitCommandError]
+) throws {
+    let actual = try JSONDecoder().decode(FlitCommandError.self, from: Data(text.utf8))
+    guard let expected = fixtures.first(where: { $0.code == code }) else {
+        throw NativeHealthTestFailure.failed("missing fixture for command error \(code)")
+    }
+    try require(actual == expected, "real command error \(code) must match its fixture")
+}
+
 @MainActor
 private func requireFoundationLayout(
     _ controller: FoundationViewController,
@@ -59,7 +90,8 @@ struct NativeHealthTests {
             throw NativeHealthTestFailure.failed("expected repository root argument")
         }
         let root = CommandLine.arguments[1]
-        let fixtureRoot = "\(root)/fixtures/protocol/commands/v1.0"
+        let fixtureRoot =
+            "\(root)/fixtures/protocol/commands/v\(flitClientProtocolVersion)"
         let dataDirectory = "\(root)/target/flit-macos/native-health-data"
 
         let requestData = try canonicalJSON(
@@ -81,6 +113,38 @@ struct NativeHealthTests {
         try require(
             outgoingRequest == requestData,
             "native client request must match the repository fixture"
+        )
+
+        let projectErrors = try decodeFixture(
+            [FlitCommandError].self,
+            at: "\(fixtureRoot)/project_errors.json"
+        )
+        let protocolMismatchError = try decodeFixture(
+            FlitCommandError.self,
+            at: "\(fixtureRoot)/protocol_mismatch.error.json"
+        )
+        let commandErrors = projectErrors + [protocolMismatchError]
+        try require(
+            Set(commandErrors.map { $0.code.rawValue }).count == 7,
+            "generated command errors must decode every Project command error code"
+        )
+        try requireCommandError(
+            try projectsListPageJson(
+                afterDisplayName: nil,
+                afterProjectId: nil,
+                limit: 1,
+                clientProtocolVersion: requestVersion
+            ),
+            code: .storageUnavailable,
+            fixtures: commandErrors
+        )
+        try requireCommandError(
+            try projectInspectJson(
+                selectedPath: "\(root)/target/flit-macos/mismatch-must-not-be-read",
+                clientProtocolVersion: "2.0"
+            ),
+            code: .protocolMismatch,
+            fixtures: commandErrors
         )
 
         try initializeCore(
@@ -111,6 +175,242 @@ struct NativeHealthTests {
             "protocol mismatch payload must match the repository fixture"
         )
         try require(coreConstructionCount() == 1, "bridge calls must share one Core construction")
+
+        let inspectionFixture = try decodeFixture(
+            FlitProjectInspectionResponse.self,
+            at: "\(fixtureRoot)/project_inspect.response.json"
+        )
+        try require(
+            inspectionFixture.protocolVersion == flitClientProtocolVersion,
+            "generated inspection response must decode the current protocol fixture"
+        )
+        _ = try decodeFixture(
+            FlitProjectInspectionRequest.self,
+            at: "\(fixtureRoot)/project_inspect.request.json"
+        )
+        _ = try decodeFixture(
+            FlitProjectRegistrationRequest.self,
+            at: "\(fixtureRoot)/project_register.request.json"
+        )
+        for (name, expectedStatus) in [
+            (
+                "project_register.registered.response.json",
+                FlitProjectRegistrationStatus.registered
+            ),
+            (
+                "project_register.duplicate_canonical_path.response.json",
+                FlitProjectRegistrationStatus.duplicateCanonicalPath
+            ),
+            (
+                "project_register.duplicate_filesystem_identity.response.json",
+                FlitProjectRegistrationStatus.duplicateFilesystemIdentity
+            ),
+        ] {
+            let response = try decodeFixture(
+                FlitProjectRegistrationResponse.self,
+                at: "\(fixtureRoot)/\(name)"
+            )
+            try require(
+                response.status == expectedStatus,
+                "generated registration response must decode \(expectedStatus)"
+            )
+        }
+        _ = try decodeFixture(
+            FlitProjectTrustRequest.self,
+            at: "\(fixtureRoot)/project_trust.request.json"
+        )
+        for (name, expectedStatus) in [
+            (
+                "project_trust.trusted.response.json",
+                FlitProjectTrustStatus.trusted
+            ),
+            (
+                "project_trust.already_trusted.response.json",
+                FlitProjectTrustStatus.alreadyTrusted
+            ),
+        ] {
+            let response = try decodeFixture(
+                FlitProjectTrustResponse.self,
+                at: "\(fixtureRoot)/\(name)"
+            )
+            try require(
+                response.status == expectedStatus,
+                "generated trust response must decode \(expectedStatus)"
+            )
+        }
+        _ = try decodeFixture(
+            FlitProjectsListRequest.self,
+            at: "\(fixtureRoot)/projects_list.request.json"
+        )
+        _ = try decodeFixture(
+            FlitProjectsListResponse.self,
+            at: "\(fixtureRoot)/projects_list.response.json"
+        )
+        let driftedInspection = Data(
+            """
+            {
+              "protocol_version": "\(flitClientProtocolVersion)",
+              "canonical_path": "/tmp/flit-project",
+              "selected_via_symlink": false
+            }
+            """.utf8
+        )
+        try requireDecodingFailure(
+            FlitProjectInspectionResponse.self,
+            from: driftedInspection,
+            "generated Project decoding must reject a missing required field"
+        )
+        let driftedRegistration = Data(
+            """
+            {
+              "protocol_version": "\(flitClientProtocolVersion)",
+              "status": "invented_status",
+              "project": null,
+              "existing_project_id": null
+            }
+            """.utf8
+        )
+        try requireDecodingFailure(
+            FlitProjectRegistrationResponse.self,
+            from: driftedRegistration,
+            "generated Project decoding must reject an unknown status"
+        )
+
+        let projectDirectory = "\(root)/target/flit-macos/native-project"
+        try FileManager.default.createDirectory(
+            atPath: projectDirectory,
+            withIntermediateDirectories: true
+        )
+        try requireCommandError(
+            try projectInspectJson(
+                selectedPath: "\(root)/target/flit-macos/missing-project",
+                clientProtocolVersion: requestVersion
+            ),
+            code: .projectInspectionFailure,
+            fixtures: commandErrors
+        )
+        try requireCommandError(
+            try projectsListPageJson(
+                afterDisplayName: "Project",
+                afterProjectId: nil,
+                limit: 50,
+                clientProtocolVersion: requestVersion
+            ),
+            code: .invalidProjectRequest,
+            fixtures: commandErrors
+        )
+        let inspected = try projectInspectJson(
+            selectedPath: projectDirectory,
+            clientProtocolVersion: requestVersion
+        )
+        let inspectedObject = try JSONDecoder().decode(
+            FlitProjectInspectionResponse.self,
+            from: Data(inspected.utf8)
+        )
+        try require(
+            !inspectedObject.selectedViaSymlink,
+            "native Project inspection must preserve direct selection"
+        )
+        let registered = try projectRegisterJson(
+            projectId: "native-project",
+            displayName: "Native Project",
+            selectedPath: projectDirectory,
+            createdAt: "2026-07-27T00:00:00.000Z",
+            clientProtocolVersion: requestVersion
+        )
+        let registeredObject = try JSONDecoder().decode(
+            FlitProjectRegistrationResponse.self,
+            from: Data(registered.utf8)
+        )
+        try require(
+            registeredObject.status == .registered,
+            "native Project registration must return its typed status"
+        )
+        let conflictDirectory = "\(root)/target/flit-macos/native-project-conflict"
+        try FileManager.default.createDirectory(
+            atPath: conflictDirectory,
+            withIntermediateDirectories: true
+        )
+        try requireCommandError(
+            try projectRegisterJson(
+                projectId: "native-project",
+                displayName: "Conflicting Native Project",
+                selectedPath: conflictDirectory,
+                createdAt: "2026-07-27T00:00:00.000Z",
+                clientProtocolVersion: requestVersion
+            ),
+            code: .projectConflict,
+            fixtures: commandErrors
+        )
+        try requireCommandError(
+            try projectTrustJson(
+                projectId: "missing-native-project",
+                selectedPath: projectDirectory,
+                confirmedAt: "2026-07-27T00:00:01.000Z",
+                clientProtocolVersion: requestVersion
+            ),
+            code: .projectNotFound,
+            fixtures: commandErrors
+        )
+        let trusted = try projectTrustJson(
+            projectId: "native-project",
+            selectedPath: projectDirectory,
+            confirmedAt: "2026-07-27T00:00:01.000Z",
+            clientProtocolVersion: requestVersion
+        )
+        let trustedObject = try JSONDecoder().decode(
+            FlitProjectTrustResponse.self,
+            from: Data(trusted.utf8)
+        )
+        try require(
+            trustedObject.status == .trusted && trustedObject.project.trusted,
+            "native Project trust must decode its exact typed result"
+        )
+        let listed = try projectsListPageJson(
+            afterDisplayName: nil,
+            afterProjectId: nil,
+            limit: 50,
+            clientProtocolVersion: requestVersion
+        )
+        let listedObject = try JSONDecoder().decode(
+            FlitProjectsListResponse.self,
+            from: Data(listed.utf8)
+        )
+        try require(
+            listedObject.projects.count == 1 && listedObject.nextCursor == nil,
+            "native Project list must return the registered active Project"
+        )
+        let driftDirectory = "\(root)/target/flit-macos/native-project-drift"
+        let movedDriftDirectory = "\(driftDirectory)-moved"
+        try FileManager.default.createDirectory(
+            atPath: driftDirectory,
+            withIntermediateDirectories: true
+        )
+        _ = try projectRegisterJson(
+            projectId: "native-project-drift",
+            displayName: "Native Project Drift",
+            selectedPath: driftDirectory,
+            createdAt: "2026-07-27T00:00:02.000Z",
+            clientProtocolVersion: requestVersion
+        )
+        try FileManager.default.moveItem(
+            atPath: driftDirectory,
+            toPath: movedDriftDirectory
+        )
+        try FileManager.default.createDirectory(
+            atPath: driftDirectory,
+            withIntermediateDirectories: true
+        )
+        try requireCommandError(
+            try projectTrustJson(
+                projectId: "native-project-drift",
+                selectedPath: driftDirectory,
+                confirmedAt: "2026-07-27T00:00:03.000Z",
+                clientProtocolVersion: requestVersion
+            ),
+            code: .projectIdentityMismatch,
+            fixtures: commandErrors
+        )
 
         guard case .ready = client.load() else {
             throw NativeHealthTestFailure.failed("repeated native health must remain ready")

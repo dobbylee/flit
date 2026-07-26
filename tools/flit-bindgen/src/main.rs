@@ -2,7 +2,7 @@ use std::{env, ffi::OsString, fs, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 use camino::Utf8PathBuf;
-use flit_protocol::PROTOCOL_VERSION;
+use flit_protocol::{PROTOCOL_VERSION, generated_swift_command_contract};
 use uniffi_bindgen::bindings::{GenerateOptions, TargetLanguage, generate};
 
 fn required_path(value: Option<OsString>, description: &str) -> Result<Utf8PathBuf> {
@@ -38,10 +38,7 @@ fn main() -> Result<()> {
     }
     fs::write(
         output.join("FlitProtocol.swift"),
-        format!(
-            "// Generated from flit_protocol::PROTOCOL_VERSION. Do not edit.\n\
-             let flitClientProtocolVersion = \"{PROTOCOL_VERSION}\"\n"
-        ),
+        generated_swift_command_contract(),
     )
-    .context("writing the generated Swift client protocol version")
+    .context("writing the generated Swift command contract")
 }

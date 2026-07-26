@@ -8,8 +8,17 @@ use std::{
     },
 };
 
-use flit_protocol::{CommandError, HealthStatus, PROTOCOL_VERSION, SystemHealthResponse};
-use flit_store::Store;
+use flit_protocol::{
+    CommandError, CommandErrorCode, HealthStatus, PROTOCOL_VERSION, ProjectInspectionResponse,
+    ProjectListCursor as ProjectListCursorResponse, ProjectRecord, ProjectRegistrationResponse,
+    ProjectRegistrationStatus, ProjectTrustResponse, ProjectTrustStatus, ProjectsListResponse,
+    SystemHealthResponse,
+};
+use flit_store::{
+    MAX_PROJECT_PAGE_SIZE, Project, ProjectDirectoryInspection,
+    ProjectListCursor as StoreProjectListCursor, ProjectRegistration, ProjectRegistrationOutcome,
+    ProjectTrustConfirmation, ProjectTrustOutcome, Store, StoreError,
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -19,6 +28,11 @@ pub mod codex_recovery;
 const DATABASE_FILE_NAME: &str = "flit.sqlite3";
 const LOCK_FILE_NAME: &str = "core.lock";
 const MAX_DATA_DIRECTORY_BYTES: usize = 4_096;
+const MAX_PROJECT_ID_BYTES: usize = 128;
+const MAX_PROJECT_DISPLAY_NAME_BYTES: usize = 256;
+const MAX_PROJECT_PATH_BYTES: usize = 4_096;
+const MAX_TIMESTAMP_BYTES: usize = 64;
+const MAX_PROJECT_RESPONSE_BYTES: usize = 1_048_576;
 
 static CORE: LazyLock<CoreManager> = LazyLock::new(CoreManager::default);
 static CORE_CONSTRUCTIONS: AtomicU64 = AtomicU64::new(0);
@@ -41,6 +55,18 @@ pub enum BridgeError {
     CoreLockFailure,
     #[error("the Core Store could not be initialized")]
     StorageFailure,
+    #[error("the Project request is invalid")]
+    InvalidProjectRequest,
+    #[error("the Project directory could not be inspected")]
+    ProjectInspectionFailure,
+    #[error("the Project identity conflicts with stored state")]
+    ProjectConflict,
+    #[error("the Project was not found")]
+    ProjectNotFound,
+    #[error("the current Project directory identity does not match stored state")]
+    ProjectIdentityMismatch,
+    #[error("the Project response exceeds the native bridge limit")]
+    ProjectResponseTooLarge,
     #[error("the embedded Rust Core could not serialize the response")]
     SerializationFailure,
 }
@@ -49,7 +75,7 @@ struct FoundationCore {
     requested_data_directory: PathBuf,
     canonical_data_directory: PathBuf,
     // Rust drops fields in declaration order, so close SQLite before releasing the guard.
-    _store: Store,
+    store: Store,
     _guard: File,
 }
 
@@ -127,6 +153,17 @@ impl CoreManager {
         }
     }
 
+    fn with_ready_core<T>(
+        &self,
+        operation: impl FnOnce(&mut FoundationCore) -> Result<T, BridgeError>,
+    ) -> Result<T, BridgeError> {
+        let mut state = self.lock_state();
+        match &mut *state {
+            CoreState::Ready(core) => operation(core),
+            CoreState::Uninitialized { .. } => Err(BridgeError::StorageFailure),
+        }
+    }
+
     fn lock_state(&self) -> MutexGuard<'_, CoreState> {
         self.state
             .lock()
@@ -181,7 +218,7 @@ impl FoundationCore {
         Ok(Self {
             requested_data_directory,
             canonical_data_directory,
-            _store: store,
+            store,
             _guard: guard,
         })
     }
@@ -309,6 +346,93 @@ fn health_json(
     serde_json::to_string(&payload).map_err(|_| BridgeError::SerializationFailure)
 }
 
+fn validate_project_input(value: &str, max_bytes: usize) -> Result<(), BridgeError> {
+    if value.trim().is_empty() || value.len() > max_bytes || value.contains('\0') {
+        return Err(BridgeError::InvalidProjectRequest);
+    }
+    Ok(())
+}
+
+fn validate_project_protocol(client_protocol_version: &str) -> Result<(), BridgeError> {
+    if client_protocol_version == PROTOCOL_VERSION {
+        Ok(())
+    } else {
+        Err(BridgeError::ProtocolMismatch)
+    }
+}
+
+fn project_record(project: Project) -> Result<ProjectRecord, BridgeError> {
+    Ok(ProjectRecord {
+        id: project.id,
+        display_name: project.display_name,
+        canonical_path: project
+            .canonical_path
+            .into_os_string()
+            .into_string()
+            .map_err(|_| BridgeError::ProjectResponseTooLarge)?,
+        filesystem_id: project.filesystem_id,
+        trusted: project.trusted,
+        default_provider: project.default_provider,
+        created_at: project.created_at,
+        updated_at: project.updated_at,
+    })
+}
+
+fn project_json<T: serde::Serialize>(response: &T) -> Result<String, BridgeError> {
+    let rendered =
+        serde_json::to_string(response).map_err(|_| BridgeError::SerializationFailure)?;
+    if rendered.len() > MAX_PROJECT_RESPONSE_BYTES {
+        return Err(BridgeError::ProjectResponseTooLarge);
+    }
+    Ok(rendered)
+}
+
+fn project_command_error(error: &BridgeError) -> Option<CommandError> {
+    let code = match error {
+        BridgeError::ProtocolMismatch => CommandErrorCode::ProtocolMismatch,
+        BridgeError::InvalidProjectRequest => CommandErrorCode::InvalidProjectRequest,
+        BridgeError::ProjectInspectionFailure => CommandErrorCode::ProjectInspectionFailure,
+        BridgeError::ProjectConflict => CommandErrorCode::ProjectConflict,
+        BridgeError::ProjectNotFound => CommandErrorCode::ProjectNotFound,
+        BridgeError::ProjectIdentityMismatch => CommandErrorCode::ProjectIdentityMismatch,
+        BridgeError::StorageFailure => CommandErrorCode::StorageUnavailable,
+        BridgeError::CoreFailure
+        | BridgeError::InvalidDataDirectory
+        | BridgeError::CoreAlreadyInitialized
+        | BridgeError::CoreAlreadyRunning
+        | BridgeError::CoreLockFailure
+        | BridgeError::ProjectResponseTooLarge
+        | BridgeError::SerializationFailure => return None,
+    };
+    Some(CommandError::for_code(code))
+}
+
+fn project_command_json<T: serde::Serialize>(
+    operation: impl FnOnce() -> Result<T, BridgeError>,
+) -> Result<String, BridgeError> {
+    match operation() {
+        Ok(response) => project_json(&response),
+        Err(error) => match project_command_error(&error) {
+            Some(command_error) => project_json(&command_error),
+            None => Err(error),
+        },
+    }
+}
+
+fn map_project_store_error(error: StoreError) -> BridgeError {
+    match error {
+        StoreError::InvalidProjectRegistration { .. }
+        | StoreError::InvalidProjectTrustConfirmation { .. }
+        | StoreError::InvalidProjectPageLimit { .. } => BridgeError::InvalidProjectRequest,
+        StoreError::ProjectInspection(_) => BridgeError::ProjectInspectionFailure,
+        StoreError::ProjectIdConflict { .. } => BridgeError::ProjectConflict,
+        StoreError::MissingProject { .. } => BridgeError::ProjectNotFound,
+        StoreError::ProjectFilesystemIdentityUnavailable { .. }
+        | StoreError::ProjectIdentityMismatch { .. } => BridgeError::ProjectIdentityMismatch,
+        _ => BridgeError::StorageFailure,
+    }
+}
+
 #[uniffi::export]
 pub fn initialize_core(
     data_directory: String,
@@ -331,6 +455,176 @@ pub fn system_health_json(client_protocol_version: String) -> Result<String, Bri
 }
 
 #[uniffi::export]
+pub fn project_inspect_json(
+    selected_path: String,
+    client_protocol_version: String,
+) -> Result<String, BridgeError> {
+    protect(|| {
+        project_command_json(|| {
+            validate_project_protocol(&client_protocol_version)?;
+            validate_project_input(&selected_path, MAX_PROJECT_PATH_BYTES)?;
+            CORE.with_ready_core(|_| {
+                let inspection = ProjectDirectoryInspection::inspect(&selected_path)
+                    .map_err(|_| BridgeError::ProjectInspectionFailure)?;
+                Ok(ProjectInspectionResponse {
+                    protocol_version: PROTOCOL_VERSION.to_owned(),
+                    canonical_path: inspection
+                        .identity
+                        .canonical_path
+                        .into_os_string()
+                        .into_string()
+                        .map_err(|_| BridgeError::ProjectInspectionFailure)?,
+                    filesystem_id: inspection.identity.filesystem_id,
+                    selected_via_symlink: inspection.selected_via_symlink,
+                })
+            })
+        })
+    })
+}
+
+#[uniffi::export]
+pub fn project_register_json(
+    project_id: String,
+    display_name: String,
+    selected_path: String,
+    created_at: String,
+    client_protocol_version: String,
+) -> Result<String, BridgeError> {
+    protect(|| {
+        project_command_json(|| {
+            validate_project_protocol(&client_protocol_version)?;
+            validate_project_input(&project_id, MAX_PROJECT_ID_BYTES)?;
+            validate_project_input(&display_name, MAX_PROJECT_DISPLAY_NAME_BYTES)?;
+            validate_project_input(&selected_path, MAX_PROJECT_PATH_BYTES)?;
+            validate_project_input(&created_at, MAX_TIMESTAMP_BYTES)?;
+            CORE.with_ready_core(|core| {
+                match core
+                    .store
+                    .register_project(ProjectRegistration {
+                        id: project_id,
+                        display_name,
+                        selected_path: PathBuf::from(selected_path),
+                        created_at,
+                    })
+                    .map_err(map_project_store_error)?
+                {
+                    ProjectRegistrationOutcome::Registered(project) => {
+                        Ok(ProjectRegistrationResponse {
+                            protocol_version: PROTOCOL_VERSION.to_owned(),
+                            status: ProjectRegistrationStatus::Registered,
+                            project: Some(project_record(project)?),
+                            existing_project_id: None,
+                        })
+                    }
+                    ProjectRegistrationOutcome::DuplicateCanonicalPath {
+                        existing_project_id,
+                    } => Ok(ProjectRegistrationResponse {
+                        protocol_version: PROTOCOL_VERSION.to_owned(),
+                        status: ProjectRegistrationStatus::DuplicateCanonicalPath,
+                        project: None,
+                        existing_project_id: Some(existing_project_id),
+                    }),
+                    ProjectRegistrationOutcome::DuplicateFilesystemIdentity {
+                        existing_project_id,
+                    } => Ok(ProjectRegistrationResponse {
+                        protocol_version: PROTOCOL_VERSION.to_owned(),
+                        status: ProjectRegistrationStatus::DuplicateFilesystemIdentity,
+                        project: None,
+                        existing_project_id: Some(existing_project_id),
+                    }),
+                }
+            })
+        })
+    })
+}
+
+#[uniffi::export]
+pub fn project_trust_json(
+    project_id: String,
+    selected_path: String,
+    confirmed_at: String,
+    client_protocol_version: String,
+) -> Result<String, BridgeError> {
+    protect(|| {
+        project_command_json(|| {
+            validate_project_protocol(&client_protocol_version)?;
+            validate_project_input(&project_id, MAX_PROJECT_ID_BYTES)?;
+            validate_project_input(&selected_path, MAX_PROJECT_PATH_BYTES)?;
+            validate_project_input(&confirmed_at, MAX_TIMESTAMP_BYTES)?;
+            CORE.with_ready_core(|core| {
+                let (status, project) = match core
+                    .store
+                    .confirm_project_trust(ProjectTrustConfirmation {
+                        project_id,
+                        selected_path: PathBuf::from(selected_path),
+                        confirmed_at,
+                    })
+                    .map_err(map_project_store_error)?
+                {
+                    ProjectTrustOutcome::Trusted(project) => (ProjectTrustStatus::Trusted, project),
+                    ProjectTrustOutcome::AlreadyTrusted(project) => {
+                        (ProjectTrustStatus::AlreadyTrusted, project)
+                    }
+                };
+                Ok(ProjectTrustResponse {
+                    protocol_version: PROTOCOL_VERSION.to_owned(),
+                    status,
+                    project: project_record(project)?,
+                })
+            })
+        })
+    })
+}
+
+#[uniffi::export]
+pub fn projects_list_page_json(
+    after_display_name: Option<String>,
+    after_project_id: Option<String>,
+    limit: u32,
+    client_protocol_version: String,
+) -> Result<String, BridgeError> {
+    protect(|| {
+        project_command_json(|| {
+            validate_project_protocol(&client_protocol_version)?;
+            let limit = usize::try_from(limit).map_err(|_| BridgeError::InvalidProjectRequest)?;
+            if !(1..=MAX_PROJECT_PAGE_SIZE).contains(&limit) {
+                return Err(BridgeError::InvalidProjectRequest);
+            }
+            let after = match (after_display_name, after_project_id) {
+                (None, None) => None,
+                (Some(display_name), Some(project_id)) => {
+                    validate_project_input(&display_name, MAX_PROJECT_DISPLAY_NAME_BYTES)?;
+                    validate_project_input(&project_id, MAX_PROJECT_ID_BYTES)?;
+                    Some(StoreProjectListCursor {
+                        display_name,
+                        project_id,
+                    })
+                }
+                _ => return Err(BridgeError::InvalidProjectRequest),
+            };
+            CORE.with_ready_core(|core| {
+                let page = core
+                    .store
+                    .list_projects_page(after.as_ref(), limit)
+                    .map_err(map_project_store_error)?;
+                Ok(ProjectsListResponse {
+                    protocol_version: PROTOCOL_VERSION.to_owned(),
+                    projects: page
+                        .projects
+                        .into_iter()
+                        .map(project_record)
+                        .collect::<Result<Vec<_>, _>>()?,
+                    next_cursor: page.next_cursor.map(|cursor| ProjectListCursorResponse {
+                        display_name: cursor.display_name,
+                        project_id: cursor.project_id,
+                    }),
+                })
+            })
+        })
+    })
+}
+
+#[uniffi::export]
 pub fn core_construction_count() -> u64 {
     CORE_CONSTRUCTIONS.load(Ordering::SeqCst)
 }
@@ -343,13 +637,17 @@ mod tests {
 
     use super::*;
 
-    fn fixture(name: &str) -> serde_json::Value {
+    fn fixture_at(version: &str, name: &str) -> serde_json::Value {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
-            .join("fixtures/protocol/commands/v1.0")
+            .join(format!("fixtures/protocol/commands/v{version}"))
             .join(name);
         serde_json::from_str(&fs::read_to_string(path).expect("health fixture should be readable"))
             .expect("health fixture should be valid JSON")
+    }
+
+    fn fixture(name: &str) -> serde_json::Value {
+        fixture_at(PROTOCOL_VERSION, name)
     }
 
     #[test]
@@ -366,9 +664,15 @@ mod tests {
                 .expect("matching protocol should return health"),
         )
         .expect("normal bridge payload should be valid JSON");
+        let previous_request: SystemHealthRequest =
+            serde_json::from_value(fixture_at("1.0", "system_health.request.json"))
+                .expect("previous health request should remain readable");
         let mismatch: serde_json::Value = serde_json::from_str(
-            &health_json("2.0", HealthStatus::NotConfigured)
-                .expect("protocol mismatch should return the typed command payload"),
+            &health_json(
+                &previous_request.client_protocol_version,
+                HealthStatus::NotConfigured,
+            )
+            .expect("protocol mismatch should return the typed command payload"),
         )
         .expect("mismatch bridge payload should be valid JSON");
 
