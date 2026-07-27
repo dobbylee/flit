@@ -956,7 +956,7 @@ fn managed_capabilities(
         || snapshot.status(ProviderCapability::Launch) != CapabilityStatus::Supported
         || snapshot.status(ProviderCapability::PermissionModeConfigure)
             != CapabilityStatus::Supported
-        || snapshot.status(ProviderCapability::PermissionRespond) != CapabilityStatus::Unsupported
+        || snapshot.status(ProviderCapability::PermissionRespond) != CapabilityStatus::Supported
     {
         return Err(ManagedStartError::ProviderUnavailable);
     }
@@ -1419,7 +1419,7 @@ mod tests {
         assert_eq!(session.cwd, project);
         assert_eq!(
             session.capabilities["permission_respond"],
-            Value::String("unsupported".to_owned())
+            Value::String("supported".to_owned())
         );
         assert_eq!(session.capabilities.len(), ProviderCapability::ALL.len());
         assert_eq!(

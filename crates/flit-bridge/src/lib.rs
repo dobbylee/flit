@@ -1643,6 +1643,7 @@ mod tests {
         CodexPermissionDecision, CodexPermissionDelivery, CodexPermissionRequest,
         CodexRuntimeFingerprint, CodexStartedTurn, CodexTurnObservation, CodexTurnTerminalOutcome,
         ProviderFingerprint, classify_codex, validated_codex_0_144_6_fingerprint,
+        validated_codex_0_145_0_fingerprint,
     };
     use flit_store::{
         InitialManagedSessionConnection, ManagedRunIntent, ProjectRegistration,
@@ -2029,6 +2030,39 @@ mod tests {
         assert_eq!(
             ready_health,
             fixture("system_health.providers_ready.response.json")
+        );
+
+        let manual_profile = validated_codex_0_145_0_fingerprint();
+        let manual = provider_diagnostics_response(Ok(CodexCompatibilityProbe {
+            runtime_fingerprint: CodexRuntimeFingerprint {
+                canonical_executable: manual_profile.canonical_executable.clone(),
+                executable_version: manual_profile.executable_version.clone(),
+                executable_sha256: manual_profile.executable_sha256.clone(),
+                combined_schema_sha256: manual_profile.combined_schema_sha256.clone(),
+                v2_schema_sha256: manual_profile.v2_schema_sha256.clone(),
+            },
+            validated_profile: Some(manual_profile.clone()),
+            capability_snapshot: classify_codex(&manual_profile),
+            version_stderr_bytes: 0,
+            schema_stdout_bytes: 0,
+            schema_stderr_bytes: 0,
+        }));
+        assert_eq!(
+            manual
+                .capabilities
+                .iter()
+                .find(|entry| entry.capability == ProtocolProviderCapability::PermissionRespond)
+                .map(|entry| entry.status),
+            Some(ProtocolCapabilityStatus::Supported)
+        );
+        assert_eq!(
+            manual.capabilities.iter().find(|entry| {
+                entry.capability == ProtocolProviderCapability::ProviderOutcomeObserve
+            }),
+            Some(&ProviderCapabilityEntry {
+                capability: ProtocolProviderCapability::ProviderOutcomeObserve,
+                status: ProtocolCapabilityStatus::Unsupported,
+            })
         );
 
         let unavailable = provider_diagnostics_response(Err(

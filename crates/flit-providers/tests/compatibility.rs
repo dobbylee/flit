@@ -66,7 +66,7 @@ fn exact_validated_codex_fingerprint_exposes_only_the_recorded_capability_matrix
 }
 
 #[test]
-fn exact_manual_profile_enables_only_policy_configuration() {
+fn exact_manual_profile_enables_configuration_and_permission_response_only() {
     let snapshot = classify_codex(&validated_codex_0_145_0_fingerprint());
     assert_eq!(snapshot.compatibility, ProviderCompatibility::Supported);
     assert_eq!(
@@ -75,7 +75,7 @@ fn exact_manual_profile_enables_only_policy_configuration() {
     );
     assert_eq!(
         snapshot.status(ProviderCapability::PermissionRespond),
-        CapabilityStatus::Unsupported
+        CapabilityStatus::Supported
     );
     assert_eq!(
         snapshot.status(ProviderCapability::ProviderOutcomeObserve),
