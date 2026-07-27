@@ -2,11 +2,12 @@ use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use flit_protocol::{
     CapabilityStatus, CommandError, EVENT_PROTOCOL_VERSION, EventEnvelope, EventProtocolVersion,
-    MAX_JSON_SAFE_INTEGER, PROTOCOL_VERSION, ProjectInspectionRequest, ProjectInspectionResponse,
-    ProjectRegistrationRequest, ProjectRegistrationResponse, ProjectTrustRequest,
-    ProjectTrustResponse, ProjectsListRequest, ProjectsListResponse, ProviderCompatibility,
-    ProviderDiagnosticsRequest, ProviderDiagnosticsResponse, ProviderUnavailableReason,
-    SystemHealthRequest, SystemHealthResponse, event_schema_id, event_schema_relative_path,
+    MAX_JSON_SAFE_INTEGER, ManagedRunStartRequest, ManagedRunStartResponse, PROTOCOL_VERSION,
+    ProjectInspectionRequest, ProjectInspectionResponse, ProjectRegistrationRequest,
+    ProjectRegistrationResponse, ProjectTrustRequest, ProjectTrustResponse, ProjectsListRequest,
+    ProjectsListResponse, ProviderCompatibility, ProviderDiagnosticsRequest,
+    ProviderDiagnosticsResponse, ProviderUnavailableReason, SystemHealthRequest,
+    SystemHealthResponse, event_schema_id, event_schema_relative_path,
     generated_swift_command_contract,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -270,6 +271,35 @@ fn current_provider_diagnostics_fixtures_are_exhaustive_and_path_free() {
 }
 
 #[test]
+fn current_managed_run_start_fixtures_round_trip_every_shape() {
+    let manifest = read_command_compatibility_manifest();
+    let current = &manifest.current;
+    assert_fixture_round_trip::<ManagedRunStartRequest>(&command_fixture(
+        current,
+        "managed_run_start.request.json",
+    ));
+    assert_fixture_round_trip::<ManagedRunStartResponse>(&command_fixture(
+        current,
+        "managed_run_start.response.json",
+    ));
+    assert_fixture_round_trip::<Vec<CommandError>>(&command_fixture(
+        current,
+        "managed_run_errors.json",
+    ));
+    let errors: Vec<CommandError> = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "managed_run_errors.json",
+        )))
+        .expect("managed Run error fixture should be readable"),
+    )
+    .expect("managed Run error fixture should match Rust types");
+    for error in errors {
+        assert_eq!(error, CommandError::for_code(error.code));
+    }
+}
+
+#[test]
 fn command_manifest_retains_the_exact_previous_minor_health_contract() {
     let manifest = read_command_compatibility_manifest();
     assert_eq!(manifest.current.version, PROTOCOL_VERSION);
@@ -369,6 +399,9 @@ fn generated_swift_project_contract_is_current_and_required_fields_fail_closed()
         "FlitCommandError",
         "FlitProviderDiagnosticsRequest",
         "FlitProviderDiagnosticsResponse",
+        "FlitManagedRunPermissionMode",
+        "FlitManagedRunStartRequest",
+        "FlitManagedRunStartResponse",
     ] {
         assert!(
             generated.contains(type_name),

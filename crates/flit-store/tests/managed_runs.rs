@@ -221,6 +221,19 @@ fn managed_run_and_exact_session_are_atomic_idempotent_and_reopen() {
             .collect::<Vec<_>>(),
         [1, 2]
     );
+    assert_eq!(
+        created_run.goal.as_deref(),
+        Some("Respond with the requested result.")
+    );
+    let created_payload = serde_json::to_string(&created_events[0].payload)
+        .expect("run.created payload should serialize");
+    assert!(!created_payload.contains("Respond with the requested result."));
+    assert_eq!(
+        created_events[0].payload.get("goal_sha256"),
+        Some(&serde_json::json!(
+            "a243866e405346bd1d66fd94322c0fa65e62cbda534a98cdb60f6a396a3802f9"
+        ))
+    );
     let duplicate = store
         .create_managed_run_intent(intent)
         .expect("duplicate Run intent");
@@ -522,6 +535,18 @@ fn external_identity_cwd_live_session_and_retry_conflicts_fail_closed() {
     assert!(matches!(
         store.connect_initial_managed_session(identity_conflict),
         Err(StoreError::ManagedSessionIdentityConflict { .. })
+    ));
+
+    let mut combined_identity_conflict =
+        session_connection("session-1", "run-2", "thread-shared", &project_path);
+    combined_identity_conflict.session_fingerprint = "different-fingerprint".to_owned();
+    assert!(matches!(
+        store.connect_initial_managed_session(combined_identity_conflict),
+        Err(StoreError::ExternalSessionAlreadyClaimed {
+            ref claimed_run_id,
+            ref claimed_session_id,
+            ..
+        }) if claimed_run_id == "run-1" && claimed_session_id == "session-1"
     ));
 
     assert!(matches!(

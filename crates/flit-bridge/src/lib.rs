@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions, TryLockError},
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
@@ -10,9 +11,9 @@ use std::{
 
 use flit_protocol::{
     CapabilityStatus as ProtocolCapabilityStatus, CommandError, CommandErrorCode,
-    FingerprintAxis as ProtocolFingerprintAxis, HealthStatus, PROTOCOL_VERSION,
-    ProjectInspectionResponse, ProjectListCursor as ProjectListCursorResponse, ProjectRecord,
-    ProjectRegistrationResponse, ProjectRegistrationStatus, ProjectTrustResponse,
+    FingerprintAxis as ProtocolFingerprintAxis, HealthStatus, ManagedRunStartRequest,
+    PROTOCOL_VERSION, ProjectInspectionResponse, ProjectListCursor as ProjectListCursorResponse,
+    ProjectRecord, ProjectRegistrationResponse, ProjectRegistrationStatus, ProjectTrustResponse,
     ProjectTrustStatus, ProjectsListResponse, ProviderCapability as ProtocolProviderCapability,
     ProviderCapabilityEntry, ProviderCompatibility as ProtocolProviderCompatibility,
     ProviderDiagnosticsResponse, ProviderKind as ProtocolProviderKind, ProviderUnavailableReason,
@@ -33,6 +34,7 @@ use flit_store::{
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 pub mod codex_recovery;
+mod managed_start;
 
 const DATABASE_FILE_NAME: &str = "flit.sqlite3";
 const LOCK_FILE_NAME: &str = "core.lock";
@@ -43,6 +45,7 @@ const MAX_PROJECT_PATH_BYTES: usize = 4_096;
 const MAX_TIMESTAMP_BYTES: usize = 64;
 const MAX_PROJECT_RESPONSE_BYTES: usize = 1_048_576;
 const MAX_PROVIDER_DIAGNOSTICS_RESPONSE_BYTES: usize = 65_536;
+const MAX_MANAGED_RUN_REQUEST_BYTES: usize = 128 * 1_024;
 
 static CORE: LazyLock<CoreManager> = LazyLock::new(CoreManager::default);
 static PROVIDER_DIAGNOSTIC_LOCK: LazyLock<Mutex<()>> = LazyLock::new(Mutex::default);
@@ -80,6 +83,8 @@ pub enum BridgeError {
     ProjectResponseTooLarge,
     #[error("the provider diagnostics response exceeds the native bridge limit")]
     ProviderDiagnosticsResponseTooLarge,
+    #[error("the managed Run request or response exceeds the native bridge limit")]
+    ManagedRunResponseTooLarge,
     #[error("the embedded Rust Core could not serialize the response")]
     SerializationFailure,
 }
@@ -87,7 +92,8 @@ pub enum BridgeError {
 struct FoundationCore {
     requested_data_directory: PathBuf,
     canonical_data_directory: PathBuf,
-    // Rust drops fields in declaration order, so close SQLite before releasing the guard.
+    // Rust drops fields in declaration order, so stop providers and close SQLite before the guard.
+    managed_runtimes: BTreeMap<String, managed_start::RetainedManagedRun>,
     store: Store,
     provider_health: HealthStatus,
     _guard: File,
@@ -256,6 +262,7 @@ impl FoundationCore {
         Ok(Self {
             requested_data_directory,
             canonical_data_directory,
+            managed_runtimes: BTreeMap::new(),
             store,
             provider_health: HealthStatus::NotConfigured,
             _guard: guard,
@@ -455,6 +462,7 @@ fn project_command_error(error: &BridgeError) -> Option<CommandError> {
         | BridgeError::CoreLockFailure
         | BridgeError::ProjectResponseTooLarge
         | BridgeError::ProviderDiagnosticsResponseTooLarge
+        | BridgeError::ManagedRunResponseTooLarge
         | BridgeError::SerializationFailure => return None,
     };
     Some(CommandError::for_code(code))
@@ -857,6 +865,81 @@ pub fn projects_list_page_json(
 }
 
 #[uniffi::export]
+pub fn managed_run_start_json(request_json: String) -> Result<String, BridgeError> {
+    protect(|| {
+        if request_json.len() > MAX_MANAGED_RUN_REQUEST_BYTES {
+            return project_json(&CommandError::for_code(CommandErrorCode::InvalidRunRequest));
+        }
+        let request = match serde_json::from_str::<ManagedRunStartRequest>(&request_json) {
+            Ok(request) => request,
+            Err(_) => {
+                return project_json(&CommandError::for_code(CommandErrorCode::InvalidRunRequest));
+            }
+        };
+        if request.client_protocol_version != PROTOCOL_VERSION {
+            return project_json(&CommandError::protocol_mismatch());
+        }
+        let result = with_provider_diagnostic_lock(|| {
+            CORE.with_ready_core(|core| {
+                let path_environment = std::env::var_os("PATH");
+                match managed_start::start_managed_run(
+                    &mut core.store,
+                    &mut core.managed_runtimes,
+                    &managed_start::ProductionCodexConnector,
+                    path_environment.as_deref(),
+                    request,
+                ) {
+                    Ok(response) => {
+                        core.provider_health = HealthStatus::Ready;
+                        bounded_json(
+                            &response,
+                            MAX_PROJECT_RESPONSE_BYTES,
+                            BridgeError::ManagedRunResponseTooLarge,
+                        )
+                    }
+                    Err(error) => {
+                        if error == managed_start::ManagedStartError::ProviderUnavailable {
+                            core.provider_health = HealthStatus::Unavailable;
+                        }
+                        project_json(&CommandError::for_code(managed_start_error_code(error)))
+                    }
+                }
+            })
+        });
+        match result {
+            Err(BridgeError::StorageFailure) => project_json(&CommandError::for_code(
+                CommandErrorCode::StorageUnavailable,
+            )),
+            result => result,
+        }
+    })
+}
+
+fn managed_start_error_code(error: managed_start::ManagedStartError) -> CommandErrorCode {
+    match error {
+        managed_start::ManagedStartError::InvalidRequest => CommandErrorCode::InvalidRunRequest,
+        managed_start::ManagedStartError::RunConflict => CommandErrorCode::RunConflict,
+        managed_start::ManagedStartError::ProjectNotFound => CommandErrorCode::ProjectNotFound,
+        managed_start::ManagedStartError::ProjectNotTrusted => CommandErrorCode::ProjectNotTrusted,
+        managed_start::ManagedStartError::ProjectIdentityMismatch => {
+            CommandErrorCode::ProjectIdentityMismatch
+        }
+        managed_start::ManagedStartError::ProviderUnavailable => {
+            CommandErrorCode::ProviderUnavailable
+        }
+        managed_start::ManagedStartError::ProviderStartFailed => {
+            CommandErrorCode::ProviderStartFailed
+        }
+        managed_start::ManagedStartError::ProviderStartUnknown => {
+            CommandErrorCode::ProviderStartUnknown
+        }
+        managed_start::ManagedStartError::StorageUnavailable => {
+            CommandErrorCode::StorageUnavailable
+        }
+    }
+}
+
+#[uniffi::export]
 pub fn core_construction_count() -> u64 {
     CORE_CONSTRUCTIONS.load(Ordering::SeqCst)
 }
@@ -928,6 +1011,26 @@ mod tests {
 
         assert_eq!(normal, fixture("system_health.response.json"));
         assert_eq!(mismatch, fixture("protocol_mismatch.error.json"));
+    }
+
+    #[test]
+    fn managed_run_start_rejects_malformed_and_mismatched_requests_as_command_errors() {
+        let malformed: CommandError = serde_json::from_str(
+            &managed_run_start_json("{}".to_owned()).expect("malformed command response"),
+        )
+        .expect("typed malformed command error");
+        assert_eq!(
+            malformed,
+            CommandError::for_code(CommandErrorCode::InvalidRunRequest)
+        );
+
+        let mut mismatch = fixture("managed_run_start.request.json");
+        mismatch["client_protocol_version"] = serde_json::Value::String("9.9".to_owned());
+        let mismatch: CommandError = serde_json::from_str(
+            &managed_run_start_json(mismatch.to_string()).expect("mismatch command response"),
+        )
+        .expect("typed mismatch command error");
+        assert_eq!(mismatch, CommandError::protocol_mismatch());
     }
 
     #[test]

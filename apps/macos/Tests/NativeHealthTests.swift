@@ -109,7 +109,12 @@ struct NativeHealthTests {
         let retainedV11BridgeError: BridgeError = .ProjectResponseTooLarge
         try require(
             retainedV11BridgeError == .ProjectResponseTooLarge,
-            "protocol 1.2 must retain the generated 1.1 Project response error case"
+            "protocol 1.3 must retain the generated Project response error case"
+        )
+        let managedRunBridgeError: BridgeError = .ManagedRunResponseTooLarge
+        try require(
+            managedRunBridgeError == .ManagedRunResponseTooLarge,
+            "protocol 1.3 must generate the managed Run bridge error case"
         )
         let outgoingRequest = try JSONSerialization.data(
             withJSONObject: ["client_protocol_version": client.clientProtocolVersion],
@@ -301,6 +306,32 @@ struct NativeHealthTests {
                 "generated provider diagnostics must decode \(compatibility)"
             )
         }
+        let managedRunRequest = try decodeFixture(
+            FlitManagedRunStartRequest.self,
+            at: "\(fixtureRoot)/managed_run_start.request.json"
+        )
+        try require(
+            managedRunRequest.permissionMode == .manual
+                && managedRunRequest.permissionModeVersion == 1,
+            "generated managed Run request must preserve exact Manual mode version"
+        )
+        let managedRunResponse = try decodeFixture(
+            FlitManagedRunStartResponse.self,
+            at: "\(fixtureRoot)/managed_run_start.response.json"
+        )
+        try require(
+            managedRunResponse.providerThreadId == "codex-thread-1"
+                && managedRunResponse.providerTurnId == "codex-turn-1",
+            "generated managed Run response must preserve provider identities"
+        )
+        let managedRunErrors = try decodeFixture(
+            [FlitCommandError].self,
+            at: "\(fixtureRoot)/managed_run_errors.json"
+        )
+        try require(
+            managedRunErrors.count == 6,
+            "generated managed Run errors must decode every public failure"
+        )
         let driftedInspection = Data(
             """
             {

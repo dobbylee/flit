@@ -4,7 +4,7 @@ use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: &str = "1.2";
+pub const PROTOCOL_VERSION: &str = "1.3";
 pub const EVENT_PROTOCOL_VERSION: &str = "1.0";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -224,6 +224,45 @@ pub struct ProviderDiagnosticsResponse {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedRunPermissionMode {
+    Manual,
+    ApproveForMe,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ManagedRunStartRequest {
+    pub run_id: String,
+    pub session_id: String,
+    pub project_id: String,
+    pub title: String,
+    pub goal: String,
+    pub provider: ProviderKind,
+    pub permission_mode: ManagedRunPermissionMode,
+    pub permission_mode_version: u64,
+    pub created_at: String,
+    pub started_at: String,
+    pub run_created_event_id: String,
+    pub start_requested_event_id: String,
+    pub session_connected_event_id: String,
+    pub start_failed_event_id: String,
+    pub start_unknown_event_id: String,
+    pub client_protocol_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ManagedRunStartResponse {
+    pub protocol_version: String,
+    pub run_id: String,
+    pub session_id: String,
+    pub provider_thread_id: String,
+    pub provider_turn_id: String,
+    pub permission_mode: ManagedRunPermissionMode,
+    pub permission_mode_version: u64,
+    pub provider_policy: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CommandErrorCode {
     ProtocolMismatch,
@@ -233,6 +272,12 @@ pub enum CommandErrorCode {
     ProjectNotFound,
     ProjectIdentityMismatch,
     StorageUnavailable,
+    InvalidRunRequest,
+    RunConflict,
+    ProjectNotTrusted,
+    ProviderUnavailable,
+    ProviderStartFailed,
+    ProviderStartUnknown,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -380,6 +425,12 @@ impl CommandError {
             CommandErrorCode::ProjectNotFound => "errors.projectNotFound",
             CommandErrorCode::ProjectIdentityMismatch => "errors.projectIdentityMismatch",
             CommandErrorCode::StorageUnavailable => "errors.storageUnavailable",
+            CommandErrorCode::InvalidRunRequest => "errors.invalidRunRequest",
+            CommandErrorCode::RunConflict => "errors.runConflict",
+            CommandErrorCode::ProjectNotTrusted => "errors.projectNotTrusted",
+            CommandErrorCode::ProviderUnavailable => "errors.providerUnavailable",
+            CommandErrorCode::ProviderStartFailed => "errors.providerStartFailed",
+            CommandErrorCode::ProviderStartUnknown => "errors.providerStartUnknown",
         };
         Self {
             code,
@@ -556,6 +607,12 @@ enum FlitCommandErrorCode: String, Codable, Sendable {
     case projectNotFound = "PROJECT_NOT_FOUND"
     case projectIdentityMismatch = "PROJECT_IDENTITY_MISMATCH"
     case storageUnavailable = "STORAGE_UNAVAILABLE"
+    case invalidRunRequest = "INVALID_RUN_REQUEST"
+    case runConflict = "RUN_CONFLICT"
+    case projectNotTrusted = "PROJECT_NOT_TRUSTED"
+    case providerUnavailable = "PROVIDER_UNAVAILABLE"
+    case providerStartFailed = "PROVIDER_START_FAILED"
+    case providerStartUnknown = "PROVIDER_START_UNKNOWN"
 }
 
 struct FlitCommandError: Codable, Equatable, Sendable {
@@ -655,6 +712,71 @@ struct FlitProviderDiagnosticsResponse: Codable, Equatable, Sendable {
         case capabilities
         case fingerprintMismatches = "fingerprint_mismatches"
         case unavailableReason = "unavailable_reason"
+    }
+}
+
+enum FlitManagedRunPermissionMode: String, Codable, Sendable {
+    case manual
+    case approveForMe = "approve_for_me"
+}
+
+struct FlitManagedRunStartRequest: Codable, Equatable, Sendable {
+    let runId: String
+    let sessionId: String
+    let projectId: String
+    let title: String
+    let goal: String
+    let provider: FlitProviderKind
+    let permissionMode: FlitManagedRunPermissionMode
+    let permissionModeVersion: UInt64
+    let createdAt: String
+    let startedAt: String
+    let runCreatedEventId: String
+    let startRequestedEventId: String
+    let sessionConnectedEventId: String
+    let startFailedEventId: String
+    let startUnknownEventId: String
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case projectId = "project_id"
+        case title
+        case goal
+        case provider
+        case permissionMode = "permission_mode"
+        case permissionModeVersion = "permission_mode_version"
+        case createdAt = "created_at"
+        case startedAt = "started_at"
+        case runCreatedEventId = "run_created_event_id"
+        case startRequestedEventId = "start_requested_event_id"
+        case sessionConnectedEventId = "session_connected_event_id"
+        case startFailedEventId = "start_failed_event_id"
+        case startUnknownEventId = "start_unknown_event_id"
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+struct FlitManagedRunStartResponse: Codable, Equatable, Sendable {
+    let protocolVersion: String
+    let runId: String
+    let sessionId: String
+    let providerThreadId: String
+    let providerTurnId: String
+    let permissionMode: FlitManagedRunPermissionMode
+    let permissionModeVersion: UInt64
+    let providerPolicy: String
+
+    private enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case providerThreadId = "provider_thread_id"
+        case providerTurnId = "provider_turn_id"
+        case permissionMode = "permission_mode"
+        case permissionModeVersion = "permission_mode_version"
+        case providerPolicy = "provider_policy"
     }
 }
 "#;

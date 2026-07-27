@@ -1,0 +1,10 @@
+{
+  "protocol_version": "1.3",
+  "run_id": "run-managed-1",
+  "session_id": "session-managed-1",
+  "provider_thread_id": "codex-thread-1",
+  "provider_turn_id": "codex-turn-1",
+  "permission_mode": "manual",
+  "permission_mode_version": 1,
+  "provider_policy": "readOnly+on-request+user"
+}

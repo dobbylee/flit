@@ -649,6 +649,23 @@ impl Store {
             });
         }
 
+        if let Some((claimed_run_id, claimed_session_id)) = transaction
+            .query_row(
+                "SELECT run_id, id FROM agent_sessions WHERE provider_kind = 'codex' AND external_session_key = ?1 ORDER BY ordinal LIMIT 1",
+                [&connection.external_session_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)?
+            && (claimed_run_id != connection.run_id || claimed_session_id != connection.id)
+        {
+            return Err(StoreError::ExternalSessionAlreadyClaimed {
+                external_session_key: connection.external_session_key,
+                claimed_run_id,
+                claimed_session_id,
+            });
+        }
+
         let existing = load_managed_session(&transaction, &connection.id)?;
         let duplicate = if let Some(existing) = &existing {
             if !managed_session_matches_connection(existing, &connection) {
@@ -667,21 +684,6 @@ impl Store {
             if run.ended_at.is_some() {
                 return Err(StoreError::ManagedRunTerminalConflict {
                     run_id: connection.run_id,
-                });
-            }
-            if let Some((claimed_run_id, claimed_session_id)) = transaction
-                .query_row(
-                    "SELECT run_id, id FROM agent_sessions WHERE provider_kind = 'codex' AND external_session_key = ?1 ORDER BY ordinal LIMIT 1",
-                    [&connection.external_session_key],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                )
-                .optional()
-                .map_err(StoreError::Sqlite)?
-            {
-                return Err(StoreError::ExternalSessionAlreadyClaimed {
-                    external_session_key: connection.external_session_key,
-                    claimed_run_id,
-                    claimed_session_id,
                 });
             }
             if let Some(live_session_id) = transaction
@@ -1490,7 +1492,10 @@ fn managed_run_intent_events(
         extensions: BTreeMap::new(),
     };
     let created_payload = json!({
-        "goal": intent.goal,
+        "goal_sha256": intent
+            .goal
+            .as_deref()
+            .map(|goal| sha256_hex(goal.as_bytes())),
         "project_id": intent.project_id,
         "provider": MANAGED_PROVIDER_KIND_CODEX,
     })
