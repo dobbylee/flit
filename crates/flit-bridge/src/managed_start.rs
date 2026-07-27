@@ -27,7 +27,7 @@ const MAX_MANAGED_TITLE_BYTES: usize = 4 * 1_024;
 const MAX_MANAGED_GOAL_BYTES: usize = 64 * 1_024;
 const MAX_MANAGED_TIMESTAMP_BYTES: usize = 128;
 const MANUAL_MODE_VERSION: u64 = 1;
-const MANUAL_PROVIDER_POLICY: &str = "readOnly+on-request+user";
+const MANUAL_PROVIDER_CONFIGURATION: &str = "readOnly+on-request+user";
 #[cfg(test)]
 const MAX_MANAGED_OBSERVATIONS_PER_CALL: usize =
     flit_providers::MAX_CODEX_COMMAND_STARTS_PER_TURN + 1;
@@ -494,7 +494,7 @@ pub(crate) fn start_managed_run(
             return Err(ManagedStartError::ProviderStartUnknown);
         }
     };
-    if started.provider_policy != MANUAL_PROVIDER_POLICY {
+    if started.provider_configuration != MANUAL_PROVIDER_CONFIGURATION {
         if provider
             .delete_started_thread(&started.thread.thread_id)
             .is_err()
@@ -558,7 +558,7 @@ pub(crate) fn start_managed_run(
         provider_turn_id: turn.turn_id.as_str().to_owned(),
         permission_mode: ManagedRunPermissionMode::Manual,
         permission_mode_version: MANUAL_MODE_VERSION,
-        provider_policy: started.provider_policy.to_owned(),
+        provider_configuration: started.provider_configuration.to_owned(),
     };
     runtimes.insert(
         request.run_id,
@@ -954,7 +954,7 @@ fn managed_capabilities(
     let snapshot = classify_codex(profile);
     if snapshot.compatibility != ProviderCompatibility::Supported
         || snapshot.status(ProviderCapability::Launch) != CapabilityStatus::Supported
-        || snapshot.status(ProviderCapability::PermissionPolicyConfigure)
+        || snapshot.status(ProviderCapability::PermissionModeConfigure)
             != CapabilityStatus::Supported
         || snapshot.status(ProviderCapability::PermissionRespond) != CapabilityStatus::Unsupported
     {
@@ -1188,7 +1188,7 @@ mod tests {
                         .expect("thread ID"),
                     canonical_cwd: cwd.to_owned(),
                 },
-                provider_policy: MANUAL_PROVIDER_POLICY,
+                provider_configuration: MANUAL_PROVIDER_CONFIGURATION,
             })
         }
 
@@ -1385,7 +1385,10 @@ mod tests {
         assert_eq!(response.session_id, "session-1");
         assert_eq!(response.provider_thread_id, "thread-1");
         assert_eq!(response.provider_turn_id, "turn-1");
-        assert_eq!(response.provider_policy, MANUAL_PROVIDER_POLICY);
+        assert_eq!(
+            response.provider_configuration,
+            MANUAL_PROVIDER_CONFIGURATION
+        );
         assert_eq!(runtimes.len(), 1);
 
         let run = store.managed_run("run-1").expect("Run read").expect("Run");
@@ -1474,7 +1477,7 @@ mod tests {
         );
 
         let mut automatic = request();
-        automatic.permission_mode = ManagedRunPermissionMode::ApproveForMe;
+        automatic.permission_mode = ManagedRunPermissionMode::ProviderAuto;
         assert_eq!(
             start_managed_run(&mut store, &mut runtimes, &connector, None, automatic,),
             Err(ManagedStartError::InvalidRequest)

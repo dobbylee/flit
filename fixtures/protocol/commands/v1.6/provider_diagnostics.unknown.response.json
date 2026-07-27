@@ -1,0 +1,35 @@
+{
+  "protocol_version": "1.6",
+  "provider": "codex",
+  "compatibility": "unknown",
+  "executable_version": "9.9.9",
+  "capabilities": [
+    {"capability": "launch", "status": "unknown"},
+    {"capability": "list_managed", "status": "unknown"},
+    {"capability": "resume", "status": "unknown"},
+    {"capability": "reconcile", "status": "unknown"},
+    {"capability": "structured_activity", "status": "unknown"},
+    {"capability": "permission_detect", "status": "unknown"},
+    {"capability": "permission_respond", "status": "unknown"},
+    {"capability": "permission_mode_configure", "status": "unknown"},
+    {"capability": "provider_outcome_observe", "status": "unknown"},
+    {"capability": "question_detect", "status": "unknown"},
+    {"capability": "question_respond", "status": "unknown"},
+    {"capability": "completion_detect", "status": "unknown"},
+    {"capability": "history", "status": "unknown"},
+    {"capability": "open_in_provider", "status": "unknown"},
+    {"capability": "continue_after_quit", "status": "unknown"},
+    {"capability": "stop", "status": "unknown"}
+  ],
+  "fingerprint_mismatches": [
+    "canonical_executable",
+    "executable_version",
+    "executable_sha256",
+    "combined_schema_sha256",
+    "v2_schema_sha256",
+    "method_allowlist_sha256",
+    "fixture_sha256",
+    "smoke_run_id"
+  ],
+  "unavailable_reason": null
+}

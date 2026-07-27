@@ -11,7 +11,7 @@ use crate::{
 };
 
 const REQUEST_ITEM_PREFIX: &str = "request:";
-const PROVIDER_POLICY_ITEM_PREFIX: &str = "provider-policy:";
+const PROVIDER_OUTCOME_ITEM_PREFIX: &str = "provider-outcome:";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestAttentionSource {
@@ -167,7 +167,8 @@ pub fn plan_request_attention(
 ) -> Result<RequestAttentionPlan, RequestAttentionError> {
     validate_binding(ingest_seq, request, source)?;
     let mut events = request_events(attention, request, source, &observation)?;
-    if let RequestStatus::Resolved(RequestResolution::ProviderPolicy(resolution)) = request.status()
+    if let RequestStatus::Resolved(RequestResolution::ProviderOutcome(resolution)) =
+        request.status()
     {
         let request_is_transitioning = events.iter().any(|event| {
             matches!(
@@ -176,10 +177,10 @@ pub fn plan_request_attention(
             )
         });
         if request_is_transitioning {
-            validate_provider_policy_slot_empty(attention, resolution)?;
-            events.push(provider_policy_event(resolution, &observation)?);
+            validate_provider_outcome_slot_empty(attention, resolution)?;
+            events.push(provider_outcome_event(resolution, &observation)?);
         } else {
-            validate_existing_provider_policy_item(attention, request, resolution)?;
+            validate_existing_provider_outcome_item(attention, request, resolution)?;
         }
     }
     Ok(RequestAttentionPlan {
@@ -308,20 +309,20 @@ fn request_events(
     Ok(event.into_iter().collect())
 }
 
-fn provider_policy_event(
-    resolution: &crate::request::ProviderPolicyResolution,
+fn provider_outcome_event(
+    resolution: &crate::request::ProviderOutcomeResolution,
     observation: &RequestAttentionObservation,
 ) -> Result<AttentionEvent, RequestAttentionError> {
     let outcome = resolution.outcome();
-    let (item_id, dedupe_key, category, severity) = provider_policy_attributes(resolution)?;
+    let (item_id, dedupe_key) = provider_outcome_attributes(resolution)?;
     let evidence_id = EvidenceId::new(outcome.evidence_id.as_str())
         .map_err(|_| RequestAttentionError::InvalidProviderEvidenceId)?;
     let evidence = AttentionEvidence::new(vec![evidence_id], None)?;
     let draft = AttentionItemDraft::new(
         item_id,
         observation.source_event_id.clone(),
-        category,
-        severity,
+        AttentionCategory::PermissionAudit,
+        AttentionSeverity::Informational,
         false,
         dedupe_key,
         evidence,
@@ -330,79 +331,63 @@ fn provider_policy_event(
     Ok(AttentionEvent::Opened(draft))
 }
 
-fn validate_provider_policy_slot_empty(
+fn validate_provider_outcome_slot_empty(
     attention: &AttentionProjection,
-    resolution: &crate::request::ProviderPolicyResolution,
+    resolution: &crate::request::ProviderOutcomeResolution,
 ) -> Result<(), RequestAttentionError> {
-    let (item_id, dedupe_key, _, _) = provider_policy_attributes(resolution)?;
+    let (item_id, dedupe_key) = provider_outcome_attributes(resolution)?;
     if attention
         .items()
         .iter()
         .any(|item| item.item_id() == &item_id || item.dedupe_key() == &dedupe_key)
     {
-        return Err(RequestAttentionError::IncompatibleProviderPolicyAttentionItem);
+        return Err(RequestAttentionError::IncompatibleProviderOutcomeAttentionItem);
     }
     Ok(())
 }
 
-fn validate_existing_provider_policy_item(
+fn validate_existing_provider_outcome_item(
     attention: &AttentionProjection,
     request: &RequestProjection,
-    resolution: &crate::request::ProviderPolicyResolution,
+    resolution: &crate::request::ProviderOutcomeResolution,
 ) -> Result<(), RequestAttentionError> {
-    let (item_id, dedupe_key, category, severity) = provider_policy_attributes(resolution)?;
+    let (item_id, dedupe_key) = provider_outcome_attributes(resolution)?;
     let candidates = attention
         .items()
         .iter()
         .filter(|item| item.item_id() == &item_id || item.dedupe_key() == &dedupe_key)
         .collect::<Vec<_>>();
     if candidates.is_empty() {
-        return Err(RequestAttentionError::MissingProviderPolicyAttentionItem);
+        return Err(RequestAttentionError::MissingProviderOutcomeAttentionItem);
     }
     let outcome = resolution.outcome();
     let evidence_id = EvidenceId::new(outcome.evidence_id.as_str())
         .map_err(|_| RequestAttentionError::InvalidProviderEvidenceId)?;
     if candidates.len() != 1 {
-        return Err(RequestAttentionError::IncompatibleProviderPolicyAttentionItem);
+        return Err(RequestAttentionError::IncompatibleProviderOutcomeAttentionItem);
     }
     let item = candidates[0];
     if item.item_id() != &item_id
         || item.dedupe_key() != &dedupe_key
-        || item.category() != category
-        || item.severity() != severity
+        || item.category() != AttentionCategory::PermissionAudit
+        || item.severity() != AttentionSeverity::Informational
         || item.blocking()
         || item.created_at() != TimestampMs::new(outcome.captured_at_ms)
         || item.created_ingest_seq() != request.version()
         || !item.evidence().evidence_ids().contains(&evidence_id)
     {
-        return Err(RequestAttentionError::IncompatibleProviderPolicyAttentionItem);
+        return Err(RequestAttentionError::IncompatibleProviderOutcomeAttentionItem);
     }
     Ok(())
 }
 
-fn provider_policy_attributes(
-    resolution: &crate::request::ProviderPolicyResolution,
-) -> Result<
-    (
-        AttentionItemId,
-        AttentionDedupeKey,
-        AttentionCategory,
-        AttentionSeverity,
-    ),
-    RequestAttentionError,
-> {
+fn provider_outcome_attributes(
+    resolution: &crate::request::ProviderOutcomeResolution,
+) -> Result<(AttentionItemId, AttentionDedupeKey), RequestAttentionError> {
     let identity = resolution.outcome().decision_id.as_str();
-    let item_id = AttentionItemId::new(format!("{PROVIDER_POLICY_ITEM_PREFIX}{identity}"))?;
-    let dedupe_key = AttentionDedupeKey::new(format!("{PROVIDER_POLICY_ITEM_PREFIX}{identity}"))?;
-    let (category, severity) = if resolution.violations().is_empty() {
-        (
-            AttentionCategory::PermissionAudit,
-            AttentionSeverity::Informational,
-        )
-    } else {
-        (AttentionCategory::Risk, AttentionSeverity::Critical)
-    };
-    Ok((item_id, dedupe_key, category, severity))
+    let item_id = AttentionItemId::new(format!("{PROVIDER_OUTCOME_ITEM_PREFIX}{identity}"))?;
+    let dedupe_key = AttentionDedupeKey::new(format!("{PROVIDER_OUTCOME_ITEM_PREFIX}{identity}"))?;
+    Ok((item_id, dedupe_key))
 }
 
 fn request_category(kind: RequestKind) -> AttentionCategory {
@@ -482,8 +467,8 @@ pub enum RequestAttentionError {
         request: RequestAttentionState,
     },
     IncompatibleRequestAttentionItem,
-    IncompatibleProviderPolicyAttentionItem,
-    MissingProviderPolicyAttentionItem,
+    IncompatibleProviderOutcomeAttentionItem,
+    MissingProviderOutcomeAttentionItem,
     IncompatibleStatuses {
         request: RequestAttentionState,
         attention: AttentionStatus,
@@ -527,10 +512,10 @@ impl fmt::Display for RequestAttentionError {
             Self::IncompatibleRequestAttentionItem => {
                 formatter.write_str("request attention item does not match its source binding")
             }
-            Self::IncompatibleProviderPolicyAttentionItem => formatter
-                .write_str("provider policy attention item does not match its decision binding"),
-            Self::MissingProviderPolicyAttentionItem => formatter
-                .write_str("provider policy attention item is missing for a resolved decision"),
+            Self::IncompatibleProviderOutcomeAttentionItem => formatter
+                .write_str("provider outcome attention item does not match its decision binding"),
+            Self::MissingProviderOutcomeAttentionItem => formatter
+                .write_str("provider outcome attention item is missing for a resolved decision"),
             Self::IncompatibleStatuses { request, attention } => write!(
                 formatter,
                 "request and attention statuses are incompatible: {request:?}, {attention:?}"

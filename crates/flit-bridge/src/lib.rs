@@ -510,11 +510,11 @@ fn protocol_capability(capability: ProviderCapability) -> ProtocolProviderCapabi
         ProviderCapability::StructuredActivity => ProtocolProviderCapability::StructuredActivity,
         ProviderCapability::PermissionDetect => ProtocolProviderCapability::PermissionDetect,
         ProviderCapability::PermissionRespond => ProtocolProviderCapability::PermissionRespond,
-        ProviderCapability::PermissionPolicyConfigure => {
-            ProtocolProviderCapability::PermissionPolicyConfigure
+        ProviderCapability::PermissionModeConfigure => {
+            ProtocolProviderCapability::PermissionModeConfigure
         }
-        ProviderCapability::PermissionPolicyObserve => {
-            ProtocolProviderCapability::PermissionPolicyObserve
+        ProviderCapability::ProviderOutcomeObserve => {
+            ProtocolProviderCapability::ProviderOutcomeObserve
         }
         ProviderCapability::QuestionDetect => ProtocolProviderCapability::QuestionDetect,
         ProviderCapability::QuestionRespond => ProtocolProviderCapability::QuestionRespond,
@@ -1849,7 +1849,7 @@ mod tests {
             provider_turn_id: "turn-observe".to_owned(),
             permission_mode: ManagedRunPermissionMode::Manual,
             permission_mode_version: 1,
-            provider_policy: "readOnly+on-request+user".to_owned(),
+            provider_configuration: "readOnly+on-request+user".to_owned(),
         };
         manager
             .with_ready_core(|core| {

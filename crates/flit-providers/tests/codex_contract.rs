@@ -90,7 +90,7 @@ fn manual_start_requires_the_exact_effective_policy_receipt() {
     let started = decode_codex_manual_start_response(&json_bytes(&response), 2, CWD)
         .expect("exact Manual receipt");
     assert_eq!(started.thread.thread_id, thread_id("managed-1"));
-    assert_eq!(started.provider_policy, "readOnly+on-request+user");
+    assert_eq!(started.provider_configuration, "readOnly+on-request+user");
 
     for field in ["approvalPolicy", "approvalsReviewer", "cwd"] {
         let mut mismatch = response.clone();

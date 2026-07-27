@@ -1,9 +1,8 @@
 use flit_core::{
-    permission_mode::{PermissionMode, PermissionModeSnapshot, PolicyFingerprint},
-    provider_policy::{
-        MissingProviderPolicyField, PolicyViolationReason, ProviderPolicyAuditReason,
-        ProviderPolicyClassification, ProviderPolicyDecision, ProviderPolicyValue,
-        ProviderTerminalOutcome, VerifiedProviderPolicyOutcome,
+    provider_outcome::{
+        MissingProviderOutcomeField, ProviderDecision, ProviderOutcomeAuditReason,
+        ProviderOutcomeClassification, ProviderOutcomeValue, ProviderTerminalOutcome,
+        VerifiedProviderOutcome,
     },
     request::{
         IgnoredRequestReason, RequestDisposition, RequestError, RequestEvent, RequestId,
@@ -20,44 +19,33 @@ fn attempt_id(value: &str) -> ResponseAttemptId {
     ResponseAttemptId::new(value).expect("test response attempt ID must be valid")
 }
 
-fn policy_value(value: &str) -> ProviderPolicyValue {
-    ProviderPolicyValue::new(value).expect("test provider policy value must be valid")
+fn outcome_value(value: &str) -> ProviderOutcomeValue {
+    ProviderOutcomeValue::new(value).expect("test provider outcome value must be valid")
 }
 
 fn provider_outcome(
     request: &str,
     request_version: u64,
     decision: &str,
-) -> VerifiedProviderPolicyOutcome {
-    VerifiedProviderPolicyOutcome {
-        session_key: policy_value("session-1"),
+) -> VerifiedProviderOutcome {
+    VerifiedProviderOutcome {
+        session_key: outcome_value("session-1"),
         request_id: request_id(request),
         request_version,
-        action_fingerprint: policy_value("action-fp"),
-        scope_fingerprint: policy_value("scope-fp"),
-        bound_mode: PermissionModeSnapshot::new(
-            PermissionMode::ApproveForMe,
-            1,
-            Some(PolicyFingerprint::new("policy-fp").expect("valid fingerprint")),
-        )
-        .expect("valid mode"),
-        policy_source: policy_value("provider-policy"),
-        policy_version: policy_value("policy-v1"),
-        policy_fingerprint: policy_value("policy-fp"),
-        decision_id: policy_value(decision),
-        decision: ProviderPolicyDecision::Allowed,
+        decision_id: outcome_value(decision),
+        decision: ProviderDecision::Allowed,
         terminal_outcome: ProviderTerminalOutcome::RequestResolved,
         captured_at_ms: 1_000,
-        evidence_id: policy_value("evidence-1"),
+        evidence_id: outcome_value("evidence-1"),
     }
 }
 
-fn policy_event(
+fn provider_event(
     request: &str,
     expected_request_version: u64,
-    classification: ProviderPolicyClassification,
+    classification: ProviderOutcomeClassification,
 ) -> RequestEvent {
-    RequestEvent::ProviderPolicyClassified {
+    RequestEvent::ProviderOutcomeClassified {
         request_id: request_id(request),
         expected_request_version,
         classification: Box::new(classification),
@@ -93,7 +81,7 @@ fn active_attempt(status: &RequestStatus) -> &ResponseAttempt {
         }
         RequestStatus::Resolved(RequestResolution::ManualResponse(attempt)) => attempt,
         RequestStatus::Open
-        | RequestStatus::Resolved(RequestResolution::ProviderPolicy(_))
+        | RequestStatus::Resolved(RequestResolution::ProviderOutcome(_))
         | RequestStatus::ProviderOutcomeUnknown(_)
         | RequestStatus::Expired => panic!("expected a manual attempt-bound state"),
     }
@@ -546,84 +534,50 @@ fn replay_matches_incremental_reduction_including_ignored_events() {
 }
 
 #[test]
-fn exact_provider_policy_outcome_resolves_permission_without_a_core_attempt() {
+fn exact_provider_outcome_resolves_permission_without_a_core_attempt() {
     let mut projection = projection(RequestKind::Permission);
     let outcome = provider_outcome("request-1", 10, "decision-1");
     assert_eq!(
         projection
             .apply(
                 11,
-                policy_event(
+                provider_event(
                     "request-1",
                     10,
-                    ProviderPolicyClassification::InformationalResolve(outcome.clone()),
+                    ProviderOutcomeClassification::Resolved(outcome.clone()),
                 ),
             )
             .expect("ordered provider outcome"),
         RequestDisposition::Applied
     );
-    let RequestStatus::Resolved(RequestResolution::ProviderPolicy(resolution)) =
+    let RequestStatus::Resolved(RequestResolution::ProviderOutcome(resolution)) =
         projection.status()
     else {
-        panic!("provider policy must resolve the permission");
+        panic!("provider outcome must resolve the permission");
     };
     assert_eq!(resolution.outcome(), &outcome);
-    assert!(resolution.violations().is_empty());
     assert!(projection.used_attempt_ids().is_empty());
     assert_eq!(
         projection.used_provider_decision_ids(),
-        &[policy_value("decision-1")]
+        &[outcome_value("decision-1")]
     );
-}
-
-#[test]
-fn provider_policy_violation_preserves_resolved_fact_and_reasons() {
-    let mut projection = projection(RequestKind::Permission);
-    let outcome = provider_outcome("request-1", 10, "decision-1");
-    let reasons = vec![
-        PolicyViolationReason::ManualMode,
-        PolicyViolationReason::OutOfProjectScope,
-    ];
-    assert_eq!(
-        projection
-            .apply(
-                11,
-                policy_event(
-                    "request-1",
-                    10,
-                    ProviderPolicyClassification::ResolvedWithPolicyViolation {
-                        outcome: outcome.clone(),
-                        reasons: reasons.clone(),
-                    },
-                ),
-            )
-            .expect("ordered provider violation"),
-        RequestDisposition::Applied
-    );
-    let RequestStatus::Resolved(RequestResolution::ProviderPolicy(resolution)) =
-        projection.status()
-    else {
-        panic!("provider violation must preserve resolved fact");
-    };
-    assert_eq!(resolution.outcome(), &outcome);
-    assert_eq!(resolution.violations(), reasons);
 }
 
 #[test]
 fn incomplete_provider_outcome_locks_and_exact_complete_reconciliation_resolves() {
     let mut projection = projection(RequestKind::Permission);
     let missing = vec![
-        MissingProviderPolicyField::PolicyFingerprint,
-        MissingProviderPolicyField::EvidenceId,
+        MissingProviderOutcomeField::DecisionId,
+        MissingProviderOutcomeField::EvidenceId,
     ];
     assert_eq!(
         projection
             .apply(
                 11,
-                policy_event(
+                provider_event(
                     "request-1",
                     10,
-                    ProviderPolicyClassification::ProviderOutcomeUnknown {
+                    ProviderOutcomeClassification::OutcomeUnknown {
                         missing: missing.clone(),
                     },
                 ),
@@ -647,10 +601,10 @@ fn incomplete_provider_outcome_locks_and_exact_complete_reconciliation_resolves(
         projection
             .apply(
                 13,
-                policy_event(
+                provider_event(
                     "request-1",
                     10,
-                    ProviderPolicyClassification::InformationalResolve(outcome.clone()),
+                    ProviderOutcomeClassification::Resolved(outcome.clone()),
                 ),
             )
             .expect("ordered reconciliation"),
@@ -658,7 +612,7 @@ fn incomplete_provider_outcome_locks_and_exact_complete_reconciliation_resolves(
     );
     assert!(matches!(
         projection.status(),
-        RequestStatus::Resolved(RequestResolution::ProviderPolicy(resolution))
+        RequestStatus::Resolved(RequestResolution::ProviderOutcome(resolution))
             if resolution.outcome() == &outcome
     ));
 
@@ -666,10 +620,10 @@ fn incomplete_provider_outcome_locks_and_exact_complete_reconciliation_resolves(
         projection
             .apply(
                 14,
-                policy_event(
+                provider_event(
                     "request-1",
                     10,
-                    ProviderPolicyClassification::InformationalResolve(outcome),
+                    ProviderOutcomeClassification::Resolved(outcome),
                 ),
             )
             .expect("duplicate decision"),
@@ -680,18 +634,15 @@ fn incomplete_provider_outcome_locks_and_exact_complete_reconciliation_resolves(
 }
 
 #[test]
-fn provider_policy_rejects_question_stale_mismatch_manual_pending_and_audit_results() {
-    let classification = ProviderPolicyClassification::InformationalResolve(provider_outcome(
-        "request-1",
-        10,
-        "decision-1",
-    ));
+fn provider_outcome_rejects_question_stale_mismatch_manual_pending_and_audit_results() {
+    let classification =
+        ProviderOutcomeClassification::Resolved(provider_outcome("request-1", 10, "decision-1"));
     let mut question = projection(RequestKind::Question);
     assert_eq!(
         question
-            .apply(11, policy_event("request-1", 10, classification.clone()))
+            .apply(11, provider_event("request-1", 10, classification.clone()))
             .expect("ordered question outcome"),
-        RequestDisposition::Ignored(IgnoredRequestReason::ProviderPolicyRequiresPermission)
+        RequestDisposition::Ignored(IgnoredRequestReason::ProviderOutcomeRequiresPermission)
     );
 
     let mut permission = projection(RequestKind::Permission);
@@ -699,14 +650,14 @@ fn provider_policy_rejects_question_stale_mismatch_manual_pending_and_audit_resu
         permission
             .apply(
                 11,
-                policy_event("request-other", 10, classification.clone())
+                provider_event("request-other", 10, classification.clone())
             )
             .expect("ordered mismatched request"),
         RequestDisposition::Ignored(IgnoredRequestReason::MismatchedProviderRequest)
     );
     assert_eq!(
         permission
-            .apply(12, policy_event("request-1", 9, classification.clone()))
+            .apply(12, provider_event("request-1", 9, classification.clone()))
             .expect("ordered stale outcome"),
         RequestDisposition::Ignored(IgnoredRequestReason::MismatchedProviderRequest)
     );
@@ -716,9 +667,9 @@ fn provider_policy_rejects_question_stale_mismatch_manual_pending_and_audit_resu
     );
     assert_eq!(
         permission
-            .apply(14, policy_event("request-1", 10, classification))
+            .apply(14, provider_event("request-1", 10, classification))
             .expect("ordered pending outcome"),
-        RequestDisposition::Ignored(IgnoredRequestReason::ProviderPolicyRequiresOpenOrUnknown)
+        RequestDisposition::Ignored(IgnoredRequestReason::ProviderOutcomeRequiresOpenOrUnknown)
     );
     assert!(matches!(
         permission.status(),
@@ -728,19 +679,19 @@ fn provider_policy_rejects_question_stale_mismatch_manual_pending_and_audit_resu
     for (ingest_seq, classification) in [
         (
             15,
-            ProviderPolicyClassification::AuditOnly(ProviderPolicyAuditReason::RequestMismatch),
+            ProviderOutcomeClassification::AuditOnly(ProviderOutcomeAuditReason::RequestMismatch),
         ),
         (
             16,
-            ProviderPolicyClassification::UnboundSessionCapabilityDegrade,
+            ProviderOutcomeClassification::UnboundSessionCapabilityDegrade,
         ),
     ] {
         assert_eq!(
             permission
-                .apply(ingest_seq, policy_event("request-1", 10, classification),)
+                .apply(ingest_seq, provider_event("request-1", 10, classification),)
                 .expect("ordered non-applicable outcome"),
             RequestDisposition::Ignored(
-                IgnoredRequestReason::ProviderPolicyClassificationNotApplicable
+                IgnoredRequestReason::ProviderOutcomeClassificationNotApplicable
             )
         );
     }
@@ -753,10 +704,10 @@ fn provider_outcome_unknown_requires_missing_fields_and_exact_open_version() {
         projection
             .apply(
                 11,
-                policy_event(
+                provider_event(
                     "request-1",
                     10,
-                    ProviderPolicyClassification::ProviderOutcomeUnknown {
+                    ProviderOutcomeClassification::OutcomeUnknown {
                         missing: Vec::new(),
                     },
                 ),
@@ -770,11 +721,11 @@ fn provider_outcome_unknown_requires_missing_fields_and_exact_open_version() {
         projection
             .apply(
                 12,
-                policy_event(
+                provider_event(
                     "request-1",
                     9,
-                    ProviderPolicyClassification::ProviderOutcomeUnknown {
-                        missing: vec![MissingProviderPolicyField::EvidenceId],
+                    ProviderOutcomeClassification::OutcomeUnknown {
+                        missing: vec![MissingProviderOutcomeField::EvidenceId],
                     },
                 ),
             )
@@ -795,28 +746,28 @@ fn provider_unknown_reconciliation_replay_matches_incremental_state() {
     let events = vec![
         (
             11,
-            policy_event(
+            provider_event(
                 "request-1",
                 10,
-                ProviderPolicyClassification::ProviderOutcomeUnknown {
-                    missing: vec![MissingProviderPolicyField::EvidenceId],
+                ProviderOutcomeClassification::OutcomeUnknown {
+                    missing: vec![MissingProviderOutcomeField::EvidenceId],
                 },
             ),
         ),
         (
             12,
-            policy_event(
+            provider_event(
                 "request-1",
                 10,
-                ProviderPolicyClassification::InformationalResolve(outcome.clone()),
+                ProviderOutcomeClassification::Resolved(outcome.clone()),
             ),
         ),
         (
             13,
-            policy_event(
+            provider_event(
                 "request-1",
                 10,
-                ProviderPolicyClassification::InformationalResolve(outcome),
+                ProviderOutcomeClassification::Resolved(outcome),
             ),
         ),
     ];
@@ -835,7 +786,7 @@ fn provider_unknown_reconciliation_replay_matches_incremental_state() {
     assert_eq!(replayed, incremental);
     assert!(matches!(
         replayed.status(),
-        RequestStatus::Resolved(RequestResolution::ProviderPolicy(_))
+        RequestStatus::Resolved(RequestResolution::ProviderOutcome(_))
     ));
     assert_eq!(replayed.version(), 12);
     assert_eq!(replayed.last_ingest_seq(), 13);

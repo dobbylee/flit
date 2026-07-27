@@ -1,9 +1,9 @@
 use std::{error::Error, fmt};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PermissionPolicyOperationId(String);
+pub struct PermissionModeOperationId(String);
 
-impl PermissionPolicyOperationId {
+impl PermissionModeOperationId {
     pub fn new(value: impl Into<String>) -> Result<Self, PermissionModeValueError> {
         let value = value.into();
         if value.trim().is_empty() {
@@ -19,13 +19,13 @@ impl PermissionPolicyOperationId {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PolicyFingerprint(String);
+pub struct ProviderConfigurationIdentity(String);
 
-impl PolicyFingerprint {
+impl ProviderConfigurationIdentity {
     pub fn new(value: impl Into<String>) -> Result<Self, PermissionModeValueError> {
         let value = value.into();
         if value.trim().is_empty() {
-            return Err(PermissionModeValueError::BlankPolicyFingerprint);
+            return Err(PermissionModeValueError::BlankProviderConfigurationIdentity);
         }
         Ok(Self(value))
     }
@@ -39,7 +39,7 @@ impl PolicyFingerprint {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PermissionMode {
     Manual,
-    ApproveForMe,
+    ProviderAuto,
     Unknown,
 }
 
@@ -47,31 +47,31 @@ pub enum PermissionMode {
 pub struct PermissionModeSnapshot {
     mode: PermissionMode,
     version: u64,
-    policy_fingerprint: Option<PolicyFingerprint>,
+    provider_configuration_identity: Option<ProviderConfigurationIdentity>,
 }
 
 impl PermissionModeSnapshot {
     pub fn new(
         mode: PermissionMode,
         version: u64,
-        policy_fingerprint: Option<PolicyFingerprint>,
+        provider_configuration_identity: Option<ProviderConfigurationIdentity>,
     ) -> Result<Self, PermissionModeValueError> {
         if version == 0 {
             return Err(PermissionModeValueError::InvalidModeVersion);
         }
-        match (mode, policy_fingerprint.as_ref()) {
+        match (mode, provider_configuration_identity.as_ref()) {
             (PermissionMode::Unknown, Some(_)) => {
-                return Err(PermissionModeValueError::UnknownModeHasFingerprint);
+                return Err(PermissionModeValueError::UnknownModeHasProviderConfiguration);
             }
-            (PermissionMode::Manual | PermissionMode::ApproveForMe, None) => {
-                return Err(PermissionModeValueError::VerifiedModeRequiresFingerprint);
+            (PermissionMode::Manual | PermissionMode::ProviderAuto, None) => {
+                return Err(PermissionModeValueError::VerifiedModeRequiresProviderConfiguration);
             }
             _ => {}
         }
         Ok(Self {
             mode,
             version,
-            policy_fingerprint,
+            provider_configuration_identity,
         })
     }
 
@@ -86,8 +86,8 @@ impl PermissionModeSnapshot {
     }
 
     #[must_use]
-    pub fn policy_fingerprint(&self) -> Option<&PolicyFingerprint> {
-        self.policy_fingerprint.as_ref()
+    pub fn provider_configuration_identity(&self) -> Option<&ProviderConfigurationIdentity> {
+        self.provider_configuration_identity.as_ref()
     }
 
     #[must_use]
@@ -99,21 +99,21 @@ impl PermissionModeSnapshot {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PermissionModeValueError {
     BlankOperationId,
-    BlankPolicyFingerprint,
+    BlankProviderConfigurationIdentity,
     BlankProviderStreamId,
     InvalidModeVersion,
-    UnknownModeHasFingerprint,
-    VerifiedModeRequiresFingerprint,
+    UnknownModeHasProviderConfiguration,
+    VerifiedModeRequiresProviderConfiguration,
 }
 
 impl fmt::Display for PermissionModeValueError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BlankOperationId => {
-                formatter.write_str("permission policy operation ID must not be blank")
+                formatter.write_str("permission mode operation ID must not be blank")
             }
-            Self::BlankPolicyFingerprint => {
-                formatter.write_str("provider policy fingerprint must not be blank")
+            Self::BlankProviderConfigurationIdentity => {
+                formatter.write_str("provider configuration identity must not be blank")
             }
             Self::BlankProviderStreamId => {
                 formatter.write_str("provider stream ID must not be blank")
@@ -121,12 +121,11 @@ impl fmt::Display for PermissionModeValueError {
             Self::InvalidModeVersion => {
                 formatter.write_str("permission mode version must be greater than zero")
             }
-            Self::UnknownModeHasFingerprint => {
-                formatter.write_str("unknown permission mode must not have a fingerprint")
-            }
-            Self::VerifiedModeRequiresFingerprint => {
-                formatter.write_str("verified permission mode requires a fingerprint")
-            }
+            Self::UnknownModeHasProviderConfiguration => formatter.write_str(
+                "unknown permission mode must not have a provider configuration identity",
+            ),
+            Self::VerifiedModeRequiresProviderConfiguration => formatter
+                .write_str("verified permission mode requires a provider configuration identity"),
         }
     }
 }
@@ -135,7 +134,7 @@ impl Error for PermissionModeValueError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PermissionModeChange {
-    operation_id: PermissionPolicyOperationId,
+    operation_id: PermissionModeOperationId,
     expected_mode_version: u64,
     prior: PermissionModeSnapshot,
     requested: PermissionModeSnapshot,
@@ -143,7 +142,7 @@ pub struct PermissionModeChange {
 
 impl PermissionModeChange {
     #[must_use]
-    pub fn operation_id(&self) -> &PermissionPolicyOperationId {
+    pub fn operation_id(&self) -> &PermissionModeOperationId {
         &self.operation_id
     }
 
@@ -164,13 +163,13 @@ impl PermissionModeChange {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PolicyConfigurationState {
+pub enum ModeConfigurationState {
     Stable,
     Pending(PermissionModeChange),
     Unknown(PermissionModeChange),
 }
 
-impl PolicyConfigurationState {
+impl ModeConfigurationState {
     fn active_change(&self) -> Option<&PermissionModeChange> {
         match self {
             Self::Pending(change) | Self::Unknown(change) => Some(change),
@@ -224,15 +223,15 @@ impl OrderedProviderCursor {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PendingPolicyObservation {
-    operation_id: PermissionPolicyOperationId,
+pub struct PendingModeObservation {
+    operation_id: PermissionModeOperationId,
     cursor: Option<OrderedProviderCursor>,
 }
 
-impl PendingPolicyObservation {
+impl PendingModeObservation {
     #[must_use]
     pub const fn new(
-        operation_id: PermissionPolicyOperationId,
+        operation_id: PermissionModeOperationId,
         cursor: Option<OrderedProviderCursor>,
     ) -> Self {
         Self {
@@ -242,7 +241,7 @@ impl PendingPolicyObservation {
     }
 
     #[must_use]
-    pub const fn operation_id(&self) -> &PermissionPolicyOperationId {
+    pub const fn operation_id(&self) -> &PermissionModeOperationId {
         &self.operation_id
     }
 
@@ -279,14 +278,14 @@ impl CompletedPermissionModeChange {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PolicyObservationBinding {
+pub enum ModeObservationBinding {
     AwaitingConfiguration,
     Bound(PermissionModeSnapshot),
-    ProviderOutcomeUnknown(PolicyObservationUnknownReason),
+    ProviderOutcomeUnknown(ModeObservationUnknownReason),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PolicyObservationUnknownReason {
+pub enum ModeObservationUnknownReason {
     ConfigurationApplicationUnknown,
     MissingObservationCursor,
     MissingEffectiveCursor,
@@ -297,9 +296,9 @@ pub enum PolicyObservationUnknownReason {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PermissionModeProjection {
     current: PermissionModeSnapshot,
-    configuration_state: PolicyConfigurationState,
+    configuration_state: ModeConfigurationState,
     last_ingest_seq: u64,
-    used_operation_ids: Vec<PermissionPolicyOperationId>,
+    used_operation_ids: Vec<PermissionModeOperationId>,
     completed_changes: Vec<CompletedPermissionModeChange>,
 }
 
@@ -313,7 +312,7 @@ impl PermissionModeProjection {
         }
         Ok(Self {
             current: initial,
-            configuration_state: PolicyConfigurationState::Stable,
+            configuration_state: ModeConfigurationState::Stable,
             last_ingest_seq: initial_ingest_seq,
             used_operation_ids: Vec::new(),
             completed_changes: Vec::new(),
@@ -326,7 +325,7 @@ impl PermissionModeProjection {
     }
 
     #[must_use]
-    pub const fn configuration_state(&self) -> &PolicyConfigurationState {
+    pub const fn configuration_state(&self) -> &ModeConfigurationState {
         &self.configuration_state
     }
 
@@ -336,7 +335,7 @@ impl PermissionModeProjection {
     }
 
     #[must_use]
-    pub fn used_operation_ids(&self) -> &[PermissionPolicyOperationId] {
+    pub fn used_operation_ids(&self) -> &[PermissionModeOperationId] {
         &self.used_operation_ids
     }
 
@@ -348,21 +347,19 @@ impl PermissionModeProjection {
     #[must_use]
     pub fn bind_pending_observation(
         &self,
-        observation: &PendingPolicyObservation,
-    ) -> PolicyObservationBinding {
+        observation: &PendingModeObservation,
+    ) -> ModeObservationBinding {
         if let Some(active) = self.configuration_state.active_change()
             && active.operation_id() == observation.operation_id()
         {
             return match self.configuration_state {
-                PolicyConfigurationState::Pending(_) => {
-                    PolicyObservationBinding::AwaitingConfiguration
-                }
-                PolicyConfigurationState::Unknown(_) => {
-                    PolicyObservationBinding::ProviderOutcomeUnknown(
-                        PolicyObservationUnknownReason::ConfigurationApplicationUnknown,
+                ModeConfigurationState::Pending(_) => ModeObservationBinding::AwaitingConfiguration,
+                ModeConfigurationState::Unknown(_) => {
+                    ModeObservationBinding::ProviderOutcomeUnknown(
+                        ModeObservationUnknownReason::ConfigurationApplicationUnknown,
                     )
                 }
-                PolicyConfigurationState::Stable => unreachable!("active change is not stable"),
+                ModeConfigurationState::Stable => unreachable!("active change is not stable"),
             };
         }
 
@@ -371,13 +368,13 @@ impl PermissionModeProjection {
             .iter()
             .find(|completed| completed.change().operation_id() == observation.operation_id())
         else {
-            return PolicyObservationBinding::ProviderOutcomeUnknown(
-                PolicyObservationUnknownReason::UnknownOperation,
+            return ModeObservationBinding::ProviderOutcomeUnknown(
+                ModeObservationUnknownReason::UnknownOperation,
             );
         };
         match completed.outcome() {
             CompletedPermissionModeOutcome::RejectedNotApplied => {
-                PolicyObservationBinding::Bound(completed.change().prior().clone())
+                ModeObservationBinding::Bound(completed.change().prior().clone())
             }
             CompletedPermissionModeOutcome::Configured { effective_cursor } => {
                 Self::bind_configured_observation(
@@ -392,40 +389,45 @@ impl PermissionModeProjection {
     fn bind_configured_observation(
         change: &PermissionModeChange,
         effective_cursor: Option<&OrderedProviderCursor>,
-        observation: &PendingPolicyObservation,
-    ) -> PolicyObservationBinding {
+        observation: &PendingModeObservation,
+    ) -> ModeObservationBinding {
         let Some(observation_cursor) = observation.cursor() else {
-            return PolicyObservationBinding::ProviderOutcomeUnknown(
-                PolicyObservationUnknownReason::MissingObservationCursor,
+            return ModeObservationBinding::ProviderOutcomeUnknown(
+                ModeObservationUnknownReason::MissingObservationCursor,
             );
         };
         let Some(effective_cursor) = effective_cursor else {
-            return PolicyObservationBinding::ProviderOutcomeUnknown(
-                PolicyObservationUnknownReason::MissingEffectiveCursor,
+            return ModeObservationBinding::ProviderOutcomeUnknown(
+                ModeObservationUnknownReason::MissingEffectiveCursor,
             );
         };
         if observation_cursor.stream_id() != effective_cursor.stream_id() {
-            return PolicyObservationBinding::ProviderOutcomeUnknown(
-                PolicyObservationUnknownReason::IncomparableProviderStream,
+            return ModeObservationBinding::ProviderOutcomeUnknown(
+                ModeObservationUnknownReason::IncomparableProviderStream,
             );
         }
         if observation_cursor.position() < effective_cursor.position() {
-            PolicyObservationBinding::Bound(change.prior().clone())
+            ModeObservationBinding::Bound(change.prior().clone())
         } else {
-            PolicyObservationBinding::Bound(change.requested().clone())
+            ModeObservationBinding::Bound(change.requested().clone())
         }
     }
 
     #[must_use]
-    pub fn permission_response_enabled(&self) -> bool {
-        matches!(self.configuration_state, PolicyConfigurationState::Stable)
+    pub fn permission_response_enabled(&self, request_mode: &PermissionModeSnapshot) -> bool {
+        matches!(self.configuration_state, ModeConfigurationState::Stable)
             && self.current.is_verified()
+            && matches!(request_mode.mode(), PermissionMode::Manual)
     }
 
     #[must_use]
-    pub fn policy_observation_enabled(&self) -> bool {
-        matches!(self.configuration_state, PolicyConfigurationState::Stable)
+    pub fn provider_outcome_observation_enabled(
+        &self,
+        request_mode: &PermissionModeSnapshot,
+    ) -> bool {
+        matches!(self.configuration_state, ModeConfigurationState::Stable)
             && self.current.is_verified()
+            && matches!(request_mode.mode(), PermissionMode::ProviderAuto)
     }
 
     pub fn apply(
@@ -469,7 +471,7 @@ impl PermissionModeProjection {
 
     fn submit_change(
         &mut self,
-        operation_id: PermissionPolicyOperationId,
+        operation_id: PermissionModeOperationId,
         expected_mode_version: u64,
         requested: PermissionModeSnapshot,
     ) -> PermissionModeDisposition {
@@ -482,17 +484,17 @@ impl PermissionModeProjection {
             );
         }
         match self.configuration_state {
-            PolicyConfigurationState::Pending(_) => {
+            ModeConfigurationState::Pending(_) => {
                 return PermissionModeDisposition::Ignored(
                     IgnoredPermissionModeReason::ConfigurationAlreadyPending,
                 );
             }
-            PolicyConfigurationState::Unknown(_) => {
+            ModeConfigurationState::Unknown(_) => {
                 return PermissionModeDisposition::Ignored(
                     IgnoredPermissionModeReason::ConfigurationUnknownLocked,
                 );
             }
-            PolicyConfigurationState::Stable => {}
+            ModeConfigurationState::Stable => {}
         }
         if !requested.is_verified() {
             return PermissionModeDisposition::Ignored(
@@ -519,7 +521,7 @@ impl PermissionModeProjection {
         }
 
         self.used_operation_ids.push(operation_id.clone());
-        self.configuration_state = PolicyConfigurationState::Pending(PermissionModeChange {
+        self.configuration_state = ModeConfigurationState::Pending(PermissionModeChange {
             operation_id,
             expected_mode_version,
             prior: self.current.clone(),
@@ -530,7 +532,7 @@ impl PermissionModeProjection {
 
     fn configuration_succeeded(
         &mut self,
-        operation_id: &PermissionPolicyOperationId,
+        operation_id: &PermissionModeOperationId,
         applied: PermissionModeSnapshot,
         effective_cursor: Option<OrderedProviderCursor>,
     ) -> PermissionModeDisposition {
@@ -542,7 +544,7 @@ impl PermissionModeProjection {
         }
 
         self.current = applied;
-        self.configuration_state = PolicyConfigurationState::Stable;
+        self.configuration_state = ModeConfigurationState::Stable;
         self.completed_changes.push(CompletedPermissionModeChange {
             change,
             outcome: CompletedPermissionModeOutcome::Configured { effective_cursor },
@@ -552,13 +554,13 @@ impl PermissionModeProjection {
 
     fn configuration_rejected(
         &mut self,
-        operation_id: &PermissionPolicyOperationId,
+        operation_id: &PermissionModeOperationId,
     ) -> PermissionModeDisposition {
         let Some(change) = self.match_active_operation(operation_id) else {
             return self.handle_non_active_receipt(operation_id);
         };
 
-        self.configuration_state = PolicyConfigurationState::Stable;
+        self.configuration_state = ModeConfigurationState::Stable;
         self.completed_changes.push(CompletedPermissionModeChange {
             change,
             outcome: CompletedPermissionModeOutcome::RejectedNotApplied,
@@ -568,7 +570,7 @@ impl PermissionModeProjection {
 
     fn configuration_unknown(
         &mut self,
-        operation_id: &PermissionPolicyOperationId,
+        operation_id: &PermissionModeOperationId,
     ) -> PermissionModeDisposition {
         if self.match_active_operation(operation_id).is_none() {
             return self.handle_non_active_receipt(operation_id);
@@ -578,7 +580,7 @@ impl PermissionModeProjection {
 
     fn match_active_operation(
         &self,
-        operation_id: &PermissionPolicyOperationId,
+        operation_id: &PermissionModeOperationId,
     ) -> Option<PermissionModeChange> {
         self.configuration_state
             .active_change()
@@ -588,7 +590,7 @@ impl PermissionModeProjection {
 
     fn handle_non_active_receipt(
         &mut self,
-        operation_id: &PermissionPolicyOperationId,
+        operation_id: &PermissionModeOperationId,
     ) -> PermissionModeDisposition {
         if self.used_operation_ids.contains(operation_id) {
             return PermissionModeDisposition::Ignored(
@@ -603,14 +605,14 @@ impl PermissionModeProjection {
 
     fn lock_or_preserve_unknown(&mut self) -> PermissionModeDisposition {
         match &self.configuration_state {
-            PolicyConfigurationState::Pending(change) => {
-                self.configuration_state = PolicyConfigurationState::Unknown(change.clone());
+            ModeConfigurationState::Pending(change) => {
+                self.configuration_state = ModeConfigurationState::Unknown(change.clone());
                 PermissionModeDisposition::Applied
             }
-            PolicyConfigurationState::Unknown(_) => PermissionModeDisposition::Ignored(
+            ModeConfigurationState::Unknown(_) => PermissionModeDisposition::Ignored(
                 IgnoredPermissionModeReason::ConfigurationAlreadyUnknown,
             ),
-            PolicyConfigurationState::Stable => PermissionModeDisposition::Ignored(
+            ModeConfigurationState::Stable => PermissionModeDisposition::Ignored(
                 IgnoredPermissionModeReason::NoActiveConfiguration,
             ),
         }
@@ -668,20 +670,20 @@ impl PermissionModeProjection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PermissionModeEvent {
     ChangeSubmitted {
-        operation_id: PermissionPolicyOperationId,
+        operation_id: PermissionModeOperationId,
         expected_mode_version: u64,
         requested: PermissionModeSnapshot,
     },
     ConfigurationSucceeded {
-        operation_id: PermissionPolicyOperationId,
+        operation_id: PermissionModeOperationId,
         applied: PermissionModeSnapshot,
         effective_cursor: Option<OrderedProviderCursor>,
     },
     ConfigurationRejectedNotApplied {
-        operation_id: PermissionPolicyOperationId,
+        operation_id: PermissionModeOperationId,
     },
     ConfigurationApplicationUnknown {
-        operation_id: PermissionPolicyOperationId,
+        operation_id: PermissionModeOperationId,
     },
 }
 

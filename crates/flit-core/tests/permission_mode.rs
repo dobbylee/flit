@@ -1,18 +1,18 @@
 use flit_core::permission_mode::{
-    CompletedPermissionModeOutcome, IgnoredPermissionModeReason, OrderedProviderCursor,
-    PendingPolicyObservation, PermissionMode, PermissionModeDisposition, PermissionModeError,
-    PermissionModeEvent, PermissionModeProjection, PermissionModeSnapshot,
-    PermissionModeValueError, PermissionPolicyOperationId, PolicyConfigurationState,
-    PolicyFingerprint, PolicyObservationBinding, PolicyObservationUnknownReason, ProviderStreamId,
-    replay_permission_mode,
+    CompletedPermissionModeOutcome, IgnoredPermissionModeReason, ModeConfigurationState,
+    ModeObservationBinding, ModeObservationUnknownReason, OrderedProviderCursor,
+    PendingModeObservation, PermissionMode, PermissionModeDisposition, PermissionModeError,
+    PermissionModeEvent, PermissionModeOperationId, PermissionModeProjection,
+    PermissionModeSnapshot, PermissionModeValueError, ProviderConfigurationIdentity,
+    ProviderStreamId, replay_permission_mode,
 };
 
-fn operation(value: &str) -> PermissionPolicyOperationId {
-    PermissionPolicyOperationId::new(value).expect("test operation ID must be valid")
+fn operation(value: &str) -> PermissionModeOperationId {
+    PermissionModeOperationId::new(value).expect("test operation ID must be valid")
 }
 
-fn fingerprint(value: &str) -> PolicyFingerprint {
-    PolicyFingerprint::new(value).expect("test fingerprint must be valid")
+fn configuration_identity(value: &str) -> ProviderConfigurationIdentity {
+    ProviderConfigurationIdentity::new(value).expect("test configuration_identity must be valid")
 }
 
 fn stream(value: &str) -> ProviderStreamId {
@@ -26,13 +26,21 @@ fn cursor(stream_value: &str, position: u64) -> OrderedProviderCursor {
 fn observation(
     operation_value: &str,
     cursor: Option<OrderedProviderCursor>,
-) -> PendingPolicyObservation {
-    PendingPolicyObservation::new(operation(operation_value), cursor)
+) -> PendingModeObservation {
+    PendingModeObservation::new(operation(operation_value), cursor)
 }
 
-fn snapshot(mode: PermissionMode, version: u64, fingerprint_value: &str) -> PermissionModeSnapshot {
-    PermissionModeSnapshot::new(mode, version, Some(fingerprint(fingerprint_value)))
-        .expect("test verified snapshot must be valid")
+fn snapshot(
+    mode: PermissionMode,
+    version: u64,
+    configuration_identity_value: &str,
+) -> PermissionModeSnapshot {
+    PermissionModeSnapshot::new(
+        mode,
+        version,
+        Some(configuration_identity(configuration_identity_value)),
+    )
+    .expect("test verified snapshot must be valid")
 }
 
 fn unknown_snapshot(version: u64) -> PermissionModeSnapshot {
@@ -64,14 +72,14 @@ fn submit(
 }
 
 #[test]
-fn value_types_enforce_identity_version_and_fingerprint_invariants() {
+fn value_types_enforce_identity_version_and_configuration_identity_invariants() {
     assert_eq!(
-        PermissionPolicyOperationId::new("\n\t"),
+        PermissionModeOperationId::new("\n\t"),
         Err(PermissionModeValueError::BlankOperationId)
     );
     assert_eq!(
-        PolicyFingerprint::new("   "),
-        Err(PermissionModeValueError::BlankPolicyFingerprint)
+        ProviderConfigurationIdentity::new("   "),
+        Err(PermissionModeValueError::BlankProviderConfigurationIdentity)
     );
     assert_eq!(
         ProviderStreamId::new("\t\n"),
@@ -81,16 +89,24 @@ fn value_types_enforce_identity_version_and_fingerprint_invariants() {
     assert_eq!(zero_cursor.stream_id().as_str(), "stream-1");
     assert_eq!(zero_cursor.position(), 0);
     assert_eq!(
-        PermissionModeSnapshot::new(PermissionMode::Manual, 0, Some(fingerprint("fp"))),
+        PermissionModeSnapshot::new(
+            PermissionMode::Manual,
+            0,
+            Some(configuration_identity("fp"))
+        ),
         Err(PermissionModeValueError::InvalidModeVersion)
     );
     assert_eq!(
         PermissionModeSnapshot::new(PermissionMode::Manual, 1, None),
-        Err(PermissionModeValueError::VerifiedModeRequiresFingerprint)
+        Err(PermissionModeValueError::VerifiedModeRequiresProviderConfiguration)
     );
     assert_eq!(
-        PermissionModeSnapshot::new(PermissionMode::Unknown, 1, Some(fingerprint("unexpected")),),
-        Err(PermissionModeValueError::UnknownModeHasFingerprint)
+        PermissionModeSnapshot::new(
+            PermissionMode::Unknown,
+            1,
+            Some(configuration_identity("unexpected")),
+        ),
+        Err(PermissionModeValueError::UnknownModeHasProviderConfiguration)
     );
     assert_eq!(
         PermissionModeProjection::new(snapshot(PermissionMode::Manual, 1, "fp"), 0),
@@ -99,43 +115,47 @@ fn value_types_enforce_identity_version_and_fingerprint_invariants() {
 }
 
 #[test]
-fn stable_verified_mode_enables_controls_while_unknown_mode_fails_closed() {
-    for mode in [PermissionMode::Manual, PermissionMode::ApproveForMe] {
-        let projection = projection(snapshot(mode, 1, "fp-1"));
-        assert_eq!(projection.current().mode(), mode);
-        assert_eq!(projection.current().version(), 1);
-        assert_eq!(
-            projection
-                .current()
-                .policy_fingerprint()
-                .map(PolicyFingerprint::as_str),
-            Some("fp-1")
-        );
-        assert!(projection.permission_response_enabled());
-        assert!(projection.policy_observation_enabled());
+fn stable_authority_path_uses_the_request_time_mode_while_unknown_fails_closed() {
+    let manual_request = snapshot(PermissionMode::Manual, 1, "manual-fp");
+    let provider_auto_request = snapshot(PermissionMode::ProviderAuto, 2, "provider-auto-config");
+    let unknown_request = unknown_snapshot(3);
+
+    for current_mode in [PermissionMode::Manual, PermissionMode::ProviderAuto] {
+        let projection = projection(snapshot(current_mode, 4, "current-config"));
+        assert!(projection.permission_response_enabled(&manual_request));
+        assert!(!projection.provider_outcome_observation_enabled(&manual_request));
+        assert!(!projection.permission_response_enabled(&provider_auto_request));
+        assert!(projection.provider_outcome_observation_enabled(&provider_auto_request));
+        assert!(!projection.permission_response_enabled(&unknown_request));
+        assert!(!projection.provider_outcome_observation_enabled(&unknown_request));
         assert_eq!(
             projection.configuration_state(),
-            &PolicyConfigurationState::Stable
+            &ModeConfigurationState::Stable
         );
     }
 
-    let projection = projection(unknown_snapshot(7));
-    assert_eq!(projection.current().mode(), PermissionMode::Unknown);
-    assert!(projection.current().policy_fingerprint().is_none());
-    assert!(!projection.permission_response_enabled());
-    assert!(!projection.policy_observation_enabled());
+    let unknown_projection = projection(unknown_snapshot(7));
+    assert_eq!(unknown_projection.current().mode(), PermissionMode::Unknown);
+    assert!(
+        unknown_projection
+            .current()
+            .provider_configuration_identity()
+            .is_none()
+    );
+    assert!(!unknown_projection.permission_response_enabled(&manual_request));
+    assert!(!unknown_projection.provider_outcome_observation_enabled(&provider_auto_request));
 }
 
 #[test]
 fn exact_current_and_next_versions_submit_one_fresh_operation_and_lock_controls() {
     let mut projection = projection(snapshot(PermissionMode::Manual, 4, "manual-fp"));
-    let requested = snapshot(PermissionMode::ApproveForMe, 5, "approve-fp");
+    let requested = snapshot(PermissionMode::ProviderAuto, 5, "provider-auto-config");
 
     assert_eq!(
         submit(&mut projection, 11, "operation-1", 4, requested.clone()),
         PermissionModeDisposition::Applied
     );
-    let PolicyConfigurationState::Pending(change) = projection.configuration_state() else {
+    let ModeConfigurationState::Pending(change) = projection.configuration_state() else {
         panic!("configuration must be pending");
     };
     assert_eq!(change.operation_id().as_str(), "operation-1");
@@ -144,8 +164,8 @@ fn exact_current_and_next_versions_submit_one_fresh_operation_and_lock_controls(
     assert_eq!(change.requested(), &requested);
     assert_eq!(projection.current().mode(), PermissionMode::Manual);
     assert_eq!(projection.current().version(), 4);
-    assert!(!projection.permission_response_enabled());
-    assert!(!projection.policy_observation_enabled());
+    assert!(!projection.permission_response_enabled(projection.current()));
+    assert!(!projection.provider_outcome_observation_enabled(&requested));
     assert_eq!(projection.last_ingest_seq(), 11);
     assert_eq!(projection.used_operation_ids(), &[operation("operation-1")]);
 
@@ -175,7 +195,7 @@ fn stale_and_invalid_requested_versions_do_not_start_an_operation() {
             11,
             "operation-stale",
             3,
-            snapshot(PermissionMode::ApproveForMe, 5, "approve-fp"),
+            snapshot(PermissionMode::ProviderAuto, 5, "provider-auto-config"),
         ),
         PermissionModeDisposition::Ignored(IgnoredPermissionModeReason::StaleExpectedModeVersion {
             current: 4,
@@ -188,7 +208,7 @@ fn stale_and_invalid_requested_versions_do_not_start_an_operation() {
             12,
             "operation-skip",
             4,
-            snapshot(PermissionMode::ApproveForMe, 6, "approve-fp"),
+            snapshot(PermissionMode::ProviderAuto, 6, "provider-auto-config"),
         ),
         PermissionModeDisposition::Ignored(IgnoredPermissionModeReason::InvalidNextModeVersion {
             expected: 5,
@@ -210,7 +230,7 @@ fn stale_and_invalid_requested_versions_do_not_start_an_operation() {
     assert_eq!(projection.current().version(), 4);
     assert_eq!(
         projection.configuration_state(),
-        &PolicyConfigurationState::Stable
+        &ModeConfigurationState::Stable
     );
     assert!(projection.used_operation_ids().is_empty());
     assert_eq!(projection.last_ingest_seq(), 13);
@@ -219,7 +239,7 @@ fn stale_and_invalid_requested_versions_do_not_start_an_operation() {
 #[test]
 fn exhausted_mode_version_rejects_new_operations() {
     let mut projection = projection(snapshot(PermissionMode::Manual, u64::MAX, "manual-fp"));
-    let requested = snapshot(PermissionMode::ApproveForMe, 1, "approve-fp");
+    let requested = snapshot(PermissionMode::ProviderAuto, 1, "provider-auto-config");
 
     assert_eq!(
         submit(
@@ -235,9 +255,9 @@ fn exhausted_mode_version_rejects_new_operations() {
 }
 
 #[test]
-fn exact_success_commits_requested_mode_version_and_fingerprint() {
+fn exact_success_commits_requested_mode_version_and_configuration_identity() {
     let mut projection = projection(snapshot(PermissionMode::Manual, 4, "manual-fp"));
-    let requested = snapshot(PermissionMode::ApproveForMe, 5, "approve-fp");
+    let requested = snapshot(PermissionMode::ProviderAuto, 5, "provider-auto-config");
     assert_eq!(
         submit(&mut projection, 11, "operation-1", 4, requested.clone()),
         PermissionModeDisposition::Applied
@@ -259,10 +279,15 @@ fn exact_success_commits_requested_mode_version_and_fingerprint() {
     assert_eq!(projection.current(), &requested);
     assert_eq!(
         projection.configuration_state(),
-        &PolicyConfigurationState::Stable
+        &ModeConfigurationState::Stable
     );
-    assert!(projection.permission_response_enabled());
-    assert!(projection.policy_observation_enabled());
+    assert!(!projection.permission_response_enabled(&requested));
+    assert!(projection.provider_outcome_observation_enabled(&requested));
+    assert!(projection.permission_response_enabled(&snapshot(
+        PermissionMode::Manual,
+        4,
+        "manual-fp",
+    )));
 
     assert_eq!(
         projection
@@ -284,7 +309,7 @@ fn exact_success_commits_requested_mode_version_and_fingerprint() {
 #[test]
 fn malformed_matching_receipt_locks_unknown_until_exact_reconciliation() {
     let initial = snapshot(PermissionMode::Manual, 4, "manual-fp");
-    let requested = snapshot(PermissionMode::ApproveForMe, 5, "approve-fp");
+    let requested = snapshot(PermissionMode::ProviderAuto, 5, "provider-auto-config");
     let mut projection = projection(initial.clone());
     assert_eq!(
         submit(&mut projection, 11, "operation-1", 4, requested.clone()),
@@ -297,7 +322,7 @@ fn malformed_matching_receipt_locks_unknown_until_exact_reconciliation() {
                 12,
                 PermissionModeEvent::ConfigurationSucceeded {
                     operation_id: operation("operation-1"),
-                    applied: snapshot(PermissionMode::ApproveForMe, 5, "wrong-fp"),
+                    applied: snapshot(PermissionMode::ProviderAuto, 5, "wrong-fp"),
                     effective_cursor: None,
                 },
             )
@@ -307,10 +332,10 @@ fn malformed_matching_receipt_locks_unknown_until_exact_reconciliation() {
     assert_eq!(projection.current(), &initial);
     assert!(matches!(
         projection.configuration_state(),
-        PolicyConfigurationState::Unknown(_)
+        ModeConfigurationState::Unknown(_)
     ));
-    assert!(!projection.permission_response_enabled());
-    assert!(!projection.policy_observation_enabled());
+    assert!(!projection.permission_response_enabled(&initial));
+    assert!(!projection.provider_outcome_observation_enabled(&requested));
 
     assert_eq!(
         projection
@@ -318,7 +343,7 @@ fn malformed_matching_receipt_locks_unknown_until_exact_reconciliation() {
                 13,
                 PermissionModeEvent::ConfigurationSucceeded {
                     operation_id: operation("operation-1"),
-                    applied: snapshot(PermissionMode::ApproveForMe, 5, "still-wrong"),
+                    applied: snapshot(PermissionMode::ProviderAuto, 5, "still-wrong"),
                     effective_cursor: None,
                 },
             )
@@ -343,13 +368,13 @@ fn malformed_matching_receipt_locks_unknown_until_exact_reconciliation() {
     assert_eq!(projection.current(), &requested);
     assert_eq!(
         projection.configuration_state(),
-        &PolicyConfigurationState::Stable
+        &ModeConfigurationState::Stable
     );
 }
 
 #[test]
 fn authenticated_not_applied_rejection_unlocks_prior_mode_without_version_change() {
-    let initial = snapshot(PermissionMode::ApproveForMe, 8, "approve-fp");
+    let initial = snapshot(PermissionMode::ProviderAuto, 8, "provider-auto-config");
     let mut projection = projection(initial.clone());
     assert_eq!(
         submit(
@@ -375,9 +400,10 @@ fn authenticated_not_applied_rejection_unlocks_prior_mode_without_version_change
     assert_eq!(projection.current(), &initial);
     assert_eq!(
         projection.configuration_state(),
-        &PolicyConfigurationState::Stable
+        &ModeConfigurationState::Stable
     );
-    assert!(projection.permission_response_enabled());
+    assert!(!projection.permission_response_enabled(&initial));
+    assert!(projection.provider_outcome_observation_enabled(&initial));
 
     assert_eq!(
         submit(
@@ -404,7 +430,7 @@ fn authenticated_not_applied_rejection_unlocks_prior_mode_without_version_change
 #[test]
 fn application_unknown_is_durable_and_same_operation_rejection_can_reconcile() {
     let initial = snapshot(PermissionMode::Manual, 2, "manual-fp");
-    let requested = snapshot(PermissionMode::ApproveForMe, 3, "approve-fp");
+    let requested = snapshot(PermissionMode::ProviderAuto, 3, "provider-auto-config");
     let mut projection = projection(initial.clone());
     assert_eq!(
         submit(&mut projection, 11, "operation-1", 2, requested),
@@ -423,7 +449,7 @@ fn application_unknown_is_durable_and_same_operation_rejection_can_reconcile() {
     );
     assert!(matches!(
         projection.configuration_state(),
-        PolicyConfigurationState::Unknown(_)
+        ModeConfigurationState::Unknown(_)
     ));
     assert_eq!(projection.current(), &initial);
 
@@ -433,7 +459,7 @@ fn application_unknown_is_durable_and_same_operation_rejection_can_reconcile() {
             13,
             "operation-2",
             2,
-            snapshot(PermissionMode::ApproveForMe, 3, "approve-fp"),
+            snapshot(PermissionMode::ProviderAuto, 3, "provider-auto-config"),
         ),
         PermissionModeDisposition::Ignored(IgnoredPermissionModeReason::ConfigurationUnknownLocked)
     );
@@ -464,14 +490,14 @@ fn application_unknown_is_durable_and_same_operation_rejection_can_reconcile() {
     assert_eq!(projection.current(), &initial);
     assert_eq!(
         projection.configuration_state(),
-        &PolicyConfigurationState::Stable
+        &ModeConfigurationState::Stable
     );
 }
 
 #[test]
 fn stale_consumed_receipt_is_audit_only_but_unrelated_active_receipt_locks_unknown() {
     let mut projection = projection(snapshot(PermissionMode::Manual, 1, "manual-fp"));
-    let first = snapshot(PermissionMode::ApproveForMe, 2, "approve-fp");
+    let first = snapshot(PermissionMode::ProviderAuto, 2, "provider-auto-config");
     assert_eq!(
         submit(&mut projection, 11, "operation-1", 1, first.clone()),
         PermissionModeDisposition::Applied
@@ -512,7 +538,7 @@ fn stale_consumed_receipt_is_audit_only_but_unrelated_active_receipt_locks_unkno
     );
     assert!(matches!(
         projection.configuration_state(),
-        PolicyConfigurationState::Pending(change)
+        ModeConfigurationState::Pending(change)
             if change.operation_id().as_str() == "operation-2"
     ));
 
@@ -531,7 +557,7 @@ fn stale_consumed_receipt_is_audit_only_but_unrelated_active_receipt_locks_unkno
     );
     assert!(matches!(
         projection.configuration_state(),
-        PolicyConfigurationState::Unknown(change)
+        ModeConfigurationState::Unknown(change)
             if change.operation_id().as_str() == "operation-2"
     ));
 }
@@ -539,7 +565,7 @@ fn stale_consumed_receipt_is_audit_only_but_unrelated_active_receipt_locks_unkno
 #[test]
 fn pending_and_unknown_observations_fail_closed_until_exact_reconciliation() {
     let initial = snapshot(PermissionMode::Manual, 1, "manual-fp");
-    let requested = snapshot(PermissionMode::ApproveForMe, 2, "approve-fp");
+    let requested = snapshot(PermissionMode::ProviderAuto, 2, "provider-auto-config");
     let mut projection = projection(initial);
     assert_eq!(
         submit(&mut projection, 11, "operation-1", 1, requested.clone()),
@@ -548,15 +574,15 @@ fn pending_and_unknown_observations_fail_closed_until_exact_reconciliation() {
     let pending = observation("operation-1", Some(cursor("stream-1", 50)));
     assert_eq!(
         projection.bind_pending_observation(&pending),
-        PolicyObservationBinding::AwaitingConfiguration
+        ModeObservationBinding::AwaitingConfiguration
     );
     assert_eq!(
         projection.bind_pending_observation(&observation(
             "operation-unknown",
             Some(cursor("stream-1", 50)),
         )),
-        PolicyObservationBinding::ProviderOutcomeUnknown(
-            PolicyObservationUnknownReason::UnknownOperation
+        ModeObservationBinding::ProviderOutcomeUnknown(
+            ModeObservationUnknownReason::UnknownOperation
         )
     );
 
@@ -573,8 +599,8 @@ fn pending_and_unknown_observations_fail_closed_until_exact_reconciliation() {
     );
     assert_eq!(
         projection.bind_pending_observation(&pending),
-        PolicyObservationBinding::ProviderOutcomeUnknown(
-            PolicyObservationUnknownReason::ConfigurationApplicationUnknown
+        ModeObservationBinding::ProviderOutcomeUnknown(
+            ModeObservationUnknownReason::ConfigurationApplicationUnknown
         )
     );
 
@@ -593,7 +619,7 @@ fn pending_and_unknown_observations_fail_closed_until_exact_reconciliation() {
     );
     assert_eq!(
         projection.bind_pending_observation(&pending),
-        PolicyObservationBinding::Bound(requested)
+        ModeObservationBinding::Bound(requested)
     );
     assert_eq!(projection.completed_changes().len(), 1);
 }
@@ -601,7 +627,7 @@ fn pending_and_unknown_observations_fail_closed_until_exact_reconciliation() {
 #[test]
 fn configured_cursor_boundary_binds_prior_before_and_requested_at_or_after_effective() {
     let initial = snapshot(PermissionMode::Manual, 4, "manual-fp");
-    let requested = snapshot(PermissionMode::ApproveForMe, 5, "approve-fp");
+    let requested = snapshot(PermissionMode::ProviderAuto, 5, "provider-auto-config");
     let mut projection = projection(initial.clone());
     assert_eq!(
         submit(&mut projection, 11, "operation-1", 4, requested.clone()),
@@ -621,7 +647,7 @@ fn configured_cursor_boundary_binds_prior_before_and_requested_at_or_after_effec
     assert_eq!(
         projection
             .bind_pending_observation(&observation("operation-1", Some(cursor("stream-1", 99)),)),
-        PolicyObservationBinding::Bound(initial.clone())
+        ModeObservationBinding::Bound(initial.clone())
     );
     for position in [100, 101] {
         assert_eq!(
@@ -629,7 +655,7 @@ fn configured_cursor_boundary_binds_prior_before_and_requested_at_or_after_effec
                 "operation-1",
                 Some(cursor("stream-1", position)),
             )),
-            PolicyObservationBinding::Bound(requested.clone())
+            ModeObservationBinding::Bound(requested.clone())
         );
     }
 
@@ -650,7 +676,7 @@ fn configured_cursor_boundary_binds_prior_before_and_requested_at_or_after_effec
 #[test]
 fn missing_or_incomparable_cursor_is_unknown_and_old_completion_survives_new_change() {
     let first_initial = snapshot(PermissionMode::Manual, 1, "manual-fp");
-    let first_requested = snapshot(PermissionMode::ApproveForMe, 2, "approve-fp");
+    let first_requested = snapshot(PermissionMode::ProviderAuto, 2, "provider-auto-config");
     let mut projection = projection(first_initial);
     assert_eq!(
         submit(
@@ -675,8 +701,8 @@ fn missing_or_incomparable_cursor_is_unknown_and_old_completion_survives_new_cha
     assert_eq!(
         projection
             .bind_pending_observation(&observation("operation-1", Some(cursor("stream-1", 10)),)),
-        PolicyObservationBinding::ProviderOutcomeUnknown(
-            PolicyObservationUnknownReason::MissingEffectiveCursor
+        ModeObservationBinding::ProviderOutcomeUnknown(
+            ModeObservationUnknownReason::MissingEffectiveCursor
         )
     );
 
@@ -705,8 +731,8 @@ fn missing_or_incomparable_cursor_is_unknown_and_old_completion_survives_new_cha
     assert_eq!(projection.completed_changes().len(), 2);
     assert_eq!(
         projection.bind_pending_observation(&observation("operation-2", None)),
-        PolicyObservationBinding::ProviderOutcomeUnknown(
-            PolicyObservationUnknownReason::MissingObservationCursor
+        ModeObservationBinding::ProviderOutcomeUnknown(
+            ModeObservationUnknownReason::MissingObservationCursor
         )
     );
     assert_eq!(
@@ -714,27 +740,27 @@ fn missing_or_incomparable_cursor_is_unknown_and_old_completion_survives_new_cha
             "operation-2",
             Some(cursor("other-stream", 20)),
         )),
-        PolicyObservationBinding::ProviderOutcomeUnknown(
-            PolicyObservationUnknownReason::IncomparableProviderStream
+        ModeObservationBinding::ProviderOutcomeUnknown(
+            ModeObservationUnknownReason::IncomparableProviderStream
         )
     );
     assert_eq!(
         projection
             .bind_pending_observation(&observation("operation-2", Some(cursor("stream-2", 20)),)),
-        PolicyObservationBinding::Bound(second_requested)
+        ModeObservationBinding::Bound(second_requested)
     );
     assert_eq!(
         projection
             .bind_pending_observation(&observation("operation-1", Some(cursor("stream-1", 10)),)),
-        PolicyObservationBinding::ProviderOutcomeUnknown(
-            PolicyObservationUnknownReason::MissingEffectiveCursor
+        ModeObservationBinding::ProviderOutcomeUnknown(
+            ModeObservationUnknownReason::MissingEffectiveCursor
         )
     );
 }
 
 #[test]
 fn authenticated_rejection_binds_pending_observation_to_prior_without_a_cursor() {
-    let initial = snapshot(PermissionMode::ApproveForMe, 7, "approve-fp");
+    let initial = snapshot(PermissionMode::ProviderAuto, 7, "provider-auto-config");
     let mut projection = projection(initial.clone());
     assert_eq!(
         submit(
@@ -757,7 +783,7 @@ fn authenticated_rejection_binds_pending_observation_to_prior_without_a_cursor()
 
     assert_eq!(
         projection.bind_pending_observation(&observation("operation-1", None)),
-        PolicyObservationBinding::Bound(initial)
+        ModeObservationBinding::Bound(initial)
     );
     assert!(matches!(
         projection
@@ -778,7 +804,7 @@ fn receipt_without_active_configuration_is_ignored() {
                 11,
                 PermissionModeEvent::ConfigurationSucceeded {
                     operation_id: operation("operation-never-submitted"),
-                    applied: snapshot(PermissionMode::ApproveForMe, 2, "approve-fp"),
+                    applied: snapshot(PermissionMode::ProviderAuto, 2, "provider-auto-config"),
                     effective_cursor: None,
                 },
             )
@@ -798,7 +824,7 @@ fn non_monotonic_event_is_rejected_without_mutating_projection() {
             11,
             "operation-1",
             1,
-            snapshot(PermissionMode::ApproveForMe, 2, "approve-fp"),
+            snapshot(PermissionMode::ProviderAuto, 2, "provider-auto-config"),
         ),
         PermissionModeDisposition::Applied
     );
@@ -866,7 +892,7 @@ fn replay_matches_incremental_reduction_with_unknown_reconciliation() {
     assert_eq!(replayed.current(), &requested);
     assert_eq!(
         replayed.configuration_state(),
-        &PolicyConfigurationState::Stable
+        &ModeConfigurationState::Stable
     );
     assert_eq!(replayed.last_ingest_seq(), 14);
     assert_eq!(replayed.used_operation_ids().len(), 1);
@@ -874,8 +900,8 @@ fn replay_matches_incremental_reduction_with_unknown_reconciliation() {
     assert_eq!(
         replayed
             .bind_pending_observation(&observation("operation-1", Some(cursor("stream-1", 1)),)),
-        PolicyObservationBinding::ProviderOutcomeUnknown(
-            PolicyObservationUnknownReason::MissingEffectiveCursor
+        ModeObservationBinding::ProviderOutcomeUnknown(
+            ModeObservationUnknownReason::MissingEffectiveCursor
         )
     );
 }

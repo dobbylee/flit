@@ -11,7 +11,7 @@ fn exact_validated_codex_fingerprint_exposes_only_the_recorded_capability_matrix
     use CapabilityStatus::{Degraded, Supported, Unsupported};
     use ProviderCapability::{
         CompletionDetect, ContinueAfterQuit, History, Launch, ListManaged, OpenInProvider,
-        PermissionDetect, PermissionPolicyConfigure, PermissionPolicyObserve, PermissionRespond,
+        PermissionDetect, PermissionModeConfigure, PermissionRespond, ProviderOutcomeObserve,
         QuestionDetect, QuestionRespond, Reconcile, Resume, Stop, StructuredActivity,
     };
 
@@ -49,8 +49,8 @@ fn exact_validated_codex_fingerprint_exposes_only_the_recorded_capability_matrix
             (StructuredActivity, Degraded),
             (PermissionDetect, Degraded),
             (PermissionRespond, Unsupported),
-            (PermissionPolicyConfigure, Unsupported),
-            (PermissionPolicyObserve, Unsupported),
+            (PermissionModeConfigure, Unsupported),
+            (ProviderOutcomeObserve, Unsupported),
             (QuestionDetect, Supported),
             (QuestionRespond, Degraded),
             (CompletionDetect, Supported),
@@ -70,7 +70,7 @@ fn exact_manual_profile_enables_only_policy_configuration() {
     let snapshot = classify_codex(&validated_codex_0_145_0_fingerprint());
     assert_eq!(snapshot.compatibility, ProviderCompatibility::Supported);
     assert_eq!(
-        snapshot.status(ProviderCapability::PermissionPolicyConfigure),
+        snapshot.status(ProviderCapability::PermissionModeConfigure),
         CapabilityStatus::Supported
     );
     assert_eq!(
@@ -78,7 +78,7 @@ fn exact_manual_profile_enables_only_policy_configuration() {
         CapabilityStatus::Unsupported
     );
     assert_eq!(
-        snapshot.status(ProviderCapability::PermissionPolicyObserve),
+        snapshot.status(ProviderCapability::ProviderOutcomeObserve),
         CapabilityStatus::Unsupported
     );
 }

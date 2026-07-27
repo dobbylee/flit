@@ -283,6 +283,15 @@ fn current_managed_run_start_fixtures_round_trip_every_shape() {
         current,
         "managed_run_start.response.json",
     ));
+    let response: ManagedRunStartResponse = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "managed_run_start.response.json",
+        )))
+        .expect("managed Run response fixture should be readable"),
+    )
+    .expect("managed Run response fixture should match Rust types");
+    assert_eq!(response.provider_configuration, "readOnly+on-request+user");
     assert_fixture_round_trip::<Vec<CommandError>>(&command_fixture(
         current,
         "managed_run_errors.json",
@@ -459,6 +468,12 @@ fn generated_swift_project_contract_is_current_and_required_fields_fail_closed()
             "generated Swift contract should contain {type_name}"
         );
     }
+    assert!(generated.contains("case providerAuto = \"provider_auto\""));
+    assert!(generated.contains("case permissionModeConfigure = \"permission_mode_configure\""));
+    assert!(generated.contains("case providerOutcomeObserve = \"provider_outcome_observe\""));
+    assert!(generated.contains("let providerConfiguration: String"));
+    assert!(!generated.contains("approveForMe"));
+    assert!(!generated.contains("providerPolicy"));
 
     let manifest = read_command_compatibility_manifest();
     let mut drifted: serde_json::Value = serde_json::from_str(

@@ -5,11 +5,9 @@ use flit_core::{
         AttentionEvent, AttentionEvidence, AttentionItemDraft, AttentionItemId,
         AttentionProjection, AttentionSeverity, AttentionStatus, SourceEventId,
     },
-    permission_mode::{PermissionMode, PermissionModeSnapshot, PolicyFingerprint},
-    provider_policy::{
-        MissingProviderPolicyField, PolicyViolationReason, ProviderPolicyClassification,
-        ProviderPolicyDecision, ProviderPolicyValue, ProviderTerminalOutcome,
-        VerifiedProviderPolicyOutcome,
+    provider_outcome::{
+        MissingProviderOutcomeField, ProviderDecision, ProviderOutcomeClassification,
+        ProviderOutcomeValue, ProviderTerminalOutcome, VerifiedProviderOutcome,
     },
     request::{
         RequestDisposition, RequestEvent, RequestId, RequestKind, RequestProjection, RequestStatus,
@@ -37,8 +35,8 @@ fn source_event_id(value: &str) -> SourceEventId {
     SourceEventId::new(value).expect("test event identifier must be valid")
 }
 
-fn value(value: &str) -> ProviderPolicyValue {
-    ProviderPolicyValue::new(value).expect("test provider value must be valid")
+fn value(value: &str) -> ProviderOutcomeValue {
+    ProviderOutcomeValue::new(value).expect("test provider value must be valid")
 }
 
 fn request(value: &str, kind: RequestKind, ingest_seq: u64) -> RequestProjection {
@@ -72,34 +70,19 @@ fn observation(label: &str, observed_at: u64) -> RequestAttentionObservation {
     )
 }
 
-fn approved_mode() -> PermissionModeSnapshot {
-    PermissionModeSnapshot::new(
-        PermissionMode::ApproveForMe,
-        1,
-        Some(PolicyFingerprint::new("policy-fp").expect("valid fingerprint")),
-    )
-    .expect("valid permission mode")
-}
-
 fn provider_outcome(
     request_id: &str,
     request_version: u64,
     decision_id: &str,
     evidence_id: &str,
     captured_at_ms: u64,
-) -> VerifiedProviderPolicyOutcome {
-    VerifiedProviderPolicyOutcome {
+) -> VerifiedProviderOutcome {
+    VerifiedProviderOutcome {
         session_key: value("session-1"),
         request_id: crate_request_id(request_id),
         request_version,
-        action_fingerprint: value("action-fp"),
-        scope_fingerprint: value("scope-fp"),
-        bound_mode: approved_mode(),
-        policy_source: value("provider-native"),
-        policy_version: value("policy-v1"),
-        policy_fingerprint: value("policy-fp"),
         decision_id: value(decision_id),
-        decision: ProviderPolicyDecision::Allowed,
+        decision: ProviderDecision::Allowed,
         terminal_outcome: ProviderTerminalOutcome::RequestResolved,
         captured_at_ms,
         evidence_id: value(evidence_id),
@@ -114,13 +97,13 @@ fn provider_draft(
     created_at: u64,
 ) -> AttentionItemDraft {
     AttentionItemDraft::new(
-        AttentionItemId::new(format!("provider-policy:{decision_id}"))
+        AttentionItemId::new(format!("provider-outcome:{decision_id}"))
             .expect("valid provider item"),
         source_event_id(&format!("provider-event-{decision_id}")),
         category,
         severity,
         false,
-        AttentionDedupeKey::new(format!("provider-policy:{decision_id}"))
+        AttentionDedupeKey::new(format!("provider-outcome:{decision_id}"))
             .expect("valid provider key"),
         AttentionEvidence::new(vec![evidence_id(evidence)], None).expect("valid provider evidence"),
         TimestampMs::new(created_at),
@@ -134,7 +117,6 @@ fn apply_provider_resolution(
     decision_id: &str,
     evidence: &str,
     captured_at: u64,
-    violations: Vec<PolicyViolationReason>,
 ) {
     let request_id = request.request_id().clone();
     let request_version = request.version();
@@ -145,21 +127,13 @@ fn apply_provider_resolution(
         evidence,
         captured_at,
     );
-    let classification = if violations.is_empty() {
-        ProviderPolicyClassification::InformationalResolve(outcome)
-    } else {
-        ProviderPolicyClassification::ResolvedWithPolicyViolation {
-            outcome,
-            reasons: violations,
-        }
-    };
     request
         .apply(
             ingest_seq,
-            RequestEvent::ProviderPolicyClassified {
+            RequestEvent::ProviderOutcomeClassified {
                 request_id,
                 expected_request_version: request_version,
-                classification: Box::new(classification),
+                classification: Box::new(ProviderOutcomeClassification::Resolved(outcome)),
             },
         )
         .expect("test provider resolution must reduce");
@@ -371,12 +345,10 @@ fn informational_provider_resolution_is_one_batch_with_a_decision_bound_audit() 
     request
         .apply(
             3,
-            RequestEvent::ProviderPolicyClassified {
+            RequestEvent::ProviderOutcomeClassified {
                 request_id: request_id("permission-1"),
                 expected_request_version: 2,
-                classification: Box::new(ProviderPolicyClassification::InformationalResolve(
-                    outcome,
-                )),
+                classification: Box::new(ProviderOutcomeClassification::Resolved(outcome)),
             },
         )
         .expect("provider outcome must reduce");
@@ -390,7 +362,7 @@ fn informational_provider_resolution_is_one_batch_with_a_decision_bound_audit() 
     let audit_item = attention
         .items()
         .iter()
-        .find(|item| item.item_id().as_str() == "provider-policy:decision-1")
+        .find(|item| item.item_id().as_str() == "provider-outcome:decision-1")
         .expect("provider audit item");
     assert_eq!(request_item.status(), AttentionStatus::Resolved);
     assert_eq!(request_item.version(), 3);
@@ -420,45 +392,6 @@ fn informational_provider_resolution_is_one_batch_with_a_decision_bound_audit() 
 }
 
 #[test]
-fn provider_policy_violation_resolves_permission_and_opens_critical_non_blocking_risk() {
-    let mut request = request("permission-1", RequestKind::Permission, 2);
-    let source = source(&request, AttentionSeverity::ActionRequired);
-    let mut attention = AttentionProjection::new(1).expect("valid attention projection");
-    sync(&mut attention, &request, &source, "requested").expect("open sync");
-    let outcome = provider_outcome("permission-1", 2, "decision-risk", "risk-evidence", 260);
-    request
-        .apply(
-            3,
-            RequestEvent::ProviderPolicyClassified {
-                request_id: request_id("permission-1"),
-                expected_request_version: 2,
-                classification: Box::new(
-                    ProviderPolicyClassification::ResolvedWithPolicyViolation {
-                        outcome,
-                        reasons: vec![PolicyViolationReason::OutOfProjectScope],
-                    },
-                ),
-            },
-        )
-        .expect("provider violation must reduce");
-    sync(&mut attention, &request, &source, "provider-violation").expect("provider violation sync");
-
-    let risk = attention
-        .items()
-        .iter()
-        .find(|item| item.item_id().as_str() == "provider-policy:decision-risk")
-        .expect("policy violation risk item");
-    assert_eq!(risk.category(), AttentionCategory::Risk);
-    assert_eq!(risk.severity(), AttentionSeverity::Critical);
-    assert!(!risk.blocking());
-    assert_eq!(risk.status(), AttentionStatus::Open);
-    assert_eq!(
-        attention.highest_active_severity(),
-        Some(AttentionSeverity::Critical)
-    );
-}
-
-#[test]
 fn provider_outcome_unknown_keeps_open_then_exact_reconciliation_resolves() {
     let mut request = request("permission-1", RequestKind::Permission, 2);
     let source = source(&request, AttentionSeverity::ActionRequired);
@@ -467,11 +400,11 @@ fn provider_outcome_unknown_keeps_open_then_exact_reconciliation_resolves() {
     request
         .apply(
             3,
-            RequestEvent::ProviderPolicyClassified {
+            RequestEvent::ProviderOutcomeClassified {
                 request_id: request_id("permission-1"),
                 expected_request_version: 2,
-                classification: Box::new(ProviderPolicyClassification::ProviderOutcomeUnknown {
-                    missing: vec![MissingProviderPolicyField::EvidenceId],
+                classification: Box::new(ProviderOutcomeClassification::OutcomeUnknown {
+                    missing: vec![MissingProviderOutcomeField::EvidenceId],
                 }),
             },
         )
@@ -500,12 +433,10 @@ fn provider_outcome_unknown_keeps_open_then_exact_reconciliation_resolves() {
     request
         .apply(
             4,
-            RequestEvent::ProviderPolicyClassified {
+            RequestEvent::ProviderOutcomeClassified {
                 request_id: request_id("permission-1"),
                 expected_request_version: 2,
-                classification: Box::new(ProviderPolicyClassification::InformationalResolve(
-                    outcome,
-                )),
+                classification: Box::new(ProviderOutcomeClassification::Resolved(outcome)),
             },
         )
         .expect("exact reconciliation must reduce");
@@ -726,25 +657,9 @@ fn ignored_or_reopened_request_cannot_become_a_late_initial_source() {
 
 #[test]
 fn provider_item_with_wrong_evidence_or_time_fails_without_mutation() {
-    let cases = [
-        (
-            "info",
-            AttentionCategory::PermissionAudit,
-            AttentionSeverity::Informational,
-            "wrong-evidence",
-            400,
-            Vec::new(),
-        ),
-        (
-            "risk",
-            AttentionCategory::Risk,
-            AttentionSeverity::Critical,
-            "provider-evidence-risk",
-            399,
-            vec![PolicyViolationReason::OutOfProjectScope],
-        ),
-    ];
-    for (decision, category, severity, item_evidence, item_time, violations) in cases {
+    let cases = [("wrong-evidence", 400), ("provider-evidence-info", 399)];
+    for (item_evidence, item_time) in cases {
+        let decision = "info";
         let request_id = format!("permission-{decision}");
         let mut request = request(&request_id, RequestKind::Permission, 2);
         let source = source(&request, AttentionSeverity::ActionRequired);
@@ -756,7 +671,6 @@ fn provider_item_with_wrong_evidence_or_time_fails_without_mutation() {
             decision,
             &format!("provider-evidence-{decision}"),
             400,
-            violations,
         );
         attention
             .apply_batch(
@@ -769,8 +683,8 @@ fn provider_item_with_wrong_evidence_or_time_fails_without_mutation() {
                     },
                     AttentionEvent::Opened(provider_draft(
                         decision,
-                        category,
-                        severity,
+                        AttentionCategory::PermissionAudit,
+                        AttentionSeverity::Informational,
                         item_evidence,
                         item_time,
                     )),
@@ -787,7 +701,7 @@ fn provider_item_with_wrong_evidence_or_time_fails_without_mutation() {
 
         assert_eq!(
             sync(&mut attention, &request, &source, "late-ignored"),
-            Err(RequestAttentionError::IncompatibleProviderPolicyAttentionItem)
+            Err(RequestAttentionError::IncompatibleProviderOutcomeAttentionItem)
         );
         assert_eq!(attention, before);
     }
@@ -811,19 +725,12 @@ fn preexisting_provider_slot_fails_before_the_request_resolution_batch() {
             )),
         )
         .expect("provider collision setup must apply");
-    apply_provider_resolution(
-        &mut request,
-        4,
-        "decision-1",
-        "provider-evidence",
-        400,
-        Vec::new(),
-    );
+    apply_provider_resolution(&mut request, 4, "decision-1", "provider-evidence", 400);
     let before = attention.clone();
 
     assert_eq!(
         sync(&mut attention, &request, &source, "provider-resolved"),
-        Err(RequestAttentionError::IncompatibleProviderPolicyAttentionItem)
+        Err(RequestAttentionError::IncompatibleProviderOutcomeAttentionItem)
     );
     assert_eq!(attention, before);
     assert_eq!(
@@ -841,14 +748,7 @@ fn missing_provider_item_cannot_be_recreated_by_a_later_ignored_event() {
     let source = source(&request, AttentionSeverity::ActionRequired);
     let mut attention = AttentionProjection::new(1).expect("valid attention projection");
     sync(&mut attention, &request, &source, "requested").expect("open sync");
-    apply_provider_resolution(
-        &mut request,
-        3,
-        "decision-1",
-        "provider-evidence",
-        400,
-        Vec::new(),
-    );
+    apply_provider_resolution(&mut request, 3, "decision-1", "provider-evidence", 400);
     attention
         .apply(
             3,
@@ -869,7 +769,7 @@ fn missing_provider_item_cannot_be_recreated_by_a_later_ignored_event() {
 
     assert_eq!(
         sync(&mut attention, &request, &source, "late-ignored"),
-        Err(RequestAttentionError::MissingProviderPolicyAttentionItem)
+        Err(RequestAttentionError::MissingProviderOutcomeAttentionItem)
     );
     assert_eq!(attention, before);
 }
@@ -956,11 +856,11 @@ fn ignored_event_cannot_catch_up_missed_pending_unknown_or_provider_resolution()
     unknown
         .apply(
             3,
-            RequestEvent::ProviderPolicyClassified {
+            RequestEvent::ProviderOutcomeClassified {
                 request_id: request_id("permission-unknown"),
                 expected_request_version: 2,
-                classification: Box::new(ProviderPolicyClassification::ProviderOutcomeUnknown {
-                    missing: vec![MissingProviderPolicyField::EvidenceId],
+                classification: Box::new(ProviderOutcomeClassification::OutcomeUnknown {
+                    missing: vec![MissingProviderOutcomeField::EvidenceId],
                 }),
             },
         )
@@ -994,7 +894,6 @@ fn ignored_event_cannot_catch_up_missed_pending_unknown_or_provider_resolution()
         "missed-decision",
         "missed-provider-evidence",
         300,
-        Vec::new(),
     );
     assert!(matches!(
         provider

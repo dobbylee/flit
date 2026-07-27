@@ -114,7 +114,7 @@ pub struct CodexStartedThread {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodexManualStartedThread {
     pub thread: CodexStartedThread,
-    pub provider_policy: &'static str,
+    pub provider_configuration: &'static str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -464,7 +464,7 @@ pub fn decode_codex_manual_start_response(
             thread_id,
             canonical_cwd,
         },
-        provider_policy: "readOnly+on-request+user",
+        provider_configuration: "readOnly+on-request+user",
     })
 }
 

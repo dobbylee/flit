@@ -3,7 +3,7 @@ pub mod attention;
 pub mod dashboard;
 pub mod lifecycle;
 pub mod permission_mode;
-pub mod provider_policy;
+pub mod provider_outcome;
 pub mod request;
 pub mod request_attention;
 pub mod run_attention;

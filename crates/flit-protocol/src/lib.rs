@@ -4,7 +4,7 @@ use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: &str = "1.5";
+pub const PROTOCOL_VERSION: &str = "1.6";
 pub const EVENT_PROTOCOL_VERSION: &str = "1.0";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -162,8 +162,8 @@ pub enum ProviderCapability {
     StructuredActivity,
     PermissionDetect,
     PermissionRespond,
-    PermissionPolicyConfigure,
-    PermissionPolicyObserve,
+    PermissionModeConfigure,
+    ProviderOutcomeObserve,
     QuestionDetect,
     QuestionRespond,
     CompletionDetect,
@@ -227,7 +227,7 @@ pub struct ProviderDiagnosticsResponse {
 #[serde(rename_all = "snake_case")]
 pub enum ManagedRunPermissionMode {
     Manual,
-    ApproveForMe,
+    ProviderAuto,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -259,7 +259,7 @@ pub struct ManagedRunStartResponse {
     pub provider_turn_id: String,
     pub permission_mode: ManagedRunPermissionMode,
     pub permission_mode_version: u64,
-    pub provider_policy: String,
+    pub provider_configuration: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -757,8 +757,8 @@ enum FlitProviderCapability: String, Codable, Sendable {
     case structuredActivity = "structured_activity"
     case permissionDetect = "permission_detect"
     case permissionRespond = "permission_respond"
-    case permissionPolicyConfigure = "permission_policy_configure"
-    case permissionPolicyObserve = "permission_policy_observe"
+    case permissionModeConfigure = "permission_mode_configure"
+    case providerOutcomeObserve = "provider_outcome_observe"
     case questionDetect = "question_detect"
     case questionRespond = "question_respond"
     case completionDetect = "completion_detect"
@@ -822,7 +822,7 @@ struct FlitProviderDiagnosticsResponse: Codable, Equatable, Sendable {
 
 enum FlitManagedRunPermissionMode: String, Codable, Sendable {
     case manual
-    case approveForMe = "approve_for_me"
+    case providerAuto = "provider_auto"
 }
 
 struct FlitManagedRunStartRequest: Codable, Equatable, Sendable {
@@ -871,7 +871,7 @@ struct FlitManagedRunStartResponse: Codable, Equatable, Sendable {
     let providerTurnId: String
     let permissionMode: FlitManagedRunPermissionMode
     let permissionModeVersion: UInt64
-    let providerPolicy: String
+    let providerConfiguration: String
 
     private enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol_version"
@@ -881,7 +881,7 @@ struct FlitManagedRunStartResponse: Codable, Equatable, Sendable {
         case providerTurnId = "provider_turn_id"
         case permissionMode = "permission_mode"
         case permissionModeVersion = "permission_mode_version"
-        case providerPolicy = "provider_policy"
+        case providerConfiguration = "provider_configuration"
     }
 }
 

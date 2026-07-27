@@ -72,8 +72,8 @@ pub enum ProviderCapability {
     StructuredActivity,
     PermissionDetect,
     PermissionRespond,
-    PermissionPolicyConfigure,
-    PermissionPolicyObserve,
+    PermissionModeConfigure,
+    ProviderOutcomeObserve,
     QuestionDetect,
     QuestionRespond,
     CompletionDetect,
@@ -92,8 +92,8 @@ impl ProviderCapability {
         Self::StructuredActivity,
         Self::PermissionDetect,
         Self::PermissionRespond,
-        Self::PermissionPolicyConfigure,
-        Self::PermissionPolicyObserve,
+        Self::PermissionModeConfigure,
+        Self::ProviderOutcomeObserve,
         Self::QuestionDetect,
         Self::QuestionRespond,
         Self::CompletionDetect,
@@ -206,7 +206,7 @@ pub fn validated_codex_0_145_0_fingerprint() -> ProviderFingerprint {
             .to_owned(),
         method_allowlist_sha256: "0de966cd124a25c926df49f4b697e588d51947c31c4e2febe2175338f6319d42"
             .to_owned(),
-        fixture_sha256: "6f844ba191b60faf079106ef9682250b3ac14e16a15e97f4c7c87f7fd2689d80"
+        fixture_sha256: "e9763750f9729069b7f83e1171a67d92a5b565479adf314dc9cf5e38395c43a2"
             .to_owned(),
         smoke_run_id: "2026-07-27-arm64-s0-9".to_owned(),
     }
@@ -254,7 +254,7 @@ pub fn classify_codex(fingerprint: &ProviderFingerprint) -> ProviderCapabilitySn
 fn codex_0_145_0_capabilities() -> Vec<CapabilityEntry> {
     let mut capabilities = codex_0_144_6_capabilities();
     for entry in &mut capabilities {
-        if entry.capability == ProviderCapability::PermissionPolicyConfigure {
+        if entry.capability == ProviderCapability::PermissionModeConfigure {
             entry.status = CapabilityStatus::Supported;
         }
     }
@@ -297,7 +297,7 @@ fn codex_0_144_6_capabilities() -> Vec<CapabilityEntry> {
     use CapabilityStatus::{Degraded, Supported, Unsupported};
     use ProviderCapability::{
         CompletionDetect, ContinueAfterQuit, History, Launch, ListManaged, OpenInProvider,
-        PermissionDetect, PermissionPolicyConfigure, PermissionPolicyObserve, PermissionRespond,
+        PermissionDetect, PermissionModeConfigure, PermissionRespond, ProviderOutcomeObserve,
         QuestionDetect, QuestionRespond, Reconcile, Resume, Stop, StructuredActivity,
     };
 
@@ -309,8 +309,8 @@ fn codex_0_144_6_capabilities() -> Vec<CapabilityEntry> {
         (StructuredActivity, Degraded),
         (PermissionDetect, Degraded),
         (PermissionRespond, Unsupported),
-        (PermissionPolicyConfigure, Unsupported),
-        (PermissionPolicyObserve, Unsupported),
+        (PermissionModeConfigure, Unsupported),
+        (ProviderOutcomeObserve, Unsupported),
         (QuestionDetect, Supported),
         (QuestionRespond, Degraded),
         (CompletionDetect, Supported),
