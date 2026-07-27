@@ -3,6 +3,7 @@ use std::{collections::BTreeSet, fs, path::PathBuf};
 use flit_protocol::{
     CapabilityStatus, CommandError, EVENT_PROTOCOL_VERSION, EventEnvelope, EventProtocolVersion,
     MAX_JSON_SAFE_INTEGER, ManagedRunObserveRequest, ManagedRunObserveResponse,
+    ManagedRunPermissionRespondRequest, ManagedRunPermissionRespondResponse,
     ManagedRunStartRequest, ManagedRunStartResponse, PROTOCOL_VERSION, ProjectInspectionRequest,
     ProjectInspectionResponse, ProjectRegistrationRequest, ProjectRegistrationResponse,
     ProjectTrustRequest, ProjectTrustResponse, ProjectsListRequest, ProjectsListResponse,
@@ -321,6 +322,28 @@ fn current_managed_run_observe_fixtures_round_trip_every_shape() {
 }
 
 #[test]
+fn current_managed_permission_response_fixtures_round_trip_every_shape() {
+    let manifest = read_command_compatibility_manifest();
+    let current = &manifest.current;
+    assert_fixture_round_trip::<ManagedRunPermissionRespondRequest>(&command_fixture(
+        current,
+        "managed_run_permission_respond.request.json",
+    ));
+    for name in [
+        "managed_run_permission_respond.delivered.response.json",
+        "managed_run_permission_respond.delivery_unknown.response.json",
+    ] {
+        assert_fixture_round_trip::<ManagedRunPermissionRespondResponse>(&command_fixture(
+            current, name,
+        ));
+    }
+    assert_fixture_round_trip::<Vec<CommandError>>(&command_fixture(
+        current,
+        "managed_run_permission_respond_errors.json",
+    ));
+}
+
+#[test]
 fn command_manifest_retains_the_exact_previous_minor_health_contract() {
     let manifest = read_command_compatibility_manifest();
     assert_eq!(manifest.current.version, PROTOCOL_VERSION);
@@ -426,6 +449,10 @@ fn generated_swift_project_contract_is_current_and_required_fields_fail_closed()
         "FlitManagedRunObserveRequest",
         "FlitManagedRunObservationStatus",
         "FlitManagedRunObserveResponse",
+        "FlitManagedRunPermissionDecision",
+        "FlitManagedRunPermissionRespondRequest",
+        "FlitManagedRunPermissionResponseStatus",
+        "FlitManagedRunPermissionRespondResponse",
     ] {
         assert!(
             generated.contains(type_name),
@@ -458,6 +485,20 @@ fn generated_swift_project_contract_is_current_and_required_fields_fail_closed()
     .expect("registration fixture should be JSON");
     unknown_status["status"] = serde_json::json!("silently_invented");
     assert!(serde_json::from_value::<ProjectRegistrationResponse>(unknown_status).is_err());
+
+    let mut unknown_permission_status: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            &manifest.current,
+            "managed_run_permission_respond.delivered.response.json",
+        )))
+        .expect("permission response fixture should be readable"),
+    )
+    .expect("permission response fixture should be JSON");
+    unknown_permission_status["status"] = serde_json::json!("silently_delivered");
+    assert!(
+        serde_json::from_value::<ManagedRunPermissionRespondResponse>(unknown_permission_status)
+            .is_err()
+    );
 }
 
 #[test]

@@ -437,6 +437,46 @@ struct NativeHealthTests {
             code: .managedRunNotActive,
             fixtures: managedRunObserveErrors
         )
+        _ = try decodeFixture(
+            FlitManagedRunPermissionRespondRequest.self,
+            at: "\(fixtureRoot)/managed_run_permission_respond.request.json"
+        )
+        for (name, expectedStatus) in [
+            (
+                "managed_run_permission_respond.delivered.response.json",
+                FlitManagedRunPermissionResponseStatus.delivered
+            ),
+            (
+                "managed_run_permission_respond.delivery_unknown.response.json",
+                FlitManagedRunPermissionResponseStatus.deliveryUnknown
+            ),
+        ] {
+            let response = try decodeFixture(
+                FlitManagedRunPermissionRespondResponse.self,
+                at: "\(fixtureRoot)/\(name)"
+            )
+            try require(
+                response.status == expectedStatus,
+                "generated permission response must decode \(expectedStatus)"
+            )
+        }
+        let permissionResponseErrors = try decodeFixture(
+            [FlitCommandError].self,
+            at: "\(fixtureRoot)/managed_run_permission_respond_errors.json"
+        )
+        try require(
+            permissionResponseErrors.count == 5,
+            "generated permission response errors must decode every public failure"
+        )
+        let permissionResponseRequest = try String(
+            contentsOfFile: "\(fixtureRoot)/managed_run_permission_respond.request.json",
+            encoding: .utf8
+        )
+        try requireCommandError(
+            try managedRunPermissionRespondJson(requestJson: permissionResponseRequest),
+            code: .managedRunNotActive,
+            fixtures: permissionResponseErrors
+        )
         let driftedInspection = Data(
             """
             {

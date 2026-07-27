@@ -4,7 +4,7 @@ use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: &str = "1.4";
+pub const PROTOCOL_VERSION: &str = "1.5";
 pub const EVENT_PROTOCOL_VERSION: &str = "1.0";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -305,6 +305,57 @@ pub enum ManagedRunObserveResponse {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedRunPermissionDecision {
+    AllowOnce,
+    Deny,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ManagedRunPermissionRespondRequest {
+    pub run_id: String,
+    pub request_id: String,
+    pub request_version: u64,
+    pub response_attempt_id: String,
+    pub decision: ManagedRunPermissionDecision,
+    pub submitted_at: String,
+    pub finished_at: String,
+    pub submitted_event_id: String,
+    pub resolved_event_id: String,
+    pub delivery_unknown_event_id: String,
+    pub client_protocol_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ManagedRunPermissionRespondResponse {
+    Delivered {
+        protocol_version: String,
+        run_id: String,
+        request_id: String,
+        request_version: u64,
+        response_attempt_id: String,
+        decision: ManagedRunPermissionDecision,
+        submitted_event_id: String,
+        submitted_version: u64,
+        outcome_event_id: String,
+        outcome_version: u64,
+    },
+    DeliveryUnknown {
+        protocol_version: String,
+        run_id: String,
+        request_id: String,
+        request_version: u64,
+        response_attempt_id: String,
+        decision: ManagedRunPermissionDecision,
+        submitted_event_id: String,
+        submitted_version: u64,
+        outcome_event_id: String,
+        outcome_version: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CommandErrorCode {
     ProtocolMismatch,
@@ -322,6 +373,8 @@ pub enum CommandErrorCode {
     ProviderStartUnknown,
     ManagedRunNotActive,
     ProviderObservationUnknown,
+    PermissionRequestStale,
+    PermissionResponseConflict,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -477,6 +530,8 @@ impl CommandError {
             CommandErrorCode::ProviderStartUnknown => "errors.providerStartUnknown",
             CommandErrorCode::ManagedRunNotActive => "errors.managedRunNotActive",
             CommandErrorCode::ProviderObservationUnknown => "errors.providerObservationUnknown",
+            CommandErrorCode::PermissionRequestStale => "errors.permissionRequestStale",
+            CommandErrorCode::PermissionResponseConflict => "errors.permissionResponseConflict",
         };
         Self {
             code,
@@ -661,6 +716,8 @@ enum FlitCommandErrorCode: String, Codable, Sendable {
     case providerStartUnknown = "PROVIDER_START_UNKNOWN"
     case managedRunNotActive = "MANAGED_RUN_NOT_ACTIVE"
     case providerObservationUnknown = "PROVIDER_OBSERVATION_UNKNOWN"
+    case permissionRequestStale = "PERMISSION_REQUEST_STALE"
+    case permissionResponseConflict = "PERMISSION_RESPONSE_CONFLICT"
 }
 
 struct FlitCommandError: Codable, Equatable, Sendable {
@@ -1023,6 +1080,182 @@ enum FlitManagedRunObserveResponse: Codable, Equatable, Sendable {
             try values.encode(providerTurnId, forKey: .providerTurnId)
             try values.encode(eventId, forKey: .eventId)
             try values.encode(eventVersion, forKey: .eventVersion)
+        }
+    }
+}
+
+enum FlitManagedRunPermissionDecision: String, Codable, Sendable {
+    case allowOnce = "allow_once"
+    case deny
+}
+
+struct FlitManagedRunPermissionRespondRequest: Codable, Equatable, Sendable {
+    let runId: String
+    let requestId: String
+    let requestVersion: UInt64
+    let responseAttemptId: String
+    let decision: FlitManagedRunPermissionDecision
+    let submittedAt: String
+    let finishedAt: String
+    let submittedEventId: String
+    let resolvedEventId: String
+    let deliveryUnknownEventId: String
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case runId = "run_id"
+        case requestId = "request_id"
+        case requestVersion = "request_version"
+        case responseAttemptId = "response_attempt_id"
+        case decision
+        case submittedAt = "submitted_at"
+        case finishedAt = "finished_at"
+        case submittedEventId = "submitted_event_id"
+        case resolvedEventId = "resolved_event_id"
+        case deliveryUnknownEventId = "delivery_unknown_event_id"
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+enum FlitManagedRunPermissionResponseStatus: String, Codable, Sendable {
+    case delivered
+    case deliveryUnknown = "delivery_unknown"
+}
+
+enum FlitManagedRunPermissionRespondResponse: Codable, Equatable, Sendable {
+    case delivered(
+        protocolVersion: String,
+        runId: String,
+        requestId: String,
+        requestVersion: UInt64,
+        responseAttemptId: String,
+        decision: FlitManagedRunPermissionDecision,
+        submittedEventId: String,
+        submittedVersion: UInt64,
+        outcomeEventId: String,
+        outcomeVersion: UInt64
+    )
+    case deliveryUnknown(
+        protocolVersion: String,
+        runId: String,
+        requestId: String,
+        requestVersion: UInt64,
+        responseAttemptId: String,
+        decision: FlitManagedRunPermissionDecision,
+        submittedEventId: String,
+        submittedVersion: UInt64,
+        outcomeEventId: String,
+        outcomeVersion: UInt64
+    )
+
+    var status: FlitManagedRunPermissionResponseStatus {
+        switch self {
+        case .delivered:
+            .delivered
+        case .deliveryUnknown:
+            .deliveryUnknown
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case status
+        case protocolVersion = "protocol_version"
+        case runId = "run_id"
+        case requestId = "request_id"
+        case requestVersion = "request_version"
+        case responseAttemptId = "response_attempt_id"
+        case decision
+        case submittedEventId = "submitted_event_id"
+        case submittedVersion = "submitted_version"
+        case outcomeEventId = "outcome_event_id"
+        case outcomeVersion = "outcome_version"
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let status = try values.decode(
+            FlitManagedRunPermissionResponseStatus.self,
+            forKey: .status
+        )
+        let common = (
+            try values.decode(String.self, forKey: .protocolVersion),
+            try values.decode(String.self, forKey: .runId),
+            try values.decode(String.self, forKey: .requestId),
+            try values.decode(UInt64.self, forKey: .requestVersion),
+            try values.decode(String.self, forKey: .responseAttemptId),
+            try values.decode(FlitManagedRunPermissionDecision.self, forKey: .decision),
+            try values.decode(String.self, forKey: .submittedEventId),
+            try values.decode(UInt64.self, forKey: .submittedVersion),
+            try values.decode(String.self, forKey: .outcomeEventId),
+            try values.decode(UInt64.self, forKey: .outcomeVersion)
+        )
+        if status == .delivered {
+            self = .delivered(
+                protocolVersion: common.0,
+                runId: common.1,
+                requestId: common.2,
+                requestVersion: common.3,
+                responseAttemptId: common.4,
+                decision: common.5,
+                submittedEventId: common.6,
+                submittedVersion: common.7,
+                outcomeEventId: common.8,
+                outcomeVersion: common.9
+            )
+        } else {
+            self = .deliveryUnknown(
+                protocolVersion: common.0,
+                runId: common.1,
+                requestId: common.2,
+                requestVersion: common.3,
+                responseAttemptId: common.4,
+                decision: common.5,
+                submittedEventId: common.6,
+                submittedVersion: common.7,
+                outcomeEventId: common.8,
+                outcomeVersion: common.9
+            )
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(status, forKey: .status)
+        switch self {
+        case let .delivered(
+            protocolVersion,
+            runId,
+            requestId,
+            requestVersion,
+            responseAttemptId,
+            decision,
+            submittedEventId,
+            submittedVersion,
+            outcomeEventId,
+            outcomeVersion
+        ),
+        let .deliveryUnknown(
+            protocolVersion,
+            runId,
+            requestId,
+            requestVersion,
+            responseAttemptId,
+            decision,
+            submittedEventId,
+            submittedVersion,
+            outcomeEventId,
+            outcomeVersion
+        ):
+            try values.encode(protocolVersion, forKey: .protocolVersion)
+            try values.encode(runId, forKey: .runId)
+            try values.encode(requestId, forKey: .requestId)
+            try values.encode(requestVersion, forKey: .requestVersion)
+            try values.encode(responseAttemptId, forKey: .responseAttemptId)
+            try values.encode(decision, forKey: .decision)
+            try values.encode(submittedEventId, forKey: .submittedEventId)
+            try values.encode(submittedVersion, forKey: .submittedVersion)
+            try values.encode(outcomeEventId, forKey: .outcomeEventId)
+            try values.encode(outcomeVersion, forKey: .outcomeVersion)
         }
     }
 }

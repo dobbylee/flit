@@ -12,12 +12,14 @@ use std::{
 use flit_protocol::{
     CapabilityStatus as ProtocolCapabilityStatus, CommandError, CommandErrorCode,
     FingerprintAxis as ProtocolFingerprintAxis, HealthStatus, ManagedRunObserveRequest,
-    ManagedRunObserveResponse, ManagedRunStartRequest, PROTOCOL_VERSION, ProjectInspectionResponse,
-    ProjectListCursor as ProjectListCursorResponse, ProjectRecord, ProjectRegistrationResponse,
-    ProjectRegistrationStatus, ProjectTrustResponse, ProjectTrustStatus, ProjectsListResponse,
-    ProviderCapability as ProtocolProviderCapability, ProviderCapabilityEntry,
-    ProviderCompatibility as ProtocolProviderCompatibility, ProviderDiagnosticsResponse,
-    ProviderKind as ProtocolProviderKind, ProviderUnavailableReason, SystemHealthResponse,
+    ManagedRunObserveResponse, ManagedRunPermissionRespondRequest,
+    ManagedRunPermissionRespondResponse, ManagedRunStartRequest, PROTOCOL_VERSION,
+    ProjectInspectionResponse, ProjectListCursor as ProjectListCursorResponse, ProjectRecord,
+    ProjectRegistrationResponse, ProjectRegistrationStatus, ProjectTrustResponse,
+    ProjectTrustStatus, ProjectsListResponse, ProviderCapability as ProtocolProviderCapability,
+    ProviderCapabilityEntry, ProviderCompatibility as ProtocolProviderCompatibility,
+    ProviderDiagnosticsResponse, ProviderKind as ProtocolProviderKind, ProviderUnavailableReason,
+    SystemHealthResponse,
 };
 use flit_providers::{
     CapabilityStatus, CodexCompatibilityProbe, CodexCompatibilityProbeError,
@@ -26,9 +28,11 @@ use flit_providers::{
     probe_codex_compatibility_on_path,
 };
 use flit_store::{
-    MAX_PROJECT_PAGE_SIZE, Project, ProjectDirectoryInspection,
-    ProjectListCursor as StoreProjectListCursor, ProjectRegistration, ProjectRegistrationOutcome,
-    ProjectTrustConfirmation, ProjectTrustOutcome, Store, StoreError,
+    AppendEventOutcome, MAX_PROJECT_PAGE_SIZE, ManagedPermissionDecision,
+    ManagedPermissionDeliveryUnknownReason, ManagedPermissionResponseAttemptOutcome,
+    ManagedPermissionResponseResult, ManagedPermissionResponseResultKind, Project,
+    ProjectDirectoryInspection, ProjectListCursor as StoreProjectListCursor, ProjectRegistration,
+    ProjectRegistrationOutcome, ProjectTrustConfirmation, ProjectTrustOutcome, Store, StoreError,
 };
 
 #[cfg(unix)]
@@ -942,7 +946,7 @@ fn start_managed_run_in_core(
 
 enum TakenManagedRuntime {
     Cached(ManagedRunObserveResponse),
-    Runtime(managed_start::RetainedManagedRun),
+    Runtime(Box<managed_start::RetainedManagedRun>),
     Error(managed_start::ManagedStartError),
 }
 
@@ -1029,7 +1033,7 @@ where
         }
         core.managed_observations_in_flight
             .insert(request.run_id.clone());
-        Ok(TakenManagedRuntime::Runtime(runtime))
+        Ok(TakenManagedRuntime::Runtime(Box::new(runtime)))
     }) {
         Ok(taken) => taken,
         Err(BridgeError::StorageFailure) => {
@@ -1048,7 +1052,7 @@ where
                 BridgeError::ManagedRunResponseTooLarge,
             );
         }
-        TakenManagedRuntime::Runtime(runtime) => runtime,
+        TakenManagedRuntime::Runtime(runtime) => *runtime,
         TakenManagedRuntime::Error(error) => {
             return project_json(&CommandError::for_code(managed_start_error_code(error)));
         }
@@ -1143,6 +1147,438 @@ fn finish_managed_observation_unknown(
     }
 }
 
+enum TakenPermissionResponse {
+    Provider(Box<PermissionProviderFlight>),
+    Complete(ManagedRunPermissionRespondResponse),
+    Error(managed_start::ManagedStartError),
+}
+
+struct PermissionProviderFlight {
+    runtime: managed_start::RetainedManagedRun,
+    prepared: managed_start::PreparedPermissionResponse,
+    submitted: flit_protocol::EventEnvelope,
+}
+
+#[uniffi::export]
+pub fn managed_run_permission_respond_json(request_json: String) -> Result<String, BridgeError> {
+    protect(|| {
+        managed_run_permission_respond_with(&CORE, request_json, |runtime, decision| {
+            runtime.respond_to_active_permission(decision)
+        })
+    })
+}
+
+fn managed_run_permission_respond_with<Respond>(
+    core_manager: &CoreManager,
+    request_json: String,
+    mut respond: Respond,
+) -> Result<String, BridgeError>
+where
+    Respond: FnMut(
+        &mut managed_start::RetainedManagedRun,
+        flit_providers::CodexPermissionDecision,
+    ) -> Result<flit_providers::CodexPermissionDelivery, ()>,
+{
+    if request_json.len() > MAX_MANAGED_RUN_REQUEST_BYTES {
+        return project_json(&CommandError::for_code(CommandErrorCode::InvalidRunRequest));
+    }
+    let request = match serde_json::from_str::<ManagedRunPermissionRespondRequest>(&request_json) {
+        Ok(request) => request,
+        Err(_) => {
+            return project_json(&CommandError::for_code(CommandErrorCode::InvalidRunRequest));
+        }
+    };
+    if request.client_protocol_version != PROTOCOL_VERSION {
+        return project_json(&CommandError::protocol_mismatch());
+    }
+    if let Err(error) = managed_start::validate_permission_response_request(&request) {
+        return project_json(&CommandError::for_code(managed_start_error_code(error)));
+    }
+
+    let taken = core_manager.with_ready_core(|core| {
+        if core
+            .managed_observations_in_flight
+            .contains(&request.run_id)
+        {
+            return Ok(TakenPermissionResponse::Error(
+                managed_start::ManagedStartError::ProviderObservationUnknown,
+            ));
+        }
+        let Some(runtime) = core.managed_runtimes.remove(&request.run_id) else {
+            return Ok(match recover_pending_permission_response(core, &request) {
+                Ok(Some(response)) => TakenPermissionResponse::Complete(response),
+                Ok(None) => {
+                    TakenPermissionResponse::Error(managed_start::ManagedStartError::RunNotActive)
+                }
+                Err(error) => TakenPermissionResponse::Error(error),
+            });
+        };
+        let prepared = match managed_start::prepare_permission_response(&runtime, &request) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                core.managed_runtimes
+                    .insert(request.run_id.clone(), runtime);
+                return Ok(TakenPermissionResponse::Error(error));
+            }
+        };
+        let attempt = core
+            .store
+            .submit_managed_permission_response(prepared.attempt.clone())
+            .map_err(managed_start::map_permission_store_error);
+        match attempt {
+            Ok(ManagedPermissionResponseAttemptOutcome::Submitted { event }) => {
+                core.managed_observations_in_flight
+                    .insert(request.run_id.clone());
+                Ok(TakenPermissionResponse::Provider(Box::new(
+                    PermissionProviderFlight {
+                        runtime,
+                        prepared,
+                        submitted: event,
+                    },
+                )))
+            }
+            Ok(ManagedPermissionResponseAttemptOutcome::Duplicate {
+                event,
+                terminal_event: Some(terminal),
+            }) => {
+                let response = permission_response_from_events(&request, &event, &terminal)?;
+                if terminal.event_type == "permission.resolved" {
+                    let mut runtime = runtime;
+                    runtime.clear_active_permission();
+                    core.managed_runtimes
+                        .insert(request.run_id.clone(), runtime);
+                }
+                Ok(TakenPermissionResponse::Complete(response))
+            }
+            Ok(ManagedPermissionResponseAttemptOutcome::Duplicate {
+                event,
+                terminal_event: None,
+            }) => {
+                let result = managed_start::permission_response_result(
+                    &prepared,
+                    &request,
+                    ManagedPermissionResponseResultKind::DeliveryUnknown(
+                        ManagedPermissionDeliveryUnknownReason::CoreRestartedAfterSubmit,
+                    ),
+                );
+                let outcome = match core.store.finish_managed_permission_response(result) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        return Ok(TakenPermissionResponse::Error(
+                            managed_start::map_permission_store_error(error),
+                        ));
+                    }
+                };
+                let outcome = appended_event(&outcome);
+                Ok(TakenPermissionResponse::Complete(
+                    permission_response_from_events(&request, &event, outcome)?,
+                ))
+            }
+            Err(error) => {
+                core.managed_runtimes
+                    .insert(request.run_id.clone(), runtime);
+                Ok(TakenPermissionResponse::Error(error))
+            }
+        }
+    })?;
+
+    let (mut runtime, prepared, submitted) = match taken {
+        TakenPermissionResponse::Provider(flight) => {
+            let PermissionProviderFlight {
+                runtime,
+                prepared,
+                submitted,
+            } = *flight;
+            (runtime, prepared, submitted)
+        }
+        TakenPermissionResponse::Complete(response) => {
+            return bounded_json(
+                &response,
+                MAX_PROJECT_RESPONSE_BYTES,
+                BridgeError::ManagedRunResponseTooLarge,
+            );
+        }
+        TakenPermissionResponse::Error(error) => {
+            return project_json(&CommandError::for_code(managed_start_error_code(error)));
+        }
+    };
+    let _flight_guard = ManagedObservationFlight {
+        core_manager,
+        run_id: request.run_id.clone(),
+    };
+    let delivered = respond(&mut runtime, prepared.provider_decision)
+        .ok()
+        .is_some_and(|delivery| permission_delivery_matches(&prepared, &delivery));
+    let result_kind = if delivered {
+        ManagedPermissionResponseResultKind::Resolved(prepared.resolution)
+    } else {
+        ManagedPermissionResponseResultKind::DeliveryUnknown(
+            ManagedPermissionDeliveryUnknownReason::ProviderOutcomeAmbiguous,
+        )
+    };
+    let result = managed_start::permission_response_result(&prepared, &request, result_kind);
+    let finished = core_manager.with_ready_core(|core| {
+        let outcome = core
+            .store
+            .finish_managed_permission_response(result)
+            .map_err(|_| BridgeError::StorageFailure)?;
+        core.managed_observations_in_flight.remove(&request.run_id);
+        if delivered {
+            runtime.clear_active_permission();
+            core.managed_runtimes
+                .insert(request.run_id.clone(), runtime);
+        }
+        Ok((outcome, delivered))
+    });
+    let (outcome, _) = match finished {
+        Ok(result) => result,
+        Err(BridgeError::StorageFailure) => {
+            return project_json(&CommandError::for_code(
+                CommandErrorCode::StorageUnavailable,
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    bounded_json(
+        &permission_response_from_events(&request, &submitted, appended_event(&outcome))?,
+        MAX_PROJECT_RESPONSE_BYTES,
+        BridgeError::ManagedRunResponseTooLarge,
+    )
+}
+
+fn recover_pending_permission_response(
+    core: &mut FoundationCore,
+    request: &ManagedRunPermissionRespondRequest,
+) -> Result<Option<ManagedRunPermissionRespondResponse>, managed_start::ManagedStartError> {
+    let latest = core
+        .store
+        .latest_ingest_seq()
+        .map_err(|_| managed_start::ManagedStartError::StorageUnavailable)?;
+    if latest <= request.request_version {
+        return Ok(None);
+    }
+    let page =
+        match core
+            .store
+            .run_events_through(&request.run_id, request.request_version, latest, 3)
+        {
+            Ok(page) => page,
+            Err(StoreError::MissingRun { .. }) => return Ok(None),
+            Err(error) => return Err(managed_start::map_permission_store_error(error)),
+        };
+    let Some(submitted) = page.events.first() else {
+        return Ok(None);
+    };
+    if !stored_permission_submit_matches(submitted, request) {
+        return Ok(None);
+    }
+    if let Some(outcome) = page.events.get(1)
+        && matches!(
+            outcome.event_type.as_str(),
+            "permission.resolved" | "permission.delivery_unknown"
+        )
+    {
+        if !stored_permission_terminal_matches(outcome, request) {
+            return Err(managed_start::ManagedStartError::PermissionResponseConflict);
+        }
+        return permission_response_from_events(request, submitted, outcome)
+            .map(Some)
+            .map_err(|_| managed_start::ManagedStartError::StorageUnavailable);
+    }
+
+    let flit_protocol::NullableSessionId::Id(session_id) = &submitted.session_id else {
+        return Err(managed_start::ManagedStartError::PermissionResponseConflict);
+    };
+    let session = core
+        .store
+        .managed_session(session_id)
+        .map_err(|_| managed_start::ManagedStartError::StorageUnavailable)?
+        .ok_or(managed_start::ManagedStartError::PermissionResponseConflict)?;
+    let provider_turn_id = submitted
+        .payload
+        .get("provider_turn_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(managed_start::ManagedStartError::PermissionResponseConflict)?;
+    let provider_item_id = submitted
+        .payload
+        .get("provider_item_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(managed_start::ManagedStartError::PermissionResponseConflict)?;
+    let provider_request_id = submitted
+        .payload
+        .get("provider_request_id")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or(managed_start::ManagedStartError::PermissionResponseConflict)?;
+    let delivery_plan_fingerprint = submitted
+        .payload
+        .get("delivery_plan_fingerprint")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(managed_start::ManagedStartError::PermissionResponseConflict)?;
+    let decision = store_permission_decision(request.decision);
+    let contract_version = submitted
+        .source
+        .contract_version
+        .as_deref()
+        .ok_or(managed_start::ManagedStartError::PermissionResponseConflict)?;
+    let result = ManagedPermissionResponseResult {
+        run_id: request.run_id.clone(),
+        session_id: session_id.clone(),
+        external_session_key: session.external_session_key,
+        provider_turn_id: provider_turn_id.to_owned(),
+        provider_item_id: provider_item_id.to_owned(),
+        provider_request_id,
+        request_id: request.request_id.clone(),
+        request_version: request.request_version,
+        response_attempt_id: request.response_attempt_id.clone(),
+        decision,
+        delivery_plan_fingerprint: delivery_plan_fingerprint.to_owned(),
+        contract_version: contract_version.to_owned(),
+        finished_at: request.finished_at.clone(),
+        outcome_event_id: request.delivery_unknown_event_id.clone(),
+        kind: ManagedPermissionResponseResultKind::DeliveryUnknown(
+            ManagedPermissionDeliveryUnknownReason::CoreRestartedAfterSubmit,
+        ),
+    };
+    let outcome = core
+        .store
+        .finish_managed_permission_response(result)
+        .map_err(managed_start::map_permission_store_error)?;
+    permission_response_from_events(request, submitted, appended_event(&outcome))
+        .map(Some)
+        .map_err(|_| managed_start::ManagedStartError::StorageUnavailable)
+}
+
+fn stored_permission_submit_matches(
+    event: &flit_protocol::EventEnvelope,
+    request: &ManagedRunPermissionRespondRequest,
+) -> bool {
+    event.event_type == "permission.response_submitted"
+        && event.event_id == request.submitted_event_id
+        && event.run_id == request.run_id
+        && event.occurred_at == request.submitted_at
+        && event.source.kind == flit_protocol::EventSourceKind::Core
+        && event.source.provider.as_deref() == Some("codex")
+        && event.source.contract_version.as_deref() == Some("codex-app-server/0.145.0")
+        && stored_permission_payload_matches(event, request)
+}
+
+fn stored_permission_terminal_matches(
+    event: &flit_protocol::EventEnvelope,
+    request: &ManagedRunPermissionRespondRequest,
+) -> bool {
+    let expected_event_id = match event.event_type.as_str() {
+        "permission.resolved" => request.resolved_event_id.as_str(),
+        "permission.delivery_unknown" => request.delivery_unknown_event_id.as_str(),
+        _ => return false,
+    };
+    event.event_id == expected_event_id
+        && event.run_id == request.run_id
+        && stored_permission_payload_matches(event, request)
+}
+
+fn stored_permission_payload_matches(
+    event: &flit_protocol::EventEnvelope,
+    request: &ManagedRunPermissionRespondRequest,
+) -> bool {
+    event
+        .payload
+        .get("request_id")
+        .and_then(serde_json::Value::as_str)
+        == Some(request.request_id.as_str())
+        && event
+            .payload
+            .get("request_version")
+            .and_then(serde_json::Value::as_u64)
+            == Some(request.request_version)
+        && event
+            .payload
+            .get("response_attempt_id")
+            .and_then(serde_json::Value::as_str)
+            == Some(request.response_attempt_id.as_str())
+        && event
+            .payload
+            .get("decision")
+            .and_then(serde_json::Value::as_str)
+            == Some(match request.decision {
+                flit_protocol::ManagedRunPermissionDecision::AllowOnce => "allow_once",
+                flit_protocol::ManagedRunPermissionDecision::Deny => "deny",
+            })
+}
+
+fn store_permission_decision(
+    decision: flit_protocol::ManagedRunPermissionDecision,
+) -> ManagedPermissionDecision {
+    match decision {
+        flit_protocol::ManagedRunPermissionDecision::AllowOnce => {
+            ManagedPermissionDecision::AllowOnce
+        }
+        flit_protocol::ManagedRunPermissionDecision::Deny => ManagedPermissionDecision::Deny,
+    }
+}
+
+fn permission_delivery_matches(
+    prepared: &managed_start::PreparedPermissionResponse,
+    delivery: &flit_providers::CodexPermissionDelivery,
+) -> bool {
+    delivery.provider_request_id == prepared.attempt.provider_request_id
+        && delivery.thread_id.as_str() == prepared.attempt.external_session_key
+        && delivery.turn_id.as_str() == prepared.attempt.provider_turn_id
+        && delivery.item_id.as_str() == prepared.attempt.provider_item_id
+        && delivery.decision == prepared.provider_decision
+}
+
+fn appended_event(outcome: &AppendEventOutcome) -> &flit_protocol::EventEnvelope {
+    match outcome {
+        AppendEventOutcome::Inserted(event) | AppendEventOutcome::Duplicate(event) => event,
+    }
+}
+
+fn permission_response_from_events(
+    request: &ManagedRunPermissionRespondRequest,
+    submitted: &flit_protocol::EventEnvelope,
+    outcome: &flit_protocol::EventEnvelope,
+) -> Result<ManagedRunPermissionRespondResponse, BridgeError> {
+    let common = (
+        PROTOCOL_VERSION.to_owned(),
+        request.run_id.clone(),
+        request.request_id.clone(),
+        request.request_version,
+        request.response_attempt_id.clone(),
+        request.decision,
+        submitted.event_id.clone(),
+        submitted.ingest_seq,
+        outcome.event_id.clone(),
+        outcome.ingest_seq,
+    );
+    match outcome.event_type.as_str() {
+        "permission.resolved" => Ok(ManagedRunPermissionRespondResponse::Delivered {
+            protocol_version: common.0,
+            run_id: common.1,
+            request_id: common.2,
+            request_version: common.3,
+            response_attempt_id: common.4,
+            decision: common.5,
+            submitted_event_id: common.6,
+            submitted_version: common.7,
+            outcome_event_id: common.8,
+            outcome_version: common.9,
+        }),
+        "permission.delivery_unknown" => Ok(ManagedRunPermissionRespondResponse::DeliveryUnknown {
+            protocol_version: common.0,
+            run_id: common.1,
+            request_id: common.2,
+            request_version: common.3,
+            response_attempt_id: common.4,
+            decision: common.5,
+            submitted_event_id: common.6,
+            submitted_version: common.7,
+            outcome_event_id: common.8,
+            outcome_version: common.9,
+        }),
+        _ => Err(BridgeError::CoreFailure),
+    }
+}
+
 fn managed_start_error_code(error: managed_start::ManagedStartError) -> CommandErrorCode {
     match error {
         managed_start::ManagedStartError::InvalidRequest => CommandErrorCode::InvalidRunRequest,
@@ -1168,6 +1604,12 @@ fn managed_start_error_code(error: managed_start::ManagedStartError) -> CommandE
         managed_start::ManagedStartError::ProviderObservationUnknown => {
             CommandErrorCode::ProviderObservationUnknown
         }
+        managed_start::ManagedStartError::PermissionRequestStale => {
+            CommandErrorCode::PermissionRequestStale
+        }
+        managed_start::ManagedStartError::PermissionResponseConflict => {
+            CommandErrorCode::PermissionResponseConflict
+        }
     }
 }
 
@@ -1192,12 +1634,15 @@ mod tests {
         time::Duration,
     };
 
-    use flit_protocol::{ManagedRunPermissionMode, ManagedRunStartResponse, SystemHealthRequest};
+    use flit_protocol::{
+        ManagedRunPermissionDecision, ManagedRunPermissionMode, ManagedRunPermissionRespondRequest,
+        ManagedRunPermissionRespondResponse, ManagedRunStartResponse, SystemHealthRequest,
+    };
     use flit_providers::{
         CodexManagedItemId, CodexManagedThreadId, CodexManagedTurnId, CodexManualStartedThread,
-        CodexPermissionRequest, CodexRuntimeFingerprint, CodexStartedTurn, CodexTurnObservation,
-        CodexTurnTerminalOutcome, ProviderFingerprint, classify_codex,
-        validated_codex_0_144_6_fingerprint,
+        CodexPermissionDecision, CodexPermissionDelivery, CodexPermissionRequest,
+        CodexRuntimeFingerprint, CodexStartedTurn, CodexTurnObservation, CodexTurnTerminalOutcome,
+        ProviderFingerprint, classify_codex, validated_codex_0_144_6_fingerprint,
     };
     use flit_store::{
         InitialManagedSessionConnection, ManagedRunIntent, ProjectRegistration,
@@ -1254,6 +1699,14 @@ mod tests {
             panic!("the injected observation boundary must be used")
         }
 
+        fn respond_to_file_change_permission(
+            &mut self,
+            _request: &CodexPermissionRequest,
+            _decision: flit_providers::CodexPermissionDecision,
+        ) -> Result<flit_providers::CodexPermissionDelivery, ()> {
+            panic!("the injected permission response boundary must be used")
+        }
+
         fn delete_started_thread(
             self: Box<Self>,
             _thread_id: &CodexManagedThreadId,
@@ -1293,6 +1746,45 @@ mod tests {
             client_protocol_version: PROTOCOL_VERSION.to_owned(),
         })
         .expect("observation request")
+    }
+
+    fn permission_response_request(
+        permission: &ManagedRunObserveResponse,
+        decision: ManagedRunPermissionDecision,
+    ) -> ManagedRunPermissionRespondRequest {
+        let ManagedRunObserveResponse::PermissionRequested {
+            run_id,
+            request_id,
+            request_version,
+            ..
+        } = permission
+        else {
+            panic!("permission response requires an open permission");
+        };
+        ManagedRunPermissionRespondRequest {
+            run_id: run_id.clone(),
+            request_id: request_id.clone(),
+            request_version: *request_version,
+            response_attempt_id: "attempt-observe".to_owned(),
+            decision,
+            submitted_at: "2026-07-27T12:00:03Z".to_owned(),
+            finished_at: "2026-07-27T12:00:04Z".to_owned(),
+            submitted_event_id: "event-permission-submitted".to_owned(),
+            resolved_event_id: "event-permission-resolved".to_owned(),
+            delivery_unknown_event_id: "event-permission-unknown".to_owned(),
+            client_protocol_version: PROTOCOL_VERSION.to_owned(),
+        }
+    }
+
+    fn open_permission(manager: &CoreManager) -> ManagedRunObserveResponse {
+        let response = managed_run_observe_with(
+            manager,
+            observation_request_json(),
+            |_runtime| Ok(permission_observation()),
+            managed_start::commit_managed_observation,
+        )
+        .expect("open permission");
+        serde_json::from_str(&response).expect("permission JSON")
     }
 
     fn observation_start_request() -> ManagedRunStartRequest {
@@ -1714,6 +2206,268 @@ mod tests {
         );
         assert_runtime_state(&manager, true);
         assert_eq!(expected_start.run_id, "run-observe");
+    }
+
+    #[test]
+    fn exact_permission_response_submits_before_one_detached_causal_delivery() {
+        let (_directory, manager, _) = observation_core("permission-delivered");
+        let permission = open_permission(&manager);
+        let request =
+            permission_response_request(&permission, ManagedRunPermissionDecision::AllowOnce);
+        let response_manager = Arc::clone(&manager);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let response_calls = Arc::clone(&calls);
+        let response = managed_run_permission_respond_with(
+            &manager,
+            serde_json::to_string(&request).expect("response request"),
+            move |_runtime, decision| {
+                response_calls.fetch_add(1, Ordering::SeqCst);
+                response_manager
+                    .with_ready_core(|core| {
+                        assert!(core.managed_observations_in_flight.contains("run-observe"));
+                        let cursor = core.store.latest_ingest_seq().expect("submitted cursor");
+                        let events = core
+                            .store
+                            .run_events_through("run-observe", 0, cursor, 10)
+                            .expect("submitted events");
+                        assert_eq!(
+                            events.events.last().expect("submitted event").event_type,
+                            "permission.response_submitted"
+                        );
+                        Ok(())
+                    })
+                    .expect("Core remains responsive during provider response");
+                assert_eq!(decision, CodexPermissionDecision::Accept);
+                Ok(CodexPermissionDelivery {
+                    provider_request_id: 7,
+                    thread_id: CodexManagedThreadId::new("thread-observe").expect("thread ID"),
+                    turn_id: CodexManagedTurnId::new("turn-observe").expect("turn ID"),
+                    item_id: CodexManagedItemId::new("item-observe").expect("item ID"),
+                    decision,
+                })
+            },
+        )
+        .expect("delivered response");
+        let response: ManagedRunPermissionRespondResponse =
+            serde_json::from_str(&response).expect("delivered JSON");
+        assert!(matches!(
+            response,
+            ManagedRunPermissionRespondResponse::Delivered {
+                submitted_version: 5,
+                outcome_version: 6,
+                ..
+            }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_runtime_state(&manager, true);
+        manager
+            .with_ready_core(|core| {
+                let runtime = core
+                    .managed_runtimes
+                    .get("run-observe")
+                    .expect("retained delivered runtime");
+                assert!(runtime.cached_permission().is_none());
+                Ok(())
+            })
+            .expect("delivered runtime state");
+    }
+
+    #[test]
+    fn ambiguous_and_duplicate_pending_permission_responses_never_retry() {
+        let (_unknown_directory, unknown_manager, _) = observation_core("permission-unknown");
+        let unknown_permission = open_permission(&unknown_manager);
+        let unknown_request =
+            permission_response_request(&unknown_permission, ManagedRunPermissionDecision::Deny);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let response_calls = Arc::clone(&calls);
+        let unknown = managed_run_permission_respond_with(
+            &unknown_manager,
+            serde_json::to_string(&unknown_request).expect("unknown request"),
+            move |_runtime, decision| {
+                response_calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(decision, CodexPermissionDecision::Decline);
+                Err(())
+            },
+        )
+        .expect("unknown response");
+        assert!(matches!(
+            serde_json::from_str::<ManagedRunPermissionRespondResponse>(&unknown)
+                .expect("unknown JSON"),
+            ManagedRunPermissionRespondResponse::DeliveryUnknown { .. }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_runtime_state(&unknown_manager, false);
+        let retry = managed_run_permission_respond_with(
+            &unknown_manager,
+            serde_json::to_string(&unknown_request).expect("retry request"),
+            |_runtime, _decision| -> Result<CodexPermissionDelivery, ()> {
+                panic!("ambiguous delivery must never retry")
+            },
+        )
+        .expect("retry delivery-unknown response");
+        assert!(matches!(
+            serde_json::from_str::<ManagedRunPermissionRespondResponse>(&retry)
+                .expect("retry delivery-unknown JSON"),
+            ManagedRunPermissionRespondResponse::DeliveryUnknown { .. }
+        ));
+
+        let (_pending_directory, pending_manager, _) =
+            observation_core("permission-pending-duplicate");
+        let pending_permission = open_permission(&pending_manager);
+        let pending_request = permission_response_request(
+            &pending_permission,
+            ManagedRunPermissionDecision::AllowOnce,
+        );
+        pending_manager
+            .with_ready_core(|core| {
+                let prepared = {
+                    let runtime = core
+                        .managed_runtimes
+                        .get("run-observe")
+                        .expect("pending runtime");
+                    managed_start::prepare_permission_response(runtime, &pending_request)
+                        .expect("prepare pending response")
+                };
+                core.store
+                    .submit_managed_permission_response(prepared.attempt)
+                    .expect("seed pending submit");
+                Ok(())
+            })
+            .expect("pending seed");
+        let pending = managed_run_permission_respond_with(
+            &pending_manager,
+            serde_json::to_string(&pending_request).expect("pending request"),
+            |_runtime, _decision| -> Result<CodexPermissionDelivery, ()> {
+                panic!("duplicate pending response must not reach provider")
+            },
+        )
+        .expect("pending duplicate response");
+        assert!(matches!(
+            serde_json::from_str::<ManagedRunPermissionRespondResponse>(&pending)
+                .expect("pending JSON"),
+            ManagedRunPermissionRespondResponse::DeliveryUnknown { .. }
+        ));
+        assert_runtime_state(&pending_manager, false);
+    }
+
+    #[test]
+    fn stale_permission_response_is_rejected_before_submit_or_provider_call() {
+        let (_directory, manager, _) = observation_core("permission-stale");
+        let permission = open_permission(&manager);
+        let mut request =
+            permission_response_request(&permission, ManagedRunPermissionDecision::AllowOnce);
+        request.request_version += 1;
+        let calls = AtomicUsize::new(0);
+        let response = managed_run_permission_respond_with(
+            &manager,
+            serde_json::to_string(&request).expect("stale request"),
+            |_runtime, _decision| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(())
+            },
+        )
+        .expect("stale response");
+        assert_eq!(
+            command_error(&response),
+            CommandError::for_code(CommandErrorCode::PermissionRequestStale)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_runtime_state(&manager, true);
+        manager
+            .with_ready_core(|core| {
+                assert_eq!(core.store.latest_ingest_seq().expect("stale cursor"), 4);
+                Ok(())
+            })
+            .expect("stale Store state");
+
+        let mut missing =
+            permission_response_request(&permission, ManagedRunPermissionDecision::AllowOnce);
+        missing.run_id = "run-missing".to_owned();
+        missing.request_version = 1;
+        let missing_response = managed_run_permission_respond_with(
+            &manager,
+            serde_json::to_string(&missing).expect("missing Run request"),
+            |_runtime, _decision| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(())
+            },
+        )
+        .expect("missing Run response");
+        assert_eq!(
+            command_error(&missing_response),
+            CommandError::for_code(CommandErrorCode::ManagedRunNotActive)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        manager
+            .with_ready_core(|core| {
+                assert_eq!(
+                    core.store.latest_ingest_seq().expect("missing Run cursor"),
+                    4
+                );
+                Ok(())
+            })
+            .expect("missing Run Store state");
+    }
+
+    #[test]
+    fn restarted_core_closes_exact_persisted_pending_response_without_provider_call() {
+        let (directory, manager, _) = observation_core("permission-restart");
+        let permission = open_permission(&manager);
+        let request =
+            permission_response_request(&permission, ManagedRunPermissionDecision::AllowOnce);
+        manager
+            .with_ready_core(|core| {
+                let prepared = {
+                    let runtime = core
+                        .managed_runtimes
+                        .get("run-observe")
+                        .expect("pre-restart runtime");
+                    managed_start::prepare_permission_response(runtime, &request)
+                        .expect("prepare pre-restart response")
+                };
+                core.store
+                    .submit_managed_permission_response(prepared.attempt)
+                    .expect("persist response before restart");
+                Ok(())
+            })
+            .expect("persist pending response");
+        drop(manager);
+
+        let restarted = CoreManager::default();
+        restarted
+            .initialize(directory.0.to_str().expect("UTF-8 restart path"))
+            .expect("restart Core");
+        let response = managed_run_permission_respond_with(
+            &restarted,
+            serde_json::to_string(&request).expect("restart request"),
+            |_runtime, _decision| -> Result<CodexPermissionDelivery, ()> {
+                panic!("restart recovery must not call the provider")
+            },
+        )
+        .expect("restart recovery response");
+        assert!(matches!(
+            serde_json::from_str::<ManagedRunPermissionRespondResponse>(&response)
+                .expect("restart response JSON"),
+            ManagedRunPermissionRespondResponse::DeliveryUnknown {
+                submitted_version: 5,
+                outcome_version: 6,
+                ..
+            }
+        ));
+        assert_runtime_state(&restarted, false);
+        restarted
+            .with_ready_core(|core| {
+                let events = core
+                    .store
+                    .run_events_through("run-observe", 0, 6, 10)
+                    .expect("restart events");
+                assert_eq!(
+                    events.events.last().expect("restart outcome").event_type,
+                    "permission.delivery_unknown"
+                );
+                Ok(())
+            })
+            .expect("restart Store state");
     }
 
     #[test]

@@ -1,8 +1,9 @@
 use std::{collections::BTreeMap, ffi::OsStr, path::Path};
 
 use flit_protocol::{
-    ManagedRunObserveRequest, ManagedRunObserveResponse, ManagedRunPermissionMode,
-    ManagedRunStartRequest, ManagedRunStartResponse, PROTOCOL_VERSION,
+    ManagedRunObserveRequest, ManagedRunObserveResponse, ManagedRunPermissionDecision,
+    ManagedRunPermissionMode, ManagedRunPermissionRespondRequest, ManagedRunStartRequest,
+    ManagedRunStartResponse, PROTOCOL_VERSION,
 };
 use flit_providers::{
     CapabilityStatus, CodexAppServer, CodexAppServerError, CodexContractError,
@@ -11,10 +12,12 @@ use flit_providers::{
     classify_codex,
 };
 use flit_store::{
-    AppendEventOutcome, InitialManagedSessionConnection, ManagedProviderObservation,
-    ManagedProviderObservationKind, ManagedReconciliationState, ManagedRunIntent,
-    ManagedRunIntentOutcome, ManagedRunStartFailure, ManagedSessionReconciliation, Store,
-    StoreError,
+    AppendEventOutcome, InitialManagedSessionConnection, ManagedPermissionDecision,
+    ManagedPermissionResolutionKind, ManagedPermissionResponseAttempt,
+    ManagedPermissionResponseResult, ManagedPermissionResponseResultKind,
+    ManagedProviderObservation, ManagedProviderObservationKind, ManagedReconciliationState,
+    ManagedRunIntent, ManagedRunIntentOutcome, ManagedRunStartFailure,
+    ManagedSessionReconciliation, Store, StoreError,
 };
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -46,6 +49,11 @@ pub(crate) trait ManagedCodexRuntime: Send {
         prompt: &str,
     ) -> Result<CodexStartedTurn, ()>;
     fn wait_for_turn_observation(&mut self) -> Result<CodexTurnObservation, ()>;
+    fn respond_to_file_change_permission(
+        &mut self,
+        request: &flit_providers::CodexPermissionRequest,
+        decision: flit_providers::CodexPermissionDecision,
+    ) -> Result<flit_providers::CodexPermissionDelivery, ()>;
     fn delete_started_thread(self: Box<Self>, thread_id: &CodexManagedThreadId) -> Result<(), ()>;
 }
 
@@ -98,6 +106,14 @@ impl ManagedCodexRuntime for CodexAppServer {
         CodexAppServer::wait_for_turn_observation(self).map_err(|_| ())
     }
 
+    fn respond_to_file_change_permission(
+        &mut self,
+        request: &flit_providers::CodexPermissionRequest,
+        decision: flit_providers::CodexPermissionDecision,
+    ) -> Result<flit_providers::CodexPermissionDelivery, ()> {
+        CodexAppServer::respond_to_file_change_permission(self, request, decision).map_err(|_| ())
+    }
+
     fn delete_started_thread(self: Box<Self>, thread_id: &CodexManagedThreadId) -> Result<(), ()> {
         (*self)
             .delete_started_thread(thread_id)
@@ -110,12 +126,48 @@ pub(crate) struct RetainedManagedRun {
     request_digest: String,
     response: ManagedRunStartResponse,
     provider: Box<dyn ManagedCodexRuntime>,
-    active_permission: Option<ManagedRunObserveResponse>,
+    active_permission: Option<RetainedPermission>,
+}
+
+pub(crate) struct RetainedPermission {
+    response: ManagedRunObserveResponse,
+    native_request: flit_providers::CodexPermissionRequest,
 }
 
 impl RetainedManagedRun {
     pub(crate) fn cached_permission(&self) -> Option<ManagedRunObserveResponse> {
-        self.active_permission.clone()
+        self.active_permission
+            .as_ref()
+            .map(|permission| permission.response.clone())
+    }
+
+    pub(crate) fn active_permission(
+        &self,
+    ) -> Option<(
+        &ManagedRunObserveResponse,
+        &flit_providers::CodexPermissionRequest,
+    )> {
+        self.active_permission
+            .as_ref()
+            .map(|permission| (&permission.response, &permission.native_request))
+    }
+
+    pub(crate) fn clear_active_permission(&mut self) {
+        self.active_permission = None;
+    }
+
+    pub(crate) fn respond_to_active_permission(
+        &mut self,
+        decision: flit_providers::CodexPermissionDecision,
+    ) -> Result<flit_providers::CodexPermissionDelivery, ()> {
+        let request = self
+            .active_permission
+            .as_ref()
+            .ok_or(())?
+            .native_request
+            .clone();
+        self.provider
+            .respond_to_file_change_permission(&request, decision)
     }
 
     pub(crate) fn start_response(&self) -> ManagedRunStartResponse {
@@ -149,6 +201,174 @@ pub(crate) enum ManagedStartError {
     StorageUnavailable,
     RunNotActive,
     ProviderObservationUnknown,
+    PermissionRequestStale,
+    PermissionResponseConflict,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedPermissionResponse {
+    pub(crate) attempt: ManagedPermissionResponseAttempt,
+    pub(crate) provider_decision: flit_providers::CodexPermissionDecision,
+    pub(crate) resolution: ManagedPermissionResolutionKind,
+}
+
+pub(crate) fn prepare_permission_response(
+    retained: &RetainedManagedRun,
+    request: &ManagedRunPermissionRespondRequest,
+) -> Result<PreparedPermissionResponse, ManagedStartError> {
+    validate_permission_response_request(request)?;
+    let Some((response, native)) = retained.active_permission() else {
+        return Err(ManagedStartError::PermissionRequestStale);
+    };
+    let ManagedRunObserveResponse::PermissionRequested {
+        run_id,
+        session_id,
+        provider_thread_id,
+        provider_turn_id,
+        provider_item_id,
+        provider_request_id,
+        request_id,
+        request_version,
+        event_id,
+        ..
+    } = response
+    else {
+        return Err(ManagedStartError::PermissionRequestStale);
+    };
+    if run_id != &request.run_id
+        || request_id != &request.request_id
+        || *request_version != request.request_version
+        || provider_thread_id != native.thread_id.as_str()
+        || provider_turn_id != native.turn_id.as_str()
+        || provider_item_id != native.item_id.as_str()
+        || *provider_request_id != native.provider_request_id
+    {
+        return Err(ManagedStartError::PermissionRequestStale);
+    }
+    let (provider_decision, store_decision, resolution) = match request.decision {
+        ManagedRunPermissionDecision::AllowOnce => (
+            flit_providers::CodexPermissionDecision::Accept,
+            ManagedPermissionDecision::AllowOnce,
+            ManagedPermissionResolutionKind::AcceptedCompleted,
+        ),
+        ManagedRunPermissionDecision::Deny => (
+            flit_providers::CodexPermissionDecision::Decline,
+            ManagedPermissionDecision::Deny,
+            ManagedPermissionResolutionKind::Declined,
+        ),
+    };
+    let delivery_plan_fingerprint =
+        permission_delivery_plan_fingerprint(request, session_id, native, store_decision);
+    Ok(PreparedPermissionResponse {
+        attempt: ManagedPermissionResponseAttempt {
+            run_id: request.run_id.clone(),
+            session_id: session_id.clone(),
+            external_session_key: native.thread_id.as_str().to_owned(),
+            provider_turn_id: native.turn_id.as_str().to_owned(),
+            provider_item_id: native.item_id.as_str().to_owned(),
+            provider_request_id: native.provider_request_id,
+            request_id: request.request_id.clone(),
+            request_version: request.request_version,
+            request_event_id: event_id.clone(),
+            response_attempt_id: request.response_attempt_id.clone(),
+            decision: store_decision,
+            delivery_plan_fingerprint,
+            contract_version: "codex-app-server/0.145.0".to_owned(),
+            submitted_at: request.submitted_at.clone(),
+            submitted_event_id: request.submitted_event_id.clone(),
+        },
+        provider_decision,
+        resolution,
+    })
+}
+
+pub(crate) fn permission_response_result(
+    prepared: &PreparedPermissionResponse,
+    request: &ManagedRunPermissionRespondRequest,
+    kind: ManagedPermissionResponseResultKind,
+) -> ManagedPermissionResponseResult {
+    let outcome_event_id = match kind {
+        ManagedPermissionResponseResultKind::Resolved(_) => request.resolved_event_id.clone(),
+        ManagedPermissionResponseResultKind::DeliveryUnknown(_) => {
+            request.delivery_unknown_event_id.clone()
+        }
+    };
+    ManagedPermissionResponseResult {
+        run_id: prepared.attempt.run_id.clone(),
+        session_id: prepared.attempt.session_id.clone(),
+        external_session_key: prepared.attempt.external_session_key.clone(),
+        provider_turn_id: prepared.attempt.provider_turn_id.clone(),
+        provider_item_id: prepared.attempt.provider_item_id.clone(),
+        provider_request_id: prepared.attempt.provider_request_id,
+        request_id: prepared.attempt.request_id.clone(),
+        request_version: prepared.attempt.request_version,
+        response_attempt_id: prepared.attempt.response_attempt_id.clone(),
+        decision: prepared.attempt.decision,
+        delivery_plan_fingerprint: prepared.attempt.delivery_plan_fingerprint.clone(),
+        contract_version: prepared.attempt.contract_version.clone(),
+        finished_at: request.finished_at.clone(),
+        outcome_event_id,
+        kind,
+    }
+}
+
+pub(crate) fn validate_permission_response_request(
+    request: &ManagedRunPermissionRespondRequest,
+) -> Result<(), ManagedStartError> {
+    for value in [
+        request.run_id.as_str(),
+        request.request_id.as_str(),
+        request.response_attempt_id.as_str(),
+        request.submitted_event_id.as_str(),
+        request.resolved_event_id.as_str(),
+        request.delivery_unknown_event_id.as_str(),
+    ] {
+        validate_text(value, MAX_MANAGED_ID_BYTES)?;
+    }
+    validate_token(&request.submitted_at, MAX_MANAGED_TIMESTAMP_BYTES)?;
+    validate_token(&request.finished_at, MAX_MANAGED_TIMESTAMP_BYTES)?;
+    if request.request_version == 0
+        || request.request_version > flit_protocol::MAX_JSON_SAFE_INTEGER
+        || request.submitted_event_id == request.resolved_event_id
+        || request.submitted_event_id == request.delivery_unknown_event_id
+        || request.resolved_event_id == request.delivery_unknown_event_id
+    {
+        return Err(ManagedStartError::InvalidRequest);
+    }
+    Ok(())
+}
+
+fn permission_delivery_plan_fingerprint(
+    request: &ManagedRunPermissionRespondRequest,
+    session_id: &str,
+    native: &flit_providers::CodexPermissionRequest,
+    decision: ManagedPermissionDecision,
+) -> String {
+    let provider_request_id = native.provider_request_id.to_string();
+    let request_version = request.request_version.to_string();
+    let decision = match decision {
+        ManagedPermissionDecision::AllowOnce => "allow_once",
+        ManagedPermissionDecision::Deny => "deny",
+    };
+    let parts = [
+        "codex-app-server/0.145.0",
+        request.run_id.as_str(),
+        session_id,
+        native.thread_id.as_str(),
+        native.turn_id.as_str(),
+        native.item_id.as_str(),
+        provider_request_id.as_str(),
+        request.request_id.as_str(),
+        request_version.as_str(),
+        request.response_attempt_id.as_str(),
+        decision,
+    ];
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 pub(crate) fn start_managed_run(
@@ -364,7 +584,7 @@ pub(crate) fn observe_managed_run(
             .get_mut(&request.run_id)
             .ok_or(ManagedStartError::RunNotActive)?;
         if let Some(permission) = &retained.active_permission {
-            return Ok(permission.clone());
+            return Ok(permission.response.clone());
         }
         (
             observe_retained_runtime(store, retained, &request),
@@ -502,7 +722,10 @@ pub(crate) fn commit_managed_observation(
                 request_version,
                 event_id,
             };
-            retained.active_permission = Some(response.clone());
+            retained.active_permission = Some(RetainedPermission {
+                response: response.clone(),
+                native_request: permission,
+            });
             Ok(ManagedObservationCommit::Complete(Box::new(response)))
         }
         CodexTurnObservation::Terminal {
@@ -818,6 +1041,19 @@ fn map_observation_store_error(error: StoreError) -> ManagedStartError {
     }
 }
 
+pub(crate) fn map_permission_store_error(error: StoreError) -> ManagedStartError {
+    match error {
+        StoreError::InvalidManagedPermissionResponse { .. } => ManagedStartError::InvalidRequest,
+        StoreError::ManagedPermissionRequestStale { .. }
+        | StoreError::ManagedPermissionRequestMismatch { .. }
+        | StoreError::ManagedSessionNotLive { .. } => ManagedStartError::PermissionRequestStale,
+        StoreError::ManagedPermissionResponseConflict { .. }
+        | StoreError::ManagedPermissionResponseNotSubmitted { .. }
+        | StoreError::EventIdentityConflict { .. } => ManagedStartError::PermissionResponseConflict,
+        _ => ManagedStartError::StorageUnavailable,
+    }
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -1028,6 +1264,20 @@ mod tests {
                 | FakeBehavior::TurnFailure
                 | FakeBehavior::CleanupFailure => Err(()),
             }
+        }
+
+        fn respond_to_file_change_permission(
+            &mut self,
+            request: &CodexPermissionRequest,
+            decision: flit_providers::CodexPermissionDecision,
+        ) -> Result<flit_providers::CodexPermissionDelivery, ()> {
+            Ok(flit_providers::CodexPermissionDelivery {
+                provider_request_id: request.provider_request_id,
+                thread_id: request.thread_id.clone(),
+                turn_id: request.turn_id.clone(),
+                item_id: request.item_id.clone(),
+                decision,
+            })
         }
 
         fn delete_started_thread(
