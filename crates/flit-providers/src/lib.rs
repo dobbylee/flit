@@ -12,14 +12,15 @@ mod version;
 pub use codex_contract::{
     CodexContractError, CodexInterruptRequested, CodexManagedItemId, CodexManagedListPage,
     CodexManagedScope, CodexManagedThreadConflict, CodexManagedThreadId, CodexManagedTurnId,
-    CodexStartedThread, CodexStartedTurn, CodexThreadRead, CodexThreadState, CodexTurnObservation,
-    CodexTurnTerminalOutcome, MAX_CODEX_APP_SERVER_FRAME_BYTES, MAX_CODEX_MANAGED_THREADS,
-    MAX_CODEX_TURN_PROMPT_BYTES, codex_initialize_request, codex_initialized_notification,
+    CodexManualStartedThread, CodexStartedThread, CodexStartedTurn, CodexThreadRead,
+    CodexThreadState, CodexTurnObservation, CodexTurnTerminalOutcome,
+    MAX_CODEX_APP_SERVER_FRAME_BYTES, MAX_CODEX_MANAGED_THREADS, MAX_CODEX_TURN_PROMPT_BYTES,
+    codex_initialize_request, codex_initialized_notification, codex_manual_start_request,
     codex_read_only_start_request, codex_read_request, codex_thread_list_request,
     codex_turn_interrupt_request, codex_turn_start_request, decode_codex_initialize_response,
-    decode_codex_read_response, decode_codex_start_response, decode_codex_thread_list_response,
-    decode_codex_turn_interrupt_response, decode_codex_turn_notification,
-    decode_codex_turn_start_response,
+    decode_codex_manual_start_response, decode_codex_read_response, decode_codex_start_response,
+    decode_codex_thread_list_response, decode_codex_turn_interrupt_response,
+    decode_codex_turn_notification, decode_codex_turn_start_response,
 };
 pub use codex_transport::{
     CODEX_APP_SERVER_REQUEST_TIMEOUT, CodexAppServer, CodexAppServerError, CodexManagedThreads,
@@ -186,17 +187,51 @@ pub fn validated_codex_0_144_6_fingerprint() -> ProviderFingerprint {
     }
 }
 
+pub fn validated_codex_0_145_0_fingerprint() -> ProviderFingerprint {
+    ProviderFingerprint {
+        canonical_executable: PathBuf::from(
+            "/opt/homebrew/Caskroom/codex/0.145.0/codex-aarch64-apple-darwin",
+        ),
+        executable_version: "0.145.0".to_owned(),
+        executable_sha256: "1da3f4e0e96028b8a771814293c3033dafd1971f943f6c7e79b0897fe705f590"
+            .to_owned(),
+        combined_schema_sha256: "1f66700d1cc3de4a5004e5614a6098878b405c7e7c5f8c9be97fc900d0ad6c68"
+            .to_owned(),
+        v2_schema_sha256: "84bc00660a8c4e69073f4f0bafcf00ec5b7238dbe59eccf404ce2352daae64e0"
+            .to_owned(),
+        method_allowlist_sha256: "0de966cd124a25c926df49f4b697e588d51947c31c4e2febe2175338f6319d42"
+            .to_owned(),
+        fixture_sha256: "894c007f3862efbf700a3e84bcea6a0069b5b5ced0996eca2df7387a4a7897d1"
+            .to_owned(),
+        smoke_run_id: "2026-07-27-arm64-s0-9".to_owned(),
+    }
+}
+
 pub fn classify_codex(fingerprint: &ProviderFingerprint) -> ProviderCapabilitySnapshot {
-    let expected = validated_codex_0_144_6_fingerprint();
-    let fingerprint_mismatches = fingerprint_mismatches(fingerprint, &expected);
-    if fingerprint_mismatches.is_empty() {
+    let legacy_mismatches =
+        fingerprint_mismatches(fingerprint, &validated_codex_0_144_6_fingerprint());
+    let manual_mismatches =
+        fingerprint_mismatches(fingerprint, &validated_codex_0_145_0_fingerprint());
+    if legacy_mismatches.is_empty() {
         ProviderCapabilitySnapshot {
             provider: ProviderKind::Codex,
             compatibility: ProviderCompatibility::Supported,
             capabilities: codex_0_144_6_capabilities(),
-            fingerprint_mismatches,
+            fingerprint_mismatches: Vec::new(),
+        }
+    } else if manual_mismatches.is_empty() {
+        ProviderCapabilitySnapshot {
+            provider: ProviderKind::Codex,
+            compatibility: ProviderCompatibility::Supported,
+            capabilities: codex_0_145_0_capabilities(),
+            fingerprint_mismatches: Vec::new(),
         }
     } else {
+        let fingerprint_mismatches = if legacy_mismatches.len() <= manual_mismatches.len() {
+            legacy_mismatches
+        } else {
+            manual_mismatches
+        };
         ProviderCapabilitySnapshot {
             provider: ProviderKind::Codex,
             compatibility: ProviderCompatibility::Unknown,
@@ -209,6 +244,16 @@ pub fn classify_codex(fingerprint: &ProviderFingerprint) -> ProviderCapabilitySn
             fingerprint_mismatches,
         }
     }
+}
+
+fn codex_0_145_0_capabilities() -> Vec<CapabilityEntry> {
+    let mut capabilities = codex_0_144_6_capabilities();
+    for entry in &mut capabilities {
+        if entry.capability == ProviderCapability::PermissionPolicyConfigure {
+            entry.status = CapabilityStatus::Supported;
+        }
+    }
+    capabilities
 }
 
 fn fingerprint_mismatches(

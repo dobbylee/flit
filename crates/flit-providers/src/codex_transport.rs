@@ -24,11 +24,12 @@ use serde_json::Value;
 use crate::{
     CapabilityStatus, CodexCompatibilityProbe, CodexCompatibilityProbeError, CodexContractError,
     CodexInterruptRequested, CodexManagedScope, CodexManagedThreadConflict, CodexManagedThreadId,
-    CodexStartedThread, CodexStartedTurn, CodexThreadRead, CodexTurnObservation,
-    ExecutableInspection, ExecutableInspectionError, ProviderCapability, ProviderCompatibility,
-    ProviderFingerprint, codex_initialize_request, codex_initialized_notification,
-    codex_read_only_start_request, codex_read_request, codex_thread_list_request,
-    codex_turn_interrupt_request, codex_turn_start_request, decode_codex_initialize_response,
+    CodexManualStartedThread, CodexStartedThread, CodexStartedTurn, CodexThreadRead,
+    CodexTurnObservation, ExecutableInspection, ExecutableInspectionError, ProviderCapability,
+    ProviderCompatibility, ProviderFingerprint, codex_initialize_request,
+    codex_initialized_notification, codex_manual_start_request, codex_read_only_start_request,
+    codex_read_request, codex_thread_list_request, codex_turn_interrupt_request,
+    codex_turn_start_request, decode_codex_initialize_response, decode_codex_manual_start_response,
     decode_codex_read_response, decode_codex_start_response, decode_codex_thread_list_response,
     decode_codex_turn_interrupt_response, decode_codex_turn_notification,
     decode_codex_turn_start_response, inspect_codex_at, probe_codex_compatibility_at,
@@ -117,6 +118,29 @@ impl CodexAppServer {
             .map_err(CodexAppServerError::Contract)?;
         let response = self.exchange(request)?;
         self.decode_or_close(decode_codex_start_response(
+            &response,
+            request_id,
+            canonical_cwd.to_owned(),
+        ))
+    }
+
+    pub fn start_manual(
+        &mut self,
+        canonical_cwd: impl AsRef<Path>,
+    ) -> Result<CodexManualStartedThread, CodexAppServerError> {
+        if self
+            .validated_profile
+            .as_ref()
+            .is_none_or(|profile| profile.executable_version != "0.145.0")
+        {
+            return Err(CodexAppServerError::ManualPolicyUnavailable);
+        }
+        let canonical_cwd = canonical_cwd.as_ref();
+        let request_id = self.take_request_id()?;
+        let request = codex_manual_start_request(request_id, canonical_cwd)
+            .map_err(CodexAppServerError::Contract)?;
+        let response = self.exchange(request)?;
+        self.decode_or_close(decode_codex_manual_start_response(
             &response,
             request_id,
             canonical_cwd.to_owned(),
@@ -1000,6 +1024,7 @@ pub enum CodexAppServerError {
         compatibility: ProviderCompatibility,
         launch: CapabilityStatus,
     },
+    ManualPolicyUnavailable,
     ExecutableChanged,
     StageExecutable(io::Error),
     StagedExecutableInspection(ExecutableInspectionError),
@@ -1044,6 +1069,9 @@ impl fmt::Display for CodexAppServerError {
             Self::CompatibilityProbe(error) => write!(formatter, "Codex probe failed: {error}"),
             Self::ExecutableReinspection(error) => {
                 write!(formatter, "Codex executable reinspection failed: {error}")
+            }
+            Self::ManualPolicyUnavailable => {
+                formatter.write_str("Codex Manual policy is unavailable for this exact profile")
             }
             Self::CapabilityUnavailable {
                 compatibility,

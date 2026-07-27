@@ -4,15 +4,17 @@ use flit_providers::{
     CodexContractError, CodexManagedScope, CodexManagedThreadId, CodexManagedTurnId,
     CodexThreadState, CodexTurnObservation, CodexTurnTerminalOutcome,
     MAX_CODEX_APP_SERVER_FRAME_BYTES, MAX_CODEX_MANAGED_THREADS, MAX_CODEX_TURN_PROMPT_BYTES,
-    codex_initialize_request, codex_initialized_notification, codex_read_only_start_request,
-    codex_read_request, codex_thread_list_request, codex_turn_interrupt_request,
-    codex_turn_start_request, decode_codex_read_response, decode_codex_start_response,
-    decode_codex_thread_list_response, decode_codex_turn_interrupt_response,
-    decode_codex_turn_notification, decode_codex_turn_start_response,
+    codex_initialize_request, codex_initialized_notification, codex_manual_start_request,
+    codex_read_only_start_request, codex_read_request, codex_thread_list_request,
+    codex_turn_interrupt_request, codex_turn_start_request, decode_codex_manual_start_response,
+    decode_codex_read_response, decode_codex_start_response, decode_codex_thread_list_response,
+    decode_codex_turn_interrupt_response, decode_codex_turn_notification,
+    decode_codex_turn_start_response,
 };
 use serde_json::{Value, json};
 
 const FIXTURE: &str = include_str!("../fixtures/codex-0.144.6-contract.jsonl");
+const MANUAL_FIXTURE: &str = include_str!("../fixtures/codex-0.145.0-manual-contract.jsonl");
 const CWD: &str = "/private/tmp/flit-synthetic-repo";
 
 #[test]
@@ -63,6 +65,42 @@ fn requests_preserve_validated_methods_and_read_only_policy() {
     assert_eq!(
         read["params"],
         json!({"threadId": "managed-1", "includeTurns": true})
+    );
+}
+
+#[test]
+fn manual_start_requires_the_exact_effective_policy_receipt() {
+    let request: Value =
+        serde_json::from_slice(&codex_manual_start_request(2, CWD).expect("manual request"))
+            .expect("JSON");
+    let mut expected_request = manual_fixture_message("manual-start-request");
+    replace_placeholders(&mut expected_request, "<synthetic-repo>", CWD);
+    assert_eq!(request, expected_request);
+    assert_eq!(request["params"]["sandbox"], "read-only");
+    assert_eq!(request["params"]["approvalPolicy"], "on-request");
+    assert_eq!(request["params"]["approvalsReviewer"], "user");
+
+    let mut response = manual_fixture_message("manual-start-response");
+    replace_placeholders(&mut response, "<synthetic-repo>", CWD);
+    replace_placeholders(&mut response, "<thread-id>", "managed-1");
+    let started = decode_codex_manual_start_response(&json_bytes(&response), 2, CWD)
+        .expect("exact Manual receipt");
+    assert_eq!(started.thread.thread_id, thread_id("managed-1"));
+    assert_eq!(started.provider_policy, "readOnly+on-request+user");
+
+    for field in ["approvalPolicy", "approvalsReviewer", "cwd"] {
+        let mut mismatch = response.clone();
+        mismatch["result"][field] = json!("wrong");
+        assert_eq!(
+            decode_codex_manual_start_response(&json_bytes(&mismatch), 2, CWD),
+            Err(CodexContractError::UnexpectedEffectivePolicy)
+        );
+    }
+    let mut network = response;
+    network["result"]["sandbox"]["networkAccess"] = json!(true);
+    assert_eq!(
+        decode_codex_manual_start_response(&json_bytes(&network), 2, CWD),
+        Err(CodexContractError::UnexpectedEffectivePolicy)
     );
 }
 
@@ -451,6 +489,15 @@ fn fixture_message(name: &str) -> Value {
     fixture_records()
         .remove(name)
         .unwrap_or_else(|| panic!("missing fixture {name}"))["message"]
+        .clone()
+}
+
+fn manual_fixture_message(name: &str) -> Value {
+    MANUAL_FIXTURE
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("fixture JSON"))
+        .find(|value| value["fixture"] == name)
+        .unwrap_or_else(|| panic!("missing manual fixture {name}"))["message"]
         .clone()
 }
 

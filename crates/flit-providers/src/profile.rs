@@ -5,11 +5,24 @@ const CODEX_0_144_6_METHOD_ALLOWLIST: &[u8] =
 const CODEX_0_144_6_CONTRACT_FIXTURES: &[u8] =
     include_bytes!("../fixtures/codex-0.144.6-contract.jsonl");
 pub(crate) const CODEX_0_144_6_SMOKE_RUN_ID: &str = "2026-07-21-arm64-3ff2583";
+const CODEX_0_145_0_METHOD_ALLOWLIST: &[u8] =
+    include_bytes!("../fixtures/codex-0.145.0-method-allowlist.txt");
+const CODEX_0_145_0_CONTRACT_FIXTURES: &[u8] =
+    include_bytes!("../fixtures/codex-0.145.0-manual-contract.jsonl");
+pub(crate) const CODEX_0_145_0_SMOKE_RUN_ID: &str = "2026-07-27-arm64-s0-9";
 
 pub(crate) struct BundledProfileEvidence {
     pub method_allowlist_sha256: String,
     pub fixture_sha256: String,
     pub smoke_run_id: String,
+}
+
+pub(crate) fn codex_0_145_0_bundled_evidence() -> BundledProfileEvidence {
+    BundledProfileEvidence {
+        method_allowlist_sha256: sha256(CODEX_0_145_0_METHOD_ALLOWLIST),
+        fixture_sha256: sha256(CODEX_0_145_0_CONTRACT_FIXTURES),
+        smoke_run_id: CODEX_0_145_0_SMOKE_RUN_ID.to_owned(),
+    }
 }
 
 pub(crate) fn codex_0_144_6_bundled_evidence() -> BundledProfileEvidence {
@@ -30,7 +43,9 @@ mod tests {
 
     use super::{
         CODEX_0_144_6_CONTRACT_FIXTURES, CODEX_0_144_6_METHOD_ALLOWLIST,
-        CODEX_0_144_6_SMOKE_RUN_ID, codex_0_144_6_bundled_evidence,
+        CODEX_0_144_6_SMOKE_RUN_ID, CODEX_0_145_0_CONTRACT_FIXTURES,
+        CODEX_0_145_0_METHOD_ALLOWLIST, CODEX_0_145_0_SMOKE_RUN_ID, codex_0_144_6_bundled_evidence,
+        codex_0_145_0_bundled_evidence,
     };
 
     #[test]
@@ -45,6 +60,34 @@ mod tests {
             "a3debd88e389320edf899c0a3399accca500bd6d5632c6862d5ac2c12ad73f8b"
         );
         assert_eq!(evidence.smoke_run_id, CODEX_0_144_6_SMOKE_RUN_ID);
+    }
+
+    #[test]
+    fn bundled_manual_profile_evidence_is_complete_and_well_formed() {
+        let evidence = codex_0_145_0_bundled_evidence();
+        let expected = crate::validated_codex_0_145_0_fingerprint();
+        assert_eq!(evidence.smoke_run_id, CODEX_0_145_0_SMOKE_RUN_ID);
+        assert_eq!(
+            evidence.method_allowlist_sha256,
+            expected.method_allowlist_sha256
+        );
+        assert_eq!(evidence.fixture_sha256, expected.fixture_sha256);
+
+        let allowlist = std::str::from_utf8(CODEX_0_145_0_METHOD_ALLOWLIST).expect("UTF-8");
+        let lines = allowlist.lines().collect::<Vec<_>>();
+        assert_eq!(
+            lines.iter().copied().collect::<BTreeSet<_>>().len(),
+            lines.len()
+        );
+        assert!(lines.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let fixtures = std::str::from_utf8(CODEX_0_145_0_CONTRACT_FIXTURES).expect("UTF-8");
+        assert_eq!(fixtures.lines().count(), 6);
+        for line in fixtures.lines() {
+            let value: serde_json::Value = serde_json::from_str(line).expect("valid JSON");
+            assert!(value["fixture"].is_string());
+            assert!(value["expected"].is_object());
+        }
     }
 
     #[test]

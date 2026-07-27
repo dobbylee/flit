@@ -3,6 +3,7 @@ use std::{collections::BTreeSet, path::PathBuf};
 use flit_providers::{
     CapabilityEntry, CapabilityStatus, FingerprintAxis, ProviderCapability, ProviderCompatibility,
     ProviderFingerprint, classify_codex, validated_codex_0_144_6_fingerprint,
+    validated_codex_0_145_0_fingerprint,
 };
 
 #[test]
@@ -62,6 +63,24 @@ fn exact_validated_codex_fingerprint_exposes_only_the_recorded_capability_matrix
     );
     assert!(snapshot.status(StructuredActivity).is_available());
     assert!(!snapshot.status(PermissionRespond).is_available());
+}
+
+#[test]
+fn exact_manual_profile_enables_only_policy_configuration() {
+    let snapshot = classify_codex(&validated_codex_0_145_0_fingerprint());
+    assert_eq!(snapshot.compatibility, ProviderCompatibility::Supported);
+    assert_eq!(
+        snapshot.status(ProviderCapability::PermissionPolicyConfigure),
+        CapabilityStatus::Supported
+    );
+    assert_eq!(
+        snapshot.status(ProviderCapability::PermissionRespond),
+        CapabilityStatus::Unsupported
+    );
+    assert_eq!(
+        snapshot.status(ProviderCapability::PermissionPolicyObserve),
+        CapabilityStatus::Unsupported
+    );
 }
 
 #[test]

@@ -112,6 +112,12 @@ pub struct CodexStartedThread {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodexManualStartedThread {
+    pub thread: CodexStartedThread,
+    pub provider_policy: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodexManagedThreadConflict {
     pub thread_id: CodexManagedThreadId,
     pub observed_cwd: PathBuf,
@@ -216,6 +222,29 @@ pub fn codex_read_only_start_request(
                 "cwd": cwd,
                 "sandbox": "read-only",
                 "approvalPolicy": "never",
+                "ephemeral": false,
+                "serviceName": "flit",
+                "threadSource": "flit",
+            },
+        }),
+    )
+}
+
+pub fn codex_manual_start_request(
+    request_id: u64,
+    canonical_cwd: impl AsRef<Path>,
+) -> Result<Vec<u8>, CodexContractError> {
+    let cwd = canonical_cwd_string(canonical_cwd.as_ref())?;
+    encode_client_frame(
+        request_id,
+        json!({
+            "id": request_id,
+            "method": "thread/start",
+            "params": {
+                "cwd": cwd,
+                "sandbox": "read-only",
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "user",
                 "ephemeral": false,
                 "serviceName": "flit",
                 "threadSource": "flit",
@@ -329,6 +358,34 @@ pub fn decode_codex_start_response(
     Ok(CodexStartedThread {
         thread_id,
         canonical_cwd,
+    })
+}
+
+pub fn decode_codex_manual_start_response(
+    frame: &[u8],
+    expected_request_id: u64,
+    canonical_cwd: impl Into<PathBuf>,
+) -> Result<CodexManualStartedThread, CodexContractError> {
+    let canonical_cwd = canonical_cwd.into();
+    validate_canonical_cwd(&canonical_cwd)?;
+    let result = response_result(frame, expected_request_id)?;
+    let thread = required_object(&result, "thread")?;
+    let thread_id = equal_thread_and_session_id(thread)?;
+    let sandbox = required_object(&result, "sandbox")?;
+    if required_string(sandbox, "type")? != "readOnly"
+        || required_bool(sandbox, "networkAccess")?
+        || required_string(&result, "approvalPolicy")? != "on-request"
+        || required_string(&result, "approvalsReviewer")? != "user"
+        || Path::new(required_string(&result, "cwd")?) != canonical_cwd
+    {
+        return Err(CodexContractError::UnexpectedEffectivePolicy);
+    }
+    Ok(CodexManualStartedThread {
+        thread: CodexStartedThread {
+            thread_id,
+            canonical_cwd,
+        },
+        provider_policy: "readOnly+on-request+user",
     })
 }
 
