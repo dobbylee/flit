@@ -4,7 +4,7 @@ use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: &str = "1.3";
+pub const PROTOCOL_VERSION: &str = "1.4";
 pub const EVENT_PROTOCOL_VERSION: &str = "1.0";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -262,6 +262,48 @@ pub struct ManagedRunStartResponse {
     pub provider_policy: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ManagedRunObserveRequest {
+    pub run_id: String,
+    pub observed_at: String,
+    pub client_protocol_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ManagedRunObserveResponse {
+    PermissionRequested {
+        protocol_version: String,
+        run_id: String,
+        session_id: String,
+        provider_thread_id: String,
+        provider_turn_id: String,
+        provider_item_id: String,
+        provider_request_id: u64,
+        request_id: String,
+        request_version: u64,
+        event_id: String,
+    },
+    TurnCompleted {
+        protocol_version: String,
+        run_id: String,
+        session_id: String,
+        provider_thread_id: String,
+        provider_turn_id: String,
+        event_id: String,
+        event_version: u64,
+    },
+    TurnInterrupted {
+        protocol_version: String,
+        run_id: String,
+        session_id: String,
+        provider_thread_id: String,
+        provider_turn_id: String,
+        event_id: String,
+        event_version: u64,
+    },
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CommandErrorCode {
@@ -278,6 +320,8 @@ pub enum CommandErrorCode {
     ProviderUnavailable,
     ProviderStartFailed,
     ProviderStartUnknown,
+    ManagedRunNotActive,
+    ProviderObservationUnknown,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -431,6 +475,8 @@ impl CommandError {
             CommandErrorCode::ProviderUnavailable => "errors.providerUnavailable",
             CommandErrorCode::ProviderStartFailed => "errors.providerStartFailed",
             CommandErrorCode::ProviderStartUnknown => "errors.providerStartUnknown",
+            CommandErrorCode::ManagedRunNotActive => "errors.managedRunNotActive",
+            CommandErrorCode::ProviderObservationUnknown => "errors.providerObservationUnknown",
         };
         Self {
             code,
@@ -613,6 +659,8 @@ enum FlitCommandErrorCode: String, Codable, Sendable {
     case providerUnavailable = "PROVIDER_UNAVAILABLE"
     case providerStartFailed = "PROVIDER_START_FAILED"
     case providerStartUnknown = "PROVIDER_START_UNKNOWN"
+    case managedRunNotActive = "MANAGED_RUN_NOT_ACTIVE"
+    case providerObservationUnknown = "PROVIDER_OBSERVATION_UNKNOWN"
 }
 
 struct FlitCommandError: Codable, Equatable, Sendable {
@@ -777,6 +825,205 @@ struct FlitManagedRunStartResponse: Codable, Equatable, Sendable {
         case permissionMode = "permission_mode"
         case permissionModeVersion = "permission_mode_version"
         case providerPolicy = "provider_policy"
+    }
+}
+
+struct FlitManagedRunObserveRequest: Codable, Equatable, Sendable {
+    let runId: String
+    let observedAt: String
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case runId = "run_id"
+        case observedAt = "observed_at"
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+enum FlitManagedRunObservationStatus: String, Codable, Sendable {
+    case permissionRequested = "permission_requested"
+    case turnCompleted = "turn_completed"
+    case turnInterrupted = "turn_interrupted"
+}
+
+enum FlitManagedRunObserveResponse: Codable, Equatable, Sendable {
+    case permissionRequested(
+        protocolVersion: String,
+        runId: String,
+        sessionId: String,
+        providerThreadId: String,
+        providerTurnId: String,
+        providerItemId: String,
+        providerRequestId: UInt64,
+        requestId: String,
+        requestVersion: UInt64,
+        eventId: String
+    )
+    case turnCompleted(
+        protocolVersion: String,
+        runId: String,
+        sessionId: String,
+        providerThreadId: String,
+        providerTurnId: String,
+        eventId: String,
+        eventVersion: UInt64
+    )
+    case turnInterrupted(
+        protocolVersion: String,
+        runId: String,
+        sessionId: String,
+        providerThreadId: String,
+        providerTurnId: String,
+        eventId: String,
+        eventVersion: UInt64
+    )
+
+    var status: FlitManagedRunObservationStatus {
+        switch self {
+        case .permissionRequested:
+            .permissionRequested
+        case .turnCompleted:
+            .turnCompleted
+        case .turnInterrupted:
+            .turnInterrupted
+        }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case status
+        case protocolVersion = "protocol_version"
+        case runId = "run_id"
+        case sessionId = "session_id"
+        case providerThreadId = "provider_thread_id"
+        case providerTurnId = "provider_turn_id"
+        case providerItemId = "provider_item_id"
+        case providerRequestId = "provider_request_id"
+        case requestId = "request_id"
+        case requestVersion = "request_version"
+        case eventId = "event_id"
+        case eventVersion = "event_version"
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let status = try values.decode(FlitManagedRunObservationStatus.self, forKey: .status)
+        let protocolVersion = try values.decode(String.self, forKey: .protocolVersion)
+        let runId = try values.decode(String.self, forKey: .runId)
+        let sessionId = try values.decode(String.self, forKey: .sessionId)
+        let providerThreadId = try values.decode(String.self, forKey: .providerThreadId)
+        let providerTurnId = try values.decode(String.self, forKey: .providerTurnId)
+        let eventId = try values.decode(String.self, forKey: .eventId)
+        switch status {
+        case .permissionRequested:
+            guard !values.contains(.eventVersion) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .eventVersion,
+                    in: values,
+                    debugDescription: "permission observation must not contain terminal fields"
+                )
+            }
+            self = .permissionRequested(
+                protocolVersion: protocolVersion,
+                runId: runId,
+                sessionId: sessionId,
+                providerThreadId: providerThreadId,
+                providerTurnId: providerTurnId,
+                providerItemId: try values.decode(String.self, forKey: .providerItemId),
+                providerRequestId: try values.decode(UInt64.self, forKey: .providerRequestId),
+                requestId: try values.decode(String.self, forKey: .requestId),
+                requestVersion: try values.decode(UInt64.self, forKey: .requestVersion),
+                eventId: eventId
+            )
+        case .turnCompleted, .turnInterrupted:
+            for key in [
+                CodingKeys.providerItemId,
+                .providerRequestId,
+                .requestId,
+                .requestVersion,
+            ] where values.contains(key) {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: values,
+                    debugDescription: "terminal observation must not contain permission fields"
+                )
+            }
+            let eventVersion = try values.decode(UInt64.self, forKey: .eventVersion)
+            if status == .turnCompleted {
+                self = .turnCompleted(
+                    protocolVersion: protocolVersion,
+                    runId: runId,
+                    sessionId: sessionId,
+                    providerThreadId: providerThreadId,
+                    providerTurnId: providerTurnId,
+                    eventId: eventId,
+                    eventVersion: eventVersion
+                )
+            } else {
+                self = .turnInterrupted(
+                    protocolVersion: protocolVersion,
+                    runId: runId,
+                    sessionId: sessionId,
+                    providerThreadId: providerThreadId,
+                    providerTurnId: providerTurnId,
+                    eventId: eventId,
+                    eventVersion: eventVersion
+                )
+            }
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(status, forKey: .status)
+        switch self {
+        case let .permissionRequested(
+            protocolVersion,
+            runId,
+            sessionId,
+            providerThreadId,
+            providerTurnId,
+            providerItemId,
+            providerRequestId,
+            requestId,
+            requestVersion,
+            eventId
+        ):
+            try values.encode(protocolVersion, forKey: .protocolVersion)
+            try values.encode(runId, forKey: .runId)
+            try values.encode(sessionId, forKey: .sessionId)
+            try values.encode(providerThreadId, forKey: .providerThreadId)
+            try values.encode(providerTurnId, forKey: .providerTurnId)
+            try values.encode(providerItemId, forKey: .providerItemId)
+            try values.encode(providerRequestId, forKey: .providerRequestId)
+            try values.encode(requestId, forKey: .requestId)
+            try values.encode(requestVersion, forKey: .requestVersion)
+            try values.encode(eventId, forKey: .eventId)
+        case let .turnCompleted(
+            protocolVersion,
+            runId,
+            sessionId,
+            providerThreadId,
+            providerTurnId,
+            eventId,
+            eventVersion
+        ),
+        let .turnInterrupted(
+            protocolVersion,
+            runId,
+            sessionId,
+            providerThreadId,
+            providerTurnId,
+            eventId,
+            eventVersion
+        ):
+            try values.encode(protocolVersion, forKey: .protocolVersion)
+            try values.encode(runId, forKey: .runId)
+            try values.encode(sessionId, forKey: .sessionId)
+            try values.encode(providerThreadId, forKey: .providerThreadId)
+            try values.encode(providerTurnId, forKey: .providerTurnId)
+            try values.encode(eventId, forKey: .eventId)
+            try values.encode(eventVersion, forKey: .eventVersion)
+        }
     }
 }
 "#;

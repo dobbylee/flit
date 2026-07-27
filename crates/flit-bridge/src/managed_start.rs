@@ -1,15 +1,18 @@
 use std::{collections::BTreeMap, ffi::OsStr, path::Path};
 
 use flit_protocol::{
-    ManagedRunPermissionMode, ManagedRunStartRequest, ManagedRunStartResponse, PROTOCOL_VERSION,
+    ManagedRunObserveRequest, ManagedRunObserveResponse, ManagedRunPermissionMode,
+    ManagedRunStartRequest, ManagedRunStartResponse, PROTOCOL_VERSION,
 };
 use flit_providers::{
     CapabilityStatus, CodexAppServer, CodexAppServerError, CodexContractError,
-    CodexManagedThreadId, CodexManualStartedThread, CodexStartedTurn, ProviderCapability,
-    ProviderCompatibility, ProviderFingerprint, classify_codex,
+    CodexManagedThreadId, CodexManualStartedThread, CodexStartedTurn, CodexTurnObservation,
+    CodexTurnTerminalOutcome, ProviderCapability, ProviderCompatibility, ProviderFingerprint,
+    classify_codex,
 };
 use flit_store::{
-    InitialManagedSessionConnection, ManagedReconciliationState, ManagedRunIntent,
+    AppendEventOutcome, InitialManagedSessionConnection, ManagedProviderObservation,
+    ManagedProviderObservationKind, ManagedReconciliationState, ManagedRunIntent,
     ManagedRunIntentOutcome, ManagedRunStartFailure, ManagedSessionReconciliation, Store,
     StoreError,
 };
@@ -22,6 +25,9 @@ const MAX_MANAGED_GOAL_BYTES: usize = 64 * 1_024;
 const MAX_MANAGED_TIMESTAMP_BYTES: usize = 128;
 const MANUAL_MODE_VERSION: u64 = 1;
 const MANUAL_PROVIDER_POLICY: &str = "readOnly+on-request+user";
+#[cfg(test)]
+const MAX_MANAGED_OBSERVATIONS_PER_CALL: usize =
+    flit_providers::MAX_CODEX_COMMAND_STARTS_PER_TURN + 1;
 
 pub(crate) trait ManagedCodexConnector {
     fn connect(&self, path_environment: Option<&OsStr>)
@@ -39,6 +45,7 @@ pub(crate) trait ManagedCodexRuntime: Send {
         thread_id: &CodexManagedThreadId,
         prompt: &str,
     ) -> Result<CodexStartedTurn, ()>;
+    fn wait_for_turn_observation(&mut self) -> Result<CodexTurnObservation, ()>;
     fn delete_started_thread(self: Box<Self>, thread_id: &CodexManagedThreadId) -> Result<(), ()>;
 }
 
@@ -87,6 +94,10 @@ impl ManagedCodexRuntime for CodexAppServer {
         CodexAppServer::start_turn(self, thread_id, prompt).map_err(|_| ())
     }
 
+    fn wait_for_turn_observation(&mut self) -> Result<CodexTurnObservation, ()> {
+        CodexAppServer::wait_for_turn_observation(self).map_err(|_| ())
+    }
+
     fn delete_started_thread(self: Box<Self>, thread_id: &CodexManagedThreadId) -> Result<(), ()> {
         (*self)
             .delete_started_thread(thread_id)
@@ -98,7 +109,31 @@ impl ManagedCodexRuntime for CodexAppServer {
 pub(crate) struct RetainedManagedRun {
     request_digest: String,
     response: ManagedRunStartResponse,
-    _provider: Box<dyn ManagedCodexRuntime>,
+    provider: Box<dyn ManagedCodexRuntime>,
+    active_permission: Option<ManagedRunObserveResponse>,
+}
+
+impl RetainedManagedRun {
+    pub(crate) fn cached_permission(&self) -> Option<ManagedRunObserveResponse> {
+        self.active_permission.clone()
+    }
+
+    pub(crate) fn start_response(&self) -> ManagedRunStartResponse {
+        self.response.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        response: ManagedRunStartResponse,
+        provider: Box<dyn ManagedCodexRuntime>,
+    ) -> Self {
+        Self {
+            request_digest: "test-runtime".to_owned(),
+            response,
+            provider,
+            active_permission: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -112,6 +147,8 @@ pub(crate) enum ManagedStartError {
     ProviderStartFailed,
     ProviderStartUnknown,
     StorageUnavailable,
+    RunNotActive,
+    ProviderObservationUnknown,
 }
 
 pub(crate) fn start_managed_run(
@@ -308,10 +345,232 @@ pub(crate) fn start_managed_run(
         RetainedManagedRun {
             request_digest,
             response: response.clone(),
-            _provider: provider,
+            provider,
+            active_permission: None,
         },
     );
     Ok(response)
+}
+
+#[cfg(test)]
+pub(crate) fn observe_managed_run(
+    store: &mut Store,
+    runtimes: &mut BTreeMap<String, RetainedManagedRun>,
+    request: ManagedRunObserveRequest,
+) -> Result<ManagedRunObserveResponse, ManagedStartError> {
+    validate_observe_request(&request)?;
+    let (result, start_response) = {
+        let retained = runtimes
+            .get_mut(&request.run_id)
+            .ok_or(ManagedStartError::RunNotActive)?;
+        if let Some(permission) = &retained.active_permission {
+            return Ok(permission.clone());
+        }
+        (
+            observe_retained_runtime(store, retained, &request),
+            retained.response.clone(),
+        )
+    };
+    let result = if result == Err(ManagedStartError::ProviderObservationUnknown) {
+        record_observation_unknown(store, &request, &start_response)?;
+        Err(ManagedStartError::ProviderObservationUnknown)
+    } else {
+        result
+    };
+    if matches!(
+        result,
+        Ok(ManagedRunObserveResponse::TurnCompleted { .. })
+            | Ok(ManagedRunObserveResponse::TurnInterrupted { .. })
+            | Err(ManagedStartError::ProviderObservationUnknown)
+    ) {
+        runtimes.remove(&request.run_id);
+    }
+    result
+}
+
+#[cfg(test)]
+fn observe_retained_runtime(
+    store: &mut Store,
+    retained: &mut RetainedManagedRun,
+    request: &ManagedRunObserveRequest,
+) -> Result<ManagedRunObserveResponse, ManagedStartError> {
+    for _ in 0..MAX_MANAGED_OBSERVATIONS_PER_CALL {
+        let observation = wait_managed_observation(retained)?;
+        match commit_managed_observation(store, retained, request, observation)? {
+            ManagedObservationCommit::Continue => {}
+            ManagedObservationCommit::Complete(response) => return Ok(*response),
+        }
+    }
+    Err(ManagedStartError::ProviderObservationUnknown)
+}
+
+pub(crate) enum ManagedObservationCommit {
+    Continue,
+    Complete(Box<ManagedRunObserveResponse>),
+}
+
+pub(crate) fn wait_managed_observation(
+    retained: &mut RetainedManagedRun,
+) -> Result<CodexTurnObservation, ManagedStartError> {
+    retained
+        .provider
+        .wait_for_turn_observation()
+        .map_err(|_| ManagedStartError::ProviderObservationUnknown)
+}
+
+pub(crate) fn commit_managed_observation(
+    store: &mut Store,
+    retained: &mut RetainedManagedRun,
+    request: &ManagedRunObserveRequest,
+    observation: CodexTurnObservation,
+) -> Result<ManagedObservationCommit, ManagedStartError> {
+    match observation {
+        CodexTurnObservation::CommandStarted {
+            thread_id,
+            turn_id,
+            item_id,
+        } => {
+            validate_observation_identity(&retained.response, &thread_id, &turn_id)?;
+            let event_id = observation_id(
+                "evt_codex_command_",
+                &[
+                    request.run_id.as_str(),
+                    thread_id.as_str(),
+                    turn_id.as_str(),
+                    item_id.as_str(),
+                ],
+            );
+            store
+                .append_managed_provider_observation(ManagedProviderObservation {
+                    run_id: request.run_id.clone(),
+                    session_id: retained.response.session_id.clone(),
+                    external_session_key: thread_id.as_str().to_owned(),
+                    provider_turn_id: turn_id.as_str().to_owned(),
+                    contract_version: "codex-app-server/0.145.0".to_owned(),
+                    event_id,
+                    observed_at: request.observed_at.clone(),
+                    kind: ManagedProviderObservationKind::CommandStarted {
+                        provider_item_id: item_id.as_str().to_owned(),
+                    },
+                })
+                .map_err(map_observation_store_error)?;
+            Ok(ManagedObservationCommit::Continue)
+        }
+        CodexTurnObservation::PermissionRequested(permission) => {
+            validate_observation_identity(
+                &retained.response,
+                &permission.thread_id,
+                &permission.turn_id,
+            )?;
+            let provider_request_id = permission.provider_request_id.to_string();
+            let axes = [
+                request.run_id.as_str(),
+                permission.thread_id.as_str(),
+                permission.turn_id.as_str(),
+                permission.item_id.as_str(),
+                provider_request_id.as_str(),
+            ];
+            let request_id = observation_id("req_codex_", &axes);
+            let event_id = observation_id("evt_codex_permission_", &axes);
+            let outcome = store
+                .append_managed_provider_observation(ManagedProviderObservation {
+                    run_id: request.run_id.clone(),
+                    session_id: retained.response.session_id.clone(),
+                    external_session_key: permission.thread_id.as_str().to_owned(),
+                    provider_turn_id: permission.turn_id.as_str().to_owned(),
+                    contract_version: "codex-app-server/0.145.0".to_owned(),
+                    event_id: event_id.clone(),
+                    observed_at: request.observed_at.clone(),
+                    kind: ManagedProviderObservationKind::PermissionRequested {
+                        request_id: request_id.clone(),
+                        provider_request_id: permission.provider_request_id,
+                        provider_item_id: permission.item_id.as_str().to_owned(),
+                        provider_started_at_ms: permission.started_at_ms,
+                    },
+                })
+                .map_err(map_observation_store_error)?;
+            let request_version = appended_event(&outcome).ingest_seq;
+            let response = ManagedRunObserveResponse::PermissionRequested {
+                protocol_version: PROTOCOL_VERSION.to_owned(),
+                run_id: request.run_id.clone(),
+                session_id: retained.response.session_id.clone(),
+                provider_thread_id: permission.thread_id.as_str().to_owned(),
+                provider_turn_id: permission.turn_id.as_str().to_owned(),
+                provider_item_id: permission.item_id.as_str().to_owned(),
+                provider_request_id: permission.provider_request_id,
+                request_id,
+                request_version,
+                event_id,
+            };
+            retained.active_permission = Some(response.clone());
+            Ok(ManagedObservationCommit::Complete(Box::new(response)))
+        }
+        CodexTurnObservation::Terminal {
+            thread_id,
+            turn_id,
+            outcome,
+        } => {
+            validate_observation_identity(&retained.response, &thread_id, &turn_id)?;
+            let terminal_outcome = outcome;
+            let (prefix, kind) = match terminal_outcome {
+                CodexTurnTerminalOutcome::Completed => (
+                    "evt_codex_completed_",
+                    ManagedProviderObservationKind::TurnCompleted,
+                ),
+                CodexTurnTerminalOutcome::Interrupted => (
+                    "evt_codex_interrupted_",
+                    ManagedProviderObservationKind::TurnInterrupted,
+                ),
+            };
+            let event_id = observation_id(
+                prefix,
+                &[
+                    request.run_id.as_str(),
+                    thread_id.as_str(),
+                    turn_id.as_str(),
+                ],
+            );
+            let outcome = store
+                .append_managed_provider_observation(ManagedProviderObservation {
+                    run_id: request.run_id.clone(),
+                    session_id: retained.response.session_id.clone(),
+                    external_session_key: thread_id.as_str().to_owned(),
+                    provider_turn_id: turn_id.as_str().to_owned(),
+                    contract_version: "codex-app-server/0.145.0".to_owned(),
+                    event_id: event_id.clone(),
+                    observed_at: request.observed_at.clone(),
+                    kind,
+                })
+                .map_err(map_observation_store_error)?;
+            let event_version = appended_event(&outcome).ingest_seq;
+            Ok(ManagedObservationCommit::Complete(Box::new(
+                match terminal_outcome {
+                    CodexTurnTerminalOutcome::Completed => {
+                        ManagedRunObserveResponse::TurnCompleted {
+                            protocol_version: PROTOCOL_VERSION.to_owned(),
+                            run_id: request.run_id.clone(),
+                            session_id: retained.response.session_id.clone(),
+                            provider_thread_id: thread_id.as_str().to_owned(),
+                            provider_turn_id: turn_id.as_str().to_owned(),
+                            event_id,
+                            event_version,
+                        }
+                    }
+                    CodexTurnTerminalOutcome::Interrupted => {
+                        ManagedRunObserveResponse::TurnInterrupted {
+                            protocol_version: PROTOCOL_VERSION.to_owned(),
+                            run_id: request.run_id.clone(),
+                            session_id: retained.response.session_id.clone(),
+                            provider_thread_id: thread_id.as_str().to_owned(),
+                            provider_turn_id: turn_id.as_str().to_owned(),
+                            event_id,
+                            event_version,
+                        }
+                    }
+                },
+            )))
+        }
+    }
 }
 
 fn validate_request(request: &ManagedRunStartRequest) -> Result<(), ManagedStartError> {
@@ -350,6 +609,73 @@ fn validate_request(request: &ManagedRunStartRequest) -> Result<(), ManagedStart
     validate_text(&request.goal, MAX_MANAGED_GOAL_BYTES)?;
     validate_token(&request.created_at, MAX_MANAGED_TIMESTAMP_BYTES)?;
     validate_token(&request.started_at, MAX_MANAGED_TIMESTAMP_BYTES)
+}
+
+pub(crate) fn validate_observe_request(
+    request: &ManagedRunObserveRequest,
+) -> Result<(), ManagedStartError> {
+    if request.client_protocol_version != PROTOCOL_VERSION {
+        return Err(ManagedStartError::InvalidRequest);
+    }
+    validate_token(&request.run_id, MAX_MANAGED_ID_BYTES)?;
+    validate_token(&request.observed_at, MAX_MANAGED_TIMESTAMP_BYTES)
+}
+
+fn validate_observation_identity(
+    response: &ManagedRunStartResponse,
+    thread_id: &CodexManagedThreadId,
+    turn_id: &flit_providers::CodexManagedTurnId,
+) -> Result<(), ManagedStartError> {
+    if response.provider_thread_id != thread_id.as_str()
+        || response.provider_turn_id != turn_id.as_str()
+    {
+        return Err(ManagedStartError::ProviderObservationUnknown);
+    }
+    Ok(())
+}
+
+fn appended_event(outcome: &AppendEventOutcome) -> &flit_protocol::EventEnvelope {
+    match outcome {
+        AppendEventOutcome::Inserted(event) | AppendEventOutcome::Duplicate(event) => event,
+    }
+}
+
+fn observation_id(prefix: &str, axes: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for axis in axes {
+        hasher.update(axis.len().to_be_bytes());
+        hasher.update(axis.as_bytes());
+    }
+    format!("{prefix}{:x}", hasher.finalize())
+}
+
+pub(crate) fn record_observation_unknown(
+    store: &mut Store,
+    request: &ManagedRunObserveRequest,
+    response: &ManagedRunStartResponse,
+) -> Result<(), ManagedStartError> {
+    store
+        .reconcile_managed_session(ManagedSessionReconciliation {
+            run_id: request.run_id.clone(),
+            session_id: response.session_id.clone(),
+            external_session_key: response.provider_thread_id.clone(),
+            state: ManagedReconciliationState::Unknown,
+            latest_turn_id: Some(response.provider_turn_id.clone()),
+            contract_version: "codex-app-server/0.145.0".to_owned(),
+            observed_at: request.observed_at.clone(),
+            gap_event_id: observation_id(
+                "evt_codex_observation_unknown_",
+                &[
+                    request.run_id.as_str(),
+                    response.provider_thread_id.as_str(),
+                    response.provider_turn_id.as_str(),
+                    request.observed_at.as_str(),
+                ],
+            ),
+            terminal_event_id: None,
+        })
+        .map(|_| ())
+        .map_err(|_| ManagedStartError::StorageUnavailable)
 }
 
 fn validate_project_identity(project: &flit_store::Project) -> Result<(), ManagedStartError> {
@@ -483,6 +809,15 @@ fn map_intent_error(error: StoreError) -> ManagedStartError {
     }
 }
 
+fn map_observation_store_error(error: StoreError) -> ManagedStartError {
+    match error {
+        StoreError::InvalidManagedProviderObservation { .. } => {
+            ManagedStartError::ProviderObservationUnknown
+        }
+        _ => ManagedStartError::StorageUnavailable,
+    }
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -500,7 +835,8 @@ mod tests {
     };
 
     use flit_providers::{
-        CodexManagedTurnId, CodexStartedThread, validated_codex_0_145_0_fingerprint,
+        CodexManagedItemId, CodexManagedTurnId, CodexPermissionRequest, CodexStartedThread,
+        validated_codex_0_145_0_fingerprint,
     };
     use flit_store::{
         InitialManagedSessionConnection, ManagedRunIntent, ProjectRegistration,
@@ -541,6 +877,11 @@ mod tests {
         ManualUnknown,
         TurnFailure,
         CleanupFailure,
+        CommandThenPermission,
+        TerminalCompleted,
+        ObservationFailure,
+        WrongObservationIdentity,
+        OversizedObservationTimestamp,
     }
 
     #[derive(Default)]
@@ -549,6 +890,7 @@ mod tests {
         manual_starts: usize,
         turns: usize,
         deletes: usize,
+        observations: usize,
     }
 
     struct FakeConnector {
@@ -629,6 +971,65 @@ mod tests {
             })
         }
 
+        fn wait_for_turn_observation(&mut self) -> Result<CodexTurnObservation, ()> {
+            let mut calls = self.calls.lock().expect("calls");
+            calls.observations += 1;
+            let observation_index = calls.observations;
+            drop(calls);
+            match self.behavior {
+                FakeBehavior::CommandThenPermission if observation_index == 1 => {
+                    Ok(CodexTurnObservation::CommandStarted {
+                        thread_id: CodexManagedThreadId::new(self.thread_id.clone())
+                            .expect("thread ID"),
+                        turn_id: CodexManagedTurnId::new("turn-1").expect("turn ID"),
+                        item_id: CodexManagedItemId::new("command-item").expect("item ID"),
+                    })
+                }
+                FakeBehavior::CommandThenPermission => Ok(
+                    CodexTurnObservation::PermissionRequested(CodexPermissionRequest {
+                        provider_request_id: 0,
+                        thread_id: CodexManagedThreadId::new(self.thread_id.clone())
+                            .expect("thread ID"),
+                        turn_id: CodexManagedTurnId::new("turn-1").expect("turn ID"),
+                        item_id: CodexManagedItemId::new("permission-item").expect("item ID"),
+                        started_at_ms: 17,
+                    }),
+                ),
+                FakeBehavior::TerminalCompleted => Ok(CodexTurnObservation::Terminal {
+                    thread_id: CodexManagedThreadId::new(self.thread_id.clone())
+                        .expect("thread ID"),
+                    turn_id: CodexManagedTurnId::new("turn-1").expect("turn ID"),
+                    outcome: CodexTurnTerminalOutcome::Completed,
+                }),
+                FakeBehavior::WrongObservationIdentity => Ok(
+                    CodexTurnObservation::PermissionRequested(CodexPermissionRequest {
+                        provider_request_id: 0,
+                        thread_id: CodexManagedThreadId::new("wrong-thread").expect("thread ID"),
+                        turn_id: CodexManagedTurnId::new("turn-1").expect("turn ID"),
+                        item_id: CodexManagedItemId::new("permission-item").expect("item ID"),
+                        started_at_ms: 17,
+                    }),
+                ),
+                FakeBehavior::OversizedObservationTimestamp => Ok(
+                    CodexTurnObservation::PermissionRequested(CodexPermissionRequest {
+                        provider_request_id: 0,
+                        thread_id: CodexManagedThreadId::new(self.thread_id.clone())
+                            .expect("thread ID"),
+                        turn_id: CodexManagedTurnId::new("turn-1").expect("turn ID"),
+                        item_id: CodexManagedItemId::new("permission-item").expect("item ID"),
+                        started_at_ms: flit_protocol::MAX_JSON_SAFE_INTEGER + 1,
+                    }),
+                ),
+                FakeBehavior::ObservationFailure => Err(()),
+                FakeBehavior::Success
+                | FakeBehavior::ConnectFailure
+                | FakeBehavior::ManualFailure
+                | FakeBehavior::ManualUnknown
+                | FakeBehavior::TurnFailure
+                | FakeBehavior::CleanupFailure => Err(()),
+            }
+        }
+
         fn delete_started_thread(
             self: Box<Self>,
             _thread_id: &CodexManagedThreadId,
@@ -688,6 +1089,14 @@ mod tests {
             session_connected_event_id: "event-session-connected".to_owned(),
             start_failed_event_id: "event-start-failed".to_owned(),
             start_unknown_event_id: "event-start-unknown".to_owned(),
+            client_protocol_version: PROTOCOL_VERSION.to_owned(),
+        }
+    }
+
+    fn observe_request() -> ManagedRunObserveRequest {
+        ManagedRunObserveRequest {
+            run_id: "run-1".to_owned(),
+            observed_at: "2026-07-27T12:00:02Z".to_owned(),
             client_protocol_version: PROTOCOL_VERSION.to_owned(),
         }
     }
@@ -1049,5 +1458,145 @@ mod tests {
         assert_eq!(calls.manual_starts, 1);
         assert_eq!(calls.turns, 0);
         assert_eq!(calls.deletes, 0);
+    }
+
+    #[test]
+    fn command_then_permission_is_durable_content_safe_and_cached_while_open() {
+        let (_directory, mut store, _project) = store_and_project("observe-permission", true);
+        let (connector, calls) = connector(FakeBehavior::CommandThenPermission, "thread-1");
+        let mut runtimes = BTreeMap::new();
+        start_managed_run(&mut store, &mut runtimes, &connector, None, request())
+            .expect("managed start");
+
+        let permission =
+            observe_managed_run(&mut store, &mut runtimes, observe_request()).expect("permission");
+        let ManagedRunObserveResponse::PermissionRequested {
+            ref provider_thread_id,
+            ref provider_turn_id,
+            ref provider_item_id,
+            provider_request_id,
+            request_version,
+            ref request_id,
+            ref event_id,
+            ..
+        } = permission
+        else {
+            panic!("expected permission response");
+        };
+        assert_eq!(provider_thread_id, "thread-1");
+        assert_eq!(provider_turn_id, "turn-1");
+        assert_eq!(provider_item_id, "permission-item");
+        assert_eq!(provider_request_id, 0);
+        assert_eq!(request_version, 5);
+        assert!(request_id.starts_with("req_codex_"));
+        assert!(event_id.starts_with("evt_codex_permission_"));
+
+        let events = store
+            .run_events_through("run-1", 0, request_version, 10)
+            .expect("Run events");
+        assert_eq!(
+            events
+                .events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "run.created",
+                "run.start_requested",
+                "session.connected",
+                "command.started",
+                "permission.requested",
+            ]
+        );
+        let rendered = serde_json::to_string(&events.events).expect("event JSON");
+        for raw in [
+            "sensitive reason",
+            "secret command",
+            "/private/secret",
+            "Update the Project and verify the result.",
+        ] {
+            assert!(!rendered.contains(raw));
+        }
+
+        let mut retry = observe_request();
+        retry.observed_at = "2026-07-27T12:00:03Z".to_owned();
+        assert_eq!(
+            observe_managed_run(&mut store, &mut runtimes, retry).expect("cached permission"),
+            permission
+        );
+        assert_eq!(calls.lock().expect("calls").observations, 2);
+        assert_eq!(runtimes.len(), 1);
+    }
+
+    #[test]
+    fn terminal_and_unknown_observations_close_or_degrade_without_false_permission() {
+        for (label, behavior, expected_terminal, expected_error) in [
+            (
+                "observe-terminal",
+                FakeBehavior::TerminalCompleted,
+                true,
+                None,
+            ),
+            (
+                "observe-failure",
+                FakeBehavior::ObservationFailure,
+                false,
+                Some(ManagedStartError::ProviderObservationUnknown),
+            ),
+            (
+                "observe-wrong-identity",
+                FakeBehavior::WrongObservationIdentity,
+                false,
+                Some(ManagedStartError::ProviderObservationUnknown),
+            ),
+            (
+                "observe-oversized-timestamp",
+                FakeBehavior::OversizedObservationTimestamp,
+                false,
+                Some(ManagedStartError::ProviderObservationUnknown),
+            ),
+        ] {
+            let (_directory, mut store, _project) = store_and_project(label, true);
+            let (connector, _calls) = connector(behavior, "thread-1");
+            let mut runtimes = BTreeMap::new();
+            start_managed_run(&mut store, &mut runtimes, &connector, None, request())
+                .expect("managed start");
+            let observed = observe_managed_run(&mut store, &mut runtimes, observe_request());
+            if expected_terminal {
+                assert!(matches!(
+                    observed,
+                    Ok(ManagedRunObserveResponse::TurnCompleted { .. })
+                ));
+                assert!(
+                    store
+                        .managed_run("run-1")
+                        .expect("Run")
+                        .expect("Run")
+                        .ended_at
+                        .is_some()
+                );
+            } else {
+                assert_eq!(observed, Err(expected_error.expect("expected error")));
+                let events = store
+                    .run_events_through(
+                        "run-1",
+                        0,
+                        store.latest_ingest_seq().expect("latest cursor"),
+                        10,
+                    )
+                    .expect("unknown events");
+                assert_eq!(
+                    events.events.last().expect("gap").event_type,
+                    "diagnostic.sequence_gap"
+                );
+                assert!(
+                    events
+                        .events
+                        .iter()
+                        .all(|event| event.event_type != "permission.requested")
+                );
+            }
+            assert!(runtimes.is_empty());
+        }
     }
 }

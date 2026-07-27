@@ -10,7 +10,8 @@ use flit_protocol::{
     EventProtocolVersion, EventSource, EventSourceKind, NullableSessionId, UnsequencedEventEnvelope,
 };
 use flit_store::{
-    InitialManagedSessionConnection, InitialManagedSessionOutcome, MAX_LIVE_MANAGED_SESSIONS,
+    AppendEventOutcome, InitialManagedSessionConnection, InitialManagedSessionOutcome,
+    MAX_LIVE_MANAGED_SESSIONS, ManagedProviderObservation, ManagedProviderObservationKind,
     ManagedReconciliationState, ManagedRunIntent, ManagedRunIntentOutcome, ManagedRunStartFailure,
     ManagedRunStartFailureOutcome, ManagedSessionReconciliation,
     ManagedSessionReconciliationOutcome, ManagedSessionTermination,
@@ -326,6 +327,132 @@ fn managed_run_and_exact_session_are_atomic_idempotent_and_reopen() {
             .collect::<Vec<_>>(),
         ["run.created", "run.start_requested", "session.connected"]
     );
+}
+
+#[test]
+fn managed_provider_observations_are_exact_ordered_idempotent_and_content_safe() {
+    let directory = TestDirectory::new("provider-observation");
+    let (mut store, _database, project_path) = trusted_store(&directory);
+    store
+        .create_managed_run_intent(run_intent(
+            "run-1",
+            "event-run-created",
+            "event-start-requested",
+        ))
+        .expect("managed Run");
+    store
+        .connect_initial_managed_session(session_connection(
+            "session-1",
+            "run-1",
+            "thread-1",
+            &project_path,
+        ))
+        .expect("managed session");
+
+    let permission = ManagedProviderObservation {
+        run_id: "run-1".to_owned(),
+        session_id: "session-1".to_owned(),
+        external_session_key: "thread-1".to_owned(),
+        provider_turn_id: "turn-1".to_owned(),
+        contract_version: "codex-app-server/0.145.0".to_owned(),
+        event_id: "event-permission".to_owned(),
+        observed_at: STARTED_AT.to_owned(),
+        kind: ManagedProviderObservationKind::PermissionRequested {
+            request_id: "request-permission".to_owned(),
+            provider_request_id: 0,
+            provider_item_id: "item-1".to_owned(),
+            provider_started_at_ms: 17,
+        },
+    };
+    let inserted = store
+        .append_managed_provider_observation(permission.clone())
+        .expect("permission observation");
+    let event = match inserted {
+        AppendEventOutcome::Inserted(event) => event,
+        other => panic!("unexpected observation outcome: {other:?}"),
+    };
+    assert_eq!(event.stream_seq, 2);
+    assert_eq!(event.event_type, "permission.requested");
+    assert_eq!(event.payload["request_id"], "request-permission");
+    assert_eq!(
+        event.payload["evidence_unavailable_reason"],
+        "raw_provider_content_not_retained"
+    );
+    assert!(event.evidence_ids.is_empty());
+    let rendered = serde_json::to_string(&event).expect("event JSON");
+    for raw in ["sensitive reason", "secret command", "/private/secret"] {
+        assert!(!rendered.contains(raw));
+    }
+    assert!(matches!(
+        store
+            .append_managed_provider_observation(permission.clone())
+            .expect("exact duplicate"),
+        AppendEventOutcome::Duplicate(ref duplicate) if duplicate == &event
+    ));
+
+    let mut conflict = permission;
+    conflict.kind = ManagedProviderObservationKind::PermissionRequested {
+        request_id: "request-permission".to_owned(),
+        provider_request_id: 0,
+        provider_item_id: "different-item".to_owned(),
+        provider_started_at_ms: 17,
+    };
+    assert!(matches!(
+        store.append_managed_provider_observation(conflict),
+        Err(StoreError::EventIdentityConflict { .. })
+    ));
+
+    let command = ManagedProviderObservation {
+        run_id: "run-1".to_owned(),
+        session_id: "session-1".to_owned(),
+        external_session_key: "thread-1".to_owned(),
+        provider_turn_id: "turn-1".to_owned(),
+        contract_version: "codex-app-server/0.145.0".to_owned(),
+        event_id: "event-command".to_owned(),
+        observed_at: STARTED_AT.to_owned(),
+        kind: ManagedProviderObservationKind::CommandStarted {
+            provider_item_id: "command-item".to_owned(),
+        },
+    };
+    assert!(matches!(
+        store
+            .append_managed_provider_observation(command)
+            .expect("command observation"),
+        AppendEventOutcome::Inserted(ref command) if command.stream_seq == 3
+    ));
+
+    let terminal = ManagedProviderObservation {
+        run_id: "run-1".to_owned(),
+        session_id: "session-1".to_owned(),
+        external_session_key: "thread-1".to_owned(),
+        provider_turn_id: "turn-1".to_owned(),
+        contract_version: "codex-app-server/0.145.0".to_owned(),
+        event_id: "event-terminal".to_owned(),
+        observed_at: ENDED_AT.to_owned(),
+        kind: ManagedProviderObservationKind::TurnCompleted,
+    };
+    let terminal_event = store
+        .append_managed_provider_observation(terminal.clone())
+        .expect("terminal observation");
+    assert!(matches!(
+        terminal_event,
+        AppendEventOutcome::Inserted(ref terminal) if terminal.stream_seq == 4
+    ));
+    assert_eq!(
+        store
+            .managed_run("run-1")
+            .expect("Run")
+            .expect("Run")
+            .ended_at
+            .as_deref(),
+        Some(ENDED_AT)
+    );
+    assert!(matches!(
+        store
+            .append_managed_provider_observation(terminal)
+            .expect("terminal duplicate"),
+        AppendEventOutcome::Duplicate(_)
+    ));
 }
 
 #[test]

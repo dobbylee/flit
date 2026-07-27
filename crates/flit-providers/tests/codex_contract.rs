@@ -239,6 +239,24 @@ fn turn_requests_and_responses_bind_exact_managed_identity() {
 fn selected_turn_notifications_require_exact_identity_and_variant() {
     let expected_thread = thread_id("managed-1");
     let expected_turn = turn_id("turn-1");
+    let mut permission = manual_fixture_message("manual-file-change-request");
+    replace_placeholders(&mut permission, "<thread-id>", "managed-1");
+    replace_placeholders(&mut permission, "<turn-id>", "turn-1");
+    replace_placeholders(&mut permission, "<item-id>", "item-permission");
+    assert_eq!(
+        decode_codex_turn_notification(&json_bytes(&permission), &expected_thread, &expected_turn),
+        Ok(Some(CodexTurnObservation::PermissionRequested(
+            flit_providers::CodexPermissionRequest {
+                provider_request_id: 0,
+                thread_id: expected_thread.clone(),
+                turn_id: expected_turn.clone(),
+                item_id: flit_providers::CodexManagedItemId::new("item-permission")
+                    .expect("item ID"),
+                started_at_ms: 0,
+            }
+        )))
+    );
+
     let mut command = fixture_message("activity-command-started");
     replace_placeholders(&mut command, "<thread-id>", "managed-1");
     replace_placeholders(&mut command, "<turn-id>", "turn-1");
@@ -292,6 +310,42 @@ fn selected_turn_notifications_require_exact_identity_and_variant() {
     assert_eq!(
         decode_codex_turn_notification(&json_bytes(&completed), &expected_thread, &expected_turn),
         Err(CodexContractError::UnexpectedTurnStatus)
+    );
+
+    let mut wrong_permission = permission.clone();
+    wrong_permission["params"]["threadId"] = json!("other-thread");
+    assert_eq!(
+        decode_codex_turn_notification(
+            &json_bytes(&wrong_permission),
+            &expected_thread,
+            &expected_turn
+        ),
+        Err(CodexContractError::UnexpectedThreadId)
+    );
+    let mut unsupported_permission = permission;
+    unsupported_permission["method"] = json!("item/permissions/requestApproval");
+    assert_eq!(
+        decode_codex_turn_notification(
+            &json_bytes(&unsupported_permission),
+            &expected_thread,
+            &expected_turn
+        ),
+        Err(CodexContractError::UnsupportedServerRequest)
+    );
+    let mut oversized_timestamp = manual_fixture_message("manual-file-change-request");
+    replace_placeholders(&mut oversized_timestamp, "<thread-id>", "managed-1");
+    replace_placeholders(&mut oversized_timestamp, "<turn-id>", "turn-1");
+    replace_placeholders(&mut oversized_timestamp, "<item-id>", "item-permission");
+    oversized_timestamp["params"]["startedAtMs"] = json!(9_007_199_254_740_992_u64);
+    assert_eq!(
+        decode_codex_turn_notification(
+            &json_bytes(&oversized_timestamp),
+            &expected_thread,
+            &expected_turn
+        ),
+        Err(CodexContractError::InvalidField {
+            field: "startedAtMs"
+        })
     );
 }
 

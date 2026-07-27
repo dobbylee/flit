@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions, TryLockError},
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
@@ -11,18 +11,19 @@ use std::{
 
 use flit_protocol::{
     CapabilityStatus as ProtocolCapabilityStatus, CommandError, CommandErrorCode,
-    FingerprintAxis as ProtocolFingerprintAxis, HealthStatus, ManagedRunStartRequest,
-    PROTOCOL_VERSION, ProjectInspectionResponse, ProjectListCursor as ProjectListCursorResponse,
-    ProjectRecord, ProjectRegistrationResponse, ProjectRegistrationStatus, ProjectTrustResponse,
-    ProjectTrustStatus, ProjectsListResponse, ProviderCapability as ProtocolProviderCapability,
-    ProviderCapabilityEntry, ProviderCompatibility as ProtocolProviderCompatibility,
-    ProviderDiagnosticsResponse, ProviderKind as ProtocolProviderKind, ProviderUnavailableReason,
-    SystemHealthResponse,
+    FingerprintAxis as ProtocolFingerprintAxis, HealthStatus, ManagedRunObserveRequest,
+    ManagedRunObserveResponse, ManagedRunStartRequest, PROTOCOL_VERSION, ProjectInspectionResponse,
+    ProjectListCursor as ProjectListCursorResponse, ProjectRecord, ProjectRegistrationResponse,
+    ProjectRegistrationStatus, ProjectTrustResponse, ProjectTrustStatus, ProjectsListResponse,
+    ProviderCapability as ProtocolProviderCapability, ProviderCapabilityEntry,
+    ProviderCompatibility as ProtocolProviderCompatibility, ProviderDiagnosticsResponse,
+    ProviderKind as ProtocolProviderKind, ProviderUnavailableReason, SystemHealthResponse,
 };
 use flit_providers::{
     CapabilityStatus, CodexCompatibilityProbe, CodexCompatibilityProbeError,
-    ExecutableInspectionError, FingerprintAxis, ProviderCapability, ProviderCapabilitySnapshot,
-    ProviderCompatibility, probe_codex_compatibility_on_path,
+    ExecutableInspectionError, FingerprintAxis, MAX_CODEX_COMMAND_STARTS_PER_TURN,
+    ProviderCapability, ProviderCapabilitySnapshot, ProviderCompatibility,
+    probe_codex_compatibility_on_path,
 };
 use flit_store::{
     MAX_PROJECT_PAGE_SIZE, Project, ProjectDirectoryInspection,
@@ -94,6 +95,7 @@ struct FoundationCore {
     canonical_data_directory: PathBuf,
     // Rust drops fields in declaration order, so stop providers and close SQLite before the guard.
     managed_runtimes: BTreeMap<String, managed_start::RetainedManagedRun>,
+    managed_observations_in_flight: BTreeSet<String>,
     store: Store,
     provider_health: HealthStatus,
     _guard: File,
@@ -263,6 +265,7 @@ impl FoundationCore {
             requested_data_directory,
             canonical_data_directory,
             managed_runtimes: BTreeMap::new(),
+            managed_observations_in_flight: BTreeSet::new(),
             store,
             provider_health: HealthStatus::NotConfigured,
             _guard: guard,
@@ -880,30 +883,14 @@ pub fn managed_run_start_json(request_json: String) -> Result<String, BridgeErro
             return project_json(&CommandError::protocol_mismatch());
         }
         let result = with_provider_diagnostic_lock(|| {
+            let path_environment = std::env::var_os("PATH");
             CORE.with_ready_core(|core| {
-                let path_environment = std::env::var_os("PATH");
-                match managed_start::start_managed_run(
-                    &mut core.store,
-                    &mut core.managed_runtimes,
+                start_managed_run_in_core(
+                    core,
                     &managed_start::ProductionCodexConnector,
                     path_environment.as_deref(),
                     request,
-                ) {
-                    Ok(response) => {
-                        core.provider_health = HealthStatus::Ready;
-                        bounded_json(
-                            &response,
-                            MAX_PROJECT_RESPONSE_BYTES,
-                            BridgeError::ManagedRunResponseTooLarge,
-                        )
-                    }
-                    Err(error) => {
-                        if error == managed_start::ManagedStartError::ProviderUnavailable {
-                            core.provider_health = HealthStatus::Unavailable;
-                        }
-                        project_json(&CommandError::for_code(managed_start_error_code(error)))
-                    }
-                }
+                )
             })
         });
         match result {
@@ -913,6 +900,247 @@ pub fn managed_run_start_json(request_json: String) -> Result<String, BridgeErro
             result => result,
         }
     })
+}
+
+fn start_managed_run_in_core(
+    core: &mut FoundationCore,
+    connector: &dyn managed_start::ManagedCodexConnector,
+    path_environment: Option<&std::ffi::OsStr>,
+    request: ManagedRunStartRequest,
+) -> Result<String, BridgeError> {
+    if core
+        .managed_observations_in_flight
+        .contains(&request.run_id)
+    {
+        return project_json(&CommandError::for_code(
+            CommandErrorCode::ProviderObservationUnknown,
+        ));
+    }
+    match managed_start::start_managed_run(
+        &mut core.store,
+        &mut core.managed_runtimes,
+        connector,
+        path_environment,
+        request,
+    ) {
+        Ok(response) => {
+            core.provider_health = HealthStatus::Ready;
+            bounded_json(
+                &response,
+                MAX_PROJECT_RESPONSE_BYTES,
+                BridgeError::ManagedRunResponseTooLarge,
+            )
+        }
+        Err(error) => {
+            if error == managed_start::ManagedStartError::ProviderUnavailable {
+                core.provider_health = HealthStatus::Unavailable;
+            }
+            project_json(&CommandError::for_code(managed_start_error_code(error)))
+        }
+    }
+}
+
+enum TakenManagedRuntime {
+    Cached(ManagedRunObserveResponse),
+    Runtime(managed_start::RetainedManagedRun),
+    Error(managed_start::ManagedStartError),
+}
+
+struct ManagedObservationFlight<'a> {
+    core_manager: &'a CoreManager,
+    run_id: String,
+}
+
+impl Drop for ManagedObservationFlight<'_> {
+    fn drop(&mut self) {
+        let _ = self.core_manager.with_ready_core(|core| {
+            core.managed_observations_in_flight.remove(&self.run_id);
+            Ok(())
+        });
+    }
+}
+
+#[uniffi::export]
+pub fn managed_run_observe_json(request_json: String) -> Result<String, BridgeError> {
+    protect(|| {
+        managed_run_observe_with(
+            &CORE,
+            request_json,
+            managed_start::wait_managed_observation,
+            managed_start::commit_managed_observation,
+        )
+    })
+}
+
+fn managed_run_observe_with<Wait, Commit>(
+    core_manager: &CoreManager,
+    request_json: String,
+    mut wait: Wait,
+    mut commit: Commit,
+) -> Result<String, BridgeError>
+where
+    Wait: FnMut(
+        &mut managed_start::RetainedManagedRun,
+    )
+        -> Result<flit_providers::CodexTurnObservation, managed_start::ManagedStartError>,
+    Commit:
+        FnMut(
+            &mut Store,
+            &mut managed_start::RetainedManagedRun,
+            &ManagedRunObserveRequest,
+            flit_providers::CodexTurnObservation,
+        )
+            -> Result<managed_start::ManagedObservationCommit, managed_start::ManagedStartError>,
+{
+    if request_json.len() > MAX_MANAGED_RUN_REQUEST_BYTES {
+        return project_json(&CommandError::for_code(CommandErrorCode::InvalidRunRequest));
+    }
+    let request = match serde_json::from_str::<ManagedRunObserveRequest>(&request_json) {
+        Ok(request) => request,
+        Err(_) => {
+            return project_json(&CommandError::for_code(CommandErrorCode::InvalidRunRequest));
+        }
+    };
+    if request.client_protocol_version != PROTOCOL_VERSION {
+        return project_json(&CommandError::protocol_mismatch());
+    }
+    if let Err(error) = managed_start::validate_observe_request(&request) {
+        return project_json(&CommandError::for_code(managed_start_error_code(error)));
+    }
+
+    let taken = match core_manager.with_ready_core(|core| {
+        if core
+            .managed_observations_in_flight
+            .contains(&request.run_id)
+        {
+            return Ok(TakenManagedRuntime::Error(
+                managed_start::ManagedStartError::ProviderObservationUnknown,
+            ));
+        }
+        let Some(runtime) = core.managed_runtimes.remove(&request.run_id) else {
+            return Ok(TakenManagedRuntime::Error(
+                managed_start::ManagedStartError::RunNotActive,
+            ));
+        };
+        if let Some(permission) = runtime.cached_permission() {
+            core.managed_runtimes
+                .insert(request.run_id.clone(), runtime);
+            return Ok(TakenManagedRuntime::Cached(permission));
+        }
+        core.managed_observations_in_flight
+            .insert(request.run_id.clone());
+        Ok(TakenManagedRuntime::Runtime(runtime))
+    }) {
+        Ok(taken) => taken,
+        Err(BridgeError::StorageFailure) => {
+            return project_json(&CommandError::for_code(
+                CommandErrorCode::StorageUnavailable,
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+
+    let mut runtime = match taken {
+        TakenManagedRuntime::Cached(response) => {
+            return bounded_json(
+                &response,
+                MAX_PROJECT_RESPONSE_BYTES,
+                BridgeError::ManagedRunResponseTooLarge,
+            );
+        }
+        TakenManagedRuntime::Runtime(runtime) => runtime,
+        TakenManagedRuntime::Error(error) => {
+            return project_json(&CommandError::for_code(managed_start_error_code(error)));
+        }
+    };
+    let _flight_guard = ManagedObservationFlight {
+        core_manager,
+        run_id: request.run_id.clone(),
+    };
+
+    for _ in 0..=MAX_CODEX_COMMAND_STARTS_PER_TURN {
+        let observation = match wait(&mut runtime) {
+            Ok(observation) => observation,
+            Err(error) => {
+                return finish_managed_observation_unknown(core_manager, request, runtime, error);
+            }
+        };
+        let committed = core_manager.with_ready_core(|core| {
+            if !core
+                .managed_observations_in_flight
+                .contains(&request.run_id)
+            {
+                return Err(BridgeError::CoreFailure);
+            }
+            Ok(commit(&mut core.store, &mut runtime, &request, observation))
+        });
+        match committed {
+            Ok(Ok(managed_start::ManagedObservationCommit::Continue)) => {}
+            Ok(Ok(managed_start::ManagedObservationCommit::Complete(response))) => {
+                let retain_runtime = matches!(
+                    response.as_ref(),
+                    ManagedRunObserveResponse::PermissionRequested { .. }
+                );
+                core_manager.with_ready_core(|core| {
+                    core.managed_observations_in_flight.remove(&request.run_id);
+                    if retain_runtime {
+                        core.managed_runtimes
+                            .insert(request.run_id.clone(), runtime);
+                    }
+                    Ok(())
+                })?;
+                return bounded_json(
+                    response.as_ref(),
+                    MAX_PROJECT_RESPONSE_BYTES,
+                    BridgeError::ManagedRunResponseTooLarge,
+                );
+            }
+            Ok(Err(error)) => {
+                if error == managed_start::ManagedStartError::ProviderObservationUnknown {
+                    return finish_managed_observation_unknown(
+                        core_manager,
+                        request,
+                        runtime,
+                        error,
+                    );
+                }
+                core_manager.with_ready_core(|core| {
+                    core.managed_observations_in_flight.remove(&request.run_id);
+                    Ok(())
+                })?;
+                return project_json(&CommandError::for_code(managed_start_error_code(error)));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    finish_managed_observation_unknown(
+        core_manager,
+        request,
+        runtime,
+        managed_start::ManagedStartError::ProviderObservationUnknown,
+    )
+}
+
+fn finish_managed_observation_unknown(
+    core_manager: &CoreManager,
+    request: ManagedRunObserveRequest,
+    runtime: managed_start::RetainedManagedRun,
+    error: managed_start::ManagedStartError,
+) -> Result<String, BridgeError> {
+    let start_response = runtime.start_response();
+    let recorded = core_manager.with_ready_core(|core| {
+        core.managed_observations_in_flight.remove(&request.run_id);
+        Ok(managed_start::record_observation_unknown(
+            &mut core.store,
+            &request,
+            &start_response,
+        ))
+    })?;
+    drop(runtime);
+    match recorded {
+        Ok(()) => project_json(&CommandError::for_code(managed_start_error_code(error))),
+        Err(storage) => project_json(&CommandError::for_code(managed_start_error_code(storage))),
+    }
 }
 
 fn managed_start_error_code(error: managed_start::ManagedStartError) -> CommandErrorCode {
@@ -936,6 +1164,10 @@ fn managed_start_error_code(error: managed_start::ManagedStartError) -> CommandE
         managed_start::ManagedStartError::StorageUnavailable => {
             CommandErrorCode::StorageUnavailable
         }
+        managed_start::ManagedStartError::RunNotActive => CommandErrorCode::ManagedRunNotActive,
+        managed_start::ManagedStartError::ProviderObservationUnknown => {
+            CommandErrorCode::ProviderObservationUnknown
+        }
     }
 }
 
@@ -947,23 +1179,99 @@ pub fn core_construction_count() -> u64 {
 #[cfg(test)]
 mod tests {
     use std::{
+        ffi::OsStr,
         fs,
-        path::PathBuf,
+        path::{Path, PathBuf},
+        process,
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicU64, AtomicUsize, Ordering},
             mpsc,
         },
         thread,
         time::Duration,
     };
 
-    use flit_protocol::SystemHealthRequest;
+    use flit_protocol::{ManagedRunPermissionMode, ManagedRunStartResponse, SystemHealthRequest};
     use flit_providers::{
-        CodexRuntimeFingerprint, classify_codex, validated_codex_0_144_6_fingerprint,
+        CodexManagedItemId, CodexManagedThreadId, CodexManagedTurnId, CodexManualStartedThread,
+        CodexPermissionRequest, CodexRuntimeFingerprint, CodexStartedTurn, CodexTurnObservation,
+        CodexTurnTerminalOutcome, ProviderFingerprint, classify_codex,
+        validated_codex_0_144_6_fingerprint,
+    };
+    use flit_store::{
+        InitialManagedSessionConnection, ManagedRunIntent, ProjectRegistration,
+        ProjectTrustConfirmation,
     };
 
     use super::*;
+
+    static NEXT_OBSERVATION_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+    struct ObservationDirectory(PathBuf);
+
+    impl ObservationDirectory {
+        fn new(label: &str) -> Self {
+            let nonce = NEXT_OBSERVATION_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "flit-bridge-observation-{label}-{}-{nonce}",
+                process::id()
+            ));
+            fs::create_dir(&path).expect("observation directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for ObservationDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct DetachedTestRuntime;
+
+    impl managed_start::ManagedCodexRuntime for DetachedTestRuntime {
+        fn validated_profile(&self) -> Option<&ProviderFingerprint> {
+            None
+        }
+
+        fn start_manual(
+            &mut self,
+            _cwd: &Path,
+        ) -> Result<CodexManualStartedThread, managed_start::ProviderStartAttemptError> {
+            panic!("detached test runtime must not start a thread")
+        }
+
+        fn start_turn(
+            &mut self,
+            _thread_id: &CodexManagedThreadId,
+            _prompt: &str,
+        ) -> Result<CodexStartedTurn, ()> {
+            panic!("detached test runtime must not start a turn")
+        }
+
+        fn wait_for_turn_observation(&mut self) -> Result<CodexTurnObservation, ()> {
+            panic!("the injected observation boundary must be used")
+        }
+
+        fn delete_started_thread(
+            self: Box<Self>,
+            _thread_id: &CodexManagedThreadId,
+        ) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+
+    struct PanicConnector;
+
+    impl managed_start::ManagedCodexConnector for PanicConnector {
+        fn connect(
+            &self,
+            _path_environment: Option<&OsStr>,
+        ) -> Result<Box<dyn managed_start::ManagedCodexRuntime>, ()> {
+            panic!("an in-flight Run must reject start before provider connection")
+        }
+    }
 
     fn fixture_at(version: &str, name: &str) -> serde_json::Value {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -976,6 +1284,151 @@ mod tests {
 
     fn fixture(name: &str) -> serde_json::Value {
         fixture_at(PROTOCOL_VERSION, name)
+    }
+
+    fn observation_request_json() -> String {
+        serde_json::to_string(&ManagedRunObserveRequest {
+            run_id: "run-observe".to_owned(),
+            observed_at: "2026-07-27T12:00:02Z".to_owned(),
+            client_protocol_version: PROTOCOL_VERSION.to_owned(),
+        })
+        .expect("observation request")
+    }
+
+    fn observation_start_request() -> ManagedRunStartRequest {
+        ManagedRunStartRequest {
+            run_id: "run-observe".to_owned(),
+            session_id: "session-observe".to_owned(),
+            project_id: "project-observe".to_owned(),
+            title: "Observe one exact permission".to_owned(),
+            goal: "Request one exact file change.".to_owned(),
+            provider: ProtocolProviderKind::Codex,
+            permission_mode: ManagedRunPermissionMode::Manual,
+            permission_mode_version: 1,
+            created_at: "2026-07-27T12:00:00Z".to_owned(),
+            started_at: "2026-07-27T12:00:01Z".to_owned(),
+            run_created_event_id: "event-observe-created".to_owned(),
+            start_requested_event_id: "event-observe-start-requested".to_owned(),
+            session_connected_event_id: "event-observe-session-connected".to_owned(),
+            start_failed_event_id: "event-observe-start-failed".to_owned(),
+            start_unknown_event_id: "event-observe-start-unknown".to_owned(),
+            client_protocol_version: PROTOCOL_VERSION.to_owned(),
+        }
+    }
+
+    fn permission_observation() -> CodexTurnObservation {
+        CodexTurnObservation::PermissionRequested(CodexPermissionRequest {
+            provider_request_id: 7,
+            thread_id: CodexManagedThreadId::new("thread-observe").expect("thread ID"),
+            turn_id: CodexManagedTurnId::new("turn-observe").expect("turn ID"),
+            item_id: CodexManagedItemId::new("item-observe").expect("item ID"),
+            started_at_ms: 17,
+        })
+    }
+
+    fn terminal_observation() -> CodexTurnObservation {
+        CodexTurnObservation::Terminal {
+            thread_id: CodexManagedThreadId::new("thread-observe").expect("thread ID"),
+            turn_id: CodexManagedTurnId::new("turn-observe").expect("turn ID"),
+            outcome: CodexTurnTerminalOutcome::Completed,
+        }
+    }
+
+    fn observation_core(
+        label: &str,
+    ) -> (
+        ObservationDirectory,
+        Arc<CoreManager>,
+        ManagedRunStartResponse,
+    ) {
+        let directory = ObservationDirectory::new(label);
+        let project = directory.0.join("project");
+        fs::create_dir(&project).expect("Project directory");
+        let project = fs::canonicalize(project).expect("canonical Project");
+        let manager = Arc::new(CoreManager::default());
+        manager
+            .initialize(directory.0.to_str().expect("UTF-8 test path"))
+            .expect("initialize observation Core");
+        let response = ManagedRunStartResponse {
+            protocol_version: PROTOCOL_VERSION.to_owned(),
+            run_id: "run-observe".to_owned(),
+            session_id: "session-observe".to_owned(),
+            provider_thread_id: "thread-observe".to_owned(),
+            provider_turn_id: "turn-observe".to_owned(),
+            permission_mode: ManagedRunPermissionMode::Manual,
+            permission_mode_version: 1,
+            provider_policy: "readOnly+on-request+user".to_owned(),
+        };
+        manager
+            .with_ready_core(|core| {
+                core.store
+                    .register_project(ProjectRegistration {
+                        id: "project-observe".to_owned(),
+                        display_name: "Observation Project".to_owned(),
+                        selected_path: project.clone(),
+                        created_at: "2026-07-27T12:00:00Z".to_owned(),
+                    })
+                    .expect("register Project");
+                core.store
+                    .confirm_project_trust(ProjectTrustConfirmation {
+                        project_id: "project-observe".to_owned(),
+                        selected_path: project.clone(),
+                        confirmed_at: "2026-07-27T12:00:00Z".to_owned(),
+                    })
+                    .expect("trust Project");
+                core.store
+                    .create_managed_run_intent(ManagedRunIntent {
+                        id: "run-observe".to_owned(),
+                        project_id: "project-observe".to_owned(),
+                        title: "Observe one exact permission".to_owned(),
+                        goal: Some("Request one exact file change.".to_owned()),
+                        start_request: serde_json::Map::new(),
+                        baseline_head: None,
+                        created_at: "2026-07-27T12:00:00Z".to_owned(),
+                        run_created_event_id: "event-observe-created".to_owned(),
+                        start_requested_event_id: "event-observe-start-requested".to_owned(),
+                    })
+                    .expect("create managed Run");
+                core.store
+                    .connect_initial_managed_session(InitialManagedSessionConnection {
+                        id: "session-observe".to_owned(),
+                        run_id: "run-observe".to_owned(),
+                        external_session_key: "thread-observe".to_owned(),
+                        session_fingerprint: "test-profile".to_owned(),
+                        executable_path: Some(PathBuf::from("/private/tmp/codex")),
+                        executable_version: Some("0.145.0".to_owned()),
+                        cwd: project,
+                        capabilities: serde_json::Map::new(),
+                        contract_version: "codex-app-server/0.145.0".to_owned(),
+                        started_at: "2026-07-27T12:00:01Z".to_owned(),
+                        connected_event_id: "event-observe-session-connected".to_owned(),
+                    })
+                    .expect("connect managed session");
+                core.managed_runtimes.insert(
+                    "run-observe".to_owned(),
+                    managed_start::RetainedManagedRun::for_test(
+                        response.clone(),
+                        Box::new(DetachedTestRuntime),
+                    ),
+                );
+                Ok(())
+            })
+            .expect("seed observation Core");
+        (directory, manager, response)
+    }
+
+    fn command_error(response: &str) -> CommandError {
+        serde_json::from_str(response).expect("command error")
+    }
+
+    fn assert_runtime_state(manager: &CoreManager, retained: bool) {
+        manager
+            .with_ready_core(|core| {
+                assert_eq!(core.managed_runtimes.contains_key("run-observe"), retained);
+                assert!(!core.managed_observations_in_flight.contains("run-observe"));
+                Ok(())
+            })
+            .expect("runtime state");
     }
 
     #[test]
@@ -1031,6 +1484,23 @@ mod tests {
         )
         .expect("typed mismatch command error");
         assert_eq!(mismatch, CommandError::protocol_mismatch());
+
+        let malformed_observe: CommandError = serde_json::from_str(
+            &managed_run_observe_json("{}".to_owned()).expect("malformed observe response"),
+        )
+        .expect("typed malformed observe error");
+        assert_eq!(
+            malformed_observe,
+            CommandError::for_code(CommandErrorCode::InvalidRunRequest)
+        );
+        let mut observe_mismatch = fixture("managed_run_observe.request.json");
+        observe_mismatch["client_protocol_version"] = serde_json::Value::String("9.9".to_owned());
+        let observe_mismatch: CommandError = serde_json::from_str(
+            &managed_run_observe_json(observe_mismatch.to_string())
+                .expect("mismatched observe response"),
+        )
+        .expect("typed mismatched observe error");
+        assert_eq!(observe_mismatch, CommandError::protocol_mismatch());
     }
 
     #[test]
@@ -1149,6 +1619,189 @@ mod tests {
         }
 
         assert_eq!(core_construction_count(), 0);
+    }
+
+    #[test]
+    fn detached_observation_releases_core_and_guards_same_run_until_runtime_restoration() {
+        let (_directory, manager, expected_start) = observation_core("detached-success");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let observer_manager = Arc::clone(&manager);
+        let observer = thread::spawn(move || {
+            managed_run_observe_with(
+                &observer_manager,
+                observation_request_json(),
+                move |_runtime| {
+                    entered_tx.send(()).expect("signal detached wait");
+                    release_rx.recv().expect("release detached wait");
+                    Ok(permission_observation())
+                },
+                managed_start::commit_managed_observation,
+            )
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detached wait begins");
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let ready_manager = Arc::clone(&manager);
+        let ready = thread::spawn(move || {
+            ready_tx
+                .send(ready_manager.require_ready())
+                .expect("send ready result");
+        });
+        let core_was_responsive = ready_rx
+            .recv_timeout(Duration::from_millis(250))
+            .map(|result| result.is_ok())
+            .unwrap_or(false);
+        if !core_was_responsive {
+            release_tx.send(()).expect("release stalled observation");
+            observer.join().expect("join stalled observer").ok();
+            ready.join().expect("join ready command");
+            panic!("detached provider wait held the Core lock");
+        }
+        ready.join().expect("join ready command");
+
+        let second_observe = managed_run_observe_with(
+            &manager,
+            observation_request_json(),
+            |_runtime| -> Result<CodexTurnObservation, managed_start::ManagedStartError> {
+                panic!("parallel observe must fail before provider wait")
+            },
+            managed_start::commit_managed_observation,
+        )
+        .expect("parallel observe response");
+        assert_eq!(
+            command_error(&second_observe),
+            CommandError::for_code(CommandErrorCode::ProviderObservationUnknown)
+        );
+        let start_while_observing = manager
+            .with_ready_core(|core| {
+                start_managed_run_in_core(core, &PanicConnector, None, observation_start_request())
+            })
+            .expect("parallel start response");
+        assert_eq!(
+            command_error(&start_while_observing),
+            CommandError::for_code(CommandErrorCode::ProviderObservationUnknown)
+        );
+
+        release_tx.send(()).expect("release observation");
+        let permission_json = observer
+            .join()
+            .expect("join observer")
+            .expect("permission response");
+        let permission: ManagedRunObserveResponse =
+            serde_json::from_str(&permission_json).expect("permission response JSON");
+        assert!(matches!(
+            permission,
+            ManagedRunObserveResponse::PermissionRequested { .. }
+        ));
+        assert_runtime_state(&manager, true);
+
+        let cached_json = managed_run_observe_with(
+            &manager,
+            observation_request_json(),
+            |_runtime| -> Result<CodexTurnObservation, managed_start::ManagedStartError> {
+                panic!("cached permission must not wait again")
+            },
+            managed_start::commit_managed_observation,
+        )
+        .expect("cached permission");
+        assert_eq!(
+            serde_json::from_str::<ManagedRunObserveResponse>(&cached_json)
+                .expect("cached response"),
+            permission
+        );
+        assert_runtime_state(&manager, true);
+        assert_eq!(expected_start.run_id, "run-observe");
+    }
+
+    #[test]
+    fn detached_observation_closes_each_terminal_unknown_storage_and_unwind_path() {
+        let (_terminal_directory, terminal_manager, _) = observation_core("detached-terminal");
+        let terminal_json = managed_run_observe_with(
+            &terminal_manager,
+            observation_request_json(),
+            |_runtime| Ok(terminal_observation()),
+            managed_start::commit_managed_observation,
+        )
+        .expect("terminal response");
+        assert!(matches!(
+            serde_json::from_str::<ManagedRunObserveResponse>(&terminal_json)
+                .expect("terminal JSON"),
+            ManagedRunObserveResponse::TurnCompleted { .. }
+        ));
+        assert_runtime_state(&terminal_manager, false);
+        terminal_manager
+            .with_ready_core(|core| {
+                assert!(
+                    core.store
+                        .managed_run("run-observe")
+                        .expect("read terminal Run")
+                        .expect("terminal Run")
+                        .ended_at
+                        .is_some()
+                );
+                Ok(())
+            })
+            .expect("terminal state");
+
+        let (_unknown_directory, unknown_manager, _) = observation_core("detached-unknown");
+        let unknown_json = managed_run_observe_with(
+            &unknown_manager,
+            observation_request_json(),
+            |_runtime| Err(managed_start::ManagedStartError::ProviderObservationUnknown),
+            managed_start::commit_managed_observation,
+        )
+        .expect("Unknown response");
+        assert_eq!(
+            command_error(&unknown_json),
+            CommandError::for_code(CommandErrorCode::ProviderObservationUnknown)
+        );
+        assert_runtime_state(&unknown_manager, false);
+        unknown_manager
+            .with_ready_core(|core| {
+                let cursor = core.store.latest_ingest_seq().expect("Unknown cursor");
+                let events = core
+                    .store
+                    .run_events_through("run-observe", 0, cursor, 10)
+                    .expect("Unknown events");
+                assert_eq!(
+                    events.events.last().expect("Unknown event").event_type,
+                    "diagnostic.sequence_gap"
+                );
+                Ok(())
+            })
+            .expect("Unknown event state");
+
+        let (_storage_directory, storage_manager, _) = observation_core("detached-storage");
+        let storage_json = managed_run_observe_with(
+            &storage_manager,
+            observation_request_json(),
+            |_runtime| Ok(permission_observation()),
+            |_store, _runtime, _request, _observation| {
+                Err(managed_start::ManagedStartError::StorageUnavailable)
+            },
+        )
+        .expect("storage error response");
+        assert_eq!(
+            command_error(&storage_json),
+            CommandError::for_code(CommandErrorCode::StorageUnavailable)
+        );
+        assert_runtime_state(&storage_manager, false);
+
+        let (_panic_directory, panic_manager, _) = observation_core("detached-panic");
+        let panic_result = protect(|| {
+            managed_run_observe_with(
+                &panic_manager,
+                observation_request_json(),
+                |_runtime| Ok(permission_observation()),
+                |_store, _runtime, _request, _observation| panic!("commit panic control"),
+            )
+        });
+        assert_eq!(panic_result, Err(BridgeError::CoreFailure));
+        assert_runtime_state(&panic_manager, false);
+        assert!(panic_manager.require_ready().is_ok());
     }
 
     #[test]

@@ -109,12 +109,12 @@ struct NativeHealthTests {
         let retainedV11BridgeError: BridgeError = .ProjectResponseTooLarge
         try require(
             retainedV11BridgeError == .ProjectResponseTooLarge,
-            "protocol 1.3 must retain the generated Project response error case"
+            "current protocol must retain the generated Project response error case"
         )
         let managedRunBridgeError: BridgeError = .ManagedRunResponseTooLarge
         try require(
             managedRunBridgeError == .ManagedRunResponseTooLarge,
-            "protocol 1.3 must generate the managed Run bridge error case"
+            "current protocol must generate the managed Run bridge error case"
         )
         let outgoingRequest = try JSONSerialization.data(
             withJSONObject: ["client_protocol_version": client.clientProtocolVersion],
@@ -331,6 +331,111 @@ struct NativeHealthTests {
         try require(
             managedRunErrors.count == 6,
             "generated managed Run errors must decode every public failure"
+        )
+        _ = try decodeFixture(
+            FlitManagedRunObserveRequest.self,
+            at: "\(fixtureRoot)/managed_run_observe.request.json"
+        )
+        for (name, expectedStatus) in [
+            (
+                "managed_run_observe.permission_requested.response.json",
+                FlitManagedRunObservationStatus.permissionRequested
+            ),
+            (
+                "managed_run_observe.turn_completed.response.json",
+                FlitManagedRunObservationStatus.turnCompleted
+            ),
+            (
+                "managed_run_observe.turn_interrupted.response.json",
+                FlitManagedRunObservationStatus.turnInterrupted
+            ),
+        ] {
+            let observation = try decodeFixture(
+                FlitManagedRunObserveResponse.self,
+                at: "\(fixtureRoot)/\(name)"
+            )
+            try require(
+                observation.status == expectedStatus,
+                "generated managed Run observation must decode \(expectedStatus)"
+            )
+        }
+        let permissionObservationData = try Data(
+            contentsOf: URL(
+                fileURLWithPath:
+                    "\(fixtureRoot)/managed_run_observe.permission_requested.response.json"
+            )
+        )
+        guard
+            let permissionObservation = try JSONSerialization.jsonObject(
+                with: permissionObservationData
+            ) as? [String: Any]
+        else {
+            throw NativeHealthTestFailure.failed("permission observation must be an object")
+        }
+        for requiredField in [
+            "provider_item_id",
+            "provider_request_id",
+            "request_id",
+            "request_version",
+        ] {
+            var missing = permissionObservation
+            missing.removeValue(forKey: requiredField)
+            try requireDecodingFailure(
+                FlitManagedRunObserveResponse.self,
+                from: try JSONSerialization.data(withJSONObject: missing),
+                "permission observation must require \(requiredField)"
+            )
+        }
+        var permissionWithTerminalField = permissionObservation
+        permissionWithTerminalField["event_version"] = 4
+        try requireDecodingFailure(
+            FlitManagedRunObserveResponse.self,
+            from: try JSONSerialization.data(withJSONObject: permissionWithTerminalField),
+            "permission observation must reject terminal fields"
+        )
+        let terminalObservationData = try Data(
+            contentsOf: URL(
+                fileURLWithPath:
+                    "\(fixtureRoot)/managed_run_observe.turn_completed.response.json"
+            )
+        )
+        guard
+            let terminalObservation = try JSONSerialization.jsonObject(
+                with: terminalObservationData
+            ) as? [String: Any]
+        else {
+            throw NativeHealthTestFailure.failed("terminal observation must be an object")
+        }
+        var terminalWithoutVersion = terminalObservation
+        terminalWithoutVersion.removeValue(forKey: "event_version")
+        try requireDecodingFailure(
+            FlitManagedRunObserveResponse.self,
+            from: try JSONSerialization.data(withJSONObject: terminalWithoutVersion),
+            "terminal observation must require event_version"
+        )
+        var terminalWithPermissionField = terminalObservation
+        terminalWithPermissionField["provider_item_id"] = "cross-variant-item"
+        try requireDecodingFailure(
+            FlitManagedRunObserveResponse.self,
+            from: try JSONSerialization.data(withJSONObject: terminalWithPermissionField),
+            "terminal observation must reject permission fields"
+        )
+        let managedRunObserveErrors = try decodeFixture(
+            [FlitCommandError].self,
+            at: "\(fixtureRoot)/managed_run_observe_errors.json"
+        )
+        try require(
+            managedRunObserveErrors.count == 2,
+            "generated managed Run observe errors must decode every public failure"
+        )
+        let managedRunObserveRequest = try String(
+            contentsOfFile: "\(fixtureRoot)/managed_run_observe.request.json",
+            encoding: .utf8
+        )
+        try requireCommandError(
+            try managedRunObserveJson(requestJson: managedRunObserveRequest),
+            code: .managedRunNotActive,
+            fixtures: managedRunObserveErrors
         )
         let driftedInspection = Data(
             """

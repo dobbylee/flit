@@ -2,13 +2,13 @@ use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use flit_protocol::{
     CapabilityStatus, CommandError, EVENT_PROTOCOL_VERSION, EventEnvelope, EventProtocolVersion,
-    MAX_JSON_SAFE_INTEGER, ManagedRunStartRequest, ManagedRunStartResponse, PROTOCOL_VERSION,
-    ProjectInspectionRequest, ProjectInspectionResponse, ProjectRegistrationRequest,
-    ProjectRegistrationResponse, ProjectTrustRequest, ProjectTrustResponse, ProjectsListRequest,
-    ProjectsListResponse, ProviderCompatibility, ProviderDiagnosticsRequest,
-    ProviderDiagnosticsResponse, ProviderUnavailableReason, SystemHealthRequest,
-    SystemHealthResponse, event_schema_id, event_schema_relative_path,
-    generated_swift_command_contract,
+    MAX_JSON_SAFE_INTEGER, ManagedRunObserveRequest, ManagedRunObserveResponse,
+    ManagedRunStartRequest, ManagedRunStartResponse, PROTOCOL_VERSION, ProjectInspectionRequest,
+    ProjectInspectionResponse, ProjectRegistrationRequest, ProjectRegistrationResponse,
+    ProjectTrustRequest, ProjectTrustResponse, ProjectsListRequest, ProjectsListResponse,
+    ProviderCompatibility, ProviderDiagnosticsRequest, ProviderDiagnosticsResponse,
+    ProviderUnavailableReason, SystemHealthRequest, SystemHealthResponse, event_schema_id,
+    event_schema_relative_path, generated_swift_command_contract,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -300,6 +300,27 @@ fn current_managed_run_start_fixtures_round_trip_every_shape() {
 }
 
 #[test]
+fn current_managed_run_observe_fixtures_round_trip_every_shape() {
+    let manifest = read_command_compatibility_manifest();
+    let current = &manifest.current;
+    assert_fixture_round_trip::<ManagedRunObserveRequest>(&command_fixture(
+        current,
+        "managed_run_observe.request.json",
+    ));
+    for name in [
+        "managed_run_observe.permission_requested.response.json",
+        "managed_run_observe.turn_completed.response.json",
+        "managed_run_observe.turn_interrupted.response.json",
+    ] {
+        assert_fixture_round_trip::<ManagedRunObserveResponse>(&command_fixture(current, name));
+    }
+    assert_fixture_round_trip::<Vec<CommandError>>(&command_fixture(
+        current,
+        "managed_run_observe_errors.json",
+    ));
+}
+
+#[test]
 fn command_manifest_retains_the_exact_previous_minor_health_contract() {
     let manifest = read_command_compatibility_manifest();
     assert_eq!(manifest.current.version, PROTOCOL_VERSION);
@@ -402,6 +423,9 @@ fn generated_swift_project_contract_is_current_and_required_fields_fail_closed()
         "FlitManagedRunPermissionMode",
         "FlitManagedRunStartRequest",
         "FlitManagedRunStartResponse",
+        "FlitManagedRunObserveRequest",
+        "FlitManagedRunObservationStatus",
+        "FlitManagedRunObserveResponse",
     ] {
         assert!(
             generated.contains(type_name),

@@ -165,6 +165,15 @@ pub struct CodexInterruptRequested {
     pub turn_id: CodexManagedTurnId,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodexPermissionRequest {
+    pub provider_request_id: u64,
+    pub thread_id: CodexManagedThreadId,
+    pub turn_id: CodexManagedTurnId,
+    pub item_id: CodexManagedItemId,
+    pub started_at_ms: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CodexTurnTerminalOutcome {
     Completed,
@@ -173,6 +182,7 @@ pub enum CodexTurnTerminalOutcome {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CodexTurnObservation {
+    PermissionRequested(CodexPermissionRequest),
     CommandStarted {
         thread_id: CodexManagedThreadId,
         turn_id: CodexManagedTurnId,
@@ -602,6 +612,39 @@ pub fn decode_codex_turn_notification(
         .get("method")
         .and_then(Value::as_str)
         .ok_or(CodexContractError::InvalidNotification)?;
+    if notification.contains_key("id") {
+        if method != "item/fileChange/requestApproval" {
+            return Err(CodexContractError::UnsupportedServerRequest);
+        }
+        let provider_request_id = required_u64(notification, "id")?;
+        validate_request_id(provider_request_id)?;
+        let params = required_object(notification, "params")?;
+        let observed_thread_id = CodexManagedThreadId::new(required_string(params, "threadId")?)?;
+        if &observed_thread_id != expected_thread_id {
+            return Err(CodexContractError::UnexpectedThreadId);
+        }
+        let observed_turn_id = CodexManagedTurnId::new(required_string(params, "turnId")?)?;
+        if &observed_turn_id != expected_turn_id {
+            return Err(CodexContractError::UnexpectedTurnId);
+        }
+        validate_nullable_string(params, "reason")?;
+        validate_nullable_string(params, "grantRoot")?;
+        let started_at_ms = required_u64(params, "startedAtMs")?;
+        if started_at_ms > MAX_JSON_SAFE_INTEGER {
+            return Err(CodexContractError::InvalidField {
+                field: "startedAtMs",
+            });
+        }
+        return Ok(Some(CodexTurnObservation::PermissionRequested(
+            CodexPermissionRequest {
+                provider_request_id,
+                thread_id: observed_thread_id,
+                turn_id: observed_turn_id,
+                item_id: CodexManagedItemId::new(required_string(params, "itemId")?)?,
+                started_at_ms,
+            },
+        )));
+    }
     if !matches!(method, "item/started" | "turn/completed") {
         return Ok(None);
     }
@@ -759,6 +802,16 @@ fn required_u64(
         .ok_or(CodexContractError::InvalidField { field })
 }
 
+fn validate_nullable_string(
+    object: &serde_json::Map<String, Value>,
+    field: &'static str,
+) -> Result<(), CodexContractError> {
+    match object.get(field) {
+        Some(Value::Null | Value::String(_)) => Ok(()),
+        _ => Err(CodexContractError::InvalidField { field }),
+    }
+}
+
 fn optional_cursor(
     object: &serde_json::Map<String, Value>,
 ) -> Result<Option<String>, CodexContractError> {
@@ -843,6 +896,7 @@ pub enum CodexContractError {
     UnexpectedDeleteReceipt,
     UnexpectedItemVariant,
     UnexpectedTurnStatus,
+    UnsupportedServerRequest,
     DuplicateThreadId,
     TooManyThreads,
     TooManyTurns,
@@ -894,6 +948,9 @@ impl fmt::Display for CodexContractError {
             }
             Self::UnexpectedTurnStatus => {
                 formatter.write_str("Codex notification returned an unvalidated terminal status")
+            }
+            Self::UnsupportedServerRequest => {
+                formatter.write_str("Codex server request method is not enabled")
             }
             Self::DuplicateThreadId => {
                 formatter.write_str("Codex list response contained a duplicate thread ID")

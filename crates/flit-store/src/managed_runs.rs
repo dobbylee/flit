@@ -122,6 +122,33 @@ pub enum InitialManagedSessionOutcome {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ManagedProviderObservationKind {
+    CommandStarted {
+        provider_item_id: String,
+    },
+    PermissionRequested {
+        request_id: String,
+        provider_request_id: u64,
+        provider_item_id: String,
+        provider_started_at_ms: u64,
+    },
+    TurnCompleted,
+    TurnInterrupted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedProviderObservation {
+    pub run_id: String,
+    pub session_id: String,
+    pub external_session_key: String,
+    pub provider_turn_id: String,
+    pub contract_version: String,
+    pub event_id: String,
+    pub observed_at: String,
+    pub kind: ManagedProviderObservationKind,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManagedTurnTerminalOutcome {
     Completed,
@@ -295,6 +322,48 @@ pub(crate) fn validate_initial_session(
         .map_err(|()| "contract_version")?;
     validate_timestamp(&connection.started_at).map_err(|()| "started_at")?;
     validate_id(&connection.connected_event_id).map_err(|()| "connected_event_id")
+}
+
+pub(crate) fn validate_provider_observation(
+    observation: &ManagedProviderObservation,
+) -> Result<(), &'static str> {
+    for (field, value) in [
+        ("run_id", observation.run_id.as_str()),
+        ("session_id", observation.session_id.as_str()),
+        (
+            "external_session_key",
+            observation.external_session_key.as_str(),
+        ),
+        ("provider_turn_id", observation.provider_turn_id.as_str()),
+        ("contract_version", observation.contract_version.as_str()),
+        ("event_id", observation.event_id.as_str()),
+    ] {
+        validate_id(value).map_err(|()| field)?;
+    }
+    validate_timestamp(&observation.observed_at).map_err(|()| "observed_at")?;
+    match &observation.kind {
+        ManagedProviderObservationKind::CommandStarted { provider_item_id } => {
+            validate_id(provider_item_id).map_err(|()| "provider_item_id")
+        }
+        ManagedProviderObservationKind::PermissionRequested {
+            request_id,
+            provider_request_id,
+            provider_item_id,
+            provider_started_at_ms,
+        } => {
+            validate_id(request_id).map_err(|()| "request_id")?;
+            validate_id(provider_item_id).map_err(|()| "provider_item_id")?;
+            if *provider_request_id > flit_protocol::MAX_JSON_SAFE_INTEGER {
+                return Err("provider_request_id");
+            }
+            if *provider_started_at_ms > flit_protocol::MAX_JSON_SAFE_INTEGER {
+                return Err("provider_started_at_ms");
+            }
+            Ok(())
+        }
+        ManagedProviderObservationKind::TurnCompleted
+        | ManagedProviderObservationKind::TurnInterrupted => Ok(()),
+    }
 }
 
 pub(crate) fn validate_session_termination(

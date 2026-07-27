@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     error::Error,
     ffi::{OsStr, OsString},
     fmt, fs,
@@ -24,17 +24,18 @@ use serde_json::Value;
 use crate::{
     CapabilityStatus, CodexCompatibilityProbe, CodexCompatibilityProbeError, CodexContractError,
     CodexDeletedThread, CodexInterruptRequested, CodexManagedScope, CodexManagedThreadConflict,
-    CodexManagedThreadId, CodexManualStartedThread, CodexStartedThread, CodexStartedTurn,
-    CodexThreadRead, CodexTurnObservation, ExecutableInspection, ExecutableInspectionError,
-    ProviderCapability, ProviderCompatibility, ProviderFingerprint, codex_initialize_request,
-    codex_initialized_notification, codex_manual_start_request, codex_read_only_start_request,
-    codex_read_request, codex_thread_delete_request, codex_thread_list_request,
-    codex_turn_interrupt_request, codex_turn_start_request, decode_codex_initialize_response,
-    decode_codex_manual_start_response, decode_codex_read_response, decode_codex_start_response,
-    decode_codex_thread_delete_response, decode_codex_thread_deleted_notification,
-    decode_codex_thread_list_response, decode_codex_turn_interrupt_response,
-    decode_codex_turn_notification, decode_codex_turn_start_response, inspect_codex_at,
-    probe_codex_compatibility_at, probe_codex_compatibility_on_path,
+    CodexManagedThreadId, CodexManualStartedThread, CodexPermissionRequest, CodexStartedThread,
+    CodexStartedTurn, CodexThreadRead, CodexTurnObservation, ExecutableInspection,
+    ExecutableInspectionError, ProviderCapability, ProviderCompatibility, ProviderFingerprint,
+    codex_initialize_request, codex_initialized_notification, codex_manual_start_request,
+    codex_read_only_start_request, codex_read_request, codex_thread_delete_request,
+    codex_thread_list_request, codex_turn_interrupt_request, codex_turn_start_request,
+    decode_codex_initialize_response, decode_codex_manual_start_response,
+    decode_codex_read_response, decode_codex_start_response, decode_codex_thread_delete_response,
+    decode_codex_thread_deleted_notification, decode_codex_thread_list_response,
+    decode_codex_turn_interrupt_response, decode_codex_turn_notification,
+    decode_codex_turn_start_response, inspect_codex_at, probe_codex_compatibility_at,
+    probe_codex_compatibility_on_path,
     process::{set_nonblocking, terminate_process_group},
 };
 
@@ -45,6 +46,7 @@ pub const MAX_CODEX_PENDING_NOTIFICATION_BYTES: usize = 1024 * 1024;
 pub const MAX_CODEX_LIST_PAGES: usize = 16;
 pub const MAX_CODEX_OBSERVATION_FRAMES: usize = 256;
 pub const MAX_CODEX_COMMAND_STARTS_PER_TURN: usize = 256;
+pub const MAX_CODEX_PERMISSION_REQUESTS_PER_TURN: usize = 256;
 const INBOUND_FRAME_QUEUE_CAPACITY: usize = 16;
 const RECEIVE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const IO_POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -67,6 +69,8 @@ struct StagedExecutable {
 struct ActiveTurn {
     started: CodexStartedTurn,
     command_item_ids: BTreeSet<crate::CodexManagedItemId>,
+    permission_requests: BTreeMap<u64, CodexPermissionRequest>,
+    permission_item_ids: BTreeSet<crate::CodexManagedItemId>,
     interrupt_requested: bool,
 }
 
@@ -293,6 +297,8 @@ impl CodexAppServer {
         self.active_turn = Some(ActiveTurn {
             started: started.clone(),
             command_item_ids: BTreeSet::new(),
+            permission_requests: BTreeMap::new(),
+            permission_item_ids: BTreeSet::new(),
             interrupt_requested: false,
         });
         Ok(started)
@@ -322,6 +328,26 @@ impl CodexAppServer {
                 }
             };
             match &observation {
+                CodexTurnObservation::PermissionRequested(request) => {
+                    let active = self
+                        .active_turn
+                        .as_mut()
+                        .ok_or(CodexAppServerError::NoActiveTurn)?;
+                    if active
+                        .permission_requests
+                        .contains_key(&request.provider_request_id)
+                        || active.permission_item_ids.contains(&request.item_id)
+                    {
+                        return self.close_with(CodexAppServerError::DuplicateTurnObservation);
+                    }
+                    if active.permission_requests.len() >= MAX_CODEX_PERMISSION_REQUESTS_PER_TURN {
+                        return self.close_with(CodexAppServerError::CommandObservationLimit);
+                    }
+                    active
+                        .permission_requests
+                        .insert(request.provider_request_id, request.clone());
+                    active.permission_item_ids.insert(request.item_id.clone());
+                }
                 CodexTurnObservation::CommandStarted { item_id, .. } => {
                     let active = self
                         .active_turn
@@ -1449,6 +1475,93 @@ done
             Err(CodexAppServerError::NoActiveTurn)
         ));
         server.shutdown().expect("turn shutdown");
+        assert_process_group_gone(&executable);
+    }
+
+    #[test]
+    fn exact_file_change_permission_request_is_retained_without_a_response() {
+        let _process_guard = test_process_guard();
+        let directory = TestDirectory::new("permission-request");
+        let executable = directory.0.join("codex");
+        write_script(
+            &executable,
+            r#"#!/bin/sh
+printf '%s' "$$" > "$0.pgid"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"managed-1","sessionId":"managed-1"},"sandbox":{"type":"readOnly","networkAccess":false},"approvalPolicy":"never"}}' ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":0,"method":"item/fileChange/requestApproval","params":{"itemId":"item-permission","startedAtMs":17,"threadId":"managed-1","turnId":"turn-1","reason":"sensitive reason","grantRoot":null}}'
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-1"}}}'
+      ;;
+    *'"decision"'*) exit 91 ;;
+  esac
+done
+"#,
+        );
+        let mut server =
+            connect_fake(&executable, Duration::from_secs(1)).expect("permission handshake");
+        let thread = server.start_read_only(TEST_CWD).expect("managed thread");
+        let started = server
+            .start_turn(&thread.thread_id, "Update one file.")
+            .expect("turn start");
+
+        assert_eq!(
+            server
+                .wait_for_turn_observation()
+                .expect("permission observation"),
+            CodexTurnObservation::PermissionRequested(CodexPermissionRequest {
+                provider_request_id: 0,
+                thread_id: thread.thread_id,
+                turn_id: started.turn_id,
+                item_id: crate::CodexManagedItemId::new("item-permission").expect("item ID"),
+                started_at_ms: 17,
+            })
+        );
+        assert_eq!(server.pending_notification_count(), 0);
+        server.shutdown().expect("permission shutdown");
+        assert_process_group_gone(&executable);
+    }
+
+    #[test]
+    fn duplicate_file_change_permission_identity_closes_the_connection() {
+        let _process_guard = test_process_guard();
+        let directory = TestDirectory::new("duplicate-permission-request");
+        let executable = directory.0.join("codex");
+        write_script(
+            &executable,
+            r#"#!/bin/sh
+printf '%s' "$$" > "$0.pgid"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"managed-1","sessionId":"managed-1"},"sandbox":{"type":"readOnly","networkAccess":false},"approvalPolicy":"never"}}' ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":0,"method":"item/fileChange/requestApproval","params":{"itemId":"item-permission","startedAtMs":17,"threadId":"managed-1","turnId":"turn-1","reason":null,"grantRoot":null}}'
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-1"}}}'
+      printf '%s\n' '{"id":0,"method":"item/fileChange/requestApproval","params":{"itemId":"item-permission","startedAtMs":17,"threadId":"managed-1","turnId":"turn-1","reason":null,"grantRoot":null}}'
+      ;;
+  esac
+done
+"#,
+        );
+        let mut server =
+            connect_fake(&executable, Duration::from_secs(1)).expect("duplicate handshake");
+        let thread = server.start_read_only(TEST_CWD).expect("managed thread");
+        server
+            .start_turn(&thread.thread_id, "Update one file.")
+            .expect("turn start");
+        assert!(matches!(
+            server
+                .wait_for_turn_observation()
+                .expect("first permission"),
+            CodexTurnObservation::PermissionRequested(_)
+        ));
+        assert!(matches!(
+            server.wait_for_turn_observation(),
+            Err(CodexAppServerError::DuplicateTurnObservation)
+        ));
         assert_process_group_gone(&executable);
     }
 

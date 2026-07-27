@@ -1,0 +1,18 @@
+{
+  "run_id": "run-managed-1",
+  "session_id": "session-managed-1",
+  "project_id": "project-1",
+  "title": "Implement the requested change",
+  "goal": "Update the Project and verify the result.",
+  "provider": "codex",
+  "permission_mode": "manual",
+  "permission_mode_version": 1,
+  "created_at": "2026-07-27T12:00:00Z",
+  "started_at": "2026-07-27T12:00:01Z",
+  "run_created_event_id": "event-run-managed-1-created",
+  "start_requested_event_id": "event-run-managed-1-start-requested",
+  "session_connected_event_id": "event-session-managed-1-connected",
+  "start_failed_event_id": "event-run-managed-1-start-failed",
+  "start_unknown_event_id": "event-run-managed-1-start-unknown",
+  "client_protocol_version": "1.4"
+}

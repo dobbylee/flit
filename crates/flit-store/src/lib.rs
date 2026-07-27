@@ -21,8 +21,9 @@ mod writer;
 pub use managed_runs::{
     InitialManagedSessionConnection, InitialManagedSessionOutcome, MANAGED_PROVIDER_KIND_CODEX,
     MAX_LIVE_MANAGED_SESSIONS, MAX_MANAGED_METADATA_JSON_BYTES, MAX_MANAGED_METADATA_JSON_DEPTH,
-    MAX_MANAGED_METADATA_JSON_VALUES, ManagedReconciliationState, ManagedRun, ManagedRunIntent,
-    ManagedRunIntentOutcome, ManagedRunStartFailure, ManagedRunStartFailureOutcome, ManagedSession,
+    MAX_MANAGED_METADATA_JSON_VALUES, ManagedProviderObservation, ManagedProviderObservationKind,
+    ManagedReconciliationState, ManagedRun, ManagedRunIntent, ManagedRunIntentOutcome,
+    ManagedRunStartFailure, ManagedRunStartFailureOutcome, ManagedSession,
     ManagedSessionReconciliation, ManagedSessionReconciliationOutcome, ManagedSessionTermination,
     ManagedSessionTerminationOutcome, ManagedTurnTerminalOutcome,
 };
@@ -767,6 +768,97 @@ impl Store {
         } else {
             Ok(InitialManagedSessionOutcome::Connected { session, event })
         }
+    }
+
+    pub fn append_managed_provider_observation(
+        &mut self,
+        observation: ManagedProviderObservation,
+    ) -> Result<AppendEventOutcome, StoreError> {
+        managed_runs::validate_provider_observation(&observation)
+            .map_err(|field| StoreError::InvalidManagedProviderObservation { field })?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+        let run = load_managed_run(&transaction, &observation.run_id)?.ok_or_else(|| {
+            StoreError::MissingRun {
+                run_id: observation.run_id.clone(),
+            }
+        })?;
+        let session =
+            load_managed_session(&transaction, &observation.session_id)?.ok_or_else(|| {
+                StoreError::MissingSession {
+                    session_id: observation.session_id.clone(),
+                }
+            })?;
+        if run.provider_kind != MANAGED_PROVIDER_KIND_CODEX
+            || session.run_id != observation.run_id
+            || session.provider_kind != MANAGED_PROVIDER_KIND_CODEX
+            || session.external_session_key != observation.external_session_key
+        {
+            return Err(StoreError::ManagedSessionIdentityConflict {
+                session_id: observation.session_id,
+            });
+        }
+        if let Some(stored) = load_event_by_id(&transaction, &observation.event_id)? {
+            let expected = managed_provider_observation_event(&observation, stored.stream_seq);
+            if UnsequencedEventEnvelope::from(stored.clone()) != expected {
+                return Err(StoreError::EventIdentityConflict {
+                    event_id: observation.event_id,
+                });
+            }
+            return Ok(AppendEventOutcome::Duplicate(stored));
+        }
+
+        if run.ended_at.is_some() || session.ended_at.is_some() || session.end_reason.is_some() {
+            return Err(StoreError::ManagedSessionNotLive {
+                session_id: observation.session_id,
+            });
+        }
+        let terminal_reason = match &observation.kind {
+            ManagedProviderObservationKind::TurnCompleted => Some("completed"),
+            ManagedProviderObservationKind::TurnInterrupted => Some("interrupted"),
+            ManagedProviderObservationKind::CommandStarted { .. }
+            | ManagedProviderObservationKind::PermissionRequested { .. } => None,
+        };
+        if let Some(end_reason) = terminal_reason {
+            let closed_session = transaction
+                .execute(
+                    "UPDATE agent_sessions SET ended_at = ?1, end_reason = ?2 WHERE id = ?3 AND run_id = ?4 AND ended_at IS NULL AND end_reason IS NULL",
+                    params![
+                        observation.observed_at,
+                        end_reason,
+                        observation.session_id,
+                        observation.run_id,
+                    ],
+                )
+                .map_err(StoreError::Sqlite)?;
+            if closed_session != 1 {
+                return Err(StoreError::ManagedSessionNotLive {
+                    session_id: observation.session_id,
+                });
+            }
+            let closed_run = transaction
+                .execute(
+                    "UPDATE runs SET ended_at = ?1 WHERE id = ?2 AND ended_at IS NULL",
+                    params![observation.observed_at, observation.run_id],
+                )
+                .map_err(StoreError::Sqlite)?;
+            if closed_run != 1 {
+                return Err(StoreError::ManagedRunTerminalConflict {
+                    run_id: observation.run_id,
+                });
+            }
+        }
+
+        let stream_seq = next_managed_session_stream_seq(&transaction, &observation.session_id)?;
+        let event = managed_provider_observation_event(&observation, stream_seq);
+        let mut outcomes = append_event_batch_in_transaction(&transaction, vec![event])?;
+        let outcome = outcomes
+            .pop()
+            .expect("one managed provider observation must produce one outcome");
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(outcome)
     }
 
     pub fn fail_managed_run_start(
@@ -1572,6 +1664,76 @@ fn managed_session_connected_event(
         confidence: 1.0,
         evidence_ids: Vec::new(),
         payload,
+        extensions: BTreeMap::new(),
+    }
+}
+
+fn managed_provider_observation_event(
+    observation: &ManagedProviderObservation,
+    stream_seq: u64,
+) -> UnsequencedEventEnvelope {
+    let (event_type, payload) = match &observation.kind {
+        ManagedProviderObservationKind::CommandStarted { provider_item_id } => (
+            "command.started",
+            json!({
+                "evidence_unavailable_reason": "raw_provider_content_not_retained",
+                "provider_item_id": provider_item_id,
+                "provider_turn_id": observation.provider_turn_id,
+            }),
+        ),
+        ManagedProviderObservationKind::PermissionRequested {
+            request_id,
+            provider_request_id,
+            provider_item_id,
+            provider_started_at_ms,
+        } => (
+            "permission.requested",
+            json!({
+                "action_kind": "filesystem.write",
+                "blocking": true,
+                "evidence_unavailable_reason": "raw_provider_content_not_retained",
+                "provider_item_id": provider_item_id,
+                "provider_request_id": provider_request_id,
+                "provider_started_at_ms": provider_started_at_ms,
+                "provider_turn_id": observation.provider_turn_id,
+                "request_id": request_id,
+            }),
+        ),
+        ManagedProviderObservationKind::TurnCompleted => (
+            "run.completed",
+            json!({
+                "evidence_unavailable_reason": "raw_provider_content_not_retained",
+                "provider_turn_id": observation.provider_turn_id,
+                "result": "completed",
+            }),
+        ),
+        ManagedProviderObservationKind::TurnInterrupted => (
+            "run.interrupted",
+            json!({
+                "evidence_unavailable_reason": "raw_provider_content_not_retained",
+                "provider_turn_id": observation.provider_turn_id,
+                "reason": "interrupted",
+            }),
+        ),
+    };
+    UnsequencedEventEnvelope {
+        protocol_version: EventProtocolVersion::V1_0,
+        event_id: observation.event_id.clone(),
+        run_id: observation.run_id.clone(),
+        session_id: NullableSessionId::Id(observation.session_id.clone()),
+        stream_seq,
+        occurred_at: observation.observed_at.clone(),
+        observed_at: observation.observed_at.clone(),
+        event_type: event_type.to_owned(),
+        source: EventSource {
+            kind: EventSourceKind::ProviderAdapter,
+            provider: Some(MANAGED_PROVIDER_KIND_CODEX.to_owned()),
+            contract_version: Some(observation.contract_version.clone()),
+            extensions: BTreeMap::new(),
+        },
+        confidence: 1.0,
+        evidence_ids: Vec::new(),
+        payload: payload.as_object().expect("object literal").clone(),
         extensions: BTreeMap::new(),
     }
 }
@@ -2965,6 +3127,9 @@ pub enum StoreError {
     InvalidInitialManagedSession {
         field: &'static str,
     },
+    InvalidManagedProviderObservation {
+        field: &'static str,
+    },
     ManagedSessionIdentityConflict {
         session_id: String,
     },
@@ -3211,6 +3376,12 @@ impl fmt::Display for StoreError {
             }
             Self::InvalidInitialManagedSession { field } => {
                 write!(formatter, "invalid initial managed session field: {field}")
+            }
+            Self::InvalidManagedProviderObservation { field } => {
+                write!(
+                    formatter,
+                    "invalid managed provider observation field: {field}"
+                )
             }
             Self::ManagedSessionIdentityConflict { session_id } => {
                 write!(
