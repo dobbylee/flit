@@ -23,17 +23,18 @@ use serde_json::Value;
 
 use crate::{
     CapabilityStatus, CodexCompatibilityProbe, CodexCompatibilityProbeError, CodexContractError,
-    CodexInterruptRequested, CodexManagedScope, CodexManagedThreadConflict, CodexManagedThreadId,
-    CodexManualStartedThread, CodexStartedThread, CodexStartedTurn, CodexThreadRead,
-    CodexTurnObservation, ExecutableInspection, ExecutableInspectionError, ProviderCapability,
-    ProviderCompatibility, ProviderFingerprint, codex_initialize_request,
+    CodexDeletedThread, CodexInterruptRequested, CodexManagedScope, CodexManagedThreadConflict,
+    CodexManagedThreadId, CodexManualStartedThread, CodexStartedThread, CodexStartedTurn,
+    CodexThreadRead, CodexTurnObservation, ExecutableInspection, ExecutableInspectionError,
+    ProviderCapability, ProviderCompatibility, ProviderFingerprint, codex_initialize_request,
     codex_initialized_notification, codex_manual_start_request, codex_read_only_start_request,
-    codex_read_request, codex_thread_list_request, codex_turn_interrupt_request,
-    codex_turn_start_request, decode_codex_initialize_response, decode_codex_manual_start_response,
-    decode_codex_read_response, decode_codex_start_response, decode_codex_thread_list_response,
-    decode_codex_turn_interrupt_response, decode_codex_turn_notification,
-    decode_codex_turn_start_response, inspect_codex_at, probe_codex_compatibility_at,
-    probe_codex_compatibility_on_path,
+    codex_read_request, codex_thread_delete_request, codex_thread_list_request,
+    codex_turn_interrupt_request, codex_turn_start_request, decode_codex_initialize_response,
+    decode_codex_manual_start_response, decode_codex_read_response, decode_codex_start_response,
+    decode_codex_thread_delete_response, decode_codex_thread_deleted_notification,
+    decode_codex_thread_list_response, decode_codex_turn_interrupt_response,
+    decode_codex_turn_notification, decode_codex_turn_start_response, inspect_codex_at,
+    probe_codex_compatibility_at, probe_codex_compatibility_on_path,
     process::{set_nonblocking, terminate_process_group},
 };
 
@@ -91,6 +92,7 @@ pub struct CodexAppServer {
     request_timeout: Duration,
     validated_profile: Option<ProviderFingerprint>,
     staged_executable: Option<StagedExecutable>,
+    started_thread_ids: BTreeSet<CodexManagedThreadId>,
     active_turn: Option<ActiveTurn>,
     last_terminal_turn: Option<CodexStartedTurn>,
 }
@@ -117,11 +119,15 @@ impl CodexAppServer {
         let request = codex_read_only_start_request(request_id, canonical_cwd)
             .map_err(CodexAppServerError::Contract)?;
         let response = self.exchange(request)?;
-        self.decode_or_close(decode_codex_start_response(
+        let started = self.decode_or_close(decode_codex_start_response(
             &response,
             request_id,
             canonical_cwd.to_owned(),
-        ))
+        ))?;
+        if !self.started_thread_ids.insert(started.thread_id.clone()) {
+            return self.close_with(CodexAppServerError::DuplicateManagedThread);
+        }
+        Ok(started)
     }
 
     pub fn start_manual(
@@ -140,11 +146,56 @@ impl CodexAppServer {
         let request = codex_manual_start_request(request_id, canonical_cwd)
             .map_err(CodexAppServerError::Contract)?;
         let response = self.exchange(request)?;
-        self.decode_or_close(decode_codex_manual_start_response(
+        let started = self.decode_or_close(decode_codex_manual_start_response(
             &response,
             request_id,
             canonical_cwd.to_owned(),
-        ))
+        ))?;
+        if !self
+            .started_thread_ids
+            .insert(started.thread.thread_id.clone())
+        {
+            return self.close_with(CodexAppServerError::DuplicateManagedThread);
+        }
+        Ok(started)
+    }
+
+    pub fn delete_started_thread(
+        mut self,
+        thread_id: &CodexManagedThreadId,
+    ) -> Result<CodexDeletedThread, CodexAppServerError> {
+        if self.active_turn.is_some() {
+            return self.close_with(CodexAppServerError::ActiveTurnExists);
+        }
+        if !self.started_thread_ids.contains(thread_id) {
+            return self.close_with(CodexAppServerError::UnownedThreadDeletion);
+        }
+        self.reject_preexisting_thread_deleted_notifications(thread_id)?;
+        let request_id = self.take_request_id()?;
+        let request = codex_thread_delete_request(request_id, thread_id)
+            .map_err(CodexAppServerError::Contract)?;
+        let response = self.exchange(request)?;
+        self.decode_or_close(decode_codex_thread_delete_response(&response, request_id))?;
+
+        let deadline = Instant::now() + self.request_timeout;
+        for _ in 0..MAX_CODEX_OBSERVATION_FRAMES {
+            let frame = self.next_notification_until(deadline)?;
+            let decoded = decode_codex_thread_deleted_notification(&frame, thread_id);
+            self.release_retained_bytes(frame.len());
+            match decoded {
+                Ok(Some(deleted)) => {
+                    self.reject_duplicate_thread_deleted_notifications(thread_id)?;
+                    self.started_thread_ids.remove(thread_id);
+                    self.terminate_owned()?;
+                    return Ok(deleted);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return self.close_with(CodexAppServerError::Contract(error));
+                }
+            }
+        }
+        self.close_with(CodexAppServerError::ObservationFrameLimit)
     }
 
     pub fn list_managed(
@@ -452,6 +503,7 @@ impl CodexAppServer {
             request_timeout,
             validated_profile: None,
             staged_executable: None,
+            started_thread_ids: BTreeSet::new(),
             active_turn: None,
             last_terminal_turn: None,
         };
@@ -650,6 +702,52 @@ impl CodexAppServer {
                 Ok(None) => {}
                 Ok(Some(_)) => {
                     return self.close_with(CodexAppServerError::DuplicateTurnObservation);
+                }
+                Err(error) => {
+                    return self.close_with(CodexAppServerError::Contract(error));
+                }
+            }
+        }
+        self.close_with(CodexAppServerError::ObservationFrameLimit)
+    }
+
+    fn reject_duplicate_thread_deleted_notifications(
+        &mut self,
+        thread_id: &CodexManagedThreadId,
+    ) -> Result<(), CodexAppServerError> {
+        for _ in 0..MAX_CODEX_OBSERVATION_FRAMES {
+            let Some(frame) = self.try_next_notification()? else {
+                return Ok(());
+            };
+            let decoded = decode_codex_thread_deleted_notification(&frame, thread_id);
+            self.release_retained_bytes(frame.len());
+            match decoded {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    return self.close_with(CodexAppServerError::DuplicateThreadDeletion);
+                }
+                Err(error) => {
+                    return self.close_with(CodexAppServerError::Contract(error));
+                }
+            }
+        }
+        self.close_with(CodexAppServerError::ObservationFrameLimit)
+    }
+
+    fn reject_preexisting_thread_deleted_notifications(
+        &mut self,
+        thread_id: &CodexManagedThreadId,
+    ) -> Result<(), CodexAppServerError> {
+        for _ in 0..MAX_CODEX_OBSERVATION_FRAMES {
+            let Some(frame) = self.try_next_notification()? else {
+                return Ok(());
+            };
+            let decoded = decode_codex_thread_deleted_notification(&frame, thread_id);
+            self.release_retained_bytes(frame.len());
+            match decoded {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    return self.close_with(CodexAppServerError::PreexistingThreadDeletion);
                 }
                 Err(error) => {
                     return self.close_with(CodexAppServerError::Contract(error));
@@ -1046,6 +1144,9 @@ pub enum CodexAppServerError {
     PaginationCycle,
     PaginationLimit,
     DuplicateManagedThread,
+    UnownedThreadDeletion,
+    PreexistingThreadDeletion,
+    DuplicateThreadDeletion,
     ActiveTurnExists,
     NoActiveTurn,
     InterruptAlreadyRequested,
@@ -1132,6 +1233,15 @@ impl fmt::Display for CodexAppServerError {
             Self::PaginationLimit => formatter.write_str("Codex list exceeded its page limit"),
             Self::DuplicateManagedThread => {
                 formatter.write_str("Codex repeated an exact managed thread across pages")
+            }
+            Self::UnownedThreadDeletion => {
+                formatter.write_str("Codex connection did not start the requested thread")
+            }
+            Self::PreexistingThreadDeletion => {
+                formatter.write_str("Codex reported thread deletion before the delete request")
+            }
+            Self::DuplicateThreadDeletion => {
+                formatter.write_str("Codex repeated an exact thread deletion notification")
             }
             Self::ActiveTurnExists => {
                 formatter.write_str("Codex connection already owns an active turn")
@@ -1599,6 +1709,201 @@ done
             .wait_for_turn_observation()
             .expect_err("observation must time out");
         assert!(ErrorKind::TimedOut.matches(&error), "{error:?}");
+        assert_process_group_gone(&executable);
+    }
+
+    #[test]
+    fn managed_thread_deletion_accepts_a_buffered_exact_notification() {
+        let _process_guard = test_process_guard();
+        let directory = TestDirectory::new("thread-delete-success");
+        let executable = directory.0.join("codex");
+        write_script(
+            &executable,
+            r#"#!/bin/sh
+printf '%s' "$$" > "$0.pgid"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"managed-1","sessionId":"managed-1"},"sandbox":{"type":"readOnly","networkAccess":false},"approvalPolicy":"never"}}' ;;
+    *'"method":"thread/delete"'*)
+      printf '%s\n' '{"method":"thread/deleted","params":{"threadId":"managed-1"}}'
+      printf '%s\n' '{"id":3,"result":{}}'
+      ;;
+  esac
+done
+"#,
+        );
+        let mut server =
+            connect_fake(&executable, Duration::from_secs(1)).expect("delete handshake");
+        let started = server.start_read_only(TEST_CWD).expect("managed thread");
+        let deleted = server
+            .delete_started_thread(&started.thread_id)
+            .expect("exact deletion receipt");
+        assert_eq!(deleted.thread_id, started.thread_id);
+        assert_process_group_gone(&executable);
+    }
+
+    #[test]
+    fn managed_thread_deletion_rejects_a_matching_notification_before_the_request() {
+        let _process_guard = test_process_guard();
+        let directory = TestDirectory::new("thread-delete-preexisting");
+        let executable = directory.0.join("codex");
+        let delete_seen = directory.0.join("delete-seen");
+        write_script(
+            &executable,
+            &format!(
+                r#"#!/bin/sh
+printf '%s' "$$" > "$0.pgid"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{{"id":1,"result":{{}}}}' ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' '{{"method":"thread/deleted","params":{{"threadId":"managed-1"}}}}'
+      printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"managed-1","sessionId":"managed-1"}},"sandbox":{{"type":"readOnly","networkAccess":false}},"approvalPolicy":"never"}}}}'
+      ;;
+    *'"method":"thread/delete"'*) printf seen > '{}' ;;
+  esac
+done
+"#,
+                delete_seen.display()
+            ),
+        );
+        let mut server =
+            connect_fake(&executable, Duration::from_secs(1)).expect("delete handshake");
+        let started = server.start_read_only(TEST_CWD).expect("managed thread");
+        let error = server
+            .delete_started_thread(&started.thread_id)
+            .expect_err("preexisting deletion must fail");
+        assert!(
+            ErrorKind::PreexistingThreadDeletion.matches(&error),
+            "{error:?}"
+        );
+        assert!(
+            !delete_seen.exists(),
+            "delete request crossed causal boundary"
+        );
+        assert_process_group_gone(&executable);
+    }
+
+    #[test]
+    fn managed_thread_deletion_closes_before_a_delayed_duplicate_can_escape() {
+        let _process_guard = test_process_guard();
+        let directory = TestDirectory::new("thread-delete-delayed-duplicate");
+        let executable = directory.0.join("codex");
+        write_script(
+            &executable,
+            r#"#!/bin/sh
+printf '%s' "$$" > "$0.pgid"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"managed-1","sessionId":"managed-1"},"sandbox":{"type":"readOnly","networkAccess":false},"approvalPolicy":"never"}}' ;;
+    *'"method":"thread/delete"'*)
+      printf '%s\n' '{"id":3,"result":{}}'
+      printf '%s\n' '{"method":"thread/deleted","params":{"threadId":"managed-1"}}'
+      /bin/sleep 0.2
+      printf '%s\n' '{"method":"thread/deleted","params":{"threadId":"managed-1"}}'
+      ;;
+  esac
+done
+"#,
+        );
+        let mut server =
+            connect_fake(&executable, Duration::from_secs(1)).expect("delete handshake");
+        let started = server.start_read_only(TEST_CWD).expect("managed thread");
+        let deleted = server
+            .delete_started_thread(&started.thread_id)
+            .expect("first exact deletion receipt");
+        assert_eq!(deleted.thread_id, started.thread_id);
+        assert_process_group_gone(&executable);
+    }
+
+    #[test]
+    fn managed_thread_deletion_failures_close_the_owned_process() {
+        let _process_guard = test_process_guard();
+        let unrelated_frames = (0..MAX_CODEX_OBSERVATION_FRAMES)
+            .map(|_| "printf '%s\\n' '{\"method\":\"turn/started\",\"params\":{}}'")
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (label, delete_behavior, expected) in [
+            (
+                "delete-missing-notification",
+                "printf '%s\\n' '{\"id\":3,\"result\":{}}'\n/bin/sleep 30 & wait".to_owned(),
+                ErrorKind::TimedOut,
+            ),
+            (
+                "delete-mismatched-thread",
+                "printf '%s\\n' '{\"id\":3,\"result\":{}}'\nprintf '%s\\n' '{\"method\":\"thread/deleted\",\"params\":{\"threadId\":\"other\"}}'".to_owned(),
+                ErrorKind::UnexpectedThreadId,
+            ),
+            (
+                "delete-duplicate-notification",
+                "printf '%s\\n' '{\"method\":\"thread/deleted\",\"params\":{\"threadId\":\"managed-1\"}}'\nprintf '%s\\n' '{\"method\":\"thread/deleted\",\"params\":{\"threadId\":\"managed-1\"}}'\nprintf '%s\\n' '{\"id\":3,\"result\":{}}'".to_owned(),
+                ErrorKind::DuplicateThreadDeletion,
+            ),
+            (
+                "delete-malformed-notification",
+                "printf '%s\\n' '{\"id\":3,\"result\":{}}'\nprintf '%s\\n' '{\"method\":\"thread/deleted\",\"params\":{}}'".to_owned(),
+                ErrorKind::InvalidThreadDeletedNotification,
+            ),
+            (
+                "delete-observation-limit",
+                format!(
+                    "printf '%s\\n' '{{\"id\":3,\"result\":{{}}}}'\n{unrelated_frames}"
+                ),
+                ErrorKind::ObservationFrameLimit,
+            ),
+        ] {
+            let directory = TestDirectory::new(label);
+            let executable = directory.0.join("codex");
+            write_script(
+                &executable,
+                &format!(
+                    r#"#!/bin/sh
+printf '%s' "$$" > "$0.pgid"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{{"id":1,"result":{{}}}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"managed-1","sessionId":"managed-1"}},"sandbox":{{"type":"readOnly","networkAccess":false}},"approvalPolicy":"never"}}}}' ;;
+    *'"method":"thread/delete"'*) {delete_behavior} ;;
+  esac
+done
+"#
+                ),
+            );
+            let mut server =
+                connect_fake(&executable, Duration::from_secs(1)).expect("delete handshake");
+            let started = server.start_read_only(TEST_CWD).expect("managed thread");
+            server.request_timeout = Duration::from_millis(200);
+            let error = server
+                .delete_started_thread(&started.thread_id)
+                .expect_err("invalid deletion must fail");
+            assert!(expected.matches(&error), "{label}: {error:?}");
+            assert_process_group_gone(&executable);
+        }
+    }
+
+    #[test]
+    fn managed_thread_deletion_rejects_an_id_not_started_by_the_connection() {
+        let _process_guard = test_process_guard();
+        let directory = TestDirectory::new("thread-delete-unowned");
+        let executable = directory.0.join("codex");
+        write_script(
+            &executable,
+            r#"#!/bin/sh
+printf '%s' "$$" > "$0.pgid"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+  esac
+done
+"#,
+        );
+        let server = connect_fake(&executable, Duration::from_secs(1)).expect("delete handshake");
+        assert!(matches!(
+            server.delete_started_thread(&thread_id("not-started-here")),
+            Err(CodexAppServerError::UnownedThreadDeletion)
+        ));
         assert_process_group_gone(&executable);
     }
 
@@ -2185,8 +2490,12 @@ exit 9
         UnterminatedFrame,
         NotificationBufferFull,
         DuplicateTurnObservation,
+        PreexistingThreadDeletion,
+        DuplicateThreadDeletion,
         CommandObservationLimit,
+        ObservationFrameLimit,
         UnexpectedThreadId,
+        InvalidThreadDeletedNotification,
     }
 
     impl ErrorKind {
@@ -2201,10 +2510,22 @@ exit 9
                 | (Self::UnterminatedFrame, CodexAppServerError::UnterminatedStdoutFrame)
                 | (Self::NotificationBufferFull, CodexAppServerError::NotificationBufferFull)
                 | (Self::DuplicateTurnObservation, CodexAppServerError::DuplicateTurnObservation)
+                | (
+                    Self::PreexistingThreadDeletion,
+                    CodexAppServerError::PreexistingThreadDeletion,
+                )
+                | (Self::DuplicateThreadDeletion, CodexAppServerError::DuplicateThreadDeletion)
                 | (Self::CommandObservationLimit, CodexAppServerError::CommandObservationLimit)
+                | (Self::ObservationFrameLimit, CodexAppServerError::ObservationFrameLimit)
                 | (
                     Self::UnexpectedThreadId,
                     CodexAppServerError::Contract(CodexContractError::UnexpectedThreadId),
+                )
+                | (
+                    Self::InvalidThreadDeletedNotification,
+                    CodexAppServerError::Contract(CodexContractError::InvalidField {
+                        field: "threadId",
+                    }),
                 ) => true,
                 (_, CodexAppServerError::CleanupAfterFailure { operation, .. }) => {
                     self.matches(operation)

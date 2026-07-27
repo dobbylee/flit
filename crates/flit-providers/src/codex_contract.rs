@@ -118,6 +118,11 @@ pub struct CodexManualStartedThread {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodexDeletedThread {
+    pub thread_id: CodexManagedThreadId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodexManagedThreadConflict {
     pub thread_id: CodexManagedThreadId,
     pub observed_cwd: PathBuf,
@@ -288,6 +293,22 @@ pub fn codex_read_request(
             "params": {
                 "threadId": thread_id.as_str(),
                 "includeTurns": true,
+            },
+        }),
+    )
+}
+
+pub fn codex_thread_delete_request(
+    request_id: u64,
+    thread_id: &CodexManagedThreadId,
+) -> Result<Vec<u8>, CodexContractError> {
+    encode_client_frame(
+        request_id,
+        json!({
+            "id": request_id,
+            "method": "thread/delete",
+            "params": {
+                "threadId": thread_id.as_str(),
             },
         }),
     )
@@ -523,6 +544,45 @@ pub fn decode_codex_turn_interrupt_response(
         thread_id: expected_thread_id.clone(),
         turn_id: expected_turn_id.clone(),
     })
+}
+
+pub fn decode_codex_thread_delete_response(
+    frame: &[u8],
+    expected_request_id: u64,
+) -> Result<(), CodexContractError> {
+    if !response_result(frame, expected_request_id)?.is_empty() {
+        return Err(CodexContractError::UnexpectedDeleteReceipt);
+    }
+    Ok(())
+}
+
+pub fn decode_codex_thread_deleted_notification(
+    frame: &[u8],
+    expected_thread_id: &CodexManagedThreadId,
+) -> Result<Option<CodexDeletedThread>, CodexContractError> {
+    if frame.len() > MAX_CODEX_APP_SERVER_FRAME_BYTES {
+        return Err(CodexContractError::FrameTooLarge);
+    }
+    let value: Value =
+        serde_json::from_slice(frame).map_err(|_| CodexContractError::MalformedJson)?;
+    let notification = value
+        .as_object()
+        .ok_or(CodexContractError::InvalidNotification)?;
+    let method = notification
+        .get("method")
+        .and_then(Value::as_str)
+        .ok_or(CodexContractError::InvalidNotification)?;
+    if method != "thread/deleted" {
+        return Ok(None);
+    }
+    let params = required_object(notification, "params")?;
+    let observed_thread_id = CodexManagedThreadId::new(required_string(params, "threadId")?)?;
+    if &observed_thread_id != expected_thread_id {
+        return Err(CodexContractError::UnexpectedThreadId);
+    }
+    Ok(Some(CodexDeletedThread {
+        thread_id: observed_thread_id,
+    }))
 }
 
 pub fn decode_codex_turn_notification(
@@ -780,6 +840,7 @@ pub enum CodexContractError {
     UnexpectedThreadId,
     UnexpectedTurnId,
     UnexpectedEffectivePolicy,
+    UnexpectedDeleteReceipt,
     UnexpectedItemVariant,
     UnexpectedTurnStatus,
     DuplicateThreadId,
@@ -824,6 +885,9 @@ impl fmt::Display for CodexContractError {
             }
             Self::UnexpectedEffectivePolicy => {
                 formatter.write_str("Codex start response did not confirm the read-only policy")
+            }
+            Self::UnexpectedDeleteReceipt => {
+                formatter.write_str("Codex thread delete response was not the exact empty receipt")
             }
             Self::UnexpectedItemVariant => {
                 formatter.write_str("Codex notification returned an unvalidated item variant")

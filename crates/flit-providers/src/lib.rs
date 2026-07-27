@@ -10,17 +10,19 @@ mod schema;
 mod version;
 
 pub use codex_contract::{
-    CodexContractError, CodexInterruptRequested, CodexManagedItemId, CodexManagedListPage,
-    CodexManagedScope, CodexManagedThreadConflict, CodexManagedThreadId, CodexManagedTurnId,
-    CodexManualStartedThread, CodexStartedThread, CodexStartedTurn, CodexThreadRead,
-    CodexThreadState, CodexTurnObservation, CodexTurnTerminalOutcome,
+    CodexContractError, CodexDeletedThread, CodexInterruptRequested, CodexManagedItemId,
+    CodexManagedListPage, CodexManagedScope, CodexManagedThreadConflict, CodexManagedThreadId,
+    CodexManagedTurnId, CodexManualStartedThread, CodexStartedThread, CodexStartedTurn,
+    CodexThreadRead, CodexThreadState, CodexTurnObservation, CodexTurnTerminalOutcome,
     MAX_CODEX_APP_SERVER_FRAME_BYTES, MAX_CODEX_MANAGED_THREADS, MAX_CODEX_TURN_PROMPT_BYTES,
     codex_initialize_request, codex_initialized_notification, codex_manual_start_request,
-    codex_read_only_start_request, codex_read_request, codex_thread_list_request,
-    codex_turn_interrupt_request, codex_turn_start_request, decode_codex_initialize_response,
-    decode_codex_manual_start_response, decode_codex_read_response, decode_codex_start_response,
-    decode_codex_thread_list_response, decode_codex_turn_interrupt_response,
-    decode_codex_turn_notification, decode_codex_turn_start_response,
+    codex_read_only_start_request, codex_read_request, codex_thread_delete_request,
+    codex_thread_list_request, codex_turn_interrupt_request, codex_turn_start_request,
+    decode_codex_initialize_response, decode_codex_manual_start_response,
+    decode_codex_read_response, decode_codex_start_response, decode_codex_thread_delete_response,
+    decode_codex_thread_deleted_notification, decode_codex_thread_list_response,
+    decode_codex_turn_interrupt_response, decode_codex_turn_notification,
+    decode_codex_turn_start_response,
 };
 pub use codex_transport::{
     CODEX_APP_SERVER_REQUEST_TIMEOUT, CodexAppServer, CodexAppServerError, CodexManagedThreads,
@@ -201,7 +203,7 @@ pub fn validated_codex_0_145_0_fingerprint() -> ProviderFingerprint {
             .to_owned(),
         method_allowlist_sha256: "0de966cd124a25c926df49f4b697e588d51947c31c4e2febe2175338f6319d42"
             .to_owned(),
-        fixture_sha256: "894c007f3862efbf700a3e84bcea6a0069b5b5ced0996eca2df7387a4a7897d1"
+        fixture_sha256: "a41be68b42ee08b82b9ebdee78bae9fcaa01501671e824e79e988d0e8c93827b"
             .to_owned(),
         smoke_run_id: "2026-07-27-arm64-s0-9".to_owned(),
     }

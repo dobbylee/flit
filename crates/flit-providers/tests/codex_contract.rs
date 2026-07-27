@@ -1,15 +1,16 @@
 use std::{collections::BTreeMap, path::PathBuf};
 
 use flit_providers::{
-    CodexContractError, CodexManagedScope, CodexManagedThreadId, CodexManagedTurnId,
-    CodexThreadState, CodexTurnObservation, CodexTurnTerminalOutcome,
+    CodexContractError, CodexDeletedThread, CodexManagedScope, CodexManagedThreadId,
+    CodexManagedTurnId, CodexThreadState, CodexTurnObservation, CodexTurnTerminalOutcome,
     MAX_CODEX_APP_SERVER_FRAME_BYTES, MAX_CODEX_MANAGED_THREADS, MAX_CODEX_TURN_PROMPT_BYTES,
     codex_initialize_request, codex_initialized_notification, codex_manual_start_request,
-    codex_read_only_start_request, codex_read_request, codex_thread_list_request,
-    codex_turn_interrupt_request, codex_turn_start_request, decode_codex_manual_start_response,
-    decode_codex_read_response, decode_codex_start_response, decode_codex_thread_list_response,
-    decode_codex_turn_interrupt_response, decode_codex_turn_notification,
-    decode_codex_turn_start_response,
+    codex_read_only_start_request, codex_read_request, codex_thread_delete_request,
+    codex_thread_list_request, codex_turn_interrupt_request, codex_turn_start_request,
+    decode_codex_manual_start_response, decode_codex_read_response, decode_codex_start_response,
+    decode_codex_thread_delete_response, decode_codex_thread_deleted_notification,
+    decode_codex_thread_list_response, decode_codex_turn_interrupt_response,
+    decode_codex_turn_notification, decode_codex_turn_start_response,
 };
 use serde_json::{Value, json};
 
@@ -101,6 +102,61 @@ fn manual_start_requires_the_exact_effective_policy_receipt() {
     assert_eq!(
         decode_codex_manual_start_response(&json_bytes(&network), 2, CWD),
         Err(CodexContractError::UnexpectedEffectivePolicy)
+    );
+}
+
+#[test]
+fn managed_thread_deletion_requires_exact_response_and_notification_identity() {
+    let expected_thread = thread_id("managed-1");
+    let request: Value =
+        serde_json::from_slice(&codex_thread_delete_request(3, &expected_thread).expect("delete"))
+            .expect("delete JSON");
+    let mut expected_request = manual_fixture_message("managed-thread-delete-request");
+    replace_placeholders(&mut expected_request, "<thread-id>", "managed-1");
+    assert_eq!(request, expected_request);
+
+    let response = manual_fixture_message("managed-thread-delete-response");
+    assert_eq!(
+        decode_codex_thread_delete_response(&json_bytes(&response), 3),
+        Ok(())
+    );
+    assert_eq!(
+        decode_codex_thread_delete_response(&json_bytes(&response), 4),
+        Err(CodexContractError::UnexpectedRequestId)
+    );
+    assert_eq!(
+        decode_codex_thread_delete_response(
+            &json_bytes(&json!({"id": 3, "result": {"unexpected": true}})),
+            3,
+        ),
+        Err(CodexContractError::UnexpectedDeleteReceipt)
+    );
+
+    let mut notification = manual_fixture_message("managed-thread-deleted");
+    replace_placeholders(&mut notification, "<thread-id>", "managed-1");
+    assert_eq!(
+        decode_codex_thread_deleted_notification(&json_bytes(&notification), &expected_thread),
+        Ok(Some(CodexDeletedThread {
+            thread_id: expected_thread.clone(),
+        }))
+    );
+    assert_eq!(
+        decode_codex_thread_deleted_notification(
+            &json_bytes(&json!({"method": "turn/started", "params": {}})),
+            &expected_thread,
+        ),
+        Ok(None)
+    );
+
+    notification["params"]["threadId"] = json!("other-thread");
+    assert_eq!(
+        decode_codex_thread_deleted_notification(&json_bytes(&notification), &expected_thread),
+        Err(CodexContractError::UnexpectedThreadId)
+    );
+    notification["params"] = json!({});
+    assert_eq!(
+        decode_codex_thread_deleted_notification(&json_bytes(&notification), &expected_thread),
+        Err(CodexContractError::InvalidField { field: "threadId" })
     );
 }
 
