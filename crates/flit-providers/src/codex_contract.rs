@@ -175,6 +175,35 @@ pub struct CodexPermissionRequest {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodexPermissionDecision {
+    Accept,
+    Decline,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodexPermissionDelivery {
+    pub provider_request_id: u64,
+    pub thread_id: CodexManagedThreadId,
+    pub turn_id: CodexManagedTurnId,
+    pub item_id: CodexManagedItemId,
+    pub decision: CodexPermissionDecision,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CodexPermissionDeliveryObservation {
+    RequestClosed {
+        provider_request_id: u64,
+        thread_id: CodexManagedThreadId,
+    },
+    Delivered(CodexPermissionDelivery),
+    TurnCompleted {
+        thread_id: CodexManagedThreadId,
+        turn_id: CodexManagedTurnId,
+        outcome: CodexTurnTerminalOutcome,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CodexTurnTerminalOutcome {
     Completed,
     Interrupted,
@@ -364,6 +393,25 @@ pub fn codex_turn_interrupt_request(
             "params": {
                 "threadId": thread_id.as_str(),
                 "turnId": turn_id.as_str(),
+            },
+        }),
+    )
+}
+
+pub fn codex_file_change_permission_response(
+    request: &CodexPermissionRequest,
+    decision: CodexPermissionDecision,
+) -> Result<Vec<u8>, CodexContractError> {
+    validate_request_id(request.provider_request_id)?;
+    encode_client_frame(
+        request.provider_request_id,
+        json!({
+            "id": request.provider_request_id,
+            "result": {
+                "decision": match decision {
+                    CodexPermissionDecision::Accept => "accept",
+                    CodexPermissionDecision::Decline => "decline",
+                },
             },
         }),
     )
@@ -701,6 +749,104 @@ pub fn decode_codex_turn_notification(
     }
 }
 
+pub fn decode_codex_permission_delivery_notification(
+    frame: &[u8],
+    expected_request: &CodexPermissionRequest,
+    decision: CodexPermissionDecision,
+) -> Result<Option<CodexPermissionDeliveryObservation>, CodexContractError> {
+    if frame.len() > MAX_CODEX_APP_SERVER_FRAME_BYTES {
+        return Err(CodexContractError::FrameTooLarge);
+    }
+    let value: Value =
+        serde_json::from_slice(frame).map_err(|_| CodexContractError::MalformedJson)?;
+    let notification = value
+        .as_object()
+        .ok_or(CodexContractError::InvalidNotification)?;
+    let method = notification
+        .get("method")
+        .and_then(Value::as_str)
+        .ok_or(CodexContractError::InvalidNotification)?;
+    if notification.contains_key("id") {
+        return Err(CodexContractError::UnsupportedServerRequest);
+    }
+    if !matches!(
+        method,
+        "serverRequest/resolved" | "item/completed" | "turn/completed"
+    ) {
+        return Ok(None);
+    }
+    let params = required_object(notification, "params")?;
+    let observed_thread_id = CodexManagedThreadId::new(required_string(params, "threadId")?)?;
+    if observed_thread_id != expected_request.thread_id {
+        return Err(CodexContractError::UnexpectedThreadId);
+    }
+    match method {
+        "serverRequest/resolved" => {
+            let provider_request_id = required_u64(params, "requestId")?;
+            validate_request_id(provider_request_id)?;
+            if provider_request_id != expected_request.provider_request_id {
+                return Err(CodexContractError::UnexpectedRequestId);
+            }
+            Ok(Some(CodexPermissionDeliveryObservation::RequestClosed {
+                provider_request_id,
+                thread_id: observed_thread_id,
+            }))
+        }
+        "item/completed" => {
+            let observed_turn_id = CodexManagedTurnId::new(required_string(params, "turnId")?)?;
+            if observed_turn_id != expected_request.turn_id {
+                return Err(CodexContractError::UnexpectedTurnId);
+            }
+            let item = required_object(params, "item")?;
+            if required_string(item, "type")? != "fileChange" {
+                return Ok(None);
+            }
+            let observed_item_id = CodexManagedItemId::new(required_string(item, "id")?)?;
+            if observed_item_id != expected_request.item_id {
+                return Ok(None);
+            }
+            let expected_status = match decision {
+                CodexPermissionDecision::Accept => "completed",
+                CodexPermissionDecision::Decline => "declined",
+            };
+            if required_string(item, "status")? != expected_status {
+                return Err(CodexContractError::UnexpectedPermissionOutcome);
+            }
+            Ok(Some(CodexPermissionDeliveryObservation::Delivered(
+                CodexPermissionDelivery {
+                    provider_request_id: expected_request.provider_request_id,
+                    thread_id: observed_thread_id,
+                    turn_id: observed_turn_id,
+                    item_id: observed_item_id,
+                    decision,
+                },
+            )))
+        }
+        "turn/completed" => {
+            let turn = required_object(params, "turn")?;
+            let observed_turn_id = CodexManagedTurnId::new(required_string(turn, "id")?)?;
+            if observed_turn_id != expected_request.turn_id {
+                return Err(CodexContractError::UnexpectedTurnId);
+            }
+            let items = required_array(turn, "items")?;
+            if items.len() > MAX_CODEX_TURN_ITEM_COUNT {
+                return Err(CodexContractError::TooManyTurnItems);
+            }
+            let outcome = match required_string(turn, "status")? {
+                "completed" => CodexTurnTerminalOutcome::Completed,
+                "interrupted" => CodexTurnTerminalOutcome::Interrupted,
+                _ => return Err(CodexContractError::UnexpectedTurnStatus),
+            };
+            Ok(Some(CodexPermissionDeliveryObservation::TurnCompleted {
+                thread_id: observed_thread_id,
+                turn_id: observed_turn_id,
+                outcome,
+            }))
+        }
+        _ => unreachable!("selected delivery methods are matched above"),
+    }
+}
+
 fn encode_client_frame(request_id: u64, value: Value) -> Result<Vec<u8>, CodexContractError> {
     validate_request_id(request_id)?;
     let frame = encode_value(value);
@@ -895,6 +1041,7 @@ pub enum CodexContractError {
     UnexpectedEffectivePolicy,
     UnexpectedDeleteReceipt,
     UnexpectedItemVariant,
+    UnexpectedPermissionOutcome,
     UnexpectedTurnStatus,
     UnsupportedServerRequest,
     DuplicateThreadId,
@@ -945,6 +1092,9 @@ impl fmt::Display for CodexContractError {
             }
             Self::UnexpectedItemVariant => {
                 formatter.write_str("Codex notification returned an unvalidated item variant")
+            }
+            Self::UnexpectedPermissionOutcome => {
+                formatter.write_str("Codex permission item returned an unexpected outcome")
             }
             Self::UnexpectedTurnStatus => {
                 formatter.write_str("Codex notification returned an unvalidated terminal status")

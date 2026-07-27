@@ -2,15 +2,18 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use flit_providers::{
     CodexContractError, CodexDeletedThread, CodexManagedScope, CodexManagedThreadId,
-    CodexManagedTurnId, CodexThreadState, CodexTurnObservation, CodexTurnTerminalOutcome,
-    MAX_CODEX_APP_SERVER_FRAME_BYTES, MAX_CODEX_MANAGED_THREADS, MAX_CODEX_TURN_PROMPT_BYTES,
+    CodexManagedTurnId, CodexPermissionDecision, CodexPermissionDelivery,
+    CodexPermissionDeliveryObservation, CodexPermissionRequest, CodexThreadState,
+    CodexTurnObservation, CodexTurnTerminalOutcome, MAX_CODEX_APP_SERVER_FRAME_BYTES,
+    MAX_CODEX_MANAGED_THREADS, MAX_CODEX_TURN_PROMPT_BYTES, codex_file_change_permission_response,
     codex_initialize_request, codex_initialized_notification, codex_manual_start_request,
     codex_read_only_start_request, codex_read_request, codex_thread_delete_request,
     codex_thread_list_request, codex_turn_interrupt_request, codex_turn_start_request,
-    decode_codex_manual_start_response, decode_codex_read_response, decode_codex_start_response,
-    decode_codex_thread_delete_response, decode_codex_thread_deleted_notification,
-    decode_codex_thread_list_response, decode_codex_turn_interrupt_response,
-    decode_codex_turn_notification, decode_codex_turn_start_response,
+    decode_codex_manual_start_response, decode_codex_permission_delivery_notification,
+    decode_codex_read_response, decode_codex_start_response, decode_codex_thread_delete_response,
+    decode_codex_thread_deleted_notification, decode_codex_thread_list_response,
+    decode_codex_turn_interrupt_response, decode_codex_turn_notification,
+    decode_codex_turn_start_response,
 };
 use serde_json::{Value, json};
 
@@ -233,6 +236,134 @@ fn turn_requests_and_responses_bind_exact_managed_identity() {
     .expect("interrupt response");
     assert_eq!(receipt.thread_id, started.thread_id);
     assert_eq!(receipt.turn_id, started.turn_id);
+}
+
+#[test]
+fn permission_response_requires_the_exact_causal_item_outcome() {
+    let request = CodexPermissionRequest {
+        provider_request_id: 0,
+        thread_id: thread_id("managed-1"),
+        turn_id: turn_id("turn-1"),
+        item_id: flit_providers::CodexManagedItemId::new("item-permission").expect("item ID"),
+        started_at_ms: 17,
+    };
+    for (decision, response_fixture, outcome_fixture) in [
+        (
+            CodexPermissionDecision::Accept,
+            "manual-file-change-accept-response",
+            "manual-file-change-completed",
+        ),
+        (
+            CodexPermissionDecision::Decline,
+            "manual-file-change-decline-response",
+            "manual-file-change-declined",
+        ),
+    ] {
+        let response: Value = serde_json::from_slice(
+            &codex_file_change_permission_response(&request, decision)
+                .expect("permission response"),
+        )
+        .expect("permission response JSON");
+        assert_eq!(response, manual_fixture_message(response_fixture));
+
+        let mut outcome = manual_fixture_message(outcome_fixture);
+        replace_placeholders(&mut outcome, "<thread-id>", "managed-1");
+        replace_placeholders(&mut outcome, "<turn-id>", "turn-1");
+        replace_placeholders(&mut outcome, "<item-id>", "item-permission");
+        assert_eq!(
+            decode_codex_permission_delivery_notification(
+                &json_bytes(&outcome),
+                &request,
+                decision
+            ),
+            Ok(Some(CodexPermissionDeliveryObservation::Delivered(
+                CodexPermissionDelivery {
+                    provider_request_id: 0,
+                    thread_id: request.thread_id.clone(),
+                    turn_id: request.turn_id.clone(),
+                    item_id: request.item_id.clone(),
+                    decision,
+                }
+            )))
+        );
+    }
+
+    let mut closure = manual_fixture_message("server-request-closure");
+    replace_placeholders(&mut closure, "<thread-id>", "managed-1");
+    assert_eq!(
+        decode_codex_permission_delivery_notification(
+            &json_bytes(&closure),
+            &request,
+            CodexPermissionDecision::Accept,
+        ),
+        Ok(Some(CodexPermissionDeliveryObservation::RequestClosed {
+            provider_request_id: 0,
+            thread_id: request.thread_id.clone(),
+        }))
+    );
+
+    let terminal = json!({
+        "method": "turn/completed",
+        "params": {
+            "threadId": "managed-1",
+            "turn": {"id": "turn-1", "items": [], "status": "completed"},
+        },
+    });
+    assert_eq!(
+        decode_codex_permission_delivery_notification(
+            &json_bytes(&terminal),
+            &request,
+            CodexPermissionDecision::Accept,
+        ),
+        Ok(Some(CodexPermissionDeliveryObservation::TurnCompleted {
+            thread_id: request.thread_id.clone(),
+            turn_id: request.turn_id.clone(),
+            outcome: CodexTurnTerminalOutcome::Completed,
+        }))
+    );
+
+    let mut wrong_status = manual_fixture_message("manual-file-change-declined");
+    replace_placeholders(&mut wrong_status, "<thread-id>", "managed-1");
+    replace_placeholders(&mut wrong_status, "<turn-id>", "turn-1");
+    replace_placeholders(&mut wrong_status, "<item-id>", "item-permission");
+    assert_eq!(
+        decode_codex_permission_delivery_notification(
+            &json_bytes(&wrong_status),
+            &request,
+            CodexPermissionDecision::Accept,
+        ),
+        Err(CodexContractError::UnexpectedPermissionOutcome)
+    );
+    wrong_status["params"]["item"]["id"] = json!("another-item");
+    assert_eq!(
+        decode_codex_permission_delivery_notification(
+            &json_bytes(&wrong_status),
+            &request,
+            CodexPermissionDecision::Accept,
+        ),
+        Ok(None)
+    );
+    wrong_status["params"]["threadId"] = json!("another-thread");
+    assert_eq!(
+        decode_codex_permission_delivery_notification(
+            &json_bytes(&wrong_status),
+            &request,
+            CodexPermissionDecision::Accept,
+        ),
+        Err(CodexContractError::UnexpectedThreadId)
+    );
+    assert_eq!(
+        decode_codex_permission_delivery_notification(
+            &json_bytes(&json!({
+                "id": 9,
+                "method": "item/fileChange/requestApproval",
+                "params": {},
+            })),
+            &request,
+            CodexPermissionDecision::Accept,
+        ),
+        Err(CodexContractError::UnsupportedServerRequest)
+    );
 }
 
 #[test]

@@ -24,13 +24,15 @@ use serde_json::Value;
 use crate::{
     CapabilityStatus, CodexCompatibilityProbe, CodexCompatibilityProbeError, CodexContractError,
     CodexDeletedThread, CodexInterruptRequested, CodexManagedScope, CodexManagedThreadConflict,
-    CodexManagedThreadId, CodexManualStartedThread, CodexPermissionRequest, CodexStartedThread,
-    CodexStartedTurn, CodexThreadRead, CodexTurnObservation, ExecutableInspection,
-    ExecutableInspectionError, ProviderCapability, ProviderCompatibility, ProviderFingerprint,
-    codex_initialize_request, codex_initialized_notification, codex_manual_start_request,
-    codex_read_only_start_request, codex_read_request, codex_thread_delete_request,
-    codex_thread_list_request, codex_turn_interrupt_request, codex_turn_start_request,
-    decode_codex_initialize_response, decode_codex_manual_start_response,
+    CodexManagedThreadId, CodexManualStartedThread, CodexPermissionDecision,
+    CodexPermissionDelivery, CodexPermissionDeliveryObservation, CodexPermissionRequest,
+    CodexStartedThread, CodexStartedTurn, CodexThreadRead, CodexTurnObservation,
+    ExecutableInspection, ExecutableInspectionError, ProviderCapability, ProviderCompatibility,
+    ProviderFingerprint, codex_file_change_permission_response, codex_initialize_request,
+    codex_initialized_notification, codex_manual_start_request, codex_read_only_start_request,
+    codex_read_request, codex_thread_delete_request, codex_thread_list_request,
+    codex_turn_interrupt_request, codex_turn_start_request, decode_codex_initialize_response,
+    decode_codex_manual_start_response, decode_codex_permission_delivery_notification,
     decode_codex_read_response, decode_codex_start_response, decode_codex_thread_delete_response,
     decode_codex_thread_deleted_notification, decode_codex_thread_list_response,
     decode_codex_turn_interrupt_response, decode_codex_turn_notification,
@@ -47,6 +49,7 @@ pub const MAX_CODEX_LIST_PAGES: usize = 16;
 pub const MAX_CODEX_OBSERVATION_FRAMES: usize = 256;
 pub const MAX_CODEX_COMMAND_STARTS_PER_TURN: usize = 256;
 pub const MAX_CODEX_PERMISSION_REQUESTS_PER_TURN: usize = 256;
+pub const CODEX_PERMISSION_DELIVERY_TIMEOUT: Duration = Duration::from_secs(2);
 const INBOUND_FRAME_QUEUE_CAPACITY: usize = 16;
 const RECEIVE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const IO_POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -71,6 +74,7 @@ struct ActiveTurn {
     command_item_ids: BTreeSet<crate::CodexManagedItemId>,
     permission_requests: BTreeMap<u64, CodexPermissionRequest>,
     permission_item_ids: BTreeSet<crate::CodexManagedItemId>,
+    responded_permission_request_ids: BTreeSet<u64>,
     interrupt_requested: bool,
 }
 
@@ -299,6 +303,7 @@ impl CodexAppServer {
             command_item_ids: BTreeSet::new(),
             permission_requests: BTreeMap::new(),
             permission_item_ids: BTreeSet::new(),
+            responded_permission_request_ids: BTreeSet::new(),
             interrupt_requested: false,
         });
         Ok(started)
@@ -375,6 +380,79 @@ impl CodexAppServer {
             return Ok(observation);
         }
 
+        self.close_with(CodexAppServerError::ObservationFrameLimit)
+    }
+
+    pub fn respond_to_file_change_permission(
+        &mut self,
+        expected_request: &CodexPermissionRequest,
+        decision: CodexPermissionDecision,
+    ) -> Result<CodexPermissionDelivery, CodexAppServerError> {
+        if self
+            .validated_profile
+            .as_ref()
+            .is_none_or(|profile| profile != &crate::validated_codex_0_145_0_fingerprint())
+        {
+            return Err(CodexAppServerError::PermissionResponseUnavailable);
+        }
+        let Some(active) = self.active_turn.as_ref() else {
+            return Err(CodexAppServerError::NoActiveTurn);
+        };
+        if active
+            .responded_permission_request_ids
+            .contains(&expected_request.provider_request_id)
+        {
+            return Err(CodexAppServerError::PermissionAlreadyResponded);
+        }
+        let Some(open_request) = active
+            .permission_requests
+            .get(&expected_request.provider_request_id)
+        else {
+            return Err(CodexAppServerError::PermissionRequestNotOpen);
+        };
+        if open_request != expected_request
+            || active.started.thread_id != expected_request.thread_id
+            || active.started.turn_id != expected_request.turn_id
+        {
+            return Err(CodexAppServerError::PermissionRequestMismatch);
+        }
+        let request = open_request.clone();
+        self.reject_preexisting_permission_resolution(&request, decision)?;
+        let response = codex_file_change_permission_response(&request, decision)
+            .map_err(CodexAppServerError::Contract)?;
+        let deadline = Instant::now() + CODEX_PERMISSION_DELIVERY_TIMEOUT;
+        self.write_frame_until(&response, deadline)?;
+        self.active_turn
+            .as_mut()
+            .ok_or(CodexAppServerError::NoActiveTurn)?
+            .responded_permission_request_ids
+            .insert(request.provider_request_id);
+
+        for _ in 0..MAX_CODEX_OBSERVATION_FRAMES {
+            let frame = self.next_notification_until(deadline)?;
+            let decoded = decode_codex_permission_delivery_notification(&frame, &request, decision);
+            self.release_retained_bytes(frame.len());
+            match decoded {
+                Ok(None | Some(CodexPermissionDeliveryObservation::RequestClosed { .. })) => {}
+                Ok(Some(CodexPermissionDeliveryObservation::Delivered(delivery))) => {
+                    let active = self
+                        .active_turn
+                        .as_mut()
+                        .ok_or(CodexAppServerError::NoActiveTurn)?;
+                    active
+                        .permission_requests
+                        .remove(&request.provider_request_id);
+                    active.permission_item_ids.remove(&request.item_id);
+                    return Ok(delivery);
+                }
+                Ok(Some(CodexPermissionDeliveryObservation::TurnCompleted { .. })) => {
+                    return self.close_with(CodexAppServerError::PermissionDeliveryUnknown);
+                }
+                Err(error) => {
+                    return self.close_with(CodexAppServerError::Contract(error));
+                }
+            }
+        }
         self.close_with(CodexAppServerError::ObservationFrameLimit)
     }
 
@@ -733,6 +811,61 @@ impl CodexAppServer {
                     return self.close_with(CodexAppServerError::Contract(error));
                 }
             }
+        }
+        self.close_with(CodexAppServerError::ObservationFrameLimit)
+    }
+
+    fn reject_preexisting_permission_resolution(
+        &mut self,
+        request: &CodexPermissionRequest,
+        decision: CodexPermissionDecision,
+    ) -> Result<(), CodexAppServerError> {
+        let mut deferred = VecDeque::new();
+        for _ in 0..MAX_CODEX_OBSERVATION_FRAMES {
+            let frame = match self.try_next_notification() {
+                Ok(Some(frame)) => frame,
+                Ok(None) => {
+                    while let Some(frame) = deferred.pop_back() {
+                        self.notifications.push_front(frame);
+                    }
+                    return Ok(());
+                }
+                Err(error) => {
+                    for frame in deferred {
+                        self.release_retained_bytes(frame.len());
+                    }
+                    return Err(error);
+                }
+            };
+            match decode_codex_permission_delivery_notification(&frame, request, decision) {
+                Ok(None) if deferred.len() < MAX_CODEX_PENDING_NOTIFICATIONS => {
+                    deferred.push_back(frame);
+                }
+                Ok(None) => {
+                    self.release_retained_bytes(frame.len());
+                    for deferred_frame in deferred {
+                        self.release_retained_bytes(deferred_frame.len());
+                    }
+                    return self.close_with(CodexAppServerError::NotificationBufferFull);
+                }
+                Ok(Some(_)) => {
+                    self.release_retained_bytes(frame.len());
+                    for deferred_frame in deferred {
+                        self.release_retained_bytes(deferred_frame.len());
+                    }
+                    return self.close_with(CodexAppServerError::PermissionRequestCleared);
+                }
+                Err(error) => {
+                    self.release_retained_bytes(frame.len());
+                    for deferred_frame in deferred {
+                        self.release_retained_bytes(deferred_frame.len());
+                    }
+                    return self.close_with(CodexAppServerError::Contract(error));
+                }
+            }
+        }
+        for frame in deferred {
+            self.release_retained_bytes(frame.len());
         }
         self.close_with(CodexAppServerError::ObservationFrameLimit)
     }
@@ -1176,6 +1309,12 @@ pub enum CodexAppServerError {
     ActiveTurnExists,
     NoActiveTurn,
     InterruptAlreadyRequested,
+    PermissionResponseUnavailable,
+    PermissionRequestNotOpen,
+    PermissionRequestMismatch,
+    PermissionAlreadyResponded,
+    PermissionRequestCleared,
+    PermissionDeliveryUnknown,
     DuplicateTurnObservation,
     CommandObservationLimit,
     ObservationFrameLimit,
@@ -1275,6 +1414,24 @@ impl fmt::Display for CodexAppServerError {
             Self::NoActiveTurn => formatter.write_str("Codex connection has no active turn"),
             Self::InterruptAlreadyRequested => {
                 formatter.write_str("Codex active turn already has an interrupt request")
+            }
+            Self::PermissionResponseUnavailable => {
+                formatter.write_str("Codex permission response is unavailable for this profile")
+            }
+            Self::PermissionRequestNotOpen => {
+                formatter.write_str("Codex permission request is not open")
+            }
+            Self::PermissionRequestMismatch => {
+                formatter.write_str("Codex permission request identity did not match")
+            }
+            Self::PermissionAlreadyResponded => {
+                formatter.write_str("Codex permission request already has a response attempt")
+            }
+            Self::PermissionRequestCleared => {
+                formatter.write_str("Codex permission request cleared before the response attempt")
+            }
+            Self::PermissionDeliveryUnknown => {
+                formatter.write_str("Codex permission response delivery could not be confirmed")
             }
             Self::DuplicateTurnObservation => {
                 formatter.write_str("Codex repeated an exact turn observation")
@@ -1522,6 +1679,298 @@ done
         assert_eq!(server.pending_notification_count(), 0);
         server.shutdown().expect("permission shutdown");
         assert_process_group_gone(&executable);
+    }
+
+    #[test]
+    fn exact_manual_permission_response_is_written_once_and_requires_causal_item() {
+        let _process_guard = test_process_guard();
+        for (label, decision, wire_decision, item_status) in [
+            (
+                "permission-accept",
+                CodexPermissionDecision::Accept,
+                "accept",
+                "completed",
+            ),
+            (
+                "permission-decline",
+                CodexPermissionDecision::Decline,
+                "decline",
+                "declined",
+            ),
+        ] {
+            let directory = TestDirectory::new(label);
+            let executable = directory.0.join("codex");
+            write_script(
+                &executable,
+                &format!(
+                    r#"#!/bin/sh
+printf '%s' "$$" > "$0.pgid"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{{"id":1,"result":{{}}}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"managed-1","sessionId":"managed-1"}},"cwd":"{TEST_CWD}","sandbox":{{"type":"readOnly","networkAccess":false}},"approvalPolicy":"on-request","approvalsReviewer":"user"}}}}' ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{{"id":0,"method":"item/fileChange/requestApproval","params":{{"itemId":"item-permission","startedAtMs":17,"threadId":"managed-1","turnId":"turn-1","reason":null,"grantRoot":null}}}}'
+      printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"turn-1"}}}}}}'
+      ;;
+    *'"decision":"{wire_decision}"'*)
+      printf '%s\n' "$line" >> "$0.responses"
+      printf '%s\n' '{{"method":"serverRequest/resolved","params":{{"requestId":0,"threadId":"managed-1"}}}}'
+      printf '%s\n' '{{"method":"item/completed","params":{{"threadId":"managed-1","turnId":"turn-1","item":{{"id":"item-permission","type":"fileChange","status":"{item_status}"}}}}}}'
+      ;;
+    *'"decision"'*) exit 91 ;;
+  esac
+done
+"#
+                ),
+            );
+            let mut server =
+                connect_manual_fake(&executable, Duration::from_secs(1)).expect("manual handshake");
+            let thread = server.start_manual(TEST_CWD).expect("Manual thread");
+            let started = server
+                .start_turn(&thread.thread.thread_id, "Update one file.")
+                .expect("turn start");
+            let request = match server
+                .wait_for_turn_observation()
+                .expect("permission observation")
+            {
+                CodexTurnObservation::PermissionRequested(request) => request,
+                other => panic!("unexpected observation: {other:?}"),
+            };
+            let mut wrong = request.clone();
+            wrong.item_id = crate::CodexManagedItemId::new("wrong-item").expect("wrong item ID");
+            assert!(matches!(
+                server.respond_to_file_change_permission(&wrong, decision),
+                Err(CodexAppServerError::PermissionRequestMismatch)
+            ));
+            wrong = request.clone();
+            wrong.provider_request_id = 99;
+            assert!(matches!(
+                server.respond_to_file_change_permission(&wrong, decision),
+                Err(CodexAppServerError::PermissionRequestNotOpen)
+            ));
+            assert!(!PathBuf::from(format!("{}.responses", executable.display())).exists());
+
+            let delivered = server
+                .respond_to_file_change_permission(&request, decision)
+                .expect("causal permission delivery");
+            assert_eq!(
+                delivered,
+                CodexPermissionDelivery {
+                    provider_request_id: 0,
+                    thread_id: thread.thread.thread_id,
+                    turn_id: started.turn_id,
+                    item_id: request.item_id.clone(),
+                    decision,
+                }
+            );
+            assert!(matches!(
+                server.respond_to_file_change_permission(&request, decision),
+                Err(CodexAppServerError::PermissionAlreadyResponded)
+            ));
+            let response_lines = fs::read_to_string(format!("{}.responses", executable.display()))
+                .expect("response log");
+            assert_eq!(response_lines.lines().count(), 1);
+            assert!(response_lines.contains(&format!(r#""decision":"{wire_decision}""#)));
+            server.shutdown().expect("permission shutdown");
+            assert_process_group_gone(&executable);
+        }
+    }
+
+    #[test]
+    fn preexisting_permission_resolution_rejects_before_response_write() {
+        let _process_guard = test_process_guard();
+        let directory = TestDirectory::new("permission-precleared");
+        let executable = directory.0.join("codex");
+        write_script(
+            &executable,
+            &format!(
+                r#"#!/bin/sh
+printf '%s' "$$" > "$0.pgid"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{{"id":1,"result":{{}}}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"managed-1","sessionId":"managed-1"}},"cwd":"{TEST_CWD}","sandbox":{{"type":"readOnly","networkAccess":false}},"approvalPolicy":"on-request","approvalsReviewer":"user"}}}}' ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{{"id":0,"method":"item/fileChange/requestApproval","params":{{"itemId":"item-permission","startedAtMs":17,"threadId":"managed-1","turnId":"turn-1","reason":null,"grantRoot":null}}}}'
+      printf '%s\n' '{{"method":"serverRequest/resolved","params":{{"requestId":0,"threadId":"managed-1"}}}}'
+      printf '%s\n' '{{"method":"item/completed","params":{{"threadId":"managed-1","turnId":"turn-1","item":{{"id":"item-permission","type":"fileChange","status":"declined"}}}}}}'
+      printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"turn-1"}}}}}}'
+      ;;
+    *'"decision"'*) printf '%s\n' "$line" >> "$0.responses" ;;
+  esac
+done
+"#
+            ),
+        );
+        let mut server =
+            connect_manual_fake(&executable, Duration::from_secs(1)).expect("manual handshake");
+        let started_thread = server.start_manual(TEST_CWD).expect("Manual thread");
+        server
+            .start_turn(&started_thread.thread.thread_id, "Update one file.")
+            .expect("turn start");
+        let request = match server
+            .wait_for_turn_observation()
+            .expect("permission observation")
+        {
+            CodexTurnObservation::PermissionRequested(request) => request,
+            other => panic!("unexpected observation: {other:?}"),
+        };
+        assert!(matches!(
+            server.respond_to_file_change_permission(&request, CodexPermissionDecision::Decline),
+            Err(CodexAppServerError::PermissionRequestCleared)
+        ));
+        assert!(!PathBuf::from(format!("{}.responses", executable.display())).exists());
+        assert_process_group_gone(&executable);
+    }
+
+    #[test]
+    fn preexisting_permission_scan_preserves_the_notification_count_bound() {
+        let _process_guard = test_process_guard();
+        let directory = TestDirectory::new("permission-preflight-overflow");
+        let executable = directory.0.join("codex");
+        write_script(
+            &executable,
+            &format!(
+                r#"#!/bin/sh
+printf '%s' "$$" > "$0.pgid"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{{"id":1,"result":{{}}}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"managed-1","sessionId":"managed-1"}},"cwd":"{TEST_CWD}","sandbox":{{"type":"readOnly","networkAccess":false}},"approvalPolicy":"on-request","approvalsReviewer":"user"}}}}' ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{{"id":0,"method":"item/fileChange/requestApproval","params":{{"itemId":"item-permission","startedAtMs":17,"threadId":"managed-1","turnId":"turn-1","reason":null,"grantRoot":null}}}}'
+      index=0
+      while [ "$index" -lt 63 ]; do
+        printf '{{"method":"progress","params":{{"index":%s}}}}\n' "$index"
+        index=$((index + 1))
+      done
+      printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"turn-1"}}}}}}'
+      printf '%s\n' '{{"method":"progress","params":{{"index":63}}}}'
+      printf '%s\n' '{{"method":"progress","params":{{"index":64}}}}'
+      ;;
+    *'"decision"'*) printf '%s\n' "$line" >> "$0.responses" ;;
+  esac
+done
+"#
+            ),
+        );
+        let mut server =
+            connect_manual_fake(&executable, Duration::from_secs(1)).expect("manual handshake");
+        let started_thread = server.start_manual(TEST_CWD).expect("Manual thread");
+        server
+            .start_turn(&started_thread.thread.thread_id, "Update one file.")
+            .expect("turn start");
+        let request = match server
+            .wait_for_turn_observation()
+            .expect("permission observation")
+        {
+            CodexTurnObservation::PermissionRequested(request) => request,
+            other => panic!("unexpected observation: {other:?}"),
+        };
+        let expected_retained = (0..65)
+            .map(|index| format!(r#"{{"method":"progress","params":{{"index":{index}}}}}"#).len())
+            .sum::<usize>();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while server.retained_notification_bytes.load(Ordering::Acquire) < expected_retained
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            server.retained_notification_bytes.load(Ordering::Acquire),
+            expected_retained
+        );
+
+        assert!(matches!(
+            server.respond_to_file_change_permission(&request, CodexPermissionDecision::Accept),
+            Err(CodexAppServerError::NotificationBufferFull)
+        ));
+        assert!(!PathBuf::from(format!("{}.responses", executable.display())).exists());
+        assert_eq!(
+            server.retained_notification_bytes.load(Ordering::Acquire),
+            0
+        );
+        assert_process_group_gone(&executable);
+    }
+
+    #[test]
+    fn ambiguous_permission_outcomes_never_become_delivered_or_retryable() {
+        let _process_guard = test_process_guard();
+        for (label, outcome, expected) in [
+            (
+                "permission-terminal-race",
+                r#"printf '%s\n' '{"method":"turn/completed","params":{"threadId":"managed-1","turn":{"id":"turn-1","items":[],"status":"completed"}}}'"#,
+                ErrorKind::PermissionDeliveryUnknown,
+            ),
+            (
+                "permission-wrong-item",
+                r#"printf '%s\n' '{"method":"item/completed","params":{"threadId":"managed-1","turnId":"turn-1","item":{"id":"another-item","type":"fileChange","status":"completed"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"managed-1","turn":{"id":"turn-1","items":[],"status":"completed"}}}'"#,
+                ErrorKind::PermissionDeliveryUnknown,
+            ),
+            (
+                "permission-malformed-item",
+                r#"printf '%s\n' '{"method":"item/completed","params":{"threadId":"managed-1","turnId":"turn-1","item":{"id":"item-permission","type":"fileChange"}}}'"#,
+                ErrorKind::InvalidPermissionOutcome,
+            ),
+            (
+                "permission-closure-only",
+                r#"printf '%s\n' '{"method":"serverRequest/resolved","params":{"requestId":0,"threadId":"managed-1"}}'"#,
+                ErrorKind::TimedOut,
+            ),
+            (
+                "permission-connection-loss",
+                "exit 0",
+                ErrorKind::UnexpectedEof,
+            ),
+        ] {
+            let directory = TestDirectory::new(label);
+            let executable = directory.0.join("codex");
+            write_script(
+                &executable,
+                &format!(
+                    r#"#!/bin/sh
+printf '%s' "$$" > "$0.pgid"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{{"id":1,"result":{{}}}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"managed-1","sessionId":"managed-1"}},"cwd":"{TEST_CWD}","sandbox":{{"type":"readOnly","networkAccess":false}},"approvalPolicy":"on-request","approvalsReviewer":"user"}}}}' ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{{"id":0,"method":"item/fileChange/requestApproval","params":{{"itemId":"item-permission","startedAtMs":17,"threadId":"managed-1","turnId":"turn-1","reason":null,"grantRoot":null}}}}'
+      printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"turn-1"}}}}}}'
+      ;;
+    *'"decision":"accept"'*)
+      printf '%s\n' "$line" >> "$0.responses"
+      {outcome}
+      ;;
+  esac
+done
+"#
+                ),
+            );
+            let mut server =
+                connect_manual_fake(&executable, Duration::from_secs(1)).expect("manual handshake");
+            let thread = server.start_manual(TEST_CWD).expect("Manual thread");
+            server
+                .start_turn(&thread.thread.thread_id, "Update one file.")
+                .expect("turn start");
+            let request = match server
+                .wait_for_turn_observation()
+                .expect("permission observation")
+            {
+                CodexTurnObservation::PermissionRequested(request) => request,
+                other => panic!("unexpected observation: {other:?}"),
+            };
+            let error = server
+                .respond_to_file_change_permission(&request, CodexPermissionDecision::Accept)
+                .expect_err("ambiguous outcome");
+            assert!(expected.matches(&error), "{label}: {error:?}");
+            let response_lines = fs::read_to_string(format!("{}.responses", executable.display()))
+                .expect("one response log");
+            assert_eq!(response_lines.lines().count(), 1);
+            assert_process_group_gone(&executable);
+        }
     }
 
     #[test]
@@ -2541,6 +2990,15 @@ exit 9
         )
     }
 
+    fn connect_manual_fake(
+        executable: &Path,
+        timeout: Duration,
+    ) -> Result<CodexAppServer, CodexAppServerError> {
+        let mut server = connect_fake(executable, timeout)?;
+        server.validated_profile = Some(crate::validated_codex_0_145_0_fingerprint());
+        Ok(server)
+    }
+
     fn test_process_guard() -> std::sync::MutexGuard<'static, ()> {
         crate::process::TEST_PROCESS_LOCK
             .lock()
@@ -2609,6 +3067,8 @@ exit 9
         ObservationFrameLimit,
         UnexpectedThreadId,
         InvalidThreadDeletedNotification,
+        PermissionDeliveryUnknown,
+        InvalidPermissionOutcome,
     }
 
     impl ErrorKind {
@@ -2631,8 +3091,18 @@ exit 9
                 | (Self::CommandObservationLimit, CodexAppServerError::CommandObservationLimit)
                 | (Self::ObservationFrameLimit, CodexAppServerError::ObservationFrameLimit)
                 | (
+                    Self::PermissionDeliveryUnknown,
+                    CodexAppServerError::PermissionDeliveryUnknown,
+                )
+                | (
                     Self::UnexpectedThreadId,
                     CodexAppServerError::Contract(CodexContractError::UnexpectedThreadId),
+                )
+                | (
+                    Self::InvalidPermissionOutcome,
+                    CodexAppServerError::Contract(CodexContractError::InvalidField {
+                        field: "status",
+                    }),
                 )
                 | (
                     Self::InvalidThreadDeletedNotification,

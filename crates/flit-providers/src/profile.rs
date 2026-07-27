@@ -82,7 +82,7 @@ mod tests {
         assert!(lines.windows(2).all(|pair| pair[0] < pair[1]));
 
         let fixtures = std::str::from_utf8(CODEX_0_145_0_CONTRACT_FIXTURES).expect("UTF-8");
-        assert_eq!(fixtures.lines().count(), 9);
+        assert_eq!(fixtures.lines().count(), 12);
         for line in fixtures.lines() {
             let value: serde_json::Value = serde_json::from_str(line).expect("valid JSON");
             assert!(value["fixture"].is_string());
