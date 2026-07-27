@@ -11,10 +11,13 @@ use flit_protocol::{
 };
 use flit_store::{
     AppendEventOutcome, InitialManagedSessionConnection, InitialManagedSessionOutcome,
-    MAX_LIVE_MANAGED_SESSIONS, ManagedProviderObservation, ManagedProviderObservationKind,
-    ManagedReconciliationState, ManagedRunIntent, ManagedRunIntentOutcome, ManagedRunStartFailure,
-    ManagedRunStartFailureOutcome, ManagedSessionReconciliation,
-    ManagedSessionReconciliationOutcome, ManagedSessionTermination,
+    MAX_LIVE_MANAGED_SESSIONS, ManagedPermissionDecision, ManagedPermissionDeliveryUnknownReason,
+    ManagedPermissionResolutionKind, ManagedPermissionResponseAttempt,
+    ManagedPermissionResponseAttemptOutcome, ManagedPermissionResponseResult,
+    ManagedPermissionResponseResultKind, ManagedProviderObservation,
+    ManagedProviderObservationKind, ManagedReconciliationState, ManagedRunIntent,
+    ManagedRunIntentOutcome, ManagedRunStartFailure, ManagedRunStartFailureOutcome,
+    ManagedSessionReconciliation, ManagedSessionReconciliationOutcome, ManagedSessionTermination,
     ManagedSessionTerminationOutcome, ManagedTurnTerminalOutcome, ProjectRegistration,
     ProjectTrustConfirmation, Store, StoreError,
 };
@@ -453,6 +456,350 @@ fn managed_provider_observations_are_exact_ordered_idempotent_and_content_safe()
             .expect("terminal duplicate"),
         AppendEventOutcome::Duplicate(_)
     ));
+}
+
+#[test]
+fn managed_permission_response_attempt_and_resolution_are_exact_durable_and_idempotent() {
+    let directory = TestDirectory::new("permission-response-resolved");
+    let (mut store, database, project_path) = trusted_store(&directory);
+    let request = open_permission_request(&mut store, &project_path);
+    assert_eq!(request.ingest_seq, 4);
+
+    let attempt = permission_attempt(&request, "attempt-1", ManagedPermissionDecision::AllowOnce);
+    let submitted = match store
+        .submit_managed_permission_response(attempt.clone())
+        .expect("submit exact response")
+    {
+        ManagedPermissionResponseAttemptOutcome::Submitted { event } => event,
+        other => panic!("unexpected response attempt outcome: {other:?}"),
+    };
+    assert_eq!(submitted.event_type, "permission.response_submitted");
+    assert_eq!(submitted.stream_seq, 3);
+    assert_eq!(submitted.payload["request_version"], 4);
+    assert_eq!(submitted.payload["decision"], "allow_once");
+    assert_eq!(submitted.payload["response_attempt_id"], "attempt-1");
+    assert_eq!(
+        submitted.payload["delivery_plan_fingerprint"],
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+    assert!(submitted.evidence_ids.is_empty());
+
+    assert!(matches!(
+        store
+            .submit_managed_permission_response(attempt.clone())
+            .expect("duplicate response attempt"),
+        ManagedPermissionResponseAttemptOutcome::Duplicate {
+            ref event,
+            terminal_event: None,
+        } if event == &submitted
+    ));
+
+    let result = permission_result(
+        &attempt,
+        "event-permission-resolved",
+        ManagedPermissionResponseResultKind::Resolved(
+            ManagedPermissionResolutionKind::AcceptedCompleted,
+        ),
+    );
+    let resolved = match store
+        .finish_managed_permission_response(result.clone())
+        .expect("resolve exact response")
+    {
+        AppendEventOutcome::Inserted(event) => event,
+        other => panic!("unexpected response result: {other:?}"),
+    };
+    assert_eq!(resolved.event_type, "permission.resolved");
+    assert_eq!(resolved.stream_seq, 4);
+    assert_eq!(
+        resolved.payload["causal_item_outcome"],
+        "accepted_completed"
+    );
+    assert_eq!(resolved.payload["response_attempt_id"], "attempt-1");
+    assert!(resolved.evidence_ids.is_empty());
+    let rendered = serde_json::to_string(&[&submitted, &resolved]).expect("event JSON");
+    for raw in [
+        "sensitive reason",
+        "secret command",
+        "/private/secret",
+        "Respond with the requested result.",
+    ] {
+        assert!(!rendered.contains(raw));
+    }
+
+    assert!(matches!(
+        store
+            .finish_managed_permission_response(result)
+            .expect("duplicate response result"),
+        AppendEventOutcome::Duplicate(ref event) if event == &resolved
+    ));
+    assert!(matches!(
+        store
+            .submit_managed_permission_response(attempt)
+            .expect("duplicate attempt after resolution"),
+        ManagedPermissionResponseAttemptOutcome::Duplicate {
+            ref event,
+            terminal_event: Some(ref terminal),
+        } if event == &submitted && terminal.as_ref() == &resolved
+    ));
+    assert_eq!(store.latest_ingest_seq().expect("stable event cursor"), 6);
+
+    drop(store);
+    let reopened = Store::open(&database, ENDED_AT).expect("reopen Store");
+    let events = reopened
+        .run_events_through("run-1", 0, 6, 10)
+        .expect("reopened events");
+    assert_eq!(
+        events
+            .events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "run.created",
+            "run.start_requested",
+            "session.connected",
+            "permission.requested",
+            "permission.response_submitted",
+            "permission.resolved",
+        ]
+    );
+}
+
+#[test]
+fn managed_permission_response_rejects_stale_wrong_and_second_attempts_without_mutation() {
+    let directory = TestDirectory::new("permission-response-conflicts");
+    let (mut store, database, project_path) = trusted_store(&directory);
+    let request = open_permission_request(&mut store, &project_path);
+    let attempt = permission_attempt(&request, "attempt-1", ManagedPermissionDecision::Deny);
+
+    let mut wrong = attempt.clone();
+    wrong.provider_item_id = "wrong-item".to_owned();
+    assert!(matches!(
+        store.submit_managed_permission_response(wrong),
+        Err(StoreError::ManagedPermissionRequestMismatch { .. })
+    ));
+    let mut stale = attempt.clone();
+    stale.request_version = 3;
+    assert!(matches!(
+        store.submit_managed_permission_response(stale),
+        Err(StoreError::ManagedPermissionRequestMismatch { .. })
+    ));
+    let mut missing = attempt.clone();
+    missing.request_version = 99;
+    assert!(matches!(
+        store.submit_managed_permission_response(missing),
+        Err(StoreError::ManagedPermissionRequestStale { .. })
+    ));
+    assert_eq!(store.latest_ingest_seq().expect("unchanged cursor"), 4);
+
+    store
+        .submit_managed_permission_response(attempt.clone())
+        .expect("first response attempt");
+    drop(store);
+    let mut store = Store::open(&database, ENDED_AT).expect("reopen pending attempt");
+    assert!(matches!(
+        store
+            .submit_managed_permission_response(attempt.clone())
+            .expect("pending duplicate after restart"),
+        ManagedPermissionResponseAttemptOutcome::Duplicate {
+            terminal_event: None,
+            ..
+        }
+    ));
+    let mut second = attempt.clone();
+    second.response_attempt_id = "attempt-2".to_owned();
+    second.submitted_event_id = "event-response-submitted-2".to_owned();
+    assert!(matches!(
+        store.submit_managed_permission_response(second),
+        Err(StoreError::ManagedPermissionResponseConflict { .. })
+    ));
+
+    let wrong_outcome = permission_result(
+        &attempt,
+        "event-permission-resolved",
+        ManagedPermissionResponseResultKind::Resolved(
+            ManagedPermissionResolutionKind::AcceptedCompleted,
+        ),
+    );
+    assert!(matches!(
+        store.finish_managed_permission_response(wrong_outcome),
+        Err(StoreError::InvalidManagedPermissionResponse { field: "kind" })
+    ));
+    let unknown = permission_result(
+        &attempt,
+        "event-permission-unknown",
+        ManagedPermissionResponseResultKind::DeliveryUnknown(
+            ManagedPermissionDeliveryUnknownReason::ProviderOutcomeAmbiguous,
+        ),
+    );
+    store
+        .finish_managed_permission_response(unknown)
+        .expect("record delivery unknown");
+    let events = store
+        .run_events_through("run-1", 0, 6, 10)
+        .expect("delivery unknown events");
+    assert_eq!(
+        events.events[5].payload["delivery_plan_fingerprint"],
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+    let resolved_after_unknown = permission_result(
+        &attempt,
+        "event-permission-resolved-late",
+        ManagedPermissionResponseResultKind::Resolved(ManagedPermissionResolutionKind::Declined),
+    );
+    assert!(matches!(
+        store.finish_managed_permission_response(resolved_after_unknown),
+        Err(StoreError::ManagedPermissionResponseConflict { .. })
+    ));
+    assert_eq!(
+        store.latest_ingest_seq().expect("one attempt and outcome"),
+        6
+    );
+}
+
+#[test]
+fn managed_permission_response_lookup_stays_exact_after_large_unrelated_history() {
+    let directory = TestDirectory::new("permission-response-history");
+    let (mut store, _database, project_path) = trusted_store(&directory);
+    store
+        .create_managed_run_intent(run_intent(
+            "run-1",
+            "event-run-created",
+            "event-start-requested",
+        ))
+        .expect("managed Run");
+    store
+        .connect_initial_managed_session(session_connection(
+            "session-1",
+            "run-1",
+            "thread-1",
+            &project_path,
+        ))
+        .expect("managed session");
+
+    for index in 0_u64..128 {
+        let request = append_permission_request(&mut store, index);
+        let attempt = indexed_permission_attempt(&request, index);
+        store
+            .submit_managed_permission_response(attempt.clone())
+            .expect("historical response attempt");
+        store
+            .finish_managed_permission_response(permission_result(
+                &attempt,
+                &format!("event-permission-unknown-{index}"),
+                ManagedPermissionResponseResultKind::DeliveryUnknown(
+                    ManagedPermissionDeliveryUnknownReason::ProviderOutcomeAmbiguous,
+                ),
+            ))
+            .expect("historical delivery unknown");
+    }
+
+    let current_request = append_permission_request(&mut store, 128);
+    let current_attempt = indexed_permission_attempt(&current_request, 128);
+    let current = store
+        .submit_managed_permission_response(current_attempt.clone())
+        .expect("current response attempt after history");
+    assert!(matches!(
+        current,
+        ManagedPermissionResponseAttemptOutcome::Submitted { ref event }
+            if event.payload["request_id"] == "request-permission-128"
+    ));
+    assert!(matches!(
+        store
+            .submit_managed_permission_response(current_attempt.clone())
+            .expect("exact current duplicate"),
+        ManagedPermissionResponseAttemptOutcome::Duplicate {
+            terminal_event: None,
+            ..
+        }
+    ));
+    append_permission_request(&mut store, 129);
+    assert!(matches!(
+        store.finish_managed_permission_response(permission_result(
+            &current_attempt,
+            "event-late-current-outcome",
+            ManagedPermissionResponseResultKind::DeliveryUnknown(
+                ManagedPermissionDeliveryUnknownReason::ProviderOutcomeAmbiguous,
+            ),
+        )),
+        Err(StoreError::ManagedPermissionRequestStale { .. })
+    ));
+    assert_eq!(
+        store.latest_ingest_seq().expect("large history cursor"),
+        3 + (128 * 3) + 3
+    );
+}
+
+#[test]
+fn managed_permission_response_requires_submit_and_a_live_current_request() {
+    let directory = TestDirectory::new("permission-response-live");
+    let (mut store, _database, project_path) = trusted_store(&directory);
+    let request = open_permission_request(&mut store, &project_path);
+    let attempt = permission_attempt(&request, "attempt-1", ManagedPermissionDecision::Deny);
+    let result = permission_result(
+        &attempt,
+        "event-permission-unknown",
+        ManagedPermissionResponseResultKind::DeliveryUnknown(
+            ManagedPermissionDeliveryUnknownReason::CoreRestartedAfterSubmit,
+        ),
+    );
+    assert!(matches!(
+        store.finish_managed_permission_response(result),
+        Err(StoreError::ManagedPermissionResponseNotSubmitted { .. })
+    ));
+
+    store
+        .append_managed_provider_observation(ManagedProviderObservation {
+            run_id: "run-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            external_session_key: "thread-1".to_owned(),
+            provider_turn_id: "turn-1".to_owned(),
+            contract_version: "codex-app-server/0.145.0".to_owned(),
+            event_id: "event-terminal".to_owned(),
+            observed_at: ENDED_AT.to_owned(),
+            kind: ManagedProviderObservationKind::TurnCompleted,
+        })
+        .expect("terminal observation");
+    assert!(matches!(
+        store.submit_managed_permission_response(attempt),
+        Err(StoreError::ManagedPermissionRequestStale { .. }
+            | StoreError::ManagedSessionNotLive { .. })
+    ));
+    assert_eq!(store.latest_ingest_seq().expect("terminal cursor"), 5);
+
+    let newer_directory = TestDirectory::new("permission-response-newer-request");
+    let (mut newer_store, _database, newer_project_path) = trusted_store(&newer_directory);
+    let first_request = open_permission_request(&mut newer_store, &newer_project_path);
+    let first_attempt = permission_attempt(
+        &first_request,
+        "attempt-old",
+        ManagedPermissionDecision::Deny,
+    );
+    newer_store
+        .append_managed_provider_observation(ManagedProviderObservation {
+            run_id: "run-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            external_session_key: "thread-1".to_owned(),
+            provider_turn_id: "turn-1".to_owned(),
+            contract_version: "codex-app-server/0.145.0".to_owned(),
+            event_id: "event-permission-requested-new".to_owned(),
+            observed_at: "2026-07-24T10:00:02Z".to_owned(),
+            kind: ManagedProviderObservationKind::PermissionRequested {
+                request_id: "request-permission-new".to_owned(),
+                provider_request_id: 18,
+                provider_item_id: "permission-item-new".to_owned(),
+                provider_started_at_ms: 43,
+            },
+        })
+        .expect("newer permission request");
+    assert!(matches!(
+        newer_store.submit_managed_permission_response(first_attempt),
+        Err(StoreError::ManagedPermissionRequestStale { .. })
+    ));
+    assert_eq!(
+        newer_store.latest_ingest_seq().expect("new request cursor"),
+        5
+    );
 }
 
 #[test]
@@ -1517,6 +1864,142 @@ fn trusted_store(directory: &TestDirectory) -> (Store, PathBuf, PathBuf) {
         .expect("Project")
         .canonical_path;
     (store, database, canonical_project_path)
+}
+
+fn open_permission_request(store: &mut Store, project_path: &Path) -> flit_protocol::EventEnvelope {
+    store
+        .create_managed_run_intent(run_intent(
+            "run-1",
+            "event-run-created",
+            "event-start-requested",
+        ))
+        .expect("managed Run");
+    store
+        .connect_initial_managed_session(session_connection(
+            "session-1",
+            "run-1",
+            "thread-1",
+            project_path,
+        ))
+        .expect("managed session");
+    match store
+        .append_managed_provider_observation(ManagedProviderObservation {
+            run_id: "run-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            external_session_key: "thread-1".to_owned(),
+            provider_turn_id: "turn-1".to_owned(),
+            contract_version: "codex-app-server/0.145.0".to_owned(),
+            event_id: "event-permission-requested".to_owned(),
+            observed_at: STARTED_AT.to_owned(),
+            kind: ManagedProviderObservationKind::PermissionRequested {
+                request_id: "request-permission".to_owned(),
+                provider_request_id: 17,
+                provider_item_id: "permission-item".to_owned(),
+                provider_started_at_ms: 42,
+            },
+        })
+        .expect("permission request")
+    {
+        AppendEventOutcome::Inserted(event) => event,
+        other => panic!("unexpected permission request: {other:?}"),
+    }
+}
+
+fn permission_attempt(
+    request: &flit_protocol::EventEnvelope,
+    response_attempt_id: &str,
+    decision: ManagedPermissionDecision,
+) -> ManagedPermissionResponseAttempt {
+    ManagedPermissionResponseAttempt {
+        run_id: "run-1".to_owned(),
+        session_id: "session-1".to_owned(),
+        external_session_key: "thread-1".to_owned(),
+        provider_turn_id: "turn-1".to_owned(),
+        provider_item_id: "permission-item".to_owned(),
+        provider_request_id: 17,
+        request_id: "request-permission".to_owned(),
+        request_version: request.ingest_seq,
+        request_event_id: request.event_id.clone(),
+        response_attempt_id: response_attempt_id.to_owned(),
+        decision,
+        delivery_plan_fingerprint:
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        contract_version: "codex-app-server/0.145.0".to_owned(),
+        submitted_at: "2026-07-24T10:00:02Z".to_owned(),
+        submitted_event_id: format!("event-response-submitted-{response_attempt_id}"),
+    }
+}
+
+fn append_permission_request(store: &mut Store, index: u64) -> flit_protocol::EventEnvelope {
+    match store
+        .append_managed_provider_observation(ManagedProviderObservation {
+            run_id: "run-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            external_session_key: "thread-1".to_owned(),
+            provider_turn_id: "turn-1".to_owned(),
+            contract_version: "codex-app-server/0.145.0".to_owned(),
+            event_id: format!("event-permission-requested-{index}"),
+            observed_at: STARTED_AT.to_owned(),
+            kind: ManagedProviderObservationKind::PermissionRequested {
+                request_id: format!("request-permission-{index}"),
+                provider_request_id: index,
+                provider_item_id: format!("permission-item-{index}"),
+                provider_started_at_ms: index,
+            },
+        })
+        .expect("indexed permission request")
+    {
+        AppendEventOutcome::Inserted(event) => event,
+        other => panic!("unexpected indexed request: {other:?}"),
+    }
+}
+
+fn indexed_permission_attempt(
+    request: &flit_protocol::EventEnvelope,
+    index: u64,
+) -> ManagedPermissionResponseAttempt {
+    ManagedPermissionResponseAttempt {
+        run_id: "run-1".to_owned(),
+        session_id: "session-1".to_owned(),
+        external_session_key: "thread-1".to_owned(),
+        provider_turn_id: "turn-1".to_owned(),
+        provider_item_id: format!("permission-item-{index}"),
+        provider_request_id: index,
+        request_id: format!("request-permission-{index}"),
+        request_version: request.ingest_seq,
+        request_event_id: request.event_id.clone(),
+        response_attempt_id: format!("attempt-{index}"),
+        decision: ManagedPermissionDecision::Deny,
+        delivery_plan_fingerprint:
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        contract_version: "codex-app-server/0.145.0".to_owned(),
+        submitted_at: "2026-07-24T10:00:02Z".to_owned(),
+        submitted_event_id: format!("event-response-submitted-{index}"),
+    }
+}
+
+fn permission_result(
+    attempt: &ManagedPermissionResponseAttempt,
+    outcome_event_id: &str,
+    kind: ManagedPermissionResponseResultKind,
+) -> ManagedPermissionResponseResult {
+    ManagedPermissionResponseResult {
+        run_id: attempt.run_id.clone(),
+        session_id: attempt.session_id.clone(),
+        external_session_key: attempt.external_session_key.clone(),
+        provider_turn_id: attempt.provider_turn_id.clone(),
+        provider_item_id: attempt.provider_item_id.clone(),
+        provider_request_id: attempt.provider_request_id,
+        request_id: attempt.request_id.clone(),
+        request_version: attempt.request_version,
+        response_attempt_id: attempt.response_attempt_id.clone(),
+        decision: attempt.decision,
+        delivery_plan_fingerprint: attempt.delivery_plan_fingerprint.clone(),
+        contract_version: attempt.contract_version.clone(),
+        finished_at: "2026-07-24T10:00:03Z".to_owned(),
+        outcome_event_id: outcome_event_id.to_owned(),
+        kind,
+    }
 }
 
 fn register_project(store: &mut Store, path: &Path, project_id: &str) {

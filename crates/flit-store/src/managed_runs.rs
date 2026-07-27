@@ -150,6 +150,106 @@ pub struct ManagedProviderObservation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedPermissionDecision {
+    AllowOnce,
+    Deny,
+}
+
+impl ManagedPermissionDecision {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::AllowOnce => "allow_once",
+            Self::Deny => "deny",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedPermissionResponseAttempt {
+    pub run_id: String,
+    pub session_id: String,
+    pub external_session_key: String,
+    pub provider_turn_id: String,
+    pub provider_item_id: String,
+    pub provider_request_id: u64,
+    pub request_id: String,
+    pub request_version: u64,
+    pub request_event_id: String,
+    pub response_attempt_id: String,
+    pub decision: ManagedPermissionDecision,
+    pub delivery_plan_fingerprint: String,
+    pub contract_version: String,
+    pub submitted_at: String,
+    pub submitted_event_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ManagedPermissionResponseAttemptOutcome {
+    Submitted {
+        event: EventEnvelope,
+    },
+    Duplicate {
+        event: EventEnvelope,
+        terminal_event: Option<Box<EventEnvelope>>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedPermissionResolutionKind {
+    AcceptedCompleted,
+    Declined,
+}
+
+impl ManagedPermissionResolutionKind {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::AcceptedCompleted => "accepted_completed",
+            Self::Declined => "declined",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedPermissionDeliveryUnknownReason {
+    ProviderOutcomeAmbiguous,
+    CoreRestartedAfterSubmit,
+}
+
+impl ManagedPermissionDeliveryUnknownReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderOutcomeAmbiguous => "provider_outcome_ambiguous",
+            Self::CoreRestartedAfterSubmit => "core_restarted_after_submit",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedPermissionResponseResultKind {
+    Resolved(ManagedPermissionResolutionKind),
+    DeliveryUnknown(ManagedPermissionDeliveryUnknownReason),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedPermissionResponseResult {
+    pub run_id: String,
+    pub session_id: String,
+    pub external_session_key: String,
+    pub provider_turn_id: String,
+    pub provider_item_id: String,
+    pub provider_request_id: u64,
+    pub request_id: String,
+    pub request_version: u64,
+    pub response_attempt_id: String,
+    pub decision: ManagedPermissionDecision,
+    pub delivery_plan_fingerprint: String,
+    pub contract_version: String,
+    pub finished_at: String,
+    pub outcome_event_id: String,
+    pub kind: ManagedPermissionResponseResultKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManagedTurnTerminalOutcome {
     Completed,
     Interrupted,
@@ -366,6 +466,88 @@ pub(crate) fn validate_provider_observation(
     }
 }
 
+pub(crate) fn validate_permission_response_attempt(
+    attempt: &ManagedPermissionResponseAttempt,
+) -> Result<(), &'static str> {
+    for (field, value) in [
+        ("run_id", attempt.run_id.as_str()),
+        ("session_id", attempt.session_id.as_str()),
+        (
+            "external_session_key",
+            attempt.external_session_key.as_str(),
+        ),
+        ("provider_turn_id", attempt.provider_turn_id.as_str()),
+        ("provider_item_id", attempt.provider_item_id.as_str()),
+        ("request_id", attempt.request_id.as_str()),
+        ("request_event_id", attempt.request_event_id.as_str()),
+        ("response_attempt_id", attempt.response_attempt_id.as_str()),
+        ("contract_version", attempt.contract_version.as_str()),
+        ("submitted_event_id", attempt.submitted_event_id.as_str()),
+    ] {
+        validate_id(value).map_err(|()| field)?;
+    }
+    if attempt.provider_request_id > flit_protocol::MAX_JSON_SAFE_INTEGER {
+        return Err("provider_request_id");
+    }
+    if attempt.request_version == 0
+        || attempt.request_version > flit_protocol::MAX_JSON_SAFE_INTEGER
+    {
+        return Err("request_version");
+    }
+    validate_sha256(&attempt.delivery_plan_fingerprint)
+        .map_err(|()| "delivery_plan_fingerprint")?;
+    validate_timestamp(&attempt.submitted_at).map_err(|()| "submitted_at")
+}
+
+pub(crate) fn validate_permission_response_result(
+    result: &ManagedPermissionResponseResult,
+) -> Result<(), &'static str> {
+    for (field, value) in [
+        ("run_id", result.run_id.as_str()),
+        ("session_id", result.session_id.as_str()),
+        ("external_session_key", result.external_session_key.as_str()),
+        ("provider_turn_id", result.provider_turn_id.as_str()),
+        ("provider_item_id", result.provider_item_id.as_str()),
+        ("request_id", result.request_id.as_str()),
+        ("response_attempt_id", result.response_attempt_id.as_str()),
+        ("contract_version", result.contract_version.as_str()),
+        ("outcome_event_id", result.outcome_event_id.as_str()),
+    ] {
+        validate_id(value).map_err(|()| field)?;
+    }
+    if result.provider_request_id > flit_protocol::MAX_JSON_SAFE_INTEGER {
+        return Err("provider_request_id");
+    }
+    if result.request_version == 0 || result.request_version > flit_protocol::MAX_JSON_SAFE_INTEGER
+    {
+        return Err("request_version");
+    }
+    validate_sha256(&result.delivery_plan_fingerprint).map_err(|()| "delivery_plan_fingerprint")?;
+    validate_timestamp(&result.finished_at).map_err(|()| "finished_at")?;
+    match (result.decision, result.kind) {
+        (
+            ManagedPermissionDecision::AllowOnce,
+            ManagedPermissionResponseResultKind::Resolved(
+                ManagedPermissionResolutionKind::AcceptedCompleted,
+            ),
+        )
+        | (
+            ManagedPermissionDecision::Deny,
+            ManagedPermissionResponseResultKind::Resolved(
+                ManagedPermissionResolutionKind::Declined,
+            ),
+        )
+        | (
+            _,
+            ManagedPermissionResponseResultKind::DeliveryUnknown(
+                ManagedPermissionDeliveryUnknownReason::ProviderOutcomeAmbiguous
+                | ManagedPermissionDeliveryUnknownReason::CoreRestartedAfterSubmit,
+            ),
+        ) => Ok(()),
+        _ => Err("kind"),
+    }
+}
+
 pub(crate) fn validate_session_termination(
     termination: &ManagedSessionTermination,
 ) -> Result<(), &'static str> {
@@ -513,6 +695,17 @@ fn validate_token(value: &str, max_bytes: usize) -> Result<(), ()> {
 
 fn validate_text(value: &str, max_bytes: usize) -> Result<(), ()> {
     if value.trim().is_empty() || value.len() > max_bytes || value.contains('\0') {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn validate_sha256(value: &str) -> Result<(), ()> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
         return Err(());
     }
     Ok(())
