@@ -7,9 +7,10 @@ use flit_providers::{
     CodexTurnObservation, CodexTurnTerminalOutcome, MAX_CODEX_APP_SERVER_FRAME_BYTES,
     MAX_CODEX_MANAGED_THREADS, MAX_CODEX_TURN_PROMPT_BYTES, codex_file_change_permission_response,
     codex_initialize_request, codex_initialized_notification, codex_manual_start_request,
-    codex_read_only_start_request, codex_read_request, codex_thread_delete_request,
-    codex_thread_list_request, codex_turn_interrupt_request, codex_turn_start_request,
-    decode_codex_manual_start_response, decode_codex_permission_delivery_notification,
+    codex_provider_auto_start_request, codex_read_only_start_request, codex_read_request,
+    codex_thread_delete_request, codex_thread_list_request, codex_turn_interrupt_request,
+    codex_turn_start_request, decode_codex_manual_start_response,
+    decode_codex_permission_delivery_notification, decode_codex_provider_auto_start_response,
     decode_codex_read_response, decode_codex_start_response, decode_codex_thread_delete_response,
     decode_codex_thread_deleted_notification, decode_codex_thread_list_response,
     decode_codex_turn_interrupt_response, decode_codex_turn_notification,
@@ -105,6 +106,84 @@ fn manual_start_requires_the_exact_effective_policy_receipt() {
     assert_eq!(
         decode_codex_manual_start_response(&json_bytes(&network), 2, CWD),
         Err(CodexContractError::UnexpectedEffectivePolicy)
+    );
+}
+
+#[test]
+fn provider_auto_start_and_outcome_require_exact_native_identity_and_causality() {
+    let request: Value =
+        serde_json::from_slice(&codex_provider_auto_start_request(2, CWD).expect("auto request"))
+            .expect("JSON");
+    let mut expected_request = manual_fixture_message("provider-auto-start-request");
+    replace_placeholders(&mut expected_request, "<synthetic-repo>", CWD);
+    assert_eq!(request, expected_request);
+
+    let mut response = manual_fixture_message("provider-auto-start-response");
+    replace_placeholders(&mut response, "<synthetic-repo>", CWD);
+    replace_placeholders(&mut response, "<thread-id>", "managed-1");
+    let started = decode_codex_provider_auto_start_response(&json_bytes(&response), 2, CWD)
+        .expect("exact ProviderAuto receipt");
+    assert_eq!(started.thread.thread_id, thread_id("managed-1"));
+    assert_eq!(
+        started.provider_configuration,
+        "readOnly+on-request+auto_review"
+    );
+
+    let expected_thread = thread_id("managed-1");
+    let expected_turn = turn_id("turn-1");
+    let cases = [
+        (
+            "provider-auto-review-started",
+            CodexTurnObservation::ProviderAutoReviewStarted {
+                thread_id: expected_thread.clone(),
+                turn_id: expected_turn.clone(),
+                review_id: flit_providers::CodexManagedItemId::new("review-1").expect("review ID"),
+                target_item_id: flit_providers::CodexManagedItemId::new("item-1").expect("item ID"),
+            },
+        ),
+        (
+            "provider-auto-review-completed",
+            CodexTurnObservation::ProviderAutoReviewCompleted {
+                thread_id: expected_thread.clone(),
+                turn_id: expected_turn.clone(),
+                review_id: flit_providers::CodexManagedItemId::new("review-1").expect("review ID"),
+                target_item_id: flit_providers::CodexManagedItemId::new("item-1").expect("item ID"),
+            },
+        ),
+        (
+            "provider-auto-file-change-completed",
+            CodexTurnObservation::FileChangeCompleted {
+                thread_id: expected_thread.clone(),
+                turn_id: expected_turn.clone(),
+                item_id: flit_providers::CodexManagedItemId::new("item-1").expect("item ID"),
+            },
+        ),
+    ];
+    for (name, expected) in cases {
+        let mut notification = manual_fixture_message(name);
+        replace_placeholders(&mut notification, "<thread-id>", "managed-1");
+        replace_placeholders(&mut notification, "<turn-id>", "turn-1");
+        replace_placeholders(&mut notification, "<review-id>", "review-1");
+        replace_placeholders(&mut notification, "<item-id>", "item-1");
+        assert_eq!(
+            decode_codex_turn_notification(
+                &json_bytes(&notification),
+                &expected_thread,
+                &expected_turn,
+            ),
+            Ok(Some(expected))
+        );
+    }
+
+    let mut malformed = manual_fixture_message("provider-auto-review-completed");
+    replace_placeholders(&mut malformed, "<thread-id>", "managed-1");
+    replace_placeholders(&mut malformed, "<turn-id>", "turn-1");
+    replace_placeholders(&mut malformed, "<review-id>", "review-1");
+    replace_placeholders(&mut malformed, "<item-id>", "item-1");
+    malformed["params"]["review"]["status"] = json!("denied");
+    assert_eq!(
+        decode_codex_turn_notification(&json_bytes(&malformed), &expected_thread, &expected_turn,),
+        Err(CodexContractError::UnexpectedProviderAutoOutcome)
     );
 }
 
@@ -426,7 +505,7 @@ fn selected_turn_notifications_require_exact_identity_and_variant() {
         }))
     );
 
-    let unselected = json!({"method": "item/completed", "params": {}});
+    let unselected = json!({"method": "item/progress", "params": {}});
     assert_eq!(
         decode_codex_turn_notification(&json_bytes(&unselected), &expected_thread, &expected_turn),
         Ok(None)

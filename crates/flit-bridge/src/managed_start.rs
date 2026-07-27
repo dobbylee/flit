@@ -728,6 +728,12 @@ pub(crate) fn commit_managed_observation(
             });
             Ok(ManagedObservationCommit::Complete(Box::new(response)))
         }
+        CodexTurnObservation::ProviderAutoReviewStarted { .. }
+        | CodexTurnObservation::ProviderAutoReviewCompleted { .. }
+        | CodexTurnObservation::FileChangeCompleted { .. }
+        | CodexTurnObservation::ProviderAutoOutcome { .. } => {
+            Err(ManagedStartError::ProviderObservationUnknown)
+        }
         CodexTurnObservation::Terminal {
             thread_id,
             turn_id,

@@ -118,6 +118,12 @@ pub struct CodexManualStartedThread {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodexProviderAutoStartedThread {
+    pub thread: CodexStartedThread,
+    pub provider_configuration: &'static str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodexDeletedThread {
     pub thread_id: CodexManagedThreadId,
 }
@@ -217,6 +223,29 @@ pub enum CodexTurnObservation {
         turn_id: CodexManagedTurnId,
         item_id: CodexManagedItemId,
     },
+    ProviderAutoReviewStarted {
+        thread_id: CodexManagedThreadId,
+        turn_id: CodexManagedTurnId,
+        review_id: CodexManagedItemId,
+        target_item_id: CodexManagedItemId,
+    },
+    ProviderAutoReviewCompleted {
+        thread_id: CodexManagedThreadId,
+        turn_id: CodexManagedTurnId,
+        review_id: CodexManagedItemId,
+        target_item_id: CodexManagedItemId,
+    },
+    FileChangeCompleted {
+        thread_id: CodexManagedThreadId,
+        turn_id: CodexManagedTurnId,
+        item_id: CodexManagedItemId,
+    },
+    ProviderAutoOutcome {
+        thread_id: CodexManagedThreadId,
+        turn_id: CodexManagedTurnId,
+        review_id: CodexManagedItemId,
+        target_item_id: CodexManagedItemId,
+    },
     Terminal {
         thread_id: CodexManagedThreadId,
         turn_id: CodexManagedTurnId,
@@ -289,6 +318,29 @@ pub fn codex_manual_start_request(
                 "sandbox": "read-only",
                 "approvalPolicy": "on-request",
                 "approvalsReviewer": "user",
+                "ephemeral": false,
+                "serviceName": "flit",
+                "threadSource": "flit",
+            },
+        }),
+    )
+}
+
+pub fn codex_provider_auto_start_request(
+    request_id: u64,
+    canonical_cwd: impl AsRef<Path>,
+) -> Result<Vec<u8>, CodexContractError> {
+    let cwd = canonical_cwd_string(canonical_cwd.as_ref())?;
+    encode_client_frame(
+        request_id,
+        json!({
+            "id": request_id,
+            "method": "thread/start",
+            "params": {
+                "cwd": cwd,
+                "sandbox": "read-only",
+                "approvalPolicy": "on-request",
+                "approvalsReviewer": "auto_review",
                 "ephemeral": false,
                 "serviceName": "flit",
                 "threadSource": "flit",
@@ -465,6 +517,34 @@ pub fn decode_codex_manual_start_response(
             canonical_cwd,
         },
         provider_configuration: "readOnly+on-request+user",
+    })
+}
+
+pub fn decode_codex_provider_auto_start_response(
+    frame: &[u8],
+    expected_request_id: u64,
+    canonical_cwd: impl Into<PathBuf>,
+) -> Result<CodexProviderAutoStartedThread, CodexContractError> {
+    let canonical_cwd = canonical_cwd.into();
+    validate_canonical_cwd(&canonical_cwd)?;
+    let result = response_result(frame, expected_request_id)?;
+    let thread = required_object(&result, "thread")?;
+    let thread_id = equal_thread_and_session_id(thread)?;
+    let sandbox = required_object(&result, "sandbox")?;
+    if required_string(sandbox, "type")? != "readOnly"
+        || required_bool(sandbox, "networkAccess")?
+        || required_string(&result, "approvalPolicy")? != "on-request"
+        || required_string(&result, "approvalsReviewer")? != "auto_review"
+        || Path::new(required_string(&result, "cwd")?) != canonical_cwd
+    {
+        return Err(CodexContractError::UnexpectedEffectivePolicy);
+    }
+    Ok(CodexProviderAutoStartedThread {
+        thread: CodexStartedThread {
+            thread_id,
+            canonical_cwd,
+        },
+        provider_configuration: "readOnly+on-request+auto_review",
     })
 }
 
@@ -693,7 +773,14 @@ pub fn decode_codex_turn_notification(
             },
         )));
     }
-    if !matches!(method, "item/started" | "turn/completed") {
+    if !matches!(
+        method,
+        "item/started"
+            | "item/completed"
+            | "item/autoApprovalReview/started"
+            | "item/autoApprovalReview/completed"
+            | "turn/completed"
+    ) {
         return Ok(None);
     }
     let params = required_object(notification, "params")?;
@@ -719,6 +806,61 @@ pub fn decode_codex_turn_notification(
             let _ = required_string(item, "cwd")?;
             let _ = required_u64(params, "startedAtMs")?;
             Ok(Some(CodexTurnObservation::CommandStarted {
+                thread_id: observed_thread_id,
+                turn_id: observed_turn_id,
+                item_id: CodexManagedItemId::new(required_string(item, "id")?)?,
+            }))
+        }
+        "item/autoApprovalReview/started" => {
+            let observed_turn_id = CodexManagedTurnId::new(required_string(params, "turnId")?)?;
+            if &observed_turn_id != expected_turn_id {
+                return Err(CodexContractError::UnexpectedTurnId);
+            }
+            let action = required_object(params, "action")?;
+            if required_string(action, "type")? != "applyPatch" {
+                return Err(CodexContractError::UnexpectedProviderAutoOutcome);
+            }
+            Ok(Some(CodexTurnObservation::ProviderAutoReviewStarted {
+                thread_id: observed_thread_id,
+                turn_id: observed_turn_id,
+                review_id: CodexManagedItemId::new(required_string(params, "reviewId")?)?,
+                target_item_id: CodexManagedItemId::new(required_string(params, "targetItemId")?)?,
+            }))
+        }
+        "item/autoApprovalReview/completed" => {
+            let observed_turn_id = CodexManagedTurnId::new(required_string(params, "turnId")?)?;
+            if &observed_turn_id != expected_turn_id {
+                return Err(CodexContractError::UnexpectedTurnId);
+            }
+            let action = required_object(params, "action")?;
+            let review = required_object(params, "review")?;
+            if required_string(action, "type")? != "applyPatch"
+                || required_string(review, "status")? != "approved"
+                || required_string(review, "riskLevel")? != "low"
+                || required_string(review, "userAuthorization")? != "unknown"
+                || required_string(params, "decisionSource")? != "agent"
+            {
+                return Err(CodexContractError::UnexpectedProviderAutoOutcome);
+            }
+            Ok(Some(CodexTurnObservation::ProviderAutoReviewCompleted {
+                thread_id: observed_thread_id,
+                turn_id: observed_turn_id,
+                review_id: CodexManagedItemId::new(required_string(params, "reviewId")?)?,
+                target_item_id: CodexManagedItemId::new(required_string(params, "targetItemId")?)?,
+            }))
+        }
+        "item/completed" => {
+            let observed_turn_id = CodexManagedTurnId::new(required_string(params, "turnId")?)?;
+            if &observed_turn_id != expected_turn_id {
+                return Err(CodexContractError::UnexpectedTurnId);
+            }
+            let item = required_object(params, "item")?;
+            if required_string(item, "type")? != "fileChange"
+                || required_string(item, "status")? != "completed"
+            {
+                return Ok(None);
+            }
+            Ok(Some(CodexTurnObservation::FileChangeCompleted {
                 thread_id: observed_thread_id,
                 turn_id: observed_turn_id,
                 item_id: CodexManagedItemId::new(required_string(item, "id")?)?,
@@ -1042,6 +1184,7 @@ pub enum CodexContractError {
     UnexpectedDeleteReceipt,
     UnexpectedItemVariant,
     UnexpectedPermissionOutcome,
+    UnexpectedProviderAutoOutcome,
     UnexpectedTurnStatus,
     UnsupportedServerRequest,
     DuplicateThreadId,
@@ -1095,6 +1238,9 @@ impl fmt::Display for CodexContractError {
             }
             Self::UnexpectedPermissionOutcome => {
                 formatter.write_str("Codex permission item returned an unexpected outcome")
+            }
+            Self::UnexpectedProviderAutoOutcome => {
+                formatter.write_str("Codex provider automatic outcome was not exact")
             }
             Self::UnexpectedTurnStatus => {
                 formatter.write_str("Codex notification returned an unvalidated terminal status")

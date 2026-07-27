@@ -13,14 +13,15 @@ pub use codex_contract::{
     CodexContractError, CodexDeletedThread, CodexInterruptRequested, CodexManagedItemId,
     CodexManagedListPage, CodexManagedScope, CodexManagedThreadConflict, CodexManagedThreadId,
     CodexManagedTurnId, CodexManualStartedThread, CodexPermissionDecision, CodexPermissionDelivery,
-    CodexPermissionDeliveryObservation, CodexPermissionRequest, CodexStartedThread,
-    CodexStartedTurn, CodexThreadRead, CodexThreadState, CodexTurnObservation,
+    CodexPermissionDeliveryObservation, CodexPermissionRequest, CodexProviderAutoStartedThread,
+    CodexStartedThread, CodexStartedTurn, CodexThreadRead, CodexThreadState, CodexTurnObservation,
     CodexTurnTerminalOutcome, MAX_CODEX_APP_SERVER_FRAME_BYTES, MAX_CODEX_MANAGED_THREADS,
     MAX_CODEX_TURN_PROMPT_BYTES, codex_file_change_permission_response, codex_initialize_request,
-    codex_initialized_notification, codex_manual_start_request, codex_read_only_start_request,
-    codex_read_request, codex_thread_delete_request, codex_thread_list_request,
-    codex_turn_interrupt_request, codex_turn_start_request, decode_codex_initialize_response,
-    decode_codex_manual_start_response, decode_codex_permission_delivery_notification,
+    codex_initialized_notification, codex_manual_start_request, codex_provider_auto_start_request,
+    codex_read_only_start_request, codex_read_request, codex_thread_delete_request,
+    codex_thread_list_request, codex_turn_interrupt_request, codex_turn_start_request,
+    decode_codex_initialize_response, decode_codex_manual_start_response,
+    decode_codex_permission_delivery_notification, decode_codex_provider_auto_start_response,
     decode_codex_read_response, decode_codex_start_response, decode_codex_thread_delete_response,
     decode_codex_thread_deleted_notification, decode_codex_thread_list_response,
     decode_codex_turn_interrupt_response, decode_codex_turn_notification,
@@ -206,7 +207,7 @@ pub fn validated_codex_0_145_0_fingerprint() -> ProviderFingerprint {
             .to_owned(),
         method_allowlist_sha256: "0de966cd124a25c926df49f4b697e588d51947c31c4e2febe2175338f6319d42"
             .to_owned(),
-        fixture_sha256: "5461cb8c3b75ae53d60a5cb1625d510e00e0fa7ebf7d19ea58bd8f332f223cb6"
+        fixture_sha256: "5f031b92aa6688793f9b88028d0ce7663711e1cbfd6b7c08a89af0f320b9514e"
             .to_owned(),
         smoke_run_id: "2026-07-27-arm64-s0-9".to_owned(),
     }

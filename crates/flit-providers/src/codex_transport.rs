@@ -26,13 +26,14 @@ use crate::{
     CodexDeletedThread, CodexInterruptRequested, CodexManagedScope, CodexManagedThreadConflict,
     CodexManagedThreadId, CodexManualStartedThread, CodexPermissionDecision,
     CodexPermissionDelivery, CodexPermissionDeliveryObservation, CodexPermissionRequest,
-    CodexStartedThread, CodexStartedTurn, CodexThreadRead, CodexTurnObservation,
-    ExecutableInspection, ExecutableInspectionError, ProviderCapability, ProviderCompatibility,
-    ProviderFingerprint, codex_file_change_permission_response, codex_initialize_request,
-    codex_initialized_notification, codex_manual_start_request, codex_read_only_start_request,
-    codex_read_request, codex_thread_delete_request, codex_thread_list_request,
-    codex_turn_interrupt_request, codex_turn_start_request, decode_codex_initialize_response,
-    decode_codex_manual_start_response, decode_codex_permission_delivery_notification,
+    CodexProviderAutoStartedThread, CodexStartedThread, CodexStartedTurn, CodexThreadRead,
+    CodexTurnObservation, ExecutableInspection, ExecutableInspectionError, ProviderCapability,
+    ProviderCompatibility, ProviderFingerprint, codex_file_change_permission_response,
+    codex_initialize_request, codex_initialized_notification, codex_manual_start_request,
+    codex_provider_auto_start_request, codex_read_only_start_request, codex_read_request,
+    codex_thread_delete_request, codex_thread_list_request, codex_turn_interrupt_request,
+    codex_turn_start_request, decode_codex_initialize_response, decode_codex_manual_start_response,
+    decode_codex_permission_delivery_notification, decode_codex_provider_auto_start_response,
     decode_codex_read_response, decode_codex_start_response, decode_codex_thread_delete_response,
     decode_codex_thread_deleted_notification, decode_codex_thread_list_response,
     decode_codex_turn_interrupt_response, decode_codex_turn_notification,
@@ -71,11 +72,28 @@ struct StagedExecutable {
 
 struct ActiveTurn {
     started: CodexStartedTurn,
+    permission_mode: CodexThreadPermissionMode,
+    provider_auto_review: Option<ProviderAutoReviewState>,
+    consumed_provider_auto_review_ids: BTreeSet<crate::CodexManagedItemId>,
+    consumed_provider_auto_target_item_ids: BTreeSet<crate::CodexManagedItemId>,
     command_item_ids: BTreeSet<crate::CodexManagedItemId>,
     permission_requests: BTreeMap<u64, CodexPermissionRequest>,
     permission_item_ids: BTreeSet<crate::CodexManagedItemId>,
     responded_permission_request_ids: BTreeSet<u64>,
     interrupt_requested: bool,
+}
+
+#[derive(Clone, Copy)]
+enum CodexThreadPermissionMode {
+    ReadOnly,
+    Manual,
+    ProviderAuto,
+}
+
+struct ProviderAutoReviewState {
+    review_id: crate::CodexManagedItemId,
+    target_item_id: crate::CodexManagedItemId,
+    completed: bool,
 }
 
 impl Drop for StagedExecutable {
@@ -101,6 +119,7 @@ pub struct CodexAppServer {
     validated_profile: Option<ProviderFingerprint>,
     staged_executable: Option<StagedExecutable>,
     started_thread_ids: BTreeSet<CodexManagedThreadId>,
+    started_thread_modes: BTreeMap<CodexManagedThreadId, CodexThreadPermissionMode>,
     active_turn: Option<ActiveTurn>,
     last_terminal_turn: Option<CodexStartedTurn>,
 }
@@ -135,6 +154,10 @@ impl CodexAppServer {
         if !self.started_thread_ids.insert(started.thread_id.clone()) {
             return self.close_with(CodexAppServerError::DuplicateManagedThread);
         }
+        self.started_thread_modes.insert(
+            started.thread_id.clone(),
+            CodexThreadPermissionMode::ReadOnly,
+        );
         Ok(started)
     }
 
@@ -165,6 +188,44 @@ impl CodexAppServer {
         {
             return self.close_with(CodexAppServerError::DuplicateManagedThread);
         }
+        self.started_thread_modes.insert(
+            started.thread.thread_id.clone(),
+            CodexThreadPermissionMode::Manual,
+        );
+        Ok(started)
+    }
+
+    pub fn start_provider_auto(
+        &mut self,
+        canonical_cwd: impl AsRef<Path>,
+    ) -> Result<CodexProviderAutoStartedThread, CodexAppServerError> {
+        if self
+            .validated_profile
+            .as_ref()
+            .is_none_or(|profile| profile != &crate::validated_codex_0_145_0_fingerprint())
+        {
+            return Err(CodexAppServerError::ProviderAutoUnavailable);
+        }
+        let canonical_cwd = canonical_cwd.as_ref();
+        let request_id = self.take_request_id()?;
+        let request = codex_provider_auto_start_request(request_id, canonical_cwd)
+            .map_err(CodexAppServerError::Contract)?;
+        let response = self.exchange(request)?;
+        let started = self.decode_or_close(decode_codex_provider_auto_start_response(
+            &response,
+            request_id,
+            canonical_cwd.to_owned(),
+        ))?;
+        if !self
+            .started_thread_ids
+            .insert(started.thread.thread_id.clone())
+        {
+            return self.close_with(CodexAppServerError::DuplicateManagedThread);
+        }
+        self.started_thread_modes.insert(
+            started.thread.thread_id.clone(),
+            CodexThreadPermissionMode::ProviderAuto,
+        );
         Ok(started)
     }
 
@@ -291,6 +352,11 @@ impl CodexAppServer {
         }
         self.reject_pending_terminal_observations()?;
         self.last_terminal_turn.take();
+        let permission_mode = self
+            .started_thread_modes
+            .get(thread_id)
+            .copied()
+            .ok_or(CodexAppServerError::UnownedTurnThread)?;
         let request_id = self.take_request_id()?;
         let request = codex_turn_start_request(request_id, thread_id, prompt)
             .map_err(CodexAppServerError::Contract)?;
@@ -300,6 +366,10 @@ impl CodexAppServer {
         ))?;
         self.active_turn = Some(ActiveTurn {
             started: started.clone(),
+            permission_mode,
+            provider_auto_review: None,
+            consumed_provider_auto_review_ids: BTreeSet::new(),
+            consumed_provider_auto_target_item_ids: BTreeSet::new(),
             command_item_ids: BTreeSet::new(),
             permission_requests: BTreeMap::new(),
             permission_item_ids: BTreeSet::new(),
@@ -338,6 +408,14 @@ impl CodexAppServer {
                         .active_turn
                         .as_mut()
                         .ok_or(CodexAppServerError::NoActiveTurn)?;
+                    if matches!(
+                        active.permission_mode,
+                        CodexThreadPermissionMode::ProviderAuto
+                    ) {
+                        return self.close_with(CodexAppServerError::Contract(
+                            CodexContractError::UnexpectedProviderAutoOutcome,
+                        ));
+                    }
                     if active
                         .permission_requests
                         .contains_key(&request.provider_request_id)
@@ -366,9 +444,118 @@ impl CodexAppServer {
                     }
                     active.command_item_ids.insert(item_id.clone());
                 }
+                CodexTurnObservation::ProviderAutoReviewStarted {
+                    review_id,
+                    target_item_id,
+                    ..
+                } => {
+                    let active = self
+                        .active_turn
+                        .as_mut()
+                        .ok_or(CodexAppServerError::NoActiveTurn)?;
+                    if !matches!(
+                        active.permission_mode,
+                        CodexThreadPermissionMode::ProviderAuto
+                    ) || active.provider_auto_review.is_some()
+                        || active.consumed_provider_auto_review_ids.contains(review_id)
+                        || active
+                            .consumed_provider_auto_target_item_ids
+                            .contains(target_item_id)
+                    {
+                        return self.close_with(CodexAppServerError::Contract(
+                            CodexContractError::UnexpectedProviderAutoOutcome,
+                        ));
+                    }
+                    active.provider_auto_review = Some(ProviderAutoReviewState {
+                        review_id: review_id.clone(),
+                        target_item_id: target_item_id.clone(),
+                        completed: false,
+                    });
+                    continue;
+                }
+                CodexTurnObservation::ProviderAutoReviewCompleted {
+                    review_id,
+                    target_item_id,
+                    ..
+                } => {
+                    let active = self
+                        .active_turn
+                        .as_mut()
+                        .ok_or(CodexAppServerError::NoActiveTurn)?;
+                    let Some(review) = active.provider_auto_review.as_mut() else {
+                        return self.close_with(CodexAppServerError::Contract(
+                            CodexContractError::UnexpectedProviderAutoOutcome,
+                        ));
+                    };
+                    if !matches!(
+                        active.permission_mode,
+                        CodexThreadPermissionMode::ProviderAuto
+                    ) || review.completed
+                        || review.review_id != *review_id
+                        || review.target_item_id != *target_item_id
+                    {
+                        return self.close_with(CodexAppServerError::Contract(
+                            CodexContractError::UnexpectedProviderAutoOutcome,
+                        ));
+                    }
+                    review.completed = true;
+                    continue;
+                }
+                CodexTurnObservation::FileChangeCompleted {
+                    thread_id,
+                    turn_id,
+                    item_id,
+                } => {
+                    let active = self
+                        .active_turn
+                        .as_mut()
+                        .ok_or(CodexAppServerError::NoActiveTurn)?;
+                    if !matches!(
+                        active.permission_mode,
+                        CodexThreadPermissionMode::ProviderAuto
+                    ) {
+                        continue;
+                    }
+                    let Some(review) = active.provider_auto_review.take() else {
+                        return self.close_with(CodexAppServerError::Contract(
+                            CodexContractError::UnexpectedProviderAutoOutcome,
+                        ));
+                    };
+                    if !review.completed || review.target_item_id != *item_id {
+                        return self.close_with(CodexAppServerError::Contract(
+                            CodexContractError::UnexpectedProviderAutoOutcome,
+                        ));
+                    }
+                    active
+                        .consumed_provider_auto_review_ids
+                        .insert(review.review_id.clone());
+                    active
+                        .consumed_provider_auto_target_item_ids
+                        .insert(review.target_item_id.clone());
+                    return Ok(CodexTurnObservation::ProviderAutoOutcome {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                        review_id: review.review_id,
+                        target_item_id: review.target_item_id,
+                    });
+                }
+                CodexTurnObservation::ProviderAutoOutcome { .. } => {
+                    return self.close_with(CodexAppServerError::Contract(
+                        CodexContractError::UnexpectedProviderAutoOutcome,
+                    ));
+                }
                 CodexTurnObservation::Terminal {
                     thread_id, turn_id, ..
                 } => {
+                    if self
+                        .active_turn
+                        .as_ref()
+                        .is_some_and(|active| active.provider_auto_review.is_some())
+                    {
+                        return self.close_with(CodexAppServerError::Contract(
+                            CodexContractError::UnexpectedProviderAutoOutcome,
+                        ));
+                    }
                     self.active_turn.take();
                     self.last_terminal_turn = Some(CodexStartedTurn {
                         thread_id: thread_id.clone(),
@@ -608,6 +795,7 @@ impl CodexAppServer {
             validated_profile: None,
             staged_executable: None,
             started_thread_ids: BTreeSet::new(),
+            started_thread_modes: BTreeMap::new(),
             active_turn: None,
             last_terminal_turn: None,
         };
@@ -1282,6 +1470,7 @@ pub enum CodexAppServerError {
         launch: CapabilityStatus,
     },
     ManualPolicyUnavailable,
+    ProviderAutoUnavailable,
     ExecutableChanged,
     StageExecutable(io::Error),
     StagedExecutableInspection(ExecutableInspectionError),
@@ -1307,6 +1496,7 @@ pub enum CodexAppServerError {
     PreexistingThreadDeletion,
     DuplicateThreadDeletion,
     ActiveTurnExists,
+    UnownedTurnThread,
     NoActiveTurn,
     InterruptAlreadyRequested,
     PermissionResponseUnavailable,
@@ -1338,6 +1528,9 @@ impl fmt::Display for CodexAppServerError {
             }
             Self::ManualPolicyUnavailable => {
                 formatter.write_str("Codex Manual policy is unavailable for this exact profile")
+            }
+            Self::ProviderAutoUnavailable => {
+                formatter.write_str("Codex ProviderAuto mode is unavailable for this exact profile")
             }
             Self::CapabilityUnavailable {
                 compatibility,
@@ -1410,6 +1603,9 @@ impl fmt::Display for CodexAppServerError {
             }
             Self::ActiveTurnExists => {
                 formatter.write_str("Codex connection already owns an active turn")
+            }
+            Self::UnownedTurnThread => {
+                formatter.write_str("Codex turn belongs to an unowned thread")
             }
             Self::NoActiveTurn => formatter.write_str("Codex connection has no active turn"),
             Self::InterruptAlreadyRequested => {
@@ -1775,6 +1971,93 @@ done
             server.shutdown().expect("permission shutdown");
             assert_process_group_gone(&executable);
         }
+    }
+
+    #[test]
+    fn provider_auto_emits_one_outcome_only_after_exact_review_and_causal_item() {
+        let _process_guard = test_process_guard();
+        let directory = TestDirectory::new("provider-auto-outcome");
+        let executable = directory.0.join("codex");
+        write_script(
+            &executable,
+            &format!(
+                r#"#!/bin/sh
+printf '%s' "$$" > "$0.pgid"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{{"id":1,"result":{{}}}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"managed-1","sessionId":"managed-1"}},"cwd":"{TEST_CWD}","sandbox":{{"type":"readOnly","networkAccess":false}},"approvalPolicy":"on-request","approvalsReviewer":"auto_review"}}}}' ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"turn-1"}}}}}}'
+      printf '%s\n' '{{"method":"item/autoApprovalReview/started","params":{{"threadId":"managed-1","turnId":"turn-1","reviewId":"review-1","targetItemId":"item-1","action":{{"type":"applyPatch"}}}}}}'
+      printf '%s\n' '{{"method":"item/autoApprovalReview/completed","params":{{"threadId":"managed-1","turnId":"turn-1","reviewId":"review-1","targetItemId":"item-1","action":{{"type":"applyPatch"}},"review":{{"status":"approved","riskLevel":"low","userAuthorization":"unknown"}},"decisionSource":"agent"}}}}'
+      printf '%s\n' '{{"method":"item/completed","params":{{"threadId":"managed-1","turnId":"turn-1","item":{{"id":"item-1","type":"fileChange","status":"completed"}}}}}}'
+      printf '%s\n' '{{"method":"item/autoApprovalReview/started","params":{{"threadId":"managed-1","turnId":"turn-1","reviewId":"review-1","targetItemId":"item-1","action":{{"type":"applyPatch"}}}}}}'
+      printf '%s\n' '{{"method":"item/autoApprovalReview/completed","params":{{"threadId":"managed-1","turnId":"turn-1","reviewId":"review-1","targetItemId":"item-1","action":{{"type":"applyPatch"}},"review":{{"status":"approved","riskLevel":"low","userAuthorization":"unknown"}},"decisionSource":"agent"}}}}'
+      printf '%s\n' '{{"method":"item/completed","params":{{"threadId":"managed-1","turnId":"turn-1","item":{{"id":"item-1","type":"fileChange","status":"completed"}}}}}}'
+      ;;
+  esac
+done
+"#
+            ),
+        );
+        let mut server =
+            connect_manual_fake(&executable, Duration::from_secs(1)).expect("auto handshake");
+        let thread = server
+            .start_provider_auto(TEST_CWD)
+            .expect("ProviderAuto thread");
+        let turn = server
+            .start_turn(&thread.thread.thread_id, "Update one file.")
+            .expect("turn start");
+        assert_eq!(
+            server
+                .wait_for_turn_observation()
+                .expect("provider outcome"),
+            CodexTurnObservation::ProviderAutoOutcome {
+                thread_id: thread.thread.thread_id,
+                turn_id: turn.turn_id,
+                review_id: crate::CodexManagedItemId::new("review-1").expect("review ID"),
+                target_item_id: crate::CodexManagedItemId::new("item-1").expect("item ID"),
+            }
+        );
+        assert!(matches!(
+            server.wait_for_turn_observation(),
+            Err(CodexAppServerError::Contract(
+                CodexContractError::UnexpectedProviderAutoOutcome
+            ))
+        ));
+        assert_process_group_gone(&executable);
+    }
+
+    #[test]
+    fn unowned_thread_is_rejected_before_a_turn_start_side_effect() {
+        let _process_guard = test_process_guard();
+        let directory = TestDirectory::new("unowned-turn");
+        let executable = directory.0.join("codex");
+        let marker = directory.0.join("turn-start-received");
+        write_script(
+            &executable,
+            &format!(
+                r#"#!/bin/sh
+printf '%s' "$$" > "$0.pgid"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{{"id":1,"result":{{}}}}' ;;
+    *'"method":"turn/start"'*) touch '{}'; printf '%s\n' '{{"id":2,"result":{{"turn":{{"id":"turn-1"}}}}}}' ;;
+  esac
+done
+"#,
+                marker.display()
+            ),
+        );
+        let mut server = connect_fake(&executable, Duration::from_secs(1)).expect("fake handshake");
+        assert!(matches!(
+            server.start_turn(&thread_id("unowned-thread"), "Do not start."),
+            Err(CodexAppServerError::UnownedTurnThread)
+        ));
+        assert!(!marker.exists());
+        server.shutdown().expect("unowned shutdown");
+        assert_process_group_gone(&executable);
     }
 
     #[test]
