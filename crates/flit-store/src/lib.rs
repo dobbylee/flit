@@ -22,8 +22,8 @@ pub use managed_runs::{
     InitialManagedSessionConnection, InitialManagedSessionOutcome, MANAGED_PROVIDER_KIND_CODEX,
     MAX_LIVE_MANAGED_SESSIONS, MAX_MANAGED_METADATA_JSON_BYTES, MAX_MANAGED_METADATA_JSON_DEPTH,
     MAX_MANAGED_METADATA_JSON_VALUES, ManagedReconciliationState, ManagedRun, ManagedRunIntent,
-    ManagedRunIntentOutcome, ManagedSession, ManagedSessionReconciliation,
-    ManagedSessionReconciliationOutcome, ManagedSessionTermination,
+    ManagedRunIntentOutcome, ManagedRunStartFailure, ManagedRunStartFailureOutcome, ManagedSession,
+    ManagedSessionReconciliation, ManagedSessionReconciliationOutcome, ManagedSessionTermination,
     ManagedSessionTerminationOutcome, ManagedTurnTerminalOutcome,
 };
 pub use projects::{
@@ -664,6 +664,11 @@ impl Store {
             }
             true
         } else {
+            if run.ended_at.is_some() {
+                return Err(StoreError::ManagedRunTerminalConflict {
+                    run_id: connection.run_id,
+                });
+            }
             if let Some((claimed_run_id, claimed_session_id)) = transaction
                 .query_row(
                     "SELECT run_id, id FROM agent_sessions WHERE provider_kind = 'codex' AND external_session_key = ?1 ORDER BY ordinal LIMIT 1",
@@ -760,6 +765,76 @@ impl Store {
         } else {
             Ok(InitialManagedSessionOutcome::Connected { session, event })
         }
+    }
+
+    pub fn fail_managed_run_start(
+        &mut self,
+        failure: ManagedRunStartFailure,
+    ) -> Result<ManagedRunStartFailureOutcome, StoreError> {
+        managed_runs::validate_run_start_failure(&failure)
+            .map_err(|field| StoreError::InvalidManagedRunStartFailure { field })?;
+        let terminal_event = managed_run_start_failed_event(&failure);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+        let run = load_managed_run(&transaction, &failure.run_id)?.ok_or_else(|| {
+            StoreError::MissingRun {
+                run_id: failure.run_id.clone(),
+            }
+        })?;
+        if run.provider_kind != MANAGED_PROVIDER_KIND_CODEX {
+            return Err(StoreError::ManagedRunProviderMismatch {
+                run_id: failure.run_id,
+            });
+        }
+        let stored_terminal_events =
+            load_managed_run_terminal_events(&transaction, &failure.run_id)?;
+        let exact = run.started_at.is_none()
+            && run.ended_at.as_deref() == Some(failure.failed_at.as_str())
+            && stored_terminal_events.len() == 1
+            && UnsequencedEventEnvelope::from(stored_terminal_events[0].clone()) == terminal_event;
+        if exact {
+            return Ok(ManagedRunStartFailureOutcome::Duplicate {
+                run,
+                event: stored_terminal_events
+                    .into_iter()
+                    .next()
+                    .expect("one exact terminal event"),
+            });
+        }
+        if run.started_at.is_some() {
+            return Err(StoreError::ManagedRunAlreadyStarted {
+                run_id: failure.run_id,
+            });
+        }
+        if run.ended_at.is_some() || !stored_terminal_events.is_empty() {
+            return Err(StoreError::ManagedRunTerminalConflict {
+                run_id: failure.run_id,
+            });
+        }
+        let updated = transaction
+            .execute(
+                "UPDATE runs SET ended_at = ?1 WHERE id = ?2 AND started_at IS NULL AND ended_at IS NULL",
+                params![failure.failed_at, failure.run_id],
+            )
+            .map_err(StoreError::Sqlite)?;
+        if updated != 1 {
+            return Err(StoreError::ManagedRunTerminalConflict {
+                run_id: failure.run_id,
+            });
+        }
+        let mut outcomes = append_event_batch_in_transaction(&transaction, vec![terminal_event])?;
+        let event = match outcomes.pop().expect("one terminal event") {
+            AppendEventOutcome::Inserted(event) | AppendEventOutcome::Duplicate(event) => event,
+        };
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        let run = load_managed_run(&self.connection, &failure.run_id)?.ok_or_else(|| {
+            StoreError::MissingRun {
+                run_id: failure.run_id,
+            }
+        })?;
+        Ok(ManagedRunStartFailureOutcome::Failed { run, event })
     }
 
     pub fn terminate_managed_session(
@@ -1487,6 +1562,36 @@ fn managed_session_connected_event(
             kind: EventSourceKind::ProviderAdapter,
             provider: Some(MANAGED_PROVIDER_KIND_CODEX.to_owned()),
             contract_version: Some(connection.contract_version.clone()),
+            extensions: BTreeMap::new(),
+        },
+        confidence: 1.0,
+        evidence_ids: Vec::new(),
+        payload,
+        extensions: BTreeMap::new(),
+    }
+}
+
+fn managed_run_start_failed_event(failure: &ManagedRunStartFailure) -> UnsequencedEventEnvelope {
+    let payload = json!({
+        "reason": failure.reason,
+        "stage": "provider_start",
+    })
+    .as_object()
+    .expect("object literal")
+    .clone();
+    UnsequencedEventEnvelope {
+        protocol_version: EventProtocolVersion::V1_0,
+        event_id: failure.failed_event_id.clone(),
+        run_id: failure.run_id.clone(),
+        session_id: NullableSessionId::Null,
+        stream_seq: 3,
+        occurred_at: failure.failed_at.clone(),
+        observed_at: failure.failed_at.clone(),
+        event_type: "run.failed".to_owned(),
+        source: EventSource {
+            kind: EventSourceKind::ProviderAdapter,
+            provider: Some(MANAGED_PROVIDER_KIND_CODEX.to_owned()),
+            contract_version: Some(failure.contract_version.clone()),
             extensions: BTreeMap::new(),
         },
         confidence: 1.0,
@@ -2832,6 +2937,9 @@ pub enum StoreError {
     InvalidManagedRunIntent {
         field: &'static str,
     },
+    InvalidManagedRunStartFailure {
+        field: &'static str,
+    },
     ManagedRunIdentityConflict {
         run_id: String,
     },
@@ -3071,6 +3179,12 @@ impl fmt::Display for StoreError {
             }
             Self::InvalidManagedRunIntent { field } => {
                 write!(formatter, "invalid managed Run intent field: {field}")
+            }
+            Self::InvalidManagedRunStartFailure { field } => {
+                write!(
+                    formatter,
+                    "invalid managed Run start failure field: {field}"
+                )
             }
             Self::ManagedRunIdentityConflict { run_id } => {
                 write!(formatter, "managed Run identity conflicts: {run_id}")

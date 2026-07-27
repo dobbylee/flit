@@ -11,8 +11,9 @@ use flit_protocol::{
 };
 use flit_store::{
     InitialManagedSessionConnection, InitialManagedSessionOutcome, MAX_LIVE_MANAGED_SESSIONS,
-    ManagedReconciliationState, ManagedRunIntent, ManagedRunIntentOutcome,
-    ManagedSessionReconciliation, ManagedSessionReconciliationOutcome, ManagedSessionTermination,
+    ManagedReconciliationState, ManagedRunIntent, ManagedRunIntentOutcome, ManagedRunStartFailure,
+    ManagedRunStartFailureOutcome, ManagedSessionReconciliation,
+    ManagedSessionReconciliationOutcome, ManagedSessionTermination,
     ManagedSessionTerminationOutcome, ManagedTurnTerminalOutcome, ProjectRegistration,
     ProjectTrustConfirmation, Store, StoreError,
 };
@@ -35,6 +36,155 @@ impl TestDirectory {
         fs::create_dir(&path).expect("test directory");
         Self(path)
     }
+}
+
+#[test]
+fn managed_start_failure_is_terminal_idempotent_and_reopens_without_a_session() {
+    let directory = TestDirectory::new("start-failure");
+    let (mut store, database, project_path) = trusted_store(&directory);
+    store
+        .create_managed_run_intent(run_intent(
+            "run-failed-start",
+            "event-failed-created",
+            "event-failed-requested",
+        ))
+        .expect("create Run intent");
+    let failure = start_failure("run-failed-start", "event-failed-terminal");
+    let (failed_run, failed_event) = match store
+        .fail_managed_run_start(failure.clone())
+        .expect("fail start")
+    {
+        ManagedRunStartFailureOutcome::Failed { run, event } => (run, event),
+        other => panic!("unexpected failure outcome: {other:?}"),
+    };
+    assert_eq!(failed_run.started_at, None);
+    assert_eq!(failed_run.ended_at.as_deref(), Some(ENDED_AT));
+    assert_eq!(failed_event.event_type, "run.failed");
+    assert_eq!(failed_event.ingest_seq, 3);
+    assert_eq!(failed_event.stream_seq, 3);
+    assert_eq!(failed_event.payload["reason"], "provider_start_failed");
+    assert_eq!(failed_event.payload["stage"], "provider_start");
+    assert_eq!(failed_event.source.kind, EventSourceKind::ProviderAdapter);
+    assert_eq!(
+        failed_event.source.contract_version.as_deref(),
+        Some("codex-app-server/0.145.0")
+    );
+
+    assert!(matches!(
+        store
+            .fail_managed_run_start(failure)
+            .expect("exact duplicate"),
+        ManagedRunStartFailureOutcome::Duplicate { event, .. } if event.ingest_seq == 3
+    ));
+    assert_eq!(store.latest_ingest_seq().expect("duplicate cursor"), 3);
+
+    let mut mismatch = start_failure("run-failed-start", "event-other-terminal");
+    mismatch.reason = "different_failure".to_owned();
+    assert!(matches!(
+        store.fail_managed_run_start(mismatch),
+        Err(StoreError::ManagedRunTerminalConflict { .. })
+    ));
+    assert_eq!(store.latest_ingest_seq().expect("conflict cursor"), 3);
+    assert!(matches!(
+        store.connect_initial_managed_session(session_connection(
+            "session-after-failure",
+            "run-failed-start",
+            "thread-after-failure",
+            &project_path,
+        )),
+        Err(StoreError::ManagedRunTerminalConflict { .. })
+    ));
+    assert_eq!(
+        store
+            .managed_session("session-after-failure")
+            .expect("no session"),
+        None
+    );
+
+    drop(store);
+    let mut reopened = Store::open(&database, CREATED_AT).expect("reopen Store");
+    assert_eq!(
+        reopened.managed_run("run-failed-start").expect("read Run"),
+        Some(failed_run)
+    );
+    assert!(matches!(
+        reopened.connect_initial_managed_session(session_connection(
+            "session-after-reopen",
+            "run-failed-start",
+            "thread-after-reopen",
+            &project_path,
+        )),
+        Err(StoreError::ManagedRunTerminalConflict { .. })
+    ));
+}
+
+#[test]
+fn managed_start_failure_rejects_invalid_or_started_runs_without_mutation() {
+    let directory = TestDirectory::new("start-failure-negative");
+    let (mut store, _database, project_path) = trusted_store(&directory);
+    store
+        .create_managed_run_intent(run_intent(
+            "run-started",
+            "event-started-created",
+            "event-started-requested",
+        ))
+        .expect("create Run");
+    store
+        .connect_initial_managed_session(session_connection(
+            "session-started",
+            "run-started",
+            "thread-started",
+            &project_path,
+        ))
+        .expect("connect session");
+    assert!(matches!(
+        store.fail_managed_run_start(start_failure("run-started", "event-invalid-terminal")),
+        Err(StoreError::ManagedRunAlreadyStarted { .. })
+    ));
+    let cursor = store.latest_ingest_seq().expect("started cursor");
+
+    let mut invalid = start_failure("run-started", "event-invalid-reason");
+    invalid.reason.clear();
+    assert!(matches!(
+        store.fail_managed_run_start(invalid),
+        Err(StoreError::InvalidManagedRunStartFailure { field: "reason" })
+    ));
+    assert_eq!(store.latest_ingest_seq().expect("unchanged cursor"), cursor);
+
+    store
+        .create_managed_run_intent(run_intent(
+            "run-rollback",
+            "event-rollback-created",
+            "event-rollback-requested",
+        ))
+        .expect("create rollback Run");
+    let rollback_cursor = store.latest_ingest_seq().expect("rollback cursor");
+    assert!(matches!(
+        store.fail_managed_run_start(start_failure("run-rollback", "event-started-created")),
+        Err(StoreError::EventIdentityConflict { .. })
+    ));
+    assert_eq!(
+        store
+            .managed_run("run-rollback")
+            .expect("rollback Run")
+            .expect("Run")
+            .ended_at,
+        None
+    );
+    assert_eq!(
+        store.latest_ingest_seq().expect("rolled back cursor"),
+        rollback_cursor
+    );
+    assert!(matches!(
+        store
+            .fail_managed_run_start(start_failure(
+                "run-rollback",
+                "event-rollback-terminal"
+            ))
+            .expect("valid failure after rollback"),
+        ManagedRunStartFailureOutcome::Failed { event, .. }
+            if event.ingest_seq == rollback_cursor + 1
+    ));
 }
 
 impl Drop for TestDirectory {
@@ -478,13 +628,14 @@ fn managed_terminal_closes_session_and_run_atomically_idempotently_and_reopens()
             "event-terminal-requested",
         ))
         .expect("managed Run");
+    let initial_connection = session_connection(
+        "session-terminal",
+        "run-terminal",
+        "thread-terminal",
+        &project_path,
+    );
     store
-        .connect_initial_managed_session(session_connection(
-            "session-terminal",
-            "run-terminal",
-            "thread-terminal",
-            &project_path,
-        ))
+        .connect_initial_managed_session(initial_connection.clone())
         .expect("managed session");
     let termination = session_termination(
         "run-terminal",
@@ -526,9 +677,15 @@ fn managed_terminal_closes_session_and_run_atomically_idempotently_and_reopens()
         } if duplicate == event
     ));
     assert_eq!(store.latest_ingest_seq().expect("duplicate cursor"), 4);
+    assert!(matches!(
+        store
+            .connect_initial_managed_session(initial_connection.clone())
+            .expect("terminal session-connect replay"),
+        InitialManagedSessionOutcome::Duplicate { event, .. } if event.ingest_seq == 3
+    ));
 
     drop(store);
-    let reopened = Store::open(&database, CREATED_AT).expect("reopen Store");
+    let mut reopened = Store::open(&database, CREATED_AT).expect("reopen Store");
     assert_eq!(
         reopened.managed_run("run-terminal").expect("reopened Run"),
         Some(run)
@@ -554,6 +711,12 @@ fn managed_terminal_closes_session_and_run_atomically_idempotently_and_reopens()
             "run.completed"
         ]
     );
+    assert!(matches!(
+        reopened
+            .connect_initial_managed_session(initial_connection)
+            .expect("reopened terminal session-connect replay"),
+        InitialManagedSessionOutcome::Duplicate { event, .. } if event.ingest_seq == 3
+    ));
 }
 
 #[test]
@@ -1239,6 +1402,16 @@ fn run_intent(run_id: &str, created_event_id: &str, requested_event_id: &str) ->
         created_at: CREATED_AT.to_owned(),
         run_created_event_id: created_event_id.to_owned(),
         start_requested_event_id: requested_event_id.to_owned(),
+    }
+}
+
+fn start_failure(run_id: &str, event_id: &str) -> ManagedRunStartFailure {
+    ManagedRunStartFailure {
+        run_id: run_id.to_owned(),
+        reason: "provider_start_failed".to_owned(),
+        contract_version: "codex-app-server/0.145.0".to_owned(),
+        failed_at: ENDED_AT.to_owned(),
+        failed_event_id: event_id.to_owned(),
     }
 }
 

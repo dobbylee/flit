@@ -14,6 +14,8 @@ const MAX_MANAGED_GOAL_BYTES: usize = 64 * 1024;
 const MAX_MANAGED_PATH_BYTES: usize = 16 * 1024;
 const MAX_MANAGED_FINGERPRINT_BYTES: usize = 4 * 1024;
 const MAX_MANAGED_TIMESTAMP_BYTES: usize = 128;
+const MAX_MANAGED_FAILURE_REASON_BYTES: usize = 4 * 1024;
+const MAX_MANAGED_CONTRACT_VERSION_BYTES: usize = 256;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ManagedRunIntent {
@@ -51,6 +53,27 @@ pub enum ManagedRunIntentOutcome {
     Duplicate {
         run: ManagedRun,
         events: Vec<EventEnvelope>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedRunStartFailure {
+    pub run_id: String,
+    pub reason: String,
+    pub contract_version: String,
+    pub failed_at: String,
+    pub failed_event_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ManagedRunStartFailureOutcome {
+    Failed {
+        run: ManagedRun,
+        event: EventEnvelope,
+    },
+    Duplicate {
+        run: ManagedRun,
+        event: EventEnvelope,
     },
 }
 
@@ -232,6 +255,20 @@ pub(crate) fn validate_run_intent(intent: &ManagedRunIntent) -> Result<(), &'sta
         return Err("event_ids");
     }
     validate_json_size(&intent.start_request).map_err(|()| "start_request")
+}
+
+pub(crate) fn validate_run_start_failure(
+    failure: &ManagedRunStartFailure,
+) -> Result<(), &'static str> {
+    validate_id(&failure.run_id).map_err(|()| "run_id")?;
+    validate_text(&failure.reason, MAX_MANAGED_FAILURE_REASON_BYTES).map_err(|()| "reason")?;
+    validate_text(
+        &failure.contract_version,
+        MAX_MANAGED_CONTRACT_VERSION_BYTES,
+    )
+    .map_err(|()| "contract_version")?;
+    validate_timestamp(&failure.failed_at).map_err(|()| "failed_at")?;
+    validate_id(&failure.failed_event_id).map_err(|()| "failed_event_id")
 }
 
 pub(crate) fn validate_initial_session(
