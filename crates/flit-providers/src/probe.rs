@@ -57,12 +57,13 @@ fn probe_codex_compatibility(
     } else {
         codex_0_144_6_bundled_evidence()
     };
+    let v2_schema_sha256 = select_v2_schema_digest(&version.executable_version, &schema);
     let runtime_fingerprint = CodexRuntimeFingerprint {
         canonical_executable: inspection.canonical_path.clone(),
         executable_version: version.executable_version,
         executable_sha256: inspection.sha256.clone(),
         combined_schema_sha256: schema.combined_schema_sha256,
-        v2_schema_sha256: schema.v2_schema_sha256,
+        v2_schema_sha256,
     };
     let (validated_profile, capability_snapshot) =
         classify_runtime_fingerprint(&runtime_fingerprint, evidence)?;
@@ -75,6 +76,14 @@ fn probe_codex_compatibility(
         schema_stdout_bytes: schema.stdout_bytes,
         schema_stderr_bytes: schema.stderr_bytes,
     })
+}
+
+fn select_v2_schema_digest(version: &str, schema: &crate::CodexSchemaProbe) -> String {
+    if version == "0.145.0" {
+        schema.v2_schema_canonical_sha256.clone()
+    } else {
+        schema.v2_schema_sha256.clone()
+    }
 }
 
 fn classify_runtime_fingerprint(
@@ -163,7 +172,7 @@ mod tests {
 
     use super::{
         CodexRuntimeFingerprint, classify_runtime_fingerprint, probe_codex_compatibility_at,
-        probe_codex_compatibility_on_path,
+        probe_codex_compatibility_on_path, select_v2_schema_digest,
     };
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -301,6 +310,23 @@ mod tests {
         assert_eq!(validated_profile, Some(expected));
         assert_eq!(snapshot.compatibility, ProviderCompatibility::Supported);
         assert!(snapshot.fingerprint_mismatches.is_empty());
+    }
+
+    #[test]
+    fn v2_digest_selection_is_version_bound_and_preserves_the_legacy_raw_axis() {
+        let inspection = inspect_codex_at("/bin/sh").expect("shell inspection");
+        let schema = crate::CodexSchemaProbe {
+            inspection,
+            combined_schema_sha256: "combined".to_owned(),
+            v2_schema_sha256: "raw".to_owned(),
+            v2_schema_canonical_sha256: "canonical".to_owned(),
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+        };
+
+        assert_eq!(select_v2_schema_digest("0.145.0", &schema), "canonical");
+        assert_eq!(select_v2_schema_digest("0.144.6", &schema), "raw");
+        assert_eq!(select_v2_schema_digest("9.9.9", &schema), "raw");
     }
 
     #[test]

@@ -203,7 +203,7 @@ pub fn validated_codex_0_145_0_fingerprint() -> ProviderFingerprint {
             .to_owned(),
         combined_schema_sha256: "1f66700d1cc3de4a5004e5614a6098878b405c7e7c5f8c9be97fc900d0ad6c68"
             .to_owned(),
-        v2_schema_sha256: "84bc00660a8c4e69073f4f0bafcf00ec5b7238dbe59eccf404ce2352daae64e0"
+        v2_schema_sha256: "62869ce8ab6c5df3f36ffc658cd2a43d153512b6b0da3d488dd17e28ea25a7f6"
             .to_owned(),
         method_allowlist_sha256: "0de966cd124a25c926df49f4b697e588d51947c31c4e2febe2175338f6319d42"
             .to_owned(),

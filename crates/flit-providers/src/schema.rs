@@ -1,9 +1,10 @@
 use std::{
+    collections::BTreeMap,
     error::Error,
     ffi::OsString,
     fmt, fs,
     fs::{DirBuilder, File, Metadata},
-    io::{self, Read},
+    io::{self, Read, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt},
     path::{Path, PathBuf},
     process,
@@ -27,6 +28,9 @@ pub const MAX_SCHEMA_BYTES: u64 = 64 * 1024 * 1024;
 
 const COMBINED_SCHEMA_FILE: &str = "codex_app_server_protocol.schemas.json";
 const V2_SCHEMA_FILE: &str = "codex_app_server_protocol.v2.schemas.json";
+const MAX_JSON_NESTING_DEPTH: usize = 128;
+const MAX_CANONICAL_JSON_NODES: usize = 262_144;
+const MAX_CANONICAL_SCALAR_BYTES: usize = MAX_SCHEMA_BYTES as usize;
 static NEXT_PROBE_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,6 +53,7 @@ pub struct CodexSchemaProbe {
     pub inspection: ExecutableInspection,
     pub combined_schema_sha256: String,
     pub v2_schema_sha256: String,
+    pub v2_schema_canonical_sha256: String,
     pub stdout_bytes: usize,
     pub stderr_bytes: usize,
 }
@@ -62,6 +67,8 @@ pub fn probe_codex_schema(
             timeout: SCHEMA_PROBE_TIMEOUT,
             max_output_bytes: MAX_SCHEMA_OUTPUT_BYTES,
             max_schema_bytes: MAX_SCHEMA_BYTES,
+            max_json_nodes: MAX_CANONICAL_JSON_NODES,
+            max_json_scalar_bytes: MAX_CANONICAL_SCALAR_BYTES,
             #[cfg(test)]
             process_fault: ProcessFault::None,
         },
@@ -73,6 +80,8 @@ struct SchemaProbePolicy {
     timeout: Duration,
     max_output_bytes: usize,
     max_schema_bytes: u64,
+    max_json_nodes: usize,
+    max_json_scalar_bytes: usize,
     #[cfg(test)]
     process_fault: ProcessFault,
 }
@@ -138,12 +147,21 @@ fn probe_codex_schema_in(
 
     let combined_schema_sha256 =
         digest_artifact(directory, SchemaArtifact::Combined, policy.max_schema_bytes)?;
-    let v2_schema_sha256 = digest_artifact(directory, SchemaArtifact::V2, policy.max_schema_bytes)?;
+    let (v2_schema_sha256, v2_schema_canonical_sha256) = digest_json_artifact(
+        directory,
+        SchemaArtifact::V2,
+        policy.max_schema_bytes,
+        JsonLimits {
+            max_nodes: policy.max_json_nodes,
+            max_scalar_bytes: policy.max_json_scalar_bytes,
+        },
+    )?;
 
     Ok(CodexSchemaProbe {
         inspection: expected.clone(),
         combined_schema_sha256,
         v2_schema_sha256,
+        v2_schema_canonical_sha256,
         stdout_bytes: output.stdout.len(),
         stderr_bytes: output.stderr_bytes,
     })
@@ -210,6 +228,428 @@ fn digest_artifact(
         return Err(CodexSchemaProbeError::ArtifactChanged { artifact });
     }
     Ok(format!("{:x}", digest.finalize()))
+}
+
+fn digest_json_artifact(
+    directory: &ProbeDirectory,
+    artifact: SchemaArtifact,
+    max_bytes: u64,
+    json_limits: JsonLimits,
+) -> Result<(String, String), CodexSchemaProbeError> {
+    let bytes = read_artifact(directory, artifact, max_bytes)?;
+    let raw_digest = format!("{:x}", Sha256::digest(&bytes));
+    let canonical_digest = digest_canonical_json(&bytes, artifact, max_bytes, json_limits)?;
+    Ok((raw_digest, canonical_digest))
+}
+
+fn read_artifact(
+    directory: &ProbeDirectory,
+    artifact: SchemaArtifact,
+    max_bytes: u64,
+) -> Result<Vec<u8>, CodexSchemaProbeError> {
+    let descriptor = openat(
+        &directory.descriptor,
+        artifact.file_name(),
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|error| CodexSchemaProbeError::OpenArtifact {
+        artifact,
+        source: io::Error::from_raw_os_error(error.raw_os_error()),
+    })?;
+    let mut file = File::from(descriptor);
+    let before = file
+        .metadata()
+        .map_err(|source| CodexSchemaProbeError::InspectArtifact { artifact, source })?;
+    if !before.is_file() {
+        return Err(CodexSchemaProbeError::ArtifactNotRegular { artifact });
+    }
+    if before.len() > max_bytes {
+        return Err(CodexSchemaProbeError::ArtifactTooLarge {
+            artifact,
+            max_bytes,
+        });
+    }
+
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    let mut limited = Read::by_ref(&mut file).take(max_bytes.saturating_add(1));
+    limited
+        .read_to_end(&mut bytes)
+        .map_err(|source| CodexSchemaProbeError::ReadArtifact { artifact, source })?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(CodexSchemaProbeError::ArtifactTooLarge {
+            artifact,
+            max_bytes,
+        });
+    }
+    let after = file
+        .metadata()
+        .map_err(|source| CodexSchemaProbeError::InspectArtifact { artifact, source })?;
+    if !same_artifact(&before, &after) || bytes.len() as u64 != after.len() {
+        return Err(CodexSchemaProbeError::ArtifactChanged { artifact });
+    }
+    Ok(bytes)
+}
+
+fn digest_canonical_json(
+    bytes: &[u8],
+    artifact: SchemaArtifact,
+    max_bytes: u64,
+    json_limits: JsonLimits,
+) -> Result<String, CodexSchemaProbeError> {
+    let value = JsonParser::parse(bytes, json_limits).map_err(|error| match error {
+        JsonParseError::Invalid => CodexSchemaProbeError::InvalidJsonArtifact { artifact },
+        JsonParseError::BudgetExceeded => {
+            CodexSchemaProbeError::CanonicalJsonBudgetExceeded { artifact }
+        }
+    })?;
+    let mut writer = DigestWriter::new(max_bytes);
+    write_canonical_json(&value, &mut writer).map_err(|()| {
+        if writer.exceeded_limit {
+            CodexSchemaProbeError::ArtifactTooLarge {
+                artifact,
+                max_bytes,
+            }
+        } else {
+            CodexSchemaProbeError::CanonicalizeArtifact { artifact }
+        }
+    })?;
+    Ok(writer.finish())
+}
+
+#[derive(Clone, Copy)]
+struct JsonLimits {
+    max_nodes: usize,
+    max_scalar_bytes: usize,
+}
+
+#[derive(Debug)]
+enum CanonicalJson {
+    Null,
+    Bool(bool),
+    Number(CanonicalNumber),
+    String(String),
+    Array(Vec<Self>),
+    Object(BTreeMap<String, Self>),
+}
+
+#[derive(Debug)]
+struct CanonicalNumber(String);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JsonParseError {
+    Invalid,
+    BudgetExceeded,
+}
+
+struct JsonParser<'a> {
+    bytes: &'a [u8],
+    position: usize,
+    remaining_nodes: usize,
+    remaining_scalar_bytes: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn parse(bytes: &'a [u8], limits: JsonLimits) -> Result<CanonicalJson, JsonParseError> {
+        let mut parser = Self {
+            bytes,
+            position: 0,
+            remaining_nodes: limits.max_nodes,
+            remaining_scalar_bytes: limits.max_scalar_bytes,
+        };
+        let value = parser.parse_value(0)?;
+        parser.skip_whitespace();
+        if parser.position != bytes.len() {
+            return Err(JsonParseError::Invalid);
+        }
+        Ok(value)
+    }
+
+    fn parse_value(&mut self, depth: usize) -> Result<CanonicalJson, JsonParseError> {
+        if depth > MAX_JSON_NESTING_DEPTH {
+            return Err(JsonParseError::Invalid);
+        }
+        if self.remaining_nodes == 0 {
+            return Err(JsonParseError::BudgetExceeded);
+        }
+        self.remaining_nodes -= 1;
+        self.skip_whitespace();
+        match self.peek().ok_or(JsonParseError::Invalid)? {
+            b'n' => {
+                self.consume_literal(b"null")?;
+                Ok(CanonicalJson::Null)
+            }
+            b't' => {
+                self.consume_literal(b"true")?;
+                Ok(CanonicalJson::Bool(true))
+            }
+            b'f' => {
+                self.consume_literal(b"false")?;
+                Ok(CanonicalJson::Bool(false))
+            }
+            b'"' => self.parse_string().map(CanonicalJson::String),
+            b'[' => self.parse_array(depth),
+            b'{' => self.parse_object(depth),
+            b'-' | b'0'..=b'9' => self.parse_number().map(CanonicalJson::Number),
+            _ => Err(JsonParseError::Invalid),
+        }
+    }
+
+    fn parse_array(&mut self, depth: usize) -> Result<CanonicalJson, JsonParseError> {
+        self.expect_byte(b'[')?;
+        self.skip_whitespace();
+        let mut values = Vec::new();
+        if self.consume_if(b']') {
+            return Ok(CanonicalJson::Array(values));
+        }
+        loop {
+            values.push(self.parse_value(depth.saturating_add(1))?);
+            self.skip_whitespace();
+            if self.consume_if(b']') {
+                return Ok(CanonicalJson::Array(values));
+            }
+            self.expect_byte(b',')?;
+        }
+    }
+
+    fn parse_object(&mut self, depth: usize) -> Result<CanonicalJson, JsonParseError> {
+        self.expect_byte(b'{')?;
+        self.skip_whitespace();
+        let mut values = BTreeMap::new();
+        if self.consume_if(b'}') {
+            return Ok(CanonicalJson::Object(values));
+        }
+        loop {
+            self.skip_whitespace();
+            let key = self.parse_string()?;
+            if values.contains_key(&key) {
+                return Err(JsonParseError::Invalid);
+            }
+            self.skip_whitespace();
+            self.expect_byte(b':')?;
+            let value = self.parse_value(depth.saturating_add(1))?;
+            values.insert(key, value);
+            self.skip_whitespace();
+            if self.consume_if(b'}') {
+                return Ok(CanonicalJson::Object(values));
+            }
+            self.expect_byte(b',')?;
+        }
+    }
+
+    fn parse_string(&mut self) -> Result<String, JsonParseError> {
+        let start = self.position;
+        self.expect_byte(b'"')?;
+        while let Some(byte) = self.peek() {
+            match byte {
+                b'"' => {
+                    self.position += 1;
+                    let raw_bytes = self.position - start;
+                    self.reserve_scalar_bytes(raw_bytes)?;
+                    return serde_json::from_slice(&self.bytes[start..self.position])
+                        .map_err(|_| JsonParseError::Invalid);
+                }
+                b'\\' => {
+                    self.position += 1;
+                    if self.peek().is_none() {
+                        return Err(JsonParseError::Invalid);
+                    }
+                    self.position += 1;
+                }
+                _ => self.position += 1,
+            }
+        }
+        Err(JsonParseError::Invalid)
+    }
+
+    fn parse_number(&mut self) -> Result<CanonicalNumber, JsonParseError> {
+        let start = self.position;
+        while self
+            .peek()
+            .is_some_and(|byte| !matches!(byte, b' ' | b'\n' | b'\r' | b'\t' | b',' | b']' | b'}'))
+        {
+            self.position += 1;
+        }
+        let bytes = &self.bytes[start..self.position];
+        if !is_valid_json_number(bytes) {
+            return Err(JsonParseError::Invalid);
+        }
+        self.reserve_scalar_bytes(bytes.len())?;
+        let lexeme = std::str::from_utf8(bytes).map_err(|_| JsonParseError::Invalid)?;
+        Ok(CanonicalNumber(lexeme.to_owned()))
+    }
+
+    fn consume_literal(&mut self, literal: &[u8]) -> Result<(), JsonParseError> {
+        let end = self
+            .position
+            .checked_add(literal.len())
+            .ok_or(JsonParseError::Invalid)?;
+        if self.bytes.get(self.position..end) != Some(literal) {
+            return Err(JsonParseError::Invalid);
+        }
+        self.position = end;
+        Ok(())
+    }
+
+    fn expect_byte(&mut self, expected: u8) -> Result<(), JsonParseError> {
+        if self.consume_if(expected) {
+            Ok(())
+        } else {
+            Err(JsonParseError::Invalid)
+        }
+    }
+
+    fn consume_if(&mut self, expected: u8) -> bool {
+        if self.peek() == Some(expected) {
+            self.position += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self
+            .peek()
+            .is_some_and(|byte| matches!(byte, b' ' | b'\n' | b'\r' | b'\t'))
+        {
+            self.position += 1;
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.position).copied()
+    }
+
+    fn reserve_scalar_bytes(&mut self, bytes: usize) -> Result<(), JsonParseError> {
+        self.remaining_scalar_bytes = self
+            .remaining_scalar_bytes
+            .checked_sub(bytes)
+            .ok_or(JsonParseError::BudgetExceeded)?;
+        Ok(())
+    }
+}
+
+fn is_valid_json_number(bytes: &[u8]) -> bool {
+    let mut position = 0;
+    if bytes.get(position) == Some(&b'-') {
+        position += 1;
+    }
+
+    match bytes.get(position) {
+        Some(b'0') => position += 1,
+        Some(b'1'..=b'9') => {
+            position += 1;
+            while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+                position += 1;
+            }
+        }
+        _ => return false,
+    }
+
+    if bytes.get(position) == Some(&b'.') {
+        position += 1;
+        let fraction_start = position;
+        while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+            position += 1;
+        }
+        if position == fraction_start {
+            return false;
+        }
+    }
+
+    if bytes
+        .get(position)
+        .is_some_and(|byte| matches!(byte, b'e' | b'E'))
+    {
+        position += 1;
+        if bytes
+            .get(position)
+            .is_some_and(|byte| matches!(byte, b'+' | b'-'))
+        {
+            position += 1;
+        }
+        let exponent_start = position;
+        while bytes.get(position).is_some_and(u8::is_ascii_digit) {
+            position += 1;
+        }
+        if position == exponent_start {
+            return false;
+        }
+    }
+
+    position == bytes.len()
+}
+
+fn write_canonical_json(value: &CanonicalJson, writer: &mut DigestWriter) -> Result<(), ()> {
+    match value {
+        CanonicalJson::Null => writer.write_all(b"null").map_err(|_| ()),
+        CanonicalJson::Bool(true) => writer.write_all(b"true").map_err(|_| ()),
+        CanonicalJson::Bool(false) => writer.write_all(b"false").map_err(|_| ()),
+        CanonicalJson::Number(number) => writer.write_all(number.0.as_bytes()).map_err(|_| ()),
+        CanonicalJson::String(value) => serde_json::to_writer(writer, value).map_err(|_| ()),
+        CanonicalJson::Array(values) => {
+            writer.write_all(b"[").map_err(|_| ())?;
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    writer.write_all(b",").map_err(|_| ())?;
+                }
+                write_canonical_json(value, writer)?;
+            }
+            writer.write_all(b"]").map_err(|_| ())
+        }
+        CanonicalJson::Object(values) => {
+            writer.write_all(b"{").map_err(|_| ())?;
+            for (index, (key, value)) in values.iter().enumerate() {
+                if index != 0 {
+                    writer.write_all(b",").map_err(|_| ())?;
+                }
+                serde_json::to_writer(&mut *writer, key).map_err(|_| ())?;
+                writer.write_all(b":").map_err(|_| ())?;
+                write_canonical_json(value, writer)?;
+            }
+            writer.write_all(b"}").map_err(|_| ())
+        }
+    }
+}
+
+struct DigestWriter {
+    digest: Sha256,
+    bytes: u64,
+    max_bytes: u64,
+    exceeded_limit: bool,
+}
+
+impl DigestWriter {
+    fn new(max_bytes: u64) -> Self {
+        Self {
+            digest: Sha256::new(),
+            bytes: 0,
+            max_bytes,
+            exceeded_limit: false,
+        }
+    }
+
+    fn finish(self) -> String {
+        format!("{:x}", self.digest.finalize())
+    }
+}
+
+impl Write for DigestWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let next_bytes = self.bytes.saturating_add(buffer.len() as u64);
+        if next_bytes > self.max_bytes {
+            self.exceeded_limit = true;
+            return Err(io::Error::other("canonical JSON exceeded size limit"));
+        }
+        self.digest.update(buffer);
+        self.bytes = next_bytes;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn same_artifact(left: &Metadata, right: &Metadata) -> bool {
@@ -369,6 +809,15 @@ pub enum CodexSchemaProbeError {
     ArtifactChanged {
         artifact: SchemaArtifact,
     },
+    InvalidJsonArtifact {
+        artifact: SchemaArtifact,
+    },
+    CanonicalJsonBudgetExceeded {
+        artifact: SchemaArtifact,
+    },
+    CanonicalizeArtifact {
+        artifact: SchemaArtifact,
+    },
     Cleanup(io::Error),
 }
 
@@ -493,6 +942,24 @@ impl fmt::Display for CodexSchemaProbeError {
                     "{artifact:?} Codex schema changed while being hashed"
                 )
             }
+            Self::InvalidJsonArtifact { artifact } => {
+                write!(
+                    formatter,
+                    "{artifact:?} Codex schema was not unambiguous JSON"
+                )
+            }
+            Self::CanonicalJsonBudgetExceeded { artifact } => {
+                write!(
+                    formatter,
+                    "{artifact:?} Codex schema exceeded the canonical JSON allocation budget"
+                )
+            }
+            Self::CanonicalizeArtifact { artifact, .. } => {
+                write!(
+                    formatter,
+                    "could not canonicalize {artifact:?} Codex schema"
+                )
+            }
             Self::Cleanup(error) => {
                 write!(
                     formatter,
@@ -587,6 +1054,10 @@ mod tests {
             format!("{:x}", Sha256::digest(combined))
         );
         assert_eq!(probe.v2_schema_sha256, format!("{:x}", Sha256::digest(v2)));
+        assert_eq!(
+            probe.v2_schema_canonical_sha256,
+            format!("{:x}", Sha256::digest(b"{\"v2\":true}"))
+        );
         assert_eq!(probe.stdout_bytes, 0);
         assert_eq!(probe.stderr_bytes, "private warning".len());
         assert_eq!(probe.inspection, inspection);
@@ -709,6 +1180,161 @@ mod tests {
     }
 
     #[test]
+    fn canonical_v2_digest_ignores_object_key_order_but_preserves_semantic_drift() {
+        let first = super::digest_canonical_json(
+            br#"{"outer":{"b":2,"a":1},"items":[{"y":true,"x":null}]}"#,
+            SchemaArtifact::V2,
+            1024,
+            test_json_limits(),
+        )
+        .expect("first canonical digest");
+        let reordered = super::digest_canonical_json(
+            br#"{"items":[{"x":null,"y":true}],"outer":{"a":1,"b":2}}"#,
+            SchemaArtifact::V2,
+            1024,
+            test_json_limits(),
+        )
+        .expect("reordered canonical digest");
+        let changed = super::digest_canonical_json(
+            br#"{"items":[{"x":null,"y":false}],"outer":{"a":1,"b":2}}"#,
+            SchemaArtifact::V2,
+            1024,
+            test_json_limits(),
+        )
+        .expect("changed canonical digest");
+
+        assert_eq!(first, reordered);
+        assert_ne!(first, changed);
+    }
+
+    #[test]
+    fn malformed_and_duplicate_key_v2_json_fail_closed_without_content_leakage() {
+        for bytes in [
+            br#"{"incomplete":"#.as_slice(),
+            br#"{"duplicate":1,"duplicate":2}"#.as_slice(),
+        ] {
+            let error =
+                super::digest_canonical_json(bytes, SchemaArtifact::V2, 1024, test_json_limits())
+                    .expect_err("invalid");
+            assert!(matches!(
+                error,
+                CodexSchemaProbeError::InvalidJsonArtifact {
+                    artifact: SchemaArtifact::V2
+                }
+            ));
+            assert!(!error.to_string().contains("duplicate"));
+            assert!(!error.to_string().contains("incomplete"));
+        }
+
+        assert!(matches!(
+            super::digest_canonical_json(b"{}", SchemaArtifact::V2, 1, test_json_limits()),
+            Err(CodexSchemaProbeError::ArtifactTooLarge {
+                artifact: SchemaArtifact::V2,
+                max_bytes: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn arbitrary_precision_number_lexemes_never_collapse_to_one_digest() {
+        let first = super::digest_canonical_json(
+            br#"{"value":18446744073709551616,"ratio":1.25}"#,
+            SchemaArtifact::V2,
+            1024,
+            test_json_limits(),
+        )
+        .expect("first arbitrary-precision digest");
+        let changed = super::digest_canonical_json(
+            br#"{"ratio":1.25,"value":18446744073709551617}"#,
+            SchemaArtifact::V2,
+            1024,
+            test_json_limits(),
+        )
+        .expect("changed arbitrary-precision digest");
+
+        assert_ne!(first, changed);
+
+        let number = super::digest_canonical_json(
+            br#"{"x":123}"#,
+            SchemaArtifact::V2,
+            1024,
+            test_json_limits(),
+        )
+        .expect("number digest");
+        let token_shaped_object = super::digest_canonical_json(
+            br#"{"x":{"$serde_json::private::Number":"123"}}"#,
+            SchemaArtifact::V2,
+            1024,
+            test_json_limits(),
+        )
+        .expect("token-shaped object digest");
+        assert_ne!(number, token_shaped_object);
+
+        let ordinary_value: serde_json::Value =
+            serde_json::from_str(r#"{"$serde_json::private::Number":"123"}"#)
+                .expect("ordinary object");
+        assert!(ordinary_value.is_object());
+        assert_eq!(
+            serde_json::to_string(&ordinary_value).expect("ordinary object JSON"),
+            r#"{"$serde_json::private::Number":"123"}"#
+        );
+    }
+
+    #[test]
+    fn invalid_v2_json_fails_the_probe_and_removes_its_directory() {
+        let directory = TestDirectory::new("invalid-json");
+        let executable = directory.0.join("codex");
+        write_script(
+            &executable,
+            "#!/bin/sh\nprintf '{}' > \"$5/codex_app_server_protocol.schemas.json\"\nprintf '{\"private\":\"value\",\"private\":2}' > \"$5/codex_app_server_protocol.v2.schemas.json\"\n",
+        );
+        let inspection = inspect_codex_at(&executable).expect("inspection");
+        let mut output_path = None;
+
+        let error =
+            probe_codex_schema_with_policy_and_observer(&inspection, test_policy(), |path| {
+                output_path = Some(path.to_owned())
+            })
+            .expect_err("ambiguous V2 JSON must fail");
+        assert!(matches!(
+            error,
+            CodexSchemaProbeError::InvalidJsonArtifact {
+                artifact: SchemaArtifact::V2
+            }
+        ));
+        assert!(!error.to_string().contains("private"));
+        assert!(!output_path.expect("observed output path").exists());
+    }
+
+    #[test]
+    fn canonical_tree_budget_fails_the_probe_and_removes_its_directory() {
+        let directory = TestDirectory::new("json-budget");
+        let executable = directory.0.join("codex");
+        write_script(
+            &executable,
+            "#!/bin/sh\nprintf '{}' > \"$5/codex_app_server_protocol.schemas.json\"\nprintf '[0,0,0,0,0]' > \"$5/codex_app_server_protocol.v2.schemas.json\"\n",
+        );
+        let inspection = inspect_codex_at(&executable).expect("inspection");
+        let mut output_path = None;
+        let policy = SchemaProbePolicy {
+            max_json_nodes: 4,
+            ..test_policy()
+        };
+
+        let error = probe_codex_schema_with_policy_and_observer(&inspection, policy, |path| {
+            output_path = Some(path.to_owned())
+        })
+        .expect_err("canonical tree budget must fail");
+        assert!(matches!(
+            error,
+            CodexSchemaProbeError::CanonicalJsonBudgetExceeded {
+                artifact: SchemaArtifact::V2
+            }
+        ));
+        assert!(!output_path.expect("observed output path").exists());
+    }
+
+    #[test]
     fn fifo_schema_artifacts_fail_without_blocking_and_remove_directory() {
         let directory = TestDirectory::new("fifo-artifacts");
         let cases = [
@@ -819,7 +1445,16 @@ mod tests {
             timeout: Duration::from_secs(5),
             max_output_bytes: 128,
             max_schema_bytes: 1024,
+            max_json_nodes: 1024,
+            max_json_scalar_bytes: 1024,
             process_fault: ProcessFault::None,
+        }
+    }
+
+    fn test_json_limits() -> super::JsonLimits {
+        super::JsonLimits {
+            max_nodes: 1024,
+            max_scalar_bytes: 1024,
         }
     }
 
