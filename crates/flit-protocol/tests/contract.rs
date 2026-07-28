@@ -9,7 +9,8 @@ use flit_protocol::{
     ProjectInspectionResponse, ProjectRegistrationRequest, ProjectRegistrationResponse,
     ProjectTrustRequest, ProjectTrustResponse, ProjectsListRequest, ProjectsListResponse,
     ProviderCompatibility, ProviderDiagnosticsRequest, ProviderDiagnosticsResponse,
-    ProviderUnavailableReason, RunDetailReadRequest, RunDetailReadResponse, SystemHealthRequest,
+    ProviderExecutionAfterQuit, ProviderUnavailableReason, QuitImpactReason, QuitImpactRequest,
+    QuitImpactResponse, RunDetailReadRequest, RunDetailReadResponse, SystemHealthRequest,
     SystemHealthResponse, event_schema_id, event_schema_relative_path,
     generated_swift_command_contract,
 };
@@ -475,6 +476,87 @@ fn current_provider_diagnostics_fixtures_are_exhaustive_and_path_free() {
 }
 
 #[test]
+fn current_quit_impact_fixtures_are_exact_bounded_and_path_free() {
+    let manifest = read_command_compatibility_manifest();
+    let current = &manifest.current;
+    assert_fixture_round_trip::<QuitImpactRequest>(&command_fixture(
+        current,
+        "quit_impact.request.json",
+    ));
+    assert_fixture_round_trip::<QuitImpactResponse>(&command_fixture(
+        current,
+        "quit_impact.response.json",
+    ));
+    let response: QuitImpactResponse = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "quit_impact.response.json",
+        )))
+        .expect("Quit impact fixture should be readable"),
+    )
+    .expect("Quit impact fixture should match Rust types");
+    assert!(response.flit_monitoring_stops);
+    assert!(response.flit_notifications_stop);
+    assert_eq!(
+        response
+            .runs
+            .iter()
+            .map(|run| (run.execution_after_quit, run.reason))
+            .collect::<Vec<_>>(),
+        [
+            (
+                ProviderExecutionAfterQuit::Continues,
+                QuitImpactReason::CapabilitySupported,
+            ),
+            (
+                ProviderExecutionAfterQuit::Stops,
+                QuitImpactReason::CapabilityUnsupported,
+            ),
+            (
+                ProviderExecutionAfterQuit::Unknown,
+                QuitImpactReason::CapabilityMissing,
+            ),
+        ]
+    );
+    let rendered = serde_json::to_string(&response).expect("Quit impact should serialize");
+    for forbidden in [
+        "canonical_path",
+        "executable",
+        "session_id",
+        "provider_thread",
+        "capabilities",
+    ] {
+        assert!(
+            !rendered.contains(forbidden),
+            "Quit impact fixture must not expose {forbidden}"
+        );
+    }
+
+    for required in [
+        "core_instance_id",
+        "cursor",
+        "flit_monitoring_stops",
+        "flit_notifications_stop",
+        "runs",
+    ] {
+        let mut missing: serde_json::Value =
+            serde_json::from_str(&rendered).expect("Quit impact fixture should be JSON");
+        missing
+            .as_object_mut()
+            .expect("Quit impact should be an object")
+            .remove(required);
+        assert!(
+            serde_json::from_value::<QuitImpactResponse>(missing).is_err(),
+            "Quit impact must require {required}"
+        );
+    }
+    let mut invented: serde_json::Value =
+        serde_json::from_str(&rendered).expect("Quit impact fixture should be JSON");
+    invented["runs"][0]["execution_after_quit"] = serde_json::json!("probably_continues");
+    assert!(serde_json::from_value::<QuitImpactResponse>(invented).is_err());
+}
+
+#[test]
 fn current_managed_run_start_fixtures_round_trip_every_shape() {
     let manifest = read_command_compatibility_manifest();
     let current = &manifest.current;
@@ -678,6 +760,11 @@ fn generated_swift_project_contract_is_current_and_required_fields_fail_closed()
         "FlitCommandError",
         "FlitProviderDiagnosticsRequest",
         "FlitProviderDiagnosticsResponse",
+        "FlitQuitImpactRequest",
+        "FlitProviderExecutionAfterQuit",
+        "FlitQuitImpactReason",
+        "FlitQuitImpactRun",
+        "FlitQuitImpactResponse",
         "FlitManagedRunPermissionMode",
         "FlitManagedRunStartRequest",
         "FlitManagedRunStartResponse",

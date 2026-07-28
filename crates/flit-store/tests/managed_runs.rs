@@ -1870,9 +1870,26 @@ fn live_managed_sessions_are_stable_bounded_and_exclude_terminal_rows() {
             .collect::<Vec<_>>(),
         ["session-a"]
     );
+    assert_eq!(
+        store
+            .complete_live_managed_sessions(2)
+            .expect("complete live session snapshot")
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect::<Vec<_>>(),
+        ["session-a", "session-z"]
+    );
+    assert!(matches!(
+        store.complete_live_managed_sessions(1),
+        Err(StoreError::LiveManagedSessionSourceLimitExceeded { max: 1 })
+    ));
     for limit in [0, MAX_LIVE_MANAGED_SESSIONS + 1] {
         assert!(matches!(
             store.live_managed_sessions(limit),
+            Err(StoreError::InvalidLiveManagedSessionLimit { .. })
+        ));
+        assert!(matches!(
+            store.complete_live_managed_sessions(limit),
             Err(StoreError::InvalidLiveManagedSessionLimit { .. })
         ));
     }
@@ -1892,6 +1909,15 @@ fn live_managed_sessions_are_stable_bounded_and_exclude_terminal_rows() {
         store
             .live_managed_sessions(2)
             .expect("remaining live session")
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect::<Vec<_>>(),
+        ["session-z"]
+    );
+    assert_eq!(
+        store
+            .complete_live_managed_sessions(1)
+            .expect("complete remaining session")
             .iter()
             .map(|session| session.id.as_str())
             .collect::<Vec<_>>(),

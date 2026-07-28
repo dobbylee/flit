@@ -4,7 +4,7 @@ use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: &str = "1.11";
+pub const PROTOCOL_VERSION: &str = "1.12";
 pub const EVENT_PROTOCOL_VERSION: &str = "1.0";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -265,6 +265,11 @@ pub struct ProviderDiagnosticsRequest {
     pub client_protocol_version: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct QuitImpactRequest {
+    pub client_protocol_version: String,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
@@ -349,6 +354,43 @@ pub struct ProviderDiagnosticsResponse {
     pub capabilities: Vec<ProviderCapabilityEntry>,
     pub fingerprint_mismatches: Vec<FingerprintAxis>,
     pub unavailable_reason: Option<ProviderUnavailableReason>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderExecutionAfterQuit {
+    Continues,
+    Stops,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuitImpactReason {
+    CapabilitySupported,
+    CapabilityUnsupported,
+    CapabilityUncertain,
+    CapabilityMissing,
+    CapabilityInvalid,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct QuitImpactRun {
+    pub run_id: String,
+    pub title: String,
+    pub provider: ProviderKind,
+    pub execution_after_quit: ProviderExecutionAfterQuit,
+    pub reason: QuitImpactReason,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct QuitImpactResponse {
+    pub protocol_version: String,
+    pub core_instance_id: String,
+    pub cursor: u64,
+    pub flit_monitoring_stops: bool,
+    pub flit_notifications_stop: bool,
+    pub runs: Vec<QuitImpactRun>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1312,6 +1354,62 @@ struct FlitProviderDiagnosticsResponse: Codable, Equatable, Sendable {
         case capabilities
         case fingerprintMismatches = "fingerprint_mismatches"
         case unavailableReason = "unavailable_reason"
+    }
+}
+
+struct FlitQuitImpactRequest: Codable, Equatable, Sendable {
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+enum FlitProviderExecutionAfterQuit: String, Codable, Sendable {
+    case continues
+    case stops
+    case unknown
+}
+
+enum FlitQuitImpactReason: String, Codable, Sendable {
+    case capabilitySupported = "capability_supported"
+    case capabilityUnsupported = "capability_unsupported"
+    case capabilityUncertain = "capability_uncertain"
+    case capabilityMissing = "capability_missing"
+    case capabilityInvalid = "capability_invalid"
+}
+
+struct FlitQuitImpactRun: Codable, Equatable, Sendable {
+    let runId: String
+    let title: String
+    let provider: FlitProviderKind
+    let executionAfterQuit: FlitProviderExecutionAfterQuit
+    let reason: FlitQuitImpactReason
+
+    private enum CodingKeys: String, CodingKey {
+        case runId = "run_id"
+        case title
+        case provider
+        case executionAfterQuit = "execution_after_quit"
+        case reason
+    }
+}
+
+struct FlitQuitImpactResponse: Codable, Equatable, Sendable {
+    let protocolVersion: String
+    let coreInstanceId: String
+    let cursor: UInt64
+    let flitMonitoringStops: Bool
+    let flitNotificationsStop: Bool
+    let runs: [FlitQuitImpactRun]
+
+    private enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case coreInstanceId = "core_instance_id"
+        case cursor
+        case flitMonitoringStops = "flit_monitoring_stops"
+        case flitNotificationsStop = "flit_notifications_stop"
+        case runs
     }
 }
 

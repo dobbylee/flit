@@ -22,7 +22,8 @@ use flit_protocol::{
     ProjectRegistrationResponse, ProjectRegistrationStatus, ProjectTrustResponse,
     ProjectTrustStatus, ProjectsListResponse, ProviderCapability as ProtocolProviderCapability,
     ProviderCapabilityEntry, ProviderCompatibility as ProtocolProviderCompatibility,
-    ProviderDiagnosticsResponse, ProviderKind as ProtocolProviderKind, ProviderUnavailableReason,
+    ProviderDiagnosticsResponse, ProviderExecutionAfterQuit, ProviderKind as ProtocolProviderKind,
+    ProviderUnavailableReason, QuitImpactReason, QuitImpactResponse, QuitImpactRun,
     RunDetailReadRequest, RunDetailReadResponse, RunEvidenceRecord, SystemHealthResponse,
 };
 use flit_providers::{
@@ -63,6 +64,7 @@ const MAX_PROJECT_PATH_BYTES: usize = 4_096;
 const MAX_TIMESTAMP_BYTES: usize = 64;
 const MAX_PROJECT_RESPONSE_BYTES: usize = 1_048_576;
 const MAX_PROVIDER_DIAGNOSTICS_RESPONSE_BYTES: usize = 65_536;
+const MAX_QUIT_IMPACT_RESPONSE_BYTES: usize = 1_048_576;
 const MAX_MANAGED_RUN_REQUEST_BYTES: usize = 128 * 1_024;
 const MAX_DASHBOARD_REQUEST_BYTES: usize = 64 * 1_024;
 const MAX_DASHBOARD_RESPONSE_BYTES: usize = 8 * 1_024 * 1_024;
@@ -107,6 +109,8 @@ pub enum BridgeError {
     ProjectResponseTooLarge,
     #[error("the provider diagnostics response exceeds the native bridge limit")]
     ProviderDiagnosticsResponseTooLarge,
+    #[error("the explicit Quit impact response exceeds the native bridge limit")]
+    QuitImpactResponseTooLarge,
     #[error("the Dashboard request is invalid")]
     InvalidDashboardRequest,
     #[error("the Dashboard response exceeds the native bridge limit")]
@@ -550,6 +554,7 @@ fn project_command_error(error: &BridgeError) -> Option<CommandError> {
         | BridgeError::CoreLockFailure
         | BridgeError::ProjectResponseTooLarge
         | BridgeError::ProviderDiagnosticsResponseTooLarge
+        | BridgeError::QuitImpactResponseTooLarge
         | BridgeError::InvalidDashboardRequest
         | BridgeError::DashboardResponseTooLarge
         | BridgeError::ManagedRunResponseTooLarge
@@ -810,6 +815,113 @@ pub fn provider_diagnostics_json(client_protocol_version: String) -> Result<Stri
             }),
             Err(error) => project_command_json::<ProviderDiagnosticsResponse>(|| Err(error)),
         }
+    })
+}
+
+fn quit_impact_command_json(
+    operation: impl FnOnce() -> Result<QuitImpactResponse, BridgeError>,
+) -> Result<String, BridgeError> {
+    match operation() {
+        Ok(response) => bounded_json(
+            &response,
+            MAX_QUIT_IMPACT_RESPONSE_BYTES,
+            BridgeError::QuitImpactResponseTooLarge,
+        ),
+        Err(error) => match project_command_error(&error) {
+            Some(command_error) => bounded_json(
+                &command_error,
+                MAX_QUIT_IMPACT_RESPONSE_BYTES,
+                BridgeError::QuitImpactResponseTooLarge,
+            ),
+            None => Err(error),
+        },
+    }
+}
+
+fn provider_execution_after_quit(
+    session: &ManagedSession,
+) -> (ProviderExecutionAfterQuit, QuitImpactReason) {
+    match session.capabilities.get("continue_after_quit") {
+        Some(serde_json::Value::String(status)) if status == "supported" => (
+            ProviderExecutionAfterQuit::Continues,
+            QuitImpactReason::CapabilitySupported,
+        ),
+        Some(serde_json::Value::String(status)) if status == "unsupported" => (
+            ProviderExecutionAfterQuit::Stops,
+            QuitImpactReason::CapabilityUnsupported,
+        ),
+        Some(serde_json::Value::String(status))
+            if matches!(status.as_str(), "degraded" | "unknown" | "unavailable") =>
+        {
+            (
+                ProviderExecutionAfterQuit::Unknown,
+                QuitImpactReason::CapabilityUncertain,
+            )
+        }
+        None => (
+            ProviderExecutionAfterQuit::Unknown,
+            QuitImpactReason::CapabilityMissing,
+        ),
+        Some(_) => (
+            ProviderExecutionAfterQuit::Unknown,
+            QuitImpactReason::CapabilityInvalid,
+        ),
+    }
+}
+
+#[uniffi::export]
+pub fn quit_impact_json(client_protocol_version: String) -> Result<String, BridgeError> {
+    protect(|| quit_impact_with(&CORE, &client_protocol_version))
+}
+
+fn quit_impact_with(
+    core_manager: &CoreManager,
+    client_protocol_version: &str,
+) -> Result<String, BridgeError> {
+    quit_impact_command_json(|| {
+        validate_project_protocol(client_protocol_version)?;
+        core_manager.with_ready_core(|core| {
+            let cursor = core
+                .store
+                .latest_ingest_seq()
+                .map_err(|_| BridgeError::StorageFailure)?;
+            let sessions = core
+                .store
+                .complete_live_managed_sessions(MAX_LIVE_MANAGED_SESSIONS)
+                .map_err(|_| BridgeError::StorageFailure)?;
+            let runs = sessions
+                .into_iter()
+                .map(|session| {
+                    let run = core
+                        .store
+                        .managed_run(&session.run_id)
+                        .map_err(|_| BridgeError::StorageFailure)?
+                        .ok_or(BridgeError::StorageFailure)?;
+                    if run.ended_at.is_some()
+                        || run.provider_kind != session.provider_kind
+                        || session.provider_kind != "codex"
+                    {
+                        return Err(BridgeError::StorageFailure);
+                    }
+                    let (execution_after_quit, reason) = provider_execution_after_quit(&session);
+                    Ok(QuitImpactRun {
+                        run_id: run.id,
+                        title: run.title,
+                        provider: ProtocolProviderKind::Codex,
+                        execution_after_quit,
+                        reason,
+                    })
+                })
+                .collect::<Result<Vec<_>, BridgeError>>()?;
+            Ok(QuitImpactResponse {
+                protocol_version: PROTOCOL_VERSION.to_owned(),
+                core_instance_id: core.core_instance_id.clone(),
+                cursor,
+                flit_monitoring_stops: true,
+                flit_notifications_stop: true,
+                runs,
+            })
+        })
     })
 }
 
@@ -2221,7 +2333,8 @@ mod tests {
     use flit_protocol::{
         ManagedRunOpenInProviderRequest, ManagedRunPermissionDecision, ManagedRunPermissionMode,
         ManagedRunPermissionRespondRequest, ManagedRunPermissionRespondResponse,
-        ManagedRunStartResponse, RunDetailReadRequest, RunDetailReadResponse, SystemHealthRequest,
+        ManagedRunStartResponse, ProviderExecutionAfterQuit, QuitImpactReason, QuitImpactResponse,
+        RunDetailReadRequest, RunDetailReadResponse, SystemHealthRequest,
     };
     use flit_providers::{
         CodexManagedItemId, CodexManagedThreadId, CodexManagedTurnId, CodexManualStartedThread,
@@ -2530,6 +2643,152 @@ mod tests {
                 Ok(())
             })
             .expect("runtime state");
+    }
+
+    #[test]
+    fn quit_impact_is_core_owned_complete_content_safe_and_read_only() {
+        let (_directory, manager, _) = observation_core("quit-impact");
+        let cursor = manager
+            .with_ready_core(|core| {
+                let cwd = core
+                    .store
+                    .managed_session("session-observe")
+                    .expect("managed session read")
+                    .expect("managed session")
+                    .cwd;
+                for (index, (suffix, capability)) in [
+                    ("supported", serde_json::json!("supported")),
+                    ("unsupported", serde_json::json!("unsupported")),
+                    ("uncertain", serde_json::json!("degraded")),
+                    ("invalid", serde_json::json!(7)),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let run_id = format!("run-quit-{suffix}");
+                    core.store
+                        .create_managed_run_intent(ManagedRunIntent {
+                            id: run_id.clone(),
+                            project_id: "project-observe".to_owned(),
+                            title: format!("Quit {suffix}"),
+                            goal: None,
+                            start_request: serde_json::Map::new(),
+                            baseline_head: None,
+                            created_at: format!("2026-07-27T12:01:{index:02}Z"),
+                            run_created_event_id: format!("event-{suffix}-created"),
+                            start_requested_event_id: format!("event-{suffix}-requested"),
+                        })
+                        .expect("create Quit impact Run");
+                    core.store
+                        .connect_initial_managed_session(InitialManagedSessionConnection {
+                            id: format!("session-quit-{suffix}"),
+                            run_id,
+                            external_session_key: format!("thread-quit-{suffix}"),
+                            session_fingerprint: "test-profile".to_owned(),
+                            executable_path: Some(PathBuf::from("/private/tmp/codex")),
+                            executable_version: Some("0.145.0".to_owned()),
+                            cwd: cwd.clone(),
+                            capabilities: serde_json::Map::from_iter([(
+                                "continue_after_quit".to_owned(),
+                                capability,
+                            )]),
+                            contract_version: "codex-app-server/0.145.0".to_owned(),
+                            started_at: format!("2026-07-27T12:02:{index:02}Z"),
+                            connected_event_id: format!("event-{suffix}-connected"),
+                        })
+                        .expect("connect Quit impact session");
+                }
+                Ok(core.store.latest_ingest_seq().expect("Quit impact cursor"))
+            })
+            .expect("seed Quit impacts");
+
+        let rendered = quit_impact_with(&manager, PROTOCOL_VERSION).expect("Quit impact response");
+        let response =
+            serde_json::from_str::<QuitImpactResponse>(&rendered).expect("Quit impact JSON");
+        assert_eq!(response.cursor, cursor);
+        assert!(response.flit_monitoring_stops);
+        assert!(response.flit_notifications_stop);
+        assert_eq!(response.runs.len(), 5);
+        for (run_id, execution, reason) in [
+            (
+                "run-observe",
+                ProviderExecutionAfterQuit::Unknown,
+                QuitImpactReason::CapabilityMissing,
+            ),
+            (
+                "run-quit-supported",
+                ProviderExecutionAfterQuit::Continues,
+                QuitImpactReason::CapabilitySupported,
+            ),
+            (
+                "run-quit-unsupported",
+                ProviderExecutionAfterQuit::Stops,
+                QuitImpactReason::CapabilityUnsupported,
+            ),
+            (
+                "run-quit-uncertain",
+                ProviderExecutionAfterQuit::Unknown,
+                QuitImpactReason::CapabilityUncertain,
+            ),
+            (
+                "run-quit-invalid",
+                ProviderExecutionAfterQuit::Unknown,
+                QuitImpactReason::CapabilityInvalid,
+            ),
+        ] {
+            let impact = response
+                .runs
+                .iter()
+                .find(|impact| impact.run_id == run_id)
+                .expect("Run impact");
+            assert_eq!(impact.execution_after_quit, execution);
+            assert_eq!(impact.reason, reason);
+        }
+        for forbidden in [
+            "/private/tmp",
+            "session-quit",
+            "thread-quit",
+            "test-profile",
+            "continue_after_quit",
+            "0.145.0",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "Quit impact must not expose {forbidden}"
+            );
+        }
+        manager
+            .with_ready_core(|core| {
+                assert_eq!(
+                    core.store.latest_ingest_seq().expect("post-read cursor"),
+                    cursor
+                );
+                Ok(())
+            })
+            .expect("Quit impact must be read-only");
+        assert_eq!(
+            command_error(
+                &quit_impact_with(&manager, "2.0").expect("protocol mismatch command error")
+            )
+            .code,
+            CommandErrorCode::ProtocolMismatch
+        );
+    }
+
+    #[test]
+    fn quit_impact_empty_store_is_an_exact_empty_snapshot() {
+        let directory = ObservationDirectory::new("quit-impact-empty");
+        let manager = CoreManager::default();
+        manager
+            .initialize(directory.0.to_str().expect("UTF-8 path"))
+            .expect("initialize empty Core");
+        let response = serde_json::from_str::<QuitImpactResponse>(
+            &quit_impact_with(&manager, PROTOCOL_VERSION).expect("empty Quit impact"),
+        )
+        .expect("empty Quit impact JSON");
+        assert_eq!(response.cursor, 0);
+        assert!(response.runs.is_empty());
+        assert!(!response.core_instance_id.is_empty());
     }
 
     #[test]

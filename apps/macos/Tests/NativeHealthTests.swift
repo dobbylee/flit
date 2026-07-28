@@ -167,6 +167,11 @@ struct NativeHealthTests {
             dashboardBridgeError == .DashboardResponseTooLarge,
             "current protocol must generate the bounded Dashboard response error case"
         )
+        let quitImpactBridgeError: BridgeError = .QuitImpactResponseTooLarge
+        try require(
+            quitImpactBridgeError == .QuitImpactResponseTooLarge,
+            "current protocol must generate the bounded Quit impact response error case"
+        )
         let outgoingRequest = try JSONSerialization.data(
             withJSONObject: ["client_protocol_version": client.clientProtocolVersion],
             options: [.sortedKeys]
@@ -233,6 +238,11 @@ struct NativeHealthTests {
             try dashboardReadJson(requestJson: initialDashboardRequest),
             code: .storageUnavailable,
             fixtures: dashboardErrors
+        )
+        try requireCommandError(
+            try quitImpactJson(clientProtocolVersion: requestVersion),
+            code: .storageUnavailable,
+            fixtures: commandErrors
         )
         try requireCommandError(
             try projectInspectJson(
@@ -322,6 +332,18 @@ struct NativeHealthTests {
                 && currentDelta.nextCursor == dashboardCursor
                 && !currentDelta.hasMore,
             "native current Dashboard delta must converge without a callback stream"
+        )
+        let emptyQuitImpact = try JSONDecoder().decode(
+            FlitQuitImpactResponse.self,
+            from: Data(try quitImpactJson(clientProtocolVersion: requestVersion).utf8)
+        )
+        try require(
+            emptyQuitImpact.runs.isEmpty
+                && emptyQuitImpact.flitMonitoringStops
+                && emptyQuitImpact.flitNotificationsStop
+                && emptyQuitImpact.coreInstanceId == dashboardCoreInstanceId
+                && emptyQuitImpact.cursor == dashboardCursor,
+            "native Quit impact must preserve the exact empty Core snapshot"
         )
         let missingDetailRequest = FlitRunDetailReadRequest(
             runId: "run-missing",
@@ -664,6 +686,25 @@ struct NativeHealthTests {
         _ = try decodeFixture(
             FlitProviderDiagnosticsRequest.self,
             at: "\(fixtureRoot)/provider_diagnostics.request.json"
+        )
+        _ = try decodeFixture(
+            FlitQuitImpactRequest.self,
+            at: "\(fixtureRoot)/quit_impact.request.json"
+        )
+        let quitImpactFixture = try decodeFixture(
+            FlitQuitImpactResponse.self,
+            at: "\(fixtureRoot)/quit_impact.response.json"
+        )
+        try require(
+            quitImpactFixture.runs.map(\.executionAfterQuit)
+                == [.continues, .stops, .unknown]
+                && quitImpactFixture.runs.map(\.reason)
+                    == [
+                        .capabilitySupported,
+                        .capabilityUnsupported,
+                        .capabilityMissing,
+                    ],
+            "generated Quit impact contract must preserve exact per-Run outcomes"
         )
         for (name, compatibility) in [
             (

@@ -1686,6 +1686,36 @@ impl Store {
             .collect()
     }
 
+    pub fn complete_live_managed_sessions(
+        &self,
+        max: usize,
+    ) -> Result<Vec<ManagedSession>, StoreError> {
+        if max == 0 || max > MAX_LIVE_MANAGED_SESSIONS {
+            return Err(StoreError::InvalidLiveManagedSessionLimit {
+                limit: max,
+                max: MAX_LIVE_MANAGED_SESSIONS,
+            });
+        }
+        let sessions = self.live_managed_sessions(max)?;
+        if sessions.len() == max {
+            let source_count = self
+                .connection
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM agent_sessions
+                     JOIN runs ON runs.id = agent_sessions.run_id
+                     WHERE agent_sessions.ended_at IS NULL AND runs.ended_at IS NULL",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(StoreError::Sqlite)?;
+            if source_count > max as i64 {
+                return Err(StoreError::LiveManagedSessionSourceLimitExceeded { max });
+            }
+        }
+        Ok(sessions)
+    }
+
     pub fn managed_run(&self, run_id: &str) -> Result<Option<ManagedRun>, StoreError> {
         if run_id.trim().is_empty() {
             return Err(StoreError::InvalidManagedRunIntent { field: "id" });
@@ -4881,6 +4911,9 @@ pub enum StoreError {
         limit: usize,
         max: usize,
     },
+    LiveManagedSessionSourceLimitExceeded {
+        max: usize,
+    },
     InvalidCheckpointReport(CheckpointReport),
     InvalidEventBatchSize {
         count: usize,
@@ -5236,6 +5269,10 @@ impl fmt::Display for StoreError {
             Self::InvalidLiveManagedSessionLimit { limit, max } => write!(
                 formatter,
                 "invalid live managed session limit {limit}; expected 1..={max}"
+            ),
+            Self::LiveManagedSessionSourceLimitExceeded { max } => write!(
+                formatter,
+                "live managed session source exceeds complete snapshot limit {max}"
             ),
             Self::InvalidCheckpointReport(report) => write!(
                 formatter,
