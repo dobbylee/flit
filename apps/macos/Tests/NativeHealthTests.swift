@@ -272,6 +272,7 @@ struct NativeHealthTests {
         try require(
             currentDelta.delivery == .delta
                 && currentDelta.events.isEmpty
+                && currentDelta.runs.isEmpty
                 && currentDelta.nextCursor == dashboardCursor
                 && !currentDelta.hasMore,
             "native current Dashboard delta must converge without a callback stream"
@@ -395,6 +396,9 @@ struct NativeHealthTests {
                 && deletions == 7
                 && unavailableReason == "git_observation_not_configured"
                 && deltaFixture.events.count == 1
+                && deltaFixture.runs.count == 1
+                && deltaFixture.runs[0].runId == deltaFixture.events[0].runId
+                && deltaFixture.runs[0].version == deltaFixture.nextCursor
                 && resyncFixture.reason == .coreInstanceMismatch,
             "generated Dashboard fixtures must preserve snapshot, delta, and resync facts"
         )
@@ -436,6 +440,7 @@ struct NativeHealthTests {
         for (name, requiredField) in [
             ("dashboard_read.initial.response.json", "runs"),
             ("dashboard_read.delta.response.json", "events"),
+            ("dashboard_read.delta.response.json", "runs"),
         ] {
             let data = try Data(
                 contentsOf: URL(fileURLWithPath: "\(fixtureRoot)/\(name)")

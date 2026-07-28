@@ -1,0 +1,46 @@
+{
+  "delivery": "delta",
+  "protocol_version": "1.10",
+  "event_schema_version": "1.0",
+  "core_instance_id": "core-instance-1",
+  "requested_after_cursor": 3,
+  "retained_after_cursor": 0,
+  "next_cursor": 4,
+  "has_more": false,
+  "events": [
+    {
+      "cursor": 4,
+      "event_id": "event-dashboard-4",
+      "run_id": "run-dashboard-1",
+      "event_type": "run.event_observed",
+      "observed_at": "2026-07-28T00:00:03.000Z"
+    }
+  ],
+  "runs": [
+    {
+      "run_id": "run-dashboard-1",
+      "project_id": "project-dashboard-1",
+      "project_display_name": "Dashboard Project",
+      "title": "Verify the Dashboard bridge",
+      "provider": "codex",
+      "version": 4,
+      "lifecycle": "Running",
+      "activity": "Testing",
+      "activity_confidence": 1.0,
+      "attention_level": "None",
+      "attention_open_count": 2,
+      "dashboard_bucket": "Working",
+      "last_progress_at": "2026-07-28T00:00:03.000Z",
+      "last_liveness_at": "2026-07-28T00:00:03.000Z",
+      "started_at": "2026-07-28T00:00:01.000Z",
+      "ended_at": null,
+      "changes": {
+        "availability": "available",
+        "files": 3,
+        "insertions": 42,
+        "deletions": 7
+      },
+      "updated_at": "2026-07-28T00:00:03.000Z"
+    }
+  ]
+}

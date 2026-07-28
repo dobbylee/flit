@@ -1,0 +1,13 @@
+{
+  "status": "delivered",
+  "protocol_version": "1.10",
+  "run_id": "run-1",
+  "request_id": "request-1",
+  "request_version": 4,
+  "response_attempt_id": "attempt-1",
+  "decision": "allow_once",
+  "submitted_event_id": "event-response-submitted",
+  "submitted_version": 5,
+  "outcome_event_id": "event-response-resolved",
+  "outcome_version": 6
+}

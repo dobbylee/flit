@@ -1,0 +1,6 @@
+{
+  "protocol_version": "1.10",
+  "core": "ready",
+  "storage": "ready",
+  "providers": "not_configured"
+}

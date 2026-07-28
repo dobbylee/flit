@@ -10,9 +10,9 @@ use flit_protocol::{
     EventProtocolVersion, EventSource, EventSourceKind, NullableSessionId, UnsequencedEventEnvelope,
 };
 use flit_store::{
-    AppendEventOutcome, MAX_DASHBOARD_DELTA_EVENTS, MAX_DASHBOARD_DELTA_SOURCE_BYTES,
-    MAX_DASHBOARD_SNAPSHOT_SOURCE_BYTES, RunSnapshot, RunSnapshotDraft, Store, StoreError,
-    WriteRunSnapshotOutcome,
+    AppendEventOutcome, MAX_DASHBOARD_DELTA_EVENTS, MAX_DASHBOARD_DELTA_RUNS,
+    MAX_DASHBOARD_DELTA_SOURCE_BYTES, MAX_DASHBOARD_SNAPSHOT_SOURCE_BYTES, RunSnapshot,
+    RunSnapshotDraft, Store, StoreError, WriteRunSnapshotOutcome,
 };
 use rusqlite::{Connection, params};
 use serde_json::{Map, json};
@@ -403,6 +403,20 @@ fn dashboard_snapshot_and_global_delta_share_one_fixed_cursor_order() {
             .collect::<Vec<_>>(),
         [third]
     );
+
+    let requested = vec![RUN_B.to_owned(), RUN_A.to_owned()];
+    let first_page_runs = store
+        .dashboard_run_snapshots_for_delta(&requested, 0, second)
+        .expect("first page projections");
+    assert_eq!(first_page_runs.len(), 1);
+    assert_eq!(first_page_runs[0].projection.run_id, RUN_B);
+    assert_eq!(first_page_runs[0].projection.version, second);
+    let second_page_runs = store
+        .dashboard_run_snapshots_for_delta(&requested, second, third)
+        .expect("second page projections");
+    assert_eq!(second_page_runs.len(), 1);
+    assert_eq!(second_page_runs[0].projection.run_id, RUN_A);
+    assert_eq!(second_page_runs[0].projection.version, third);
 }
 
 #[test]
@@ -426,6 +440,63 @@ fn dashboard_reads_reject_future_reversed_and_unbounded_ranges() {
             Err(StoreError::InvalidGlobalEventRange { .. })
         ));
     }
+    for run_ids in [
+        vec![String::new()],
+        vec![RUN_A.to_owned(), RUN_A.to_owned()],
+        (0..=MAX_DASHBOARD_DELTA_RUNS)
+            .map(|index| format!("run-{index}"))
+            .collect(),
+    ] {
+        assert!(matches!(
+            store.dashboard_run_snapshots_for_delta(&run_ids, 0, 1),
+            Err(StoreError::InvalidDashboardProjectionRequest { field: "run_ids" })
+        ));
+    }
+    assert!(matches!(
+        store.dashboard_run_snapshots_for_delta(&[RUN_A.to_owned()], 2, 1),
+        Err(StoreError::InvalidDashboardProjectionRequest { field: "cursor" })
+    ));
+}
+
+#[test]
+fn changed_projection_read_ignores_unrelated_corrupt_snapshots() {
+    let database = TestDatabase::new("dashboard-changed-projections");
+    let mut store = database.open();
+    let run_a_version = append(&mut store, event(RUN_A, "event-a", 1));
+    let run_b_version = append(&mut store, event(RUN_B, "event-b", 1));
+    store
+        .write_run_snapshot(snapshot(RUN_A, run_a_version, "Running", "Editing", 0.9))
+        .expect("Run A snapshot");
+    store
+        .write_run_snapshot(snapshot(RUN_B, run_b_version, "Running", "Testing", 1.0))
+        .expect("Run B snapshot");
+
+    let connection = Connection::open(database.path()).expect("corruption connection");
+    connection
+        .execute(
+            "UPDATE run_snapshots SET snapshot_json = '{}' WHERE run_id = ?1",
+            [RUN_B],
+        )
+        .expect("corrupt unrelated snapshot");
+    drop(connection);
+
+    let changed = store
+        .dashboard_run_snapshots_for_delta(
+            &[RUN_A.to_owned()],
+            0,
+            store.latest_ingest_seq().expect("latest cursor"),
+        )
+        .expect("changed Run projection");
+    assert_eq!(changed.len(), 1);
+    assert_eq!(changed[0].projection.run_id, RUN_A);
+    assert!(matches!(
+        store.dashboard_run_snapshots_for_delta(&[RUN_B.to_owned()], 0, run_b_version),
+        Err(StoreError::StoredRunSnapshotInvalid { .. })
+    ));
+    assert!(matches!(
+        store.dashboard_run_snapshots_through(run_b_version),
+        Err(StoreError::StoredRunSnapshotInvalid { .. })
+    ));
 }
 
 #[test]
@@ -451,6 +522,10 @@ fn dashboard_snapshot_source_bound_fails_before_loading_oversized_json() {
     let reopened = database.open();
     assert!(matches!(
         reopened.dashboard_run_snapshots_through(version),
+        Err(StoreError::DashboardSnapshotReadTooLarge { .. })
+    ));
+    assert!(matches!(
+        reopened.dashboard_run_snapshots_for_delta(&[RUN_A.to_owned()], 0, version),
         Err(StoreError::DashboardSnapshotReadTooLarge { .. })
     ));
     let connection = Connection::open(database.path()).expect("inspect oversized source");

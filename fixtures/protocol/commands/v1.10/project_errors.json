@@ -1,0 +1,26 @@
+[
+  {
+    "code": "INVALID_PROJECT_REQUEST",
+    "message_key": "errors.invalidProjectRequest"
+  },
+  {
+    "code": "PROJECT_INSPECTION_FAILURE",
+    "message_key": "errors.projectInspectionFailure"
+  },
+  {
+    "code": "PROJECT_CONFLICT",
+    "message_key": "errors.projectConflict"
+  },
+  {
+    "code": "PROJECT_NOT_FOUND",
+    "message_key": "errors.projectNotFound"
+  },
+  {
+    "code": "PROJECT_IDENTITY_MISMATCH",
+    "message_key": "errors.projectIdentityMismatch"
+  },
+  {
+    "code": "STORAGE_UNAVAILABLE",
+    "message_key": "errors.storageUnavailable"
+  }
+]

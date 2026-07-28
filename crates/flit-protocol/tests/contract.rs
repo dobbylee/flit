@@ -263,6 +263,41 @@ fn current_dashboard_read_fixtures_round_trip_every_delivery() {
             )
     ));
 
+    let delta: DashboardReadResponse = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "dashboard_read.delta.response.json",
+        )))
+        .expect("projection-bearing delta fixture should be readable"),
+    )
+    .expect("projection-bearing delta should match Rust types");
+    assert!(matches!(
+        delta,
+        DashboardReadResponse::Delta {
+            next_cursor,
+            events,
+            runs,
+            ..
+        } if events.len() == 1
+            && runs.len() == 1
+            && runs[0].run_id == events[0].run_id
+            && runs[0].version == next_cursor
+    ));
+
+    let mut missing_delta_runs: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "dashboard_read.delta.response.json",
+        )))
+        .expect("projection-bearing delta fixture should be readable"),
+    )
+    .expect("projection-bearing delta fixture should be JSON");
+    missing_delta_runs
+        .as_object_mut()
+        .expect("Dashboard delta should be an object")
+        .remove("runs");
+    assert!(serde_json::from_value::<DashboardReadResponse>(missing_delta_runs).is_err());
+
     for invalid_changes in [
         serde_json::json!({
             "availability": "estimated",

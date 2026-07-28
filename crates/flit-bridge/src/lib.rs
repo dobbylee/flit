@@ -1087,6 +1087,13 @@ fn dashboard_read_response(
         .store
         .dashboard_event_locators_through(after_cursor, latest_cursor, requested_event_limit)
         .map_err(|_| BridgeError::StorageFailure)?;
+    let changed_run_ids = page
+        .events
+        .iter()
+        .map(|event| event.run_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
     let events = page
         .events
         .into_iter()
@@ -1099,6 +1106,18 @@ fn dashboard_read_response(
         })
         .collect::<Vec<_>>();
     let next_cursor = events.last().map_or(after_cursor, |event| event.cursor);
+    let runs = core
+        .store
+        .dashboard_run_snapshots_for_delta(&changed_run_ids, after_cursor, next_cursor)
+        .map_err(|error| match error {
+            StoreError::DashboardSnapshotReadTooLarge { .. } => {
+                BridgeError::DashboardResponseTooLarge
+            }
+            _ => BridgeError::StorageFailure,
+        })?
+        .into_iter()
+        .map(dashboard_run_record)
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(DashboardReadResponse::Delta {
         protocol_version: PROTOCOL_VERSION.to_owned(),
         event_schema_version: EVENT_PROTOCOL_VERSION.to_owned(),
@@ -1108,6 +1127,7 @@ fn dashboard_read_response(
         next_cursor,
         has_more: next_cursor < page.upper_bound,
         events,
+        runs,
     })
 }
 
@@ -2274,13 +2294,16 @@ mod tests {
             .expect("delta request"),
         )
         .expect("Dashboard delta");
-        match serde_json::from_str::<DashboardReadResponse>(&delta).expect("delta response") {
+        let delta_cursor = match serde_json::from_str::<DashboardReadResponse>(&delta)
+            .expect("delta response")
+        {
             DashboardReadResponse::Delta {
                 requested_after_cursor,
                 retained_after_cursor,
                 next_cursor,
                 has_more,
                 events,
+                runs,
                 ..
             } => {
                 assert_eq!(requested_after_cursor, initial_cursor);
@@ -2290,10 +2313,38 @@ mod tests {
                 assert_eq!(events.len(), 1);
                 assert_eq!(events[0].cursor, next_cursor);
                 assert_eq!(events[0].event_type, "run.completed");
+                assert_eq!(runs.len(), 1);
+                assert_eq!(runs[0].run_id, "run-observe");
+                assert_eq!(runs[0].version, next_cursor);
+                assert_eq!(runs[0].lifecycle, "Finished");
+                next_cursor
             }
             DashboardReadResponse::Snapshot { .. } => panic!("current cursor must return a delta"),
-        }
+        };
         assert!(delta.len() <= MAX_DASHBOARD_RESPONSE_BYTES);
+
+        let empty_delta = dashboard_read_with(
+            &manager,
+            &serde_json::to_string(&DashboardReadRequest {
+                expected_core_instance_id: Some(core_instance_id.clone()),
+                after_cursor: Some(delta_cursor),
+                requested_event_limit: 50,
+                client_protocol_version: PROTOCOL_VERSION.to_owned(),
+            })
+            .expect("empty delta request"),
+        )
+        .expect("empty Dashboard delta");
+        assert!(matches!(
+            serde_json::from_str::<DashboardReadResponse>(&empty_delta)
+                .expect("empty delta response"),
+            DashboardReadResponse::Delta {
+                next_cursor,
+                has_more: false,
+                events,
+                runs,
+                ..
+            } if next_cursor == delta_cursor && events.is_empty() && runs.is_empty()
+        ));
 
         let mismatched = dashboard_read_with(
             &manager,
@@ -2333,6 +2384,123 @@ mod tests {
                 reason: DashboardSnapshotReason::CursorAhead,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn dashboard_delta_defers_a_projection_until_its_exact_tail_page() {
+        let (_directory, manager, _) = observation_core("dashboard-delta-tail");
+        let permission = open_permission(&manager);
+        let permission_cursor = manager
+            .with_ready_core(|core| {
+                core.store
+                    .latest_ingest_seq()
+                    .map_err(|_| BridgeError::StorageFailure)
+            })
+            .expect("permission cursor");
+        let request =
+            permission_response_request(&permission, ManagedRunPermissionDecision::AllowOnce);
+        managed_run_permission_respond_with(
+            &manager,
+            serde_json::to_string(&request).expect("permission response request"),
+            |_runtime, decision| {
+                Ok(CodexPermissionDelivery {
+                    provider_request_id: 7,
+                    thread_id: CodexManagedThreadId::new("thread-observe").expect("thread ID"),
+                    turn_id: CodexManagedTurnId::new("turn-observe").expect("turn ID"),
+                    item_id: CodexManagedItemId::new("item-observe").expect("item ID"),
+                    decision,
+                })
+            },
+        )
+        .expect("resolve permission");
+        let core_instance_id = manager
+            .with_ready_core(|core| Ok(core.core_instance_id.clone()))
+            .expect("Core instance ID");
+
+        let first = dashboard_read_with(
+            &manager,
+            &serde_json::to_string(&DashboardReadRequest {
+                expected_core_instance_id: Some(core_instance_id.clone()),
+                after_cursor: Some(permission_cursor),
+                requested_event_limit: 1,
+                client_protocol_version: PROTOCOL_VERSION.to_owned(),
+            })
+            .expect("first delta request"),
+        )
+        .expect("first delta page");
+        let first_cursor =
+            match serde_json::from_str::<DashboardReadResponse>(&first).expect("first delta") {
+                DashboardReadResponse::Delta {
+                    next_cursor,
+                    has_more,
+                    events,
+                    runs,
+                    ..
+                } => {
+                    assert!(has_more);
+                    assert_eq!(events.len(), 1);
+                    assert_eq!(events[0].event_type, "permission.response_submitted");
+                    assert!(runs.is_empty());
+                    next_cursor
+                }
+                DashboardReadResponse::Snapshot { .. } => {
+                    panic!("current cursor must return a first delta page")
+                }
+            };
+
+        let second = dashboard_read_with(
+            &manager,
+            &serde_json::to_string(&DashboardReadRequest {
+                expected_core_instance_id: Some(core_instance_id.clone()),
+                after_cursor: Some(first_cursor),
+                requested_event_limit: 1,
+                client_protocol_version: PROTOCOL_VERSION.to_owned(),
+            })
+            .expect("second delta request"),
+        )
+        .expect("second delta page");
+        match serde_json::from_str::<DashboardReadResponse>(&second).expect("second delta") {
+            DashboardReadResponse::Delta {
+                next_cursor,
+                has_more,
+                events,
+                runs,
+                ..
+            } => {
+                assert!(!has_more);
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].event_type, "permission.resolved");
+                assert_eq!(runs.len(), 1);
+                assert_eq!(runs[0].run_id, "run-observe");
+                assert_eq!(runs[0].version, next_cursor);
+                assert_eq!(runs[0].attention_open_count, 0);
+            }
+            DashboardReadResponse::Snapshot { .. } => {
+                panic!("current cursor must return a second delta page")
+            }
+        }
+
+        let combined = dashboard_read_with(
+            &manager,
+            &serde_json::to_string(&DashboardReadRequest {
+                expected_core_instance_id: Some(core_instance_id),
+                after_cursor: Some(permission_cursor),
+                requested_event_limit: 2,
+                client_protocol_version: PROTOCOL_VERSION.to_owned(),
+            })
+            .expect("combined delta request"),
+        )
+        .expect("combined delta page");
+        assert!(matches!(
+            serde_json::from_str::<DashboardReadResponse>(&combined)
+                .expect("combined delta response"),
+            DashboardReadResponse::Delta {
+                has_more: false,
+                events,
+                runs,
+                ..
+            } if events.len() == 2 && runs.len() == 1 && runs[0].run_id == "run-observe"
         ));
     }
 

@@ -4,7 +4,7 @@ use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: &str = "1.9";
+pub const PROTOCOL_VERSION: &str = "1.10";
 pub const EVENT_PROTOCOL_VERSION: &str = "1.0";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -216,6 +216,7 @@ pub enum DashboardReadResponse {
         next_cursor: u64,
         has_more: bool,
         events: Vec<DashboardEventRecord>,
+        runs: Vec<DashboardRunRecord>,
     },
 }
 
@@ -1013,6 +1014,7 @@ struct FlitDashboardDeltaResponse: Codable, Equatable, Sendable {
     let nextCursor: UInt64
     let hasMore: Bool
     let events: [FlitDashboardEventRecord]
+    let runs: [FlitDashboardRunRecord]
 
     private enum CodingKeys: String, CodingKey {
         case delivery
@@ -1024,6 +1026,7 @@ struct FlitDashboardDeltaResponse: Codable, Equatable, Sendable {
         case nextCursor = "next_cursor"
         case hasMore = "has_more"
         case events
+        case runs
     }
 }
 
