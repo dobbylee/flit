@@ -116,6 +116,11 @@ struct NativeHealthTests {
             managedRunBridgeError == .ManagedRunResponseTooLarge,
             "current protocol must generate the managed Run bridge error case"
         )
+        let dashboardBridgeError: BridgeError = .DashboardResponseTooLarge
+        try require(
+            dashboardBridgeError == .DashboardResponseTooLarge,
+            "current protocol must generate the bounded Dashboard response error case"
+        )
         let outgoingRequest = try JSONSerialization.data(
             withJSONObject: ["client_protocol_version": client.clientProtocolVersion],
             options: [.sortedKeys]
@@ -170,6 +175,19 @@ struct NativeHealthTests {
             code: .storageUnavailable,
             fixtures: commandErrors
         )
+        let dashboardErrors = try decodeFixture(
+            [FlitCommandError].self,
+            at: "\(fixtureRoot)/dashboard_read_errors.json"
+        )
+        let initialDashboardRequest = try String(
+            contentsOfFile: "\(fixtureRoot)/dashboard_read.initial.request.json",
+            encoding: .utf8
+        )
+        try requireCommandError(
+            try dashboardReadJson(requestJson: initialDashboardRequest),
+            code: .storageUnavailable,
+            fixtures: dashboardErrors
+        )
         try requireCommandError(
             try projectInspectJson(
                 selectedPath: "\(root)/target/flit-macos/mismatch-must-not-be-read",
@@ -207,6 +225,57 @@ struct NativeHealthTests {
             "protocol mismatch payload must match the repository fixture"
         )
         try require(coreConstructionCount() == 1, "bridge calls must share one Core construction")
+        let initialDashboard = try JSONDecoder().decode(
+            FlitDashboardReadResponse.self,
+            from: Data(try dashboardReadJson(requestJson: initialDashboardRequest).utf8)
+        )
+        let dashboardCoreInstanceId: String
+        let dashboardCursor: UInt64
+        switch initialDashboard {
+        case let .snapshot(response):
+            try require(
+                response.delivery == .snapshot
+                    && response.reason == .initial
+                    && response.runs.isEmpty
+                    && !response.hasMore,
+                "native initial Dashboard read must return one empty persisted snapshot"
+            )
+            dashboardCoreInstanceId = response.coreInstanceId
+            dashboardCursor = response.nextCursor
+        case .delta:
+            throw NativeHealthTestFailure.failed(
+                "native initial Dashboard read must not return a delta"
+            )
+        }
+        let currentDashboardRequest = FlitDashboardReadRequest(
+            expectedCoreInstanceId: dashboardCoreInstanceId,
+            afterCursor: dashboardCursor,
+            requestedEventLimit: 50,
+            clientProtocolVersion: requestVersion
+        )
+        let currentDashboard = try JSONDecoder().decode(
+            FlitDashboardReadResponse.self,
+            from: Data(
+                try dashboardReadJson(
+                    requestJson: String(
+                        data: try JSONEncoder().encode(currentDashboardRequest),
+                        encoding: .utf8
+                    )!
+                ).utf8
+            )
+        )
+        guard case let .delta(currentDelta) = currentDashboard else {
+            throw NativeHealthTestFailure.failed(
+                "native current Dashboard cursor must return a delta"
+            )
+        }
+        try require(
+            currentDelta.delivery == .delta
+                && currentDelta.events.isEmpty
+                && currentDelta.nextCursor == dashboardCursor
+                && !currentDelta.hasMore,
+            "native current Dashboard delta must converge without a callback stream"
+        )
 
         let inspectionFixture = try decodeFixture(
             FlitProjectInspectionResponse.self,
@@ -278,6 +347,68 @@ struct NativeHealthTests {
             FlitProjectsListResponse.self,
             at: "\(fixtureRoot)/projects_list.response.json"
         )
+        _ = try decodeFixture(
+            FlitDashboardReadRequest.self,
+            at: "\(fixtureRoot)/dashboard_read.initial.request.json"
+        )
+        _ = try decodeFixture(
+            FlitDashboardReadRequest.self,
+            at: "\(fixtureRoot)/dashboard_read.delta.request.json"
+        )
+        let initialDashboardFixture = try decodeFixture(
+            FlitDashboardReadResponse.self,
+            at: "\(fixtureRoot)/dashboard_read.initial.response.json"
+        )
+        let deltaDashboardFixture = try decodeFixture(
+            FlitDashboardReadResponse.self,
+            at: "\(fixtureRoot)/dashboard_read.delta.response.json"
+        )
+        let resyncDashboardFixture = try decodeFixture(
+            FlitDashboardReadResponse.self,
+            at: "\(fixtureRoot)/dashboard_read.resync.response.json"
+        )
+        guard
+            case let .snapshot(initialSnapshotFixture) = initialDashboardFixture,
+            case let .delta(deltaFixture) = deltaDashboardFixture,
+            case let .snapshot(resyncFixture) = resyncDashboardFixture
+        else {
+            throw NativeHealthTestFailure.failed(
+                "generated Dashboard fixtures must preserve tagged delivery variants"
+            )
+        }
+        try require(
+            initialSnapshotFixture.reason == .initial
+                && initialSnapshotFixture.runs.count == 1
+                && initialSnapshotFixture.runs[0].attentionOpenCount == 2
+                && initialSnapshotFixture.runs[0].changes.files == 3
+                && initialSnapshotFixture.runs[0].changes.insertions == 42
+                && initialSnapshotFixture.runs[0].changes.deletions == 7
+                && deltaFixture.events.count == 1
+                && resyncFixture.reason == .coreInstanceMismatch,
+            "generated Dashboard fixtures must preserve snapshot, delta, and resync facts"
+        )
+        for (name, requiredField) in [
+            ("dashboard_read.initial.response.json", "runs"),
+            ("dashboard_read.delta.response.json", "events"),
+        ] {
+            let data = try Data(
+                contentsOf: URL(fileURLWithPath: "\(fixtureRoot)/\(name)")
+            )
+            guard
+                var object = try JSONSerialization.jsonObject(with: data)
+                    as? [String: Any]
+            else {
+                throw NativeHealthTestFailure.failed(
+                    "Dashboard delivery fixture must be an object"
+                )
+            }
+            object.removeValue(forKey: requiredField)
+            try requireDecodingFailure(
+                FlitDashboardReadResponse.self,
+                from: try JSONSerialization.data(withJSONObject: object),
+                "Dashboard delivery must require \(requiredField)"
+            )
+        }
         _ = try decodeFixture(
             FlitProviderDiagnosticsRequest.self,
             at: "\(fixtureRoot)/provider_diagnostics.request.json"

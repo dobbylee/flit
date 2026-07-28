@@ -55,6 +55,10 @@ const PROJECT_FILESYSTEM_IDENTITY_MIGRATION_SQL: &str =
 const MAX_EVENT_READ_LIMIT: usize = 1_000;
 const MAX_MANAGED_PERMISSION_RESPONSE_EVENTS: usize = 2;
 pub const MAX_EVENT_APPEND_BATCH: usize = 50;
+pub const MAX_DASHBOARD_DELTA_EVENTS: usize = 50;
+pub const MAX_DASHBOARD_DELTA_SOURCE_BYTES: usize = 1_048_576;
+pub const MAX_DASHBOARD_SNAPSHOT_RUNS: usize = 1_000;
+pub const MAX_DASHBOARD_SNAPSHOT_SOURCE_BYTES: usize = 1_048_576;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectionPolicy {
@@ -111,6 +115,21 @@ pub struct RunSnapshot {
     pub last_liveness_at: Option<String>,
     pub snapshot: Map<String, Value>,
     pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DashboardRunSnapshot {
+    pub project_id: String,
+    pub project_display_name: String,
+    pub title: String,
+    pub provider_kind: String,
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+    pub attention_open_count: u64,
+    pub change_files: u64,
+    pub change_insertions: u64,
+    pub change_deletions: u64,
+    pub projection: RunSnapshot,
 }
 
 impl From<RunSnapshotDraft> for RunSnapshot {
@@ -274,6 +293,21 @@ pub enum WriteRunSnapshotOutcome {
 pub struct RunEventPage {
     pub upper_bound: u64,
     pub events: Vec<EventEnvelope>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DashboardEventLocator {
+    pub cursor: u64,
+    pub event_id: String,
+    pub run_id: String,
+    pub event_type: String,
+    pub observed_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DashboardEventLocatorPage {
+    pub upper_bound: u64,
+    pub events: Vec<DashboardEventLocator>,
 }
 
 impl Store {
@@ -1765,6 +1799,143 @@ impl Store {
         load_run_snapshot(&self.connection, run_id)
     }
 
+    pub fn dashboard_run_snapshots_through(
+        &self,
+        upper_bound: u64,
+    ) -> Result<Vec<DashboardRunSnapshot>, StoreError> {
+        let latest = self.latest_ingest_seq()?;
+        if upper_bound > latest || upper_bound > MAX_JSON_SAFE_INTEGER {
+            return Err(StoreError::InvalidDashboardSnapshotCursor { upper_bound });
+        }
+        let (count, source_bytes) = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(
+                    LENGTH(CAST(snapshots.run_id AS BLOB))
+                    + LENGTH(CAST(runs.project_id AS BLOB))
+                    + LENGTH(CAST(projects.display_name AS BLOB))
+                    + LENGTH(CAST(runs.title AS BLOB))
+                    + LENGTH(CAST(runs.provider_kind AS BLOB))
+                    + COALESCE(LENGTH(CAST(runs.started_at AS BLOB)), 0)
+                    + COALESCE(LENGTH(CAST(runs.ended_at AS BLOB)), 0)
+                    + LENGTH(CAST(snapshots.lifecycle AS BLOB))
+                    + LENGTH(CAST(snapshots.activity AS BLOB))
+                    + LENGTH(CAST(snapshots.attention_level AS BLOB))
+                    + LENGTH(CAST(snapshots.dashboard_bucket AS BLOB))
+                    + COALESCE(LENGTH(CAST(snapshots.last_progress_at AS BLOB)), 0)
+                    + COALESCE(LENGTH(CAST(snapshots.last_liveness_at AS BLOB)), 0)
+                    + LENGTH(CAST(snapshots.snapshot_json AS BLOB))
+                    + LENGTH(CAST(snapshots.updated_at AS BLOB))
+                ), 0)
+                 FROM run_snapshots AS snapshots
+                 JOIN runs ON runs.id = snapshots.run_id
+                 JOIN projects ON projects.id = runs.project_id
+                 WHERE runs.deleted_at IS NULL AND snapshots.version <= ?1",
+                [upper_bound as i64],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(StoreError::Sqlite)?;
+        if count < 0
+            || source_bytes < 0
+            || usize::try_from(count).map_or(true, |count| count > MAX_DASHBOARD_SNAPSHOT_RUNS)
+            || usize::try_from(source_bytes)
+                .map_or(true, |bytes| bytes > MAX_DASHBOARD_SNAPSHOT_SOURCE_BYTES)
+        {
+            return Err(StoreError::DashboardSnapshotReadTooLarge {
+                count,
+                source_bytes,
+            });
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT snapshots.run_id, runs.project_id, projects.display_name, runs.title, runs.provider_kind, runs.started_at, runs.ended_at
+                 FROM run_snapshots AS snapshots
+                 JOIN runs ON runs.id = snapshots.run_id
+                 JOIN projects ON projects.id = runs.project_id
+                 WHERE runs.deleted_at IS NULL AND snapshots.version <= ?1
+                 ORDER BY snapshots.run_id",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let metadata = statement
+            .query_map([upper_bound as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            })
+            .map_err(StoreError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::Sqlite)?;
+        drop(statement);
+
+        metadata
+            .into_iter()
+            .map(
+                |(
+                    run_id,
+                    project_id,
+                    project_display_name,
+                    title,
+                    provider_kind,
+                    started_at,
+                    ended_at,
+                )| {
+                    let projection = load_run_snapshot(&self.connection, &run_id)?.ok_or(
+                        StoreError::StoredRunSnapshotInvalid {
+                            run_id,
+                            field: "row",
+                        },
+                    )?;
+                    let attention_open_count = projection
+                        .snapshot
+                        .get("attention")
+                        .and_then(Value::as_object)
+                        .and_then(|attention| attention.get("open_count"))
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| StoreError::StoredRunSnapshotInvalid {
+                            run_id: projection.run_id.clone(),
+                            field: "attention.open_count",
+                        })?;
+                    let changes = projection
+                        .snapshot
+                        .get("changes")
+                        .and_then(Value::as_object)
+                        .ok_or_else(|| StoreError::StoredRunSnapshotInvalid {
+                            run_id: projection.run_id.clone(),
+                            field: "changes",
+                        })?;
+                    let count = |key: &str, field: &'static str| {
+                        changes.get(key).and_then(Value::as_u64).ok_or_else(|| {
+                            StoreError::StoredRunSnapshotInvalid {
+                                run_id: projection.run_id.clone(),
+                                field,
+                            }
+                        })
+                    };
+                    Ok(DashboardRunSnapshot {
+                        project_id,
+                        project_display_name,
+                        title,
+                        provider_kind,
+                        started_at,
+                        ended_at,
+                        attention_open_count,
+                        change_files: count("files", "changes.files")?,
+                        change_insertions: count("insertions", "changes.insertions")?,
+                        change_deletions: count("deletions", "changes.deletions")?,
+                        projection,
+                    })
+                },
+            )
+            .collect()
+    }
+
     pub fn latest_ingest_seq(&self) -> Result<u64, StoreError> {
         let latest = self
             .connection
@@ -1773,6 +1944,143 @@ impl Store {
             })
             .map_err(StoreError::Sqlite)?;
         latest.map_or(Ok(0), assigned_sequence)
+    }
+
+    pub fn dashboard_event_locators_through(
+        &self,
+        cursor: u64,
+        upper_bound: u64,
+        limit: usize,
+    ) -> Result<DashboardEventLocatorPage, StoreError> {
+        if cursor > upper_bound
+            || upper_bound > MAX_JSON_SAFE_INTEGER
+            || !(1..=MAX_DASHBOARD_DELTA_EVENTS).contains(&limit)
+        {
+            return Err(StoreError::InvalidGlobalEventRange {
+                cursor,
+                upper_bound,
+                limit,
+            });
+        }
+        let latest = self.latest_ingest_seq()?;
+        if upper_bound > latest {
+            return Err(StoreError::InvalidGlobalEventRange {
+                cursor,
+                upper_bound,
+                limit,
+            });
+        }
+        let (count, source_bytes) = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(
+                    LENGTH(CAST(event_id AS BLOB))
+                    + LENGTH(CAST(run_id AS BLOB))
+                    + LENGTH(CAST(event_type AS BLOB))
+                    + LENGTH(CAST(observed_at AS BLOB))
+                ), 0)
+                 FROM (
+                    SELECT event_id, run_id, event_type, observed_at
+                    FROM events
+                    WHERE ingest_seq > ?1 AND ingest_seq <= ?2
+                    ORDER BY ingest_seq
+                    LIMIT ?3
+                 )",
+                params![cursor as i64, upper_bound as i64, limit as i64],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(StoreError::Sqlite)?;
+        if count < 0
+            || source_bytes < 0
+            || usize::try_from(count).map_or(true, |count| count > limit)
+            || usize::try_from(source_bytes)
+                .map_or(true, |bytes| bytes > MAX_DASHBOARD_DELTA_SOURCE_BYTES)
+        {
+            return Err(StoreError::DashboardEventLocatorReadTooLarge {
+                count,
+                source_bytes,
+            });
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT ingest_seq, event_id, run_id, event_type, observed_at
+                 FROM events
+                 WHERE ingest_seq > ?1 AND ingest_seq <= ?2
+                 ORDER BY ingest_seq
+                 LIMIT ?3",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let events = statement
+            .query_map(
+                params![cursor as i64, upper_bound as i64, limit as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .map_err(StoreError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::Sqlite)?;
+        drop(statement);
+        let events = events
+            .into_iter()
+            .map(|(ingest_seq, event_id, run_id, event_type, observed_at)| {
+                let cursor = assigned_sequence(ingest_seq)?;
+                for (field, value) in [
+                    ("event_id", event_id.as_str()),
+                    ("run_id", run_id.as_str()),
+                    ("event_type", event_type.as_str()),
+                    ("observed_at", observed_at.as_str()),
+                ] {
+                    if value.trim().is_empty() {
+                        return Err(StoreError::StoredDashboardEventLocatorInvalid {
+                            cursor,
+                            field,
+                        });
+                    }
+                }
+                Ok(DashboardEventLocator {
+                    cursor,
+                    event_id,
+                    run_id,
+                    event_type,
+                    observed_at,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut expected_cursor =
+            cursor
+                .checked_add(1)
+                .ok_or(StoreError::StoredDashboardEventCursorGap {
+                    expected_cursor: cursor,
+                    actual_cursor: events.first().map(|event| event.cursor),
+                })?;
+        for event in &events {
+            if event.cursor != expected_cursor {
+                return Err(StoreError::StoredDashboardEventCursorGap {
+                    expected_cursor,
+                    actual_cursor: Some(event.cursor),
+                });
+            }
+            expected_cursor += 1;
+        }
+        if events.len() < limit && events.last().map_or(cursor, |event| event.cursor) < upper_bound
+        {
+            return Err(StoreError::StoredDashboardEventCursorGap {
+                expected_cursor,
+                actual_cursor: None,
+            });
+        }
+        Ok(DashboardEventLocatorPage {
+            upper_bound,
+            events,
+        })
     }
 
     pub fn run_events_through(
@@ -2962,6 +3270,29 @@ fn validate_snapshot_json(snapshot: &RunSnapshotDraft) -> Result<(), StoreError>
             field: "attention.level",
         });
     }
+    if attention
+        .get("open_count")
+        .and_then(Value::as_u64)
+        .is_none_or(|count| count > MAX_JSON_SAFE_INTEGER)
+    {
+        return Err(StoreError::InvalidRunSnapshot {
+            field: "attention.open_count",
+        });
+    }
+    let changes = snapshot
+        .snapshot
+        .get("changes")
+        .and_then(Value::as_object)
+        .ok_or(StoreError::InvalidRunSnapshot { field: "changes" })?;
+    for field in ["files", "insertions", "deletions"] {
+        if changes
+            .get(field)
+            .and_then(Value::as_u64)
+            .is_none_or(|count| count > MAX_JSON_SAFE_INTEGER)
+        {
+            return Err(StoreError::InvalidRunSnapshot { field: "changes" });
+        }
+    }
     string_matches("dashboard_bucket", &snapshot.dashboard_bucket)?;
     validate_optional_snapshot_field(
         &snapshot.snapshot,
@@ -3951,6 +4282,30 @@ pub enum StoreError {
         upper_bound: u64,
         limit: usize,
     },
+    InvalidDashboardSnapshotCursor {
+        upper_bound: u64,
+    },
+    DashboardSnapshotReadTooLarge {
+        count: i64,
+        source_bytes: i64,
+    },
+    InvalidGlobalEventRange {
+        cursor: u64,
+        upper_bound: u64,
+        limit: usize,
+    },
+    DashboardEventLocatorReadTooLarge {
+        count: i64,
+        source_bytes: i64,
+    },
+    StoredDashboardEventLocatorInvalid {
+        cursor: u64,
+        field: &'static str,
+    },
+    StoredDashboardEventCursorGap {
+        expected_cursor: u64,
+        actual_cursor: Option<u64>,
+    },
     InvalidEvent {
         field: &'static str,
     },
@@ -4273,6 +4628,49 @@ impl fmt::Display for StoreError {
                 formatter,
                 "invalid Run event range: cursor {cursor}, upper bound {upper_bound}, limit {limit}"
             ),
+            Self::InvalidDashboardSnapshotCursor { upper_bound } => write!(
+                formatter,
+                "invalid Dashboard snapshot upper bound: {upper_bound}"
+            ),
+            Self::DashboardSnapshotReadTooLarge {
+                count,
+                source_bytes,
+            } => write!(
+                formatter,
+                "Dashboard snapshot read exceeds its source bound: {count} rows, {source_bytes} bytes"
+            ),
+            Self::InvalidGlobalEventRange {
+                cursor,
+                upper_bound,
+                limit,
+            } => write!(
+                formatter,
+                "invalid global event range: cursor {cursor}, upper bound {upper_bound}, limit {limit}"
+            ),
+            Self::DashboardEventLocatorReadTooLarge {
+                count,
+                source_bytes,
+            } => write!(
+                formatter,
+                "Dashboard event locator read exceeds its source bound: {count} rows, {source_bytes} bytes"
+            ),
+            Self::StoredDashboardEventLocatorInvalid { cursor, field } => write!(
+                formatter,
+                "stored Dashboard event locator {cursor} has an invalid {field} field"
+            ),
+            Self::StoredDashboardEventCursorGap {
+                expected_cursor,
+                actual_cursor,
+            } => match actual_cursor {
+                Some(actual_cursor) => write!(
+                    formatter,
+                    "stored Dashboard event cursor gap: expected {expected_cursor}, found {actual_cursor}"
+                ),
+                None => write!(
+                    formatter,
+                    "stored Dashboard event cursor gap: expected {expected_cursor}, found no row"
+                ),
+            },
             Self::InvalidEvent { field } => write!(formatter, "invalid event field: {field}"),
             Self::InvalidEventReadRange { cursor, limit } => write!(
                 formatter,

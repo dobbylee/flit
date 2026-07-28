@@ -7,19 +7,21 @@ use std::{
         LazyLock, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use flit_protocol::{
     CapabilityStatus as ProtocolCapabilityStatus, CommandError, CommandErrorCode,
-    FingerprintAxis as ProtocolFingerprintAxis, HealthStatus, ManagedRunObserveRequest,
-    ManagedRunObserveResponse, ManagedRunPermissionRespondRequest,
-    ManagedRunPermissionRespondResponse, ManagedRunStartRequest, PROTOCOL_VERSION,
-    ProjectInspectionResponse, ProjectListCursor as ProjectListCursorResponse, ProjectRecord,
-    ProjectRegistrationResponse, ProjectRegistrationStatus, ProjectTrustResponse,
-    ProjectTrustStatus, ProjectsListResponse, ProviderCapability as ProtocolProviderCapability,
-    ProviderCapabilityEntry, ProviderCompatibility as ProtocolProviderCompatibility,
-    ProviderDiagnosticsResponse, ProviderKind as ProtocolProviderKind, ProviderUnavailableReason,
-    SystemHealthResponse,
+    DashboardEventRecord, DashboardReadRequest, DashboardReadResponse, DashboardRunRecord,
+    DashboardSnapshotReason, EVENT_PROTOCOL_VERSION, FingerprintAxis as ProtocolFingerprintAxis,
+    HealthStatus, ManagedRunObserveRequest, ManagedRunObserveResponse,
+    ManagedRunPermissionRespondRequest, ManagedRunPermissionRespondResponse,
+    ManagedRunStartRequest, PROTOCOL_VERSION, ProjectInspectionResponse,
+    ProjectListCursor as ProjectListCursorResponse, ProjectRecord, ProjectRegistrationResponse,
+    ProjectRegistrationStatus, ProjectTrustResponse, ProjectTrustStatus, ProjectsListResponse,
+    ProviderCapability as ProtocolProviderCapability, ProviderCapabilityEntry,
+    ProviderCompatibility as ProtocolProviderCompatibility, ProviderDiagnosticsResponse,
+    ProviderKind as ProtocolProviderKind, ProviderUnavailableReason, SystemHealthResponse,
 };
 use flit_providers::{
     CapabilityStatus, CodexCompatibilityProbe, CodexCompatibilityProbeError,
@@ -28,12 +30,14 @@ use flit_providers::{
     probe_codex_compatibility_on_path,
 };
 use flit_store::{
-    AppendEventOutcome, MAX_PROJECT_PAGE_SIZE, ManagedPermissionDecision,
+    AppendEventOutcome, DashboardRunSnapshot as StoreDashboardRunSnapshot,
+    MAX_DASHBOARD_DELTA_EVENTS, MAX_PROJECT_PAGE_SIZE, ManagedPermissionDecision,
     ManagedPermissionDeliveryUnknownReason, ManagedPermissionResponseAttemptOutcome,
     ManagedPermissionResponseResult, ManagedPermissionResponseResultKind, Project,
     ProjectDirectoryInspection, ProjectListCursor as StoreProjectListCursor, ProjectRegistration,
     ProjectRegistrationOutcome, ProjectTrustConfirmation, ProjectTrustOutcome, Store, StoreError,
 };
+use sha2::{Digest, Sha256};
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -51,10 +55,15 @@ const MAX_TIMESTAMP_BYTES: usize = 64;
 const MAX_PROJECT_RESPONSE_BYTES: usize = 1_048_576;
 const MAX_PROVIDER_DIAGNOSTICS_RESPONSE_BYTES: usize = 65_536;
 const MAX_MANAGED_RUN_REQUEST_BYTES: usize = 128 * 1_024;
+const MAX_DASHBOARD_REQUEST_BYTES: usize = 64 * 1_024;
+const MAX_DASHBOARD_RESPONSE_BYTES: usize = 8 * 1_024 * 1_024;
+const MAX_CORE_INSTANCE_ID_BYTES: usize = 256;
+const DASHBOARD_DELTA_RETENTION_EVENTS: u64 = 2_000;
 
 static CORE: LazyLock<CoreManager> = LazyLock::new(CoreManager::default);
 static PROVIDER_DIAGNOSTIC_LOCK: LazyLock<Mutex<()>> = LazyLock::new(Mutex::default);
 static CORE_CONSTRUCTIONS: AtomicU64 = AtomicU64::new(0);
+static CORE_INSTANCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 uniffi::setup_scaffolding!();
 
@@ -88,6 +97,10 @@ pub enum BridgeError {
     ProjectResponseTooLarge,
     #[error("the provider diagnostics response exceeds the native bridge limit")]
     ProviderDiagnosticsResponseTooLarge,
+    #[error("the Dashboard request is invalid")]
+    InvalidDashboardRequest,
+    #[error("the Dashboard response exceeds the native bridge limit")]
+    DashboardResponseTooLarge,
     #[error("the managed Run request or response exceeds the native bridge limit")]
     ManagedRunResponseTooLarge,
     #[error("the embedded Rust Core could not serialize the response")]
@@ -97,6 +110,7 @@ pub enum BridgeError {
 struct FoundationCore {
     requested_data_directory: PathBuf,
     canonical_data_directory: PathBuf,
+    core_instance_id: String,
     // Rust drops fields in declaration order, so stop providers and close SQLite before the guard.
     managed_runtimes: BTreeMap<String, managed_start::RetainedManagedRun>,
     managed_observations_in_flight: BTreeSet<String>,
@@ -267,6 +281,7 @@ impl FoundationCore {
 
         Ok(Self {
             requested_data_directory,
+            core_instance_id: core_instance_id(&canonical_data_directory),
             canonical_data_directory,
             managed_runtimes: BTreeMap::new(),
             managed_observations_in_flight: BTreeSet::new(),
@@ -284,6 +299,20 @@ impl FoundationCore {
             .map(|canonical| canonical == self.canonical_data_directory)
             .unwrap_or(false)
     }
+}
+
+fn core_instance_id(canonical_data_directory: &Path) -> String {
+    let sequence = CORE_INSTANCE_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut digest = Sha256::new();
+    digest.update(canonical_data_directory.to_string_lossy().as_bytes());
+    digest.update(std::process::id().to_le_bytes());
+    digest.update(sequence.to_le_bytes());
+    digest.update(timestamp.to_le_bytes());
+    format!("core-{:x}", digest.finalize())
 }
 
 fn validate_data_directory(data_directory: &str) -> Result<PathBuf, BridgeError> {
@@ -469,6 +498,8 @@ fn project_command_error(error: &BridgeError) -> Option<CommandError> {
         | BridgeError::CoreLockFailure
         | BridgeError::ProjectResponseTooLarge
         | BridgeError::ProviderDiagnosticsResponseTooLarge
+        | BridgeError::InvalidDashboardRequest
+        | BridgeError::DashboardResponseTooLarge
         | BridgeError::ManagedRunResponseTooLarge
         | BridgeError::SerializationFailure => return None,
     };
@@ -869,6 +900,224 @@ pub fn projects_list_page_json(
             })
         })
     })
+}
+
+fn dashboard_command_error(error: &BridgeError) -> Option<CommandError> {
+    let code = match error {
+        BridgeError::ProtocolMismatch => CommandErrorCode::ProtocolMismatch,
+        BridgeError::InvalidDashboardRequest => CommandErrorCode::InvalidDashboardRequest,
+        BridgeError::StorageFailure => CommandErrorCode::StorageUnavailable,
+        _ => return None,
+    };
+    Some(CommandError::for_code(code))
+}
+
+fn dashboard_command_json(
+    operation: impl FnOnce() -> Result<DashboardReadResponse, BridgeError>,
+) -> Result<String, BridgeError> {
+    match operation() {
+        Ok(response) => bounded_json(
+            &response,
+            MAX_DASHBOARD_RESPONSE_BYTES,
+            BridgeError::DashboardResponseTooLarge,
+        ),
+        Err(error) => match dashboard_command_error(&error) {
+            Some(command_error) => bounded_json(
+                &command_error,
+                MAX_DASHBOARD_RESPONSE_BYTES,
+                BridgeError::DashboardResponseTooLarge,
+            ),
+            None => Err(error),
+        },
+    }
+}
+
+fn dashboard_run_record(
+    snapshot: StoreDashboardRunSnapshot,
+) -> Result<DashboardRunRecord, BridgeError> {
+    let provider = match snapshot.provider_kind.as_str() {
+        "codex" => ProtocolProviderKind::Codex,
+        _ => return Err(BridgeError::StorageFailure),
+    };
+    Ok(DashboardRunRecord {
+        run_id: snapshot.projection.run_id,
+        project_id: snapshot.project_id,
+        project_display_name: snapshot.project_display_name,
+        title: snapshot.title,
+        provider,
+        version: snapshot.projection.version,
+        lifecycle: snapshot.projection.lifecycle,
+        activity: snapshot.projection.activity,
+        activity_confidence: snapshot.projection.activity_confidence,
+        attention_level: snapshot.projection.attention_level,
+        attention_open_count: snapshot.attention_open_count,
+        dashboard_bucket: snapshot.projection.dashboard_bucket,
+        last_progress_at: snapshot.projection.last_progress_at,
+        last_liveness_at: snapshot.projection.last_liveness_at,
+        started_at: snapshot.started_at,
+        ended_at: snapshot.ended_at,
+        changes: flit_protocol::DashboardChangeSummary {
+            files: snapshot.change_files,
+            insertions: snapshot.change_insertions,
+            deletions: snapshot.change_deletions,
+        },
+        updated_at: snapshot.projection.updated_at,
+    })
+}
+
+fn dashboard_snapshot_response(
+    core: &FoundationCore,
+    reason: DashboardSnapshotReason,
+    requested_after_cursor: Option<u64>,
+    latest_cursor: u64,
+    retained_after_cursor: u64,
+) -> Result<DashboardReadResponse, BridgeError> {
+    let runs = core
+        .store
+        .dashboard_run_snapshots_through(latest_cursor)
+        .map_err(|error| match error {
+            StoreError::DashboardSnapshotReadTooLarge { .. } => {
+                BridgeError::DashboardResponseTooLarge
+            }
+            _ => BridgeError::StorageFailure,
+        })?
+        .into_iter()
+        .map(dashboard_run_record)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(DashboardReadResponse::Snapshot {
+        protocol_version: PROTOCOL_VERSION.to_owned(),
+        event_schema_version: EVENT_PROTOCOL_VERSION.to_owned(),
+        core_instance_id: core.core_instance_id.clone(),
+        reason,
+        requested_after_cursor,
+        retained_after_cursor,
+        next_cursor: latest_cursor,
+        has_more: false,
+        runs,
+    })
+}
+
+fn dashboard_resync_reason(
+    expected_core_instance_id: &str,
+    actual_core_instance_id: &str,
+    after_cursor: u64,
+    latest_cursor: u64,
+    retained_after_cursor: u64,
+) -> Option<DashboardSnapshotReason> {
+    if expected_core_instance_id != actual_core_instance_id {
+        Some(DashboardSnapshotReason::CoreInstanceMismatch)
+    } else if after_cursor > latest_cursor {
+        Some(DashboardSnapshotReason::CursorAhead)
+    } else if after_cursor < retained_after_cursor {
+        Some(DashboardSnapshotReason::CursorExpired)
+    } else {
+        None
+    }
+}
+
+fn dashboard_read_response(
+    core: &FoundationCore,
+    request: DashboardReadRequest,
+) -> Result<DashboardReadResponse, BridgeError> {
+    if request.client_protocol_version != PROTOCOL_VERSION {
+        return Err(BridgeError::ProtocolMismatch);
+    }
+    let requested_event_limit = usize::try_from(request.requested_event_limit)
+        .map_err(|_| BridgeError::InvalidDashboardRequest)?;
+    if !(1..=MAX_DASHBOARD_DELTA_EVENTS).contains(&requested_event_limit) {
+        return Err(BridgeError::InvalidDashboardRequest);
+    }
+    let latest_cursor = core
+        .store
+        .latest_ingest_seq()
+        .map_err(|_| BridgeError::StorageFailure)?;
+    let retained_after_cursor = latest_cursor.saturating_sub(DASHBOARD_DELTA_RETENTION_EVENTS);
+
+    let (expected_core_instance_id, after_cursor) =
+        match (request.expected_core_instance_id, request.after_cursor) {
+            (None, None) => {
+                return dashboard_snapshot_response(
+                    core,
+                    DashboardSnapshotReason::Initial,
+                    None,
+                    latest_cursor,
+                    retained_after_cursor,
+                );
+            }
+            (Some(expected_core_instance_id), Some(after_cursor))
+                if !expected_core_instance_id.trim().is_empty()
+                    && expected_core_instance_id.len() <= MAX_CORE_INSTANCE_ID_BYTES
+                    && !expected_core_instance_id.contains('\0')
+                    && after_cursor <= flit_protocol::MAX_JSON_SAFE_INTEGER =>
+            {
+                (expected_core_instance_id, after_cursor)
+            }
+            _ => return Err(BridgeError::InvalidDashboardRequest),
+        };
+
+    let resync_reason = dashboard_resync_reason(
+        &expected_core_instance_id,
+        &core.core_instance_id,
+        after_cursor,
+        latest_cursor,
+        retained_after_cursor,
+    );
+    if let Some(reason) = resync_reason {
+        return dashboard_snapshot_response(
+            core,
+            reason,
+            Some(after_cursor),
+            latest_cursor,
+            retained_after_cursor,
+        );
+    }
+
+    let page = core
+        .store
+        .dashboard_event_locators_through(after_cursor, latest_cursor, requested_event_limit)
+        .map_err(|_| BridgeError::StorageFailure)?;
+    let events = page
+        .events
+        .into_iter()
+        .map(|event| DashboardEventRecord {
+            cursor: event.cursor,
+            event_id: event.event_id,
+            run_id: event.run_id,
+            event_type: event.event_type,
+            observed_at: event.observed_at,
+        })
+        .collect::<Vec<_>>();
+    let next_cursor = events.last().map_or(after_cursor, |event| event.cursor);
+    Ok(DashboardReadResponse::Delta {
+        protocol_version: PROTOCOL_VERSION.to_owned(),
+        event_schema_version: EVENT_PROTOCOL_VERSION.to_owned(),
+        core_instance_id: core.core_instance_id.clone(),
+        requested_after_cursor: after_cursor,
+        retained_after_cursor,
+        next_cursor,
+        has_more: next_cursor < page.upper_bound,
+        events,
+    })
+}
+
+fn dashboard_read_with(
+    core_manager: &CoreManager,
+    request_json: &str,
+) -> Result<String, BridgeError> {
+    if request_json.len() > MAX_DASHBOARD_REQUEST_BYTES {
+        return dashboard_command_json(|| Err(BridgeError::InvalidDashboardRequest));
+    }
+    let request = serde_json::from_str::<DashboardReadRequest>(request_json)
+        .map_err(|_| BridgeError::InvalidDashboardRequest);
+    dashboard_command_json(|| {
+        let request = request?;
+        core_manager.with_ready_core(|core| dashboard_read_response(core, request))
+    })
+}
+
+#[uniffi::export]
+pub fn dashboard_read_json(request_json: String) -> Result<String, BridgeError> {
+    protect(|| dashboard_read_with(&CORE, &request_json))
 }
 
 #[uniffi::export]
@@ -1648,7 +1897,7 @@ mod tests {
     };
     use flit_store::{
         InitialManagedSessionConnection, ManagedRunIntent, ProjectRegistration,
-        ProjectTrustConfirmation,
+        ProjectTrustConfirmation, RunSnapshotDraft,
     };
 
     use super::*;
@@ -1940,6 +2189,271 @@ mod tests {
                 Ok(())
             })
             .expect("runtime state");
+    }
+
+    fn seed_dashboard_projection(manager: &CoreManager) {
+        manager
+            .with_ready_core(|core| {
+                let version = core.store.latest_ingest_seq().expect("Dashboard cursor");
+                let snapshot = serde_json::json!({
+                    "run_id": "run-observe",
+                    "version": version,
+                    "lifecycle": "Running",
+                    "activity": {
+                        "kind": "Testing",
+                        "confidence": 1.0
+                    },
+                    "attention": {
+                        "level": "None",
+                        "open_count": 2
+                    },
+                    "dashboard_bucket": "Working",
+                    "last_progress_at": "2026-07-27T12:00:01Z",
+                    "last_liveness_at": "2026-07-27T12:00:01Z",
+                    "changes": {
+                        "files": 3,
+                        "insertions": 42,
+                        "deletions": 7
+                    }
+                });
+                core.store
+                    .write_run_snapshot(RunSnapshotDraft {
+                        run_id: "run-observe".to_owned(),
+                        version,
+                        lifecycle: "Running".to_owned(),
+                        activity: "Testing".to_owned(),
+                        activity_confidence: 1.0,
+                        attention_level: "None".to_owned(),
+                        dashboard_bucket: "Working".to_owned(),
+                        last_progress_at: Some("2026-07-27T12:00:01Z".to_owned()),
+                        last_liveness_at: Some("2026-07-27T12:00:01Z".to_owned()),
+                        snapshot: snapshot
+                            .as_object()
+                            .expect("Dashboard snapshot object")
+                            .clone(),
+                        updated_at: "2026-07-27T12:00:01Z".to_owned(),
+                    })
+                    .expect("write Dashboard projection");
+                Ok(())
+            })
+            .expect("seed Dashboard projection");
+    }
+
+    #[test]
+    fn dashboard_initial_delta_and_resync_are_exact_and_bounded() {
+        let (directory, manager, _) = observation_core("dashboard-read");
+        seed_dashboard_projection(&manager);
+        let initial = dashboard_read_with(
+            &manager,
+            &serde_json::to_string(&DashboardReadRequest {
+                expected_core_instance_id: None,
+                after_cursor: None,
+                requested_event_limit: MAX_DASHBOARD_DELTA_EVENTS as u32,
+                client_protocol_version: PROTOCOL_VERSION.to_owned(),
+            })
+            .expect("initial request"),
+        )
+        .expect("initial Dashboard read");
+        let (core_instance_id, initial_cursor) =
+            match serde_json::from_str::<DashboardReadResponse>(&initial)
+                .expect("initial Dashboard response")
+            {
+                DashboardReadResponse::Snapshot {
+                    reason,
+                    core_instance_id,
+                    requested_after_cursor,
+                    retained_after_cursor,
+                    next_cursor,
+                    has_more,
+                    runs,
+                    ..
+                } => {
+                    assert_eq!(reason, DashboardSnapshotReason::Initial);
+                    assert_eq!(requested_after_cursor, None);
+                    assert_eq!(retained_after_cursor, 0);
+                    assert!(!has_more);
+                    assert_eq!(runs.len(), 1);
+                    assert_eq!(runs[0].run_id, "run-observe");
+                    assert_eq!(runs[0].project_display_name, "Observation Project");
+                    assert_eq!(runs[0].version, next_cursor);
+                    assert_eq!(runs[0].attention_open_count, 2);
+                    assert_eq!(runs[0].changes.files, 3);
+                    assert_eq!(runs[0].changes.insertions, 42);
+                    assert_eq!(runs[0].changes.deletions, 7);
+                    assert!(core_instance_id.starts_with("core-"));
+                    assert!(
+                        !core_instance_id
+                            .contains(directory.0.to_str().expect("UTF-8 Dashboard path"))
+                    );
+                    (core_instance_id, next_cursor)
+                }
+                DashboardReadResponse::Delta { .. } => panic!("initial read must be a snapshot"),
+            };
+
+        managed_run_observe_with(
+            &manager,
+            observation_request_json(),
+            |_runtime| Ok(terminal_observation()),
+            managed_start::commit_managed_observation,
+        )
+        .expect("append Dashboard delta");
+        let delta = dashboard_read_with(
+            &manager,
+            &serde_json::to_string(&DashboardReadRequest {
+                expected_core_instance_id: Some(core_instance_id.clone()),
+                after_cursor: Some(initial_cursor),
+                requested_event_limit: 1,
+                client_protocol_version: PROTOCOL_VERSION.to_owned(),
+            })
+            .expect("delta request"),
+        )
+        .expect("Dashboard delta");
+        match serde_json::from_str::<DashboardReadResponse>(&delta).expect("delta response") {
+            DashboardReadResponse::Delta {
+                requested_after_cursor,
+                retained_after_cursor,
+                next_cursor,
+                has_more,
+                events,
+                ..
+            } => {
+                assert_eq!(requested_after_cursor, initial_cursor);
+                assert_eq!(retained_after_cursor, 0);
+                assert_eq!(next_cursor, initial_cursor + 1);
+                assert!(!has_more);
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].cursor, next_cursor);
+                assert_eq!(events[0].event_type, "run.completed");
+            }
+            DashboardReadResponse::Snapshot { .. } => panic!("current cursor must return a delta"),
+        }
+        assert!(delta.len() <= MAX_DASHBOARD_RESPONSE_BYTES);
+
+        let mismatched = dashboard_read_with(
+            &manager,
+            &serde_json::to_string(&DashboardReadRequest {
+                expected_core_instance_id: Some("stale-core".to_owned()),
+                after_cursor: Some(initial_cursor),
+                requested_event_limit: 50,
+                client_protocol_version: PROTOCOL_VERSION.to_owned(),
+            })
+            .expect("mismatched request"),
+        )
+        .expect("mismatched resync");
+        assert!(matches!(
+            serde_json::from_str::<DashboardReadResponse>(&mismatched).expect("resync response"),
+            DashboardReadResponse::Snapshot {
+                reason: DashboardSnapshotReason::CoreInstanceMismatch,
+                requested_after_cursor: Some(cursor),
+                next_cursor,
+                ..
+            } if cursor == initial_cursor && next_cursor == initial_cursor + 1
+        ));
+
+        let ahead = dashboard_read_with(
+            &manager,
+            &serde_json::to_string(&DashboardReadRequest {
+                expected_core_instance_id: Some(core_instance_id),
+                after_cursor: Some(initial_cursor + 2),
+                requested_event_limit: 50,
+                client_protocol_version: PROTOCOL_VERSION.to_owned(),
+            })
+            .expect("ahead request"),
+        )
+        .expect("ahead resync");
+        assert!(matches!(
+            serde_json::from_str::<DashboardReadResponse>(&ahead).expect("ahead response"),
+            DashboardReadResponse::Snapshot {
+                reason: DashboardSnapshotReason::CursorAhead,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn dashboard_request_boundaries_fail_closed_without_store_mutation() {
+        let (_directory, manager, _) = observation_core("dashboard-invalid");
+        let cursor = manager
+            .with_ready_core(|core| {
+                core.store
+                    .latest_ingest_seq()
+                    .map_err(|_| BridgeError::StorageFailure)
+            })
+            .expect("initial cursor");
+        for request in [
+            "{}".to_owned(),
+            serde_json::json!({
+                "expected_core_instance_id": "partial",
+                "after_cursor": null,
+                "requested_event_limit": 50,
+                "client_protocol_version": PROTOCOL_VERSION
+            })
+            .to_string(),
+            serde_json::to_string(&DashboardReadRequest {
+                expected_core_instance_id: None,
+                after_cursor: None,
+                requested_event_limit: 51,
+                client_protocol_version: PROTOCOL_VERSION.to_owned(),
+            })
+            .expect("limit request"),
+            serde_json::to_string(&DashboardReadRequest {
+                expected_core_instance_id: None,
+                after_cursor: None,
+                requested_event_limit: 50,
+                client_protocol_version: "0.0".to_owned(),
+            })
+            .expect("protocol request"),
+        ] {
+            let response = dashboard_read_with(&manager, &request).expect("command error response");
+            let error = command_error(&response);
+            assert!(matches!(
+                error.code,
+                CommandErrorCode::InvalidDashboardRequest | CommandErrorCode::ProtocolMismatch
+            ));
+        }
+        let oversized = " ".repeat(MAX_DASHBOARD_REQUEST_BYTES + 1);
+        assert_eq!(
+            command_error(
+                &dashboard_read_with(&manager, &oversized).expect("oversized command response")
+            ),
+            CommandError::for_code(CommandErrorCode::InvalidDashboardRequest)
+        );
+        manager
+            .with_ready_core(|core| {
+                assert_eq!(
+                    core.store
+                        .latest_ingest_seq()
+                        .map_err(|_| BridgeError::StorageFailure)?,
+                    cursor
+                );
+                Ok(())
+            })
+            .expect("unchanged Dashboard Store");
+    }
+
+    #[test]
+    fn dashboard_resync_priority_and_response_byte_cap_are_explicit() {
+        assert_eq!(
+            dashboard_resync_reason("stale", "current", 9, 8, 7),
+            Some(DashboardSnapshotReason::CoreInstanceMismatch)
+        );
+        assert_eq!(
+            dashboard_resync_reason("current", "current", 9, 8, 7),
+            Some(DashboardSnapshotReason::CursorAhead)
+        );
+        assert_eq!(
+            dashboard_resync_reason("current", "current", 6, 8, 7),
+            Some(DashboardSnapshotReason::CursorExpired)
+        );
+        assert_eq!(dashboard_resync_reason("current", "current", 7, 8, 7), None);
+        assert_eq!(
+            bounded_json(
+                &"x".repeat(MAX_DASHBOARD_RESPONSE_BYTES),
+                MAX_DASHBOARD_RESPONSE_BYTES,
+                BridgeError::DashboardResponseTooLarge,
+            ),
+            Err(BridgeError::DashboardResponseTooLarge)
+        );
     }
 
     #[test]

@@ -1,15 +1,16 @@
 use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use flit_protocol::{
-    CapabilityStatus, CommandError, EVENT_PROTOCOL_VERSION, EventEnvelope, EventProtocolVersion,
-    MAX_JSON_SAFE_INTEGER, ManagedRunObserveRequest, ManagedRunObserveResponse,
-    ManagedRunPermissionRespondRequest, ManagedRunPermissionRespondResponse,
-    ManagedRunStartRequest, ManagedRunStartResponse, PROTOCOL_VERSION, ProjectInspectionRequest,
-    ProjectInspectionResponse, ProjectRegistrationRequest, ProjectRegistrationResponse,
-    ProjectTrustRequest, ProjectTrustResponse, ProjectsListRequest, ProjectsListResponse,
-    ProviderCompatibility, ProviderDiagnosticsRequest, ProviderDiagnosticsResponse,
-    ProviderUnavailableReason, SystemHealthRequest, SystemHealthResponse, event_schema_id,
-    event_schema_relative_path, generated_swift_command_contract,
+    CapabilityStatus, CommandError, DashboardReadRequest, DashboardReadResponse,
+    EVENT_PROTOCOL_VERSION, EventEnvelope, EventProtocolVersion, MAX_JSON_SAFE_INTEGER,
+    ManagedRunObserveRequest, ManagedRunObserveResponse, ManagedRunPermissionRespondRequest,
+    ManagedRunPermissionRespondResponse, ManagedRunStartRequest, ManagedRunStartResponse,
+    PROTOCOL_VERSION, ProjectInspectionRequest, ProjectInspectionResponse,
+    ProjectRegistrationRequest, ProjectRegistrationResponse, ProjectTrustRequest,
+    ProjectTrustResponse, ProjectsListRequest, ProjectsListResponse, ProviderCompatibility,
+    ProviderDiagnosticsRequest, ProviderDiagnosticsResponse, ProviderUnavailableReason,
+    SystemHealthRequest, SystemHealthResponse, event_schema_id, event_schema_relative_path,
+    generated_swift_command_contract,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -174,6 +175,73 @@ fn current_project_command_fixtures_round_trip_every_shape() {
     .expect("Project error fixture should match Rust types");
     for error in errors {
         assert_eq!(error, CommandError::for_code(error.code));
+    }
+}
+
+#[test]
+fn current_dashboard_read_fixtures_round_trip_every_delivery() {
+    let manifest = read_command_compatibility_manifest();
+    let current = &manifest.current;
+    for name in [
+        "dashboard_read.initial.request.json",
+        "dashboard_read.delta.request.json",
+    ] {
+        assert_fixture_round_trip::<DashboardReadRequest>(&command_fixture(current, name));
+    }
+    for name in [
+        "dashboard_read.initial.response.json",
+        "dashboard_read.delta.response.json",
+        "dashboard_read.resync.response.json",
+    ] {
+        assert_fixture_round_trip::<DashboardReadResponse>(&command_fixture(current, name));
+    }
+    assert_fixture_round_trip::<Vec<CommandError>>(&command_fixture(
+        current,
+        "dashboard_read_errors.json",
+    ));
+
+    let mut missing_identity: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "dashboard_read.initial.response.json",
+        )))
+        .expect("Dashboard snapshot fixture should be readable"),
+    )
+    .expect("Dashboard snapshot fixture should be JSON");
+    missing_identity
+        .as_object_mut()
+        .expect("Dashboard snapshot should be an object")
+        .remove("core_instance_id");
+    assert!(serde_json::from_value::<DashboardReadResponse>(missing_identity).is_err());
+
+    let mut unknown_reason: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "dashboard_read.resync.response.json",
+        )))
+        .expect("Dashboard resync fixture should be readable"),
+    )
+    .expect("Dashboard resync fixture should be JSON");
+    unknown_reason["reason"] = serde_json::json!("silently_continue");
+    assert!(serde_json::from_value::<DashboardReadResponse>(unknown_reason).is_err());
+
+    for required in ["attention_open_count", "changes"] {
+        let mut missing_projection: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(repository_path(&command_fixture(
+                current,
+                "dashboard_read.initial.response.json",
+            )))
+            .expect("Dashboard projection fixture should be readable"),
+        )
+        .expect("Dashboard projection fixture should be JSON");
+        missing_projection["runs"][0]
+            .as_object_mut()
+            .expect("Dashboard Run should be an object")
+            .remove(required);
+        assert!(
+            serde_json::from_value::<DashboardReadResponse>(missing_projection).is_err(),
+            "Dashboard Run must require {required}"
+        );
     }
 }
 
@@ -458,6 +526,13 @@ fn generated_swift_project_contract_is_current_and_required_fields_fail_closed()
         "FlitProjectTrustResponse",
         "FlitProjectsListRequest",
         "FlitProjectsListResponse",
+        "FlitDashboardReadRequest",
+        "FlitDashboardDelivery",
+        "FlitDashboardSnapshotReason",
+        "FlitDashboardRunRecord",
+        "FlitDashboardChangeSummary",
+        "FlitDashboardEventRecord",
+        "FlitDashboardReadResponse",
         "FlitCommandError",
         "FlitProviderDiagnosticsRequest",
         "FlitProviderDiagnosticsResponse",

@@ -4,7 +4,7 @@ use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: &str = "1.7";
+pub const PROTOCOL_VERSION: &str = "1.8";
 pub const EVENT_PROTOCOL_VERSION: &str = "1.0";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -130,6 +130,87 @@ pub struct ProjectsListResponse {
     pub protocol_version: String,
     pub projects: Vec<ProjectRecord>,
     pub next_cursor: Option<ProjectListCursor>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DashboardReadRequest {
+    pub expected_core_instance_id: Option<String>,
+    pub after_cursor: Option<u64>,
+    pub requested_event_limit: u32,
+    pub client_protocol_version: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DashboardSnapshotReason {
+    Initial,
+    CoreInstanceMismatch,
+    CursorAhead,
+    CursorExpired,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct DashboardRunRecord {
+    pub run_id: String,
+    pub project_id: String,
+    pub project_display_name: String,
+    pub title: String,
+    pub provider: ProviderKind,
+    pub version: u64,
+    pub lifecycle: String,
+    pub activity: String,
+    pub activity_confidence: f64,
+    pub attention_level: String,
+    pub attention_open_count: u64,
+    pub dashboard_bucket: String,
+    pub last_progress_at: Option<String>,
+    pub last_liveness_at: Option<String>,
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+    pub changes: DashboardChangeSummary,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DashboardChangeSummary {
+    pub files: u64,
+    pub insertions: u64,
+    pub deletions: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DashboardEventRecord {
+    pub cursor: u64,
+    pub event_id: String,
+    pub run_id: String,
+    pub event_type: String,
+    pub observed_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "delivery", rename_all = "snake_case")]
+pub enum DashboardReadResponse {
+    Snapshot {
+        protocol_version: String,
+        event_schema_version: String,
+        core_instance_id: String,
+        reason: DashboardSnapshotReason,
+        requested_after_cursor: Option<u64>,
+        retained_after_cursor: u64,
+        next_cursor: u64,
+        has_more: bool,
+        runs: Vec<DashboardRunRecord>,
+    },
+    Delta {
+        protocol_version: String,
+        event_schema_version: String,
+        core_instance_id: String,
+        requested_after_cursor: u64,
+        retained_after_cursor: u64,
+        next_cursor: u64,
+        has_more: bool,
+        events: Vec<DashboardEventRecord>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -389,6 +470,7 @@ pub enum ManagedRunPermissionRespondResponse {
 pub enum CommandErrorCode {
     ProtocolMismatch,
     InvalidProjectRequest,
+    InvalidDashboardRequest,
     ProjectInspectionFailure,
     ProjectConflict,
     ProjectNotFound,
@@ -546,6 +628,7 @@ impl CommandError {
         let message_key = match code {
             CommandErrorCode::ProtocolMismatch => "errors.protocolMismatch",
             CommandErrorCode::InvalidProjectRequest => "errors.invalidProjectRequest",
+            CommandErrorCode::InvalidDashboardRequest => "errors.invalidDashboardRequest",
             CommandErrorCode::ProjectInspectionFailure => "errors.projectInspectionFailure",
             CommandErrorCode::ProjectConflict => "errors.projectConflict",
             CommandErrorCode::ProjectNotFound => "errors.projectNotFound",
@@ -729,9 +812,178 @@ struct FlitProjectsListResponse: Codable, Equatable, Sendable {
     }
 }
 
+struct FlitDashboardReadRequest: Codable, Equatable, Sendable {
+    let expectedCoreInstanceId: String?
+    let afterCursor: UInt64?
+    let requestedEventLimit: UInt32
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case expectedCoreInstanceId = "expected_core_instance_id"
+        case afterCursor = "after_cursor"
+        case requestedEventLimit = "requested_event_limit"
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+enum FlitDashboardDelivery: String, Codable, Sendable {
+    case snapshot
+    case delta
+}
+
+enum FlitDashboardSnapshotReason: String, Codable, Sendable {
+    case initial
+    case coreInstanceMismatch = "core_instance_mismatch"
+    case cursorAhead = "cursor_ahead"
+    case cursorExpired = "cursor_expired"
+}
+
+struct FlitDashboardRunRecord: Codable, Equatable, Sendable {
+    let runId: String
+    let projectId: String
+    let projectDisplayName: String
+    let title: String
+    let provider: FlitProviderKind
+    let version: UInt64
+    let lifecycle: String
+    let activity: String
+    let activityConfidence: Double
+    let attentionLevel: String
+    let attentionOpenCount: UInt64
+    let dashboardBucket: String
+    let lastProgressAt: String?
+    let lastLivenessAt: String?
+    let startedAt: String?
+    let endedAt: String?
+    let changes: FlitDashboardChangeSummary
+    let updatedAt: String
+
+    private enum CodingKeys: String, CodingKey {
+        case runId = "run_id"
+        case projectId = "project_id"
+        case projectDisplayName = "project_display_name"
+        case title
+        case provider
+        case version
+        case lifecycle
+        case activity
+        case activityConfidence = "activity_confidence"
+        case attentionLevel = "attention_level"
+        case attentionOpenCount = "attention_open_count"
+        case dashboardBucket = "dashboard_bucket"
+        case lastProgressAt = "last_progress_at"
+        case lastLivenessAt = "last_liveness_at"
+        case startedAt = "started_at"
+        case endedAt = "ended_at"
+        case changes
+        case updatedAt = "updated_at"
+    }
+}
+
+struct FlitDashboardChangeSummary: Codable, Equatable, Sendable {
+    let files: UInt64
+    let insertions: UInt64
+    let deletions: UInt64
+}
+
+struct FlitDashboardEventRecord: Codable, Equatable, Sendable {
+    let cursor: UInt64
+    let eventId: String
+    let runId: String
+    let eventType: String
+    let observedAt: String
+
+    private enum CodingKeys: String, CodingKey {
+        case cursor
+        case eventId = "event_id"
+        case runId = "run_id"
+        case eventType = "event_type"
+        case observedAt = "observed_at"
+    }
+}
+
+struct FlitDashboardSnapshotResponse: Codable, Equatable, Sendable {
+    let delivery: FlitDashboardDelivery
+    let protocolVersion: String
+    let eventSchemaVersion: String
+    let coreInstanceId: String
+    let reason: FlitDashboardSnapshotReason
+    let requestedAfterCursor: UInt64?
+    let retainedAfterCursor: UInt64
+    let nextCursor: UInt64
+    let hasMore: Bool
+    let runs: [FlitDashboardRunRecord]
+
+    private enum CodingKeys: String, CodingKey {
+        case delivery
+        case protocolVersion = "protocol_version"
+        case eventSchemaVersion = "event_schema_version"
+        case coreInstanceId = "core_instance_id"
+        case reason
+        case requestedAfterCursor = "requested_after_cursor"
+        case retainedAfterCursor = "retained_after_cursor"
+        case nextCursor = "next_cursor"
+        case hasMore = "has_more"
+        case runs
+    }
+}
+
+struct FlitDashboardDeltaResponse: Codable, Equatable, Sendable {
+    let delivery: FlitDashboardDelivery
+    let protocolVersion: String
+    let eventSchemaVersion: String
+    let coreInstanceId: String
+    let requestedAfterCursor: UInt64
+    let retainedAfterCursor: UInt64
+    let nextCursor: UInt64
+    let hasMore: Bool
+    let events: [FlitDashboardEventRecord]
+
+    private enum CodingKeys: String, CodingKey {
+        case delivery
+        case protocolVersion = "protocol_version"
+        case eventSchemaVersion = "event_schema_version"
+        case coreInstanceId = "core_instance_id"
+        case requestedAfterCursor = "requested_after_cursor"
+        case retainedAfterCursor = "retained_after_cursor"
+        case nextCursor = "next_cursor"
+        case hasMore = "has_more"
+        case events
+    }
+}
+
+enum FlitDashboardReadResponse: Codable, Equatable, Sendable {
+    case snapshot(FlitDashboardSnapshotResponse)
+    case delta(FlitDashboardDeltaResponse)
+
+    private enum CodingKeys: String, CodingKey {
+        case delivery
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(FlitDashboardDelivery.self, forKey: .delivery) {
+        case .snapshot:
+            self = .snapshot(try FlitDashboardSnapshotResponse(from: decoder))
+        case .delta:
+            self = .delta(try FlitDashboardDeltaResponse(from: decoder))
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        switch self {
+        case let .snapshot(response):
+            try response.encode(to: encoder)
+        case let .delta(response):
+            try response.encode(to: encoder)
+        }
+    }
+}
+
 enum FlitCommandErrorCode: String, Codable, Sendable {
     case protocolMismatch = "PROTOCOL_MISMATCH"
     case invalidProjectRequest = "INVALID_PROJECT_REQUEST"
+    case invalidDashboardRequest = "INVALID_DASHBOARD_REQUEST"
     case projectInspectionFailure = "PROJECT_INSPECTION_FAILURE"
     case projectConflict = "PROJECT_CONFLICT"
     case projectNotFound = "PROJECT_NOT_FOUND"

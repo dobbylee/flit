@@ -10,7 +10,9 @@ use flit_protocol::{
     EventProtocolVersion, EventSource, EventSourceKind, NullableSessionId, UnsequencedEventEnvelope,
 };
 use flit_store::{
-    AppendEventOutcome, RunSnapshot, RunSnapshotDraft, Store, StoreError, WriteRunSnapshotOutcome,
+    AppendEventOutcome, MAX_DASHBOARD_DELTA_EVENTS, MAX_DASHBOARD_DELTA_SOURCE_BYTES,
+    MAX_DASHBOARD_SNAPSHOT_SOURCE_BYTES, RunSnapshot, RunSnapshotDraft, Store, StoreError,
+    WriteRunSnapshotOutcome,
 };
 use rusqlite::{Connection, params};
 use serde_json::{Map, json};
@@ -317,6 +319,219 @@ fn run_tail_rejects_invalid_bounds_and_missing_runs() {
     ));
 }
 
+#[test]
+fn dashboard_snapshot_and_global_delta_share_one_fixed_cursor_order() {
+    let database = TestDatabase::new("dashboard-read");
+    let mut store = database.open();
+    let first = append(&mut store, event(RUN_A, "event-a-1", 1));
+    let second = append(&mut store, event(RUN_B, "event-b-1", 1));
+    let third = append(&mut store, event(RUN_A, "event-a-2", 2));
+    assert_eq!((first, second, third), (1, 2, 3));
+    let mut run_a_snapshot = snapshot(RUN_A, third, "Running", "Testing", 1.0);
+    run_a_snapshot
+        .snapshot
+        .get_mut("attention")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("attention object")
+        .insert("open_count".to_owned(), json!(2));
+    run_a_snapshot.snapshot.insert(
+        "changes".to_owned(),
+        json!({"files": 3, "insertions": 42, "deletions": 7}),
+    );
+    store
+        .write_run_snapshot(run_a_snapshot)
+        .expect("Run A snapshot");
+    store
+        .write_run_snapshot(snapshot(RUN_B, second, "Running", "Editing", 0.9))
+        .expect("Run B snapshot");
+
+    let through_second = store
+        .dashboard_run_snapshots_through(second)
+        .expect("fixed Dashboard snapshot");
+    assert_eq!(through_second.len(), 1);
+    assert_eq!(through_second[0].projection.run_id, RUN_B);
+    assert_eq!(through_second[0].project_id, PROJECT_ID);
+    assert_eq!(through_second[0].project_display_name, "Snapshots");
+    assert_eq!(through_second[0].title, RUN_B);
+    assert_eq!(through_second[0].provider_kind, "codex");
+
+    let current = store
+        .dashboard_run_snapshots_through(third)
+        .expect("current Dashboard snapshot");
+    assert_eq!(
+        current
+            .iter()
+            .map(|snapshot| snapshot.projection.run_id.as_str())
+            .collect::<Vec<_>>(),
+        [RUN_A, RUN_B]
+    );
+    assert_eq!(current[0].attention_open_count, 2);
+    assert_eq!(current[0].change_files, 3);
+    assert_eq!(current[0].change_insertions, 42);
+    assert_eq!(current[0].change_deletions, 7);
+
+    let first_page = store
+        .dashboard_event_locators_through(0, third, 2)
+        .expect("first global page");
+    assert_eq!(first_page.upper_bound, third);
+    assert_eq!(
+        first_page
+            .events
+            .iter()
+            .map(|event| event.cursor)
+            .collect::<Vec<_>>(),
+        [first, second]
+    );
+    let second_page = store
+        .dashboard_event_locators_through(second, third, MAX_DASHBOARD_DELTA_EVENTS)
+        .expect("second global page");
+    assert_eq!(
+        second_page
+            .events
+            .iter()
+            .map(|event| event.cursor)
+            .collect::<Vec<_>>(),
+        [third]
+    );
+}
+
+#[test]
+fn dashboard_reads_reject_future_reversed_and_unbounded_ranges() {
+    let database = TestDatabase::new("dashboard-bounds");
+    let mut store = database.open();
+    append(&mut store, event(RUN_A, "event-a", 1));
+
+    assert!(matches!(
+        store.dashboard_run_snapshots_through(2),
+        Err(StoreError::InvalidDashboardSnapshotCursor { upper_bound: 2 })
+    ));
+    for (cursor, upper_bound, limit) in [
+        (2, 1, 1),
+        (0, 2, 1),
+        (0, 1, 0),
+        (0, 1, MAX_DASHBOARD_DELTA_EVENTS + 1),
+    ] {
+        assert!(matches!(
+            store.dashboard_event_locators_through(cursor, upper_bound, limit),
+            Err(StoreError::InvalidGlobalEventRange { .. })
+        ));
+    }
+}
+
+#[test]
+fn dashboard_snapshot_source_bound_fails_before_loading_oversized_json() {
+    let database = TestDatabase::new("dashboard-source-bound");
+    let mut store = database.open();
+    let version = append(&mut store, event(RUN_A, "event-a", 1));
+    store
+        .write_run_snapshot(snapshot(RUN_A, version, "Running", "Editing", 0.9))
+        .expect("valid source snapshot");
+    drop(store);
+
+    let oversized = "x".repeat(MAX_DASHBOARD_SNAPSHOT_SOURCE_BYTES + 1);
+    let connection = Connection::open(database.path()).expect("oversize snapshot connection");
+    connection
+        .execute(
+            "UPDATE run_snapshots SET snapshot_json = ?2 WHERE run_id = ?1",
+            params![RUN_A, oversized],
+        )
+        .expect("oversize stored snapshot");
+    drop(connection);
+
+    let reopened = database.open();
+    assert!(matches!(
+        reopened.dashboard_run_snapshots_through(version),
+        Err(StoreError::DashboardSnapshotReadTooLarge { .. })
+    ));
+    let connection = Connection::open(database.path()).expect("inspect oversized source");
+    let stored_bytes: i64 = connection
+        .query_row(
+            "SELECT LENGTH(CAST(snapshot_json AS BLOB)) FROM run_snapshots WHERE run_id = ?1",
+            [RUN_A],
+            |row| row.get(0),
+        )
+        .expect("stored oversized source length");
+    assert_eq!(
+        stored_bytes,
+        i64::try_from(MAX_DASHBOARD_SNAPSHOT_SOURCE_BYTES + 1).expect("source bound fits i64")
+    );
+}
+
+#[test]
+fn dashboard_delta_reads_only_bounded_locators_not_large_event_content() {
+    let database = TestDatabase::new("dashboard-locator-only");
+    let mut store = database.open();
+    let mut oversized = event(RUN_A, "event-large-payload", 1);
+    oversized.payload.insert(
+        "raw_provider_content".to_owned(),
+        serde_json::Value::String("x".repeat(MAX_DASHBOARD_DELTA_SOURCE_BYTES * 2)),
+    );
+    let cursor = append(&mut store, oversized);
+
+    let page = store
+        .dashboard_event_locators_through(0, cursor, MAX_DASHBOARD_DELTA_EVENTS)
+        .expect("locator-only Dashboard delta");
+    assert_eq!(page.events.len(), 1);
+    assert_eq!(page.events[0].cursor, cursor);
+    assert_eq!(page.events[0].event_id, "event-large-payload");
+    assert_eq!(page.events[0].run_id, RUN_A);
+    assert_eq!(page.events[0].event_type, "run.event_observed");
+}
+
+#[test]
+fn dashboard_delta_rejects_middle_and_tail_cursor_gaps_without_repair() {
+    let database = TestDatabase::new("dashboard-cursor-gaps");
+    let mut store = database.open();
+    let first = append(&mut store, event(RUN_A, "event-gap-1", 1));
+    let second = append(&mut store, event(RUN_A, "event-gap-2", 2));
+    let third = append(&mut store, event(RUN_A, "event-gap-3", 3));
+    let fourth = append(&mut store, event(RUN_A, "event-gap-4", 4));
+    drop(store);
+
+    let connection = Connection::open(database.path()).expect("corrupt event connection");
+    connection
+        .execute(
+            "DELETE FROM events WHERE ingest_seq = ?1",
+            [i64::try_from(second).expect("cursor fits i64")],
+        )
+        .expect("remove middle event");
+    drop(connection);
+
+    let reopened = database.open();
+    assert!(matches!(
+        reopened.dashboard_event_locators_through(first, third, MAX_DASHBOARD_DELTA_EVENTS),
+        Err(StoreError::StoredDashboardEventCursorGap {
+            expected_cursor,
+            actual_cursor: Some(actual_cursor),
+        }) if expected_cursor == second && actual_cursor == third
+    ));
+    drop(reopened);
+
+    let connection = Connection::open(database.path()).expect("corrupt tail connection");
+    connection
+        .execute(
+            "DELETE FROM events WHERE ingest_seq = ?1",
+            [i64::try_from(third).expect("cursor fits i64")],
+        )
+        .expect("remove fixed-bound tail event");
+    drop(connection);
+
+    let reopened = database.open();
+    assert!(matches!(
+        reopened.dashboard_event_locators_through(second, third, MAX_DASHBOARD_DELTA_EVENTS),
+        Err(StoreError::StoredDashboardEventCursorGap {
+            expected_cursor,
+            actual_cursor: None,
+        }) if expected_cursor == third
+    ));
+    assert_eq!(
+        reopened
+            .latest_ingest_seq()
+            .expect("unchanged later cursor"),
+        fourth
+    );
+}
+
 fn append(store: &mut Store, event: UnsequencedEventEnvelope) -> u64 {
     match store.append_event(event).expect("append event") {
         AppendEventOutcome::Inserted(event) => event.ingest_seq,
@@ -371,6 +586,11 @@ fn snapshot(
         "dashboard_bucket": "Working",
         "last_progress_at": last_progress_at,
         "last_liveness_at": last_liveness_at,
+        "changes": {
+            "files": 0,
+            "insertions": 0,
+            "deletions": 0
+        },
         "future_projection_field": { "kept": true }
     });
     RunSnapshotDraft {
