@@ -1793,8 +1793,12 @@ while IFS= read -r line; do
     *'"method":"thread/start"'*) printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"managed-1","sessionId":"managed-1"}},"sandbox":{{"type":"readOnly","networkAccess":false}},"approvalPolicy":"never"}}}}' ;;
     *'"method":"turn/start"'*)
       printf '%s\n' '{{"method":"turn/started","params":{{"threadId":"managed-1","turn":{{"id":"turn-1"}}}}}}'
+      printf '%s\n' '{{"method":"item/started","params":{{"item":{{"id":"user-1","type":"userMessage"}},"startedAtMs":0,"threadId":"managed-1","turnId":"turn-1"}}}}'
+      printf '%s\n' '{{"method":"item/completed","params":{{"item":{{"id":"user-1","type":"userMessage"}},"threadId":"managed-1","turnId":"turn-1"}}}}'
+      printf '%s\n' '{{"method":"item/started","params":{{"item":{{"id":"agent-1","type":"agentMessage"}},"startedAtMs":0,"threadId":"managed-1","turnId":"turn-1"}}}}'
       printf '%s\n' '{{"method":"item/started","params":{{"item":{{"id":"item-1","type":"commandExecution","command":"secret command","commandActions":[],"cwd":"{TEST_CWD}","status":"inProgress"}},"startedAtMs":0,"threadId":"managed-1","turnId":"turn-1"}}}}'
       printf '%s\n' '{{"id":3,"result":{{"turn":{{"id":"turn-1"}}}}}}'
+      printf '%s\n' '{{"method":"item/completed","params":{{"item":{{"id":"agent-1","type":"agentMessage"}},"threadId":"managed-1","turnId":"turn-1"}}}}'
       printf '%s\n' '{{"method":"turn/completed","params":{{"threadId":"managed-1","turn":{{"id":"turn-1","items":[],"status":"completed"}}}}}}'
       ;;
   esac

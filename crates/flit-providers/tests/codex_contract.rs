@@ -510,6 +510,48 @@ fn selected_turn_notifications_require_exact_identity_and_variant() {
         decode_codex_turn_notification(&json_bytes(&unselected), &expected_thread, &expected_turn),
         Ok(None)
     );
+    for item_type in ["userMessage", "agentMessage"] {
+        let non_command_start = json!({
+            "method": "item/started",
+            "params": {
+                "item": {
+                    "id": format!("item-{item_type}"),
+                    "type": item_type,
+                },
+                "startedAtMs": 0,
+                "threadId": "managed-1",
+                "turnId": "turn-1",
+            },
+        });
+        assert_eq!(
+            decode_codex_turn_notification(
+                &json_bytes(&non_command_start),
+                &expected_thread,
+                &expected_turn,
+            ),
+            Ok(None)
+        );
+    }
+    let unknown_item_start = json!({
+        "method": "item/started",
+        "params": {
+            "item": {
+                "id": "item-unknown",
+                "type": "futureItem",
+            },
+            "startedAtMs": 0,
+            "threadId": "managed-1",
+            "turnId": "turn-1",
+        },
+    });
+    assert_eq!(
+        decode_codex_turn_notification(
+            &json_bytes(&unknown_item_start),
+            &expected_thread,
+            &expected_turn,
+        ),
+        Err(CodexContractError::UnexpectedItemVariant)
+    );
 
     command["params"]["turnId"] = json!("other-turn");
     assert_eq!(

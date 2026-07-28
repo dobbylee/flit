@@ -795,16 +795,40 @@ pub fn decode_codex_turn_notification(
             if &observed_turn_id != expected_turn_id {
                 return Err(CodexContractError::UnexpectedTurnId);
             }
+            let started_at_ms = required_u64(params, "startedAtMs")?;
+            if started_at_ms > MAX_JSON_SAFE_INTEGER {
+                return Err(CodexContractError::InvalidField {
+                    field: "startedAtMs",
+                });
+            }
             let item = required_object(params, "item")?;
-            if required_string(item, "type")? != "commandExecution"
-                || required_string(item, "status")? != "inProgress"
-            {
+            match required_string(item, "type")? {
+                "commandExecution" => {}
+                "userMessage"
+                | "hookPrompt"
+                | "agentMessage"
+                | "plan"
+                | "reasoning"
+                | "fileChange"
+                | "mcpToolCall"
+                | "dynamicToolCall"
+                | "collabAgentToolCall"
+                | "subAgentActivity"
+                | "webSearch"
+                | "imageView"
+                | "sleep"
+                | "imageGeneration"
+                | "enteredReviewMode"
+                | "exitedReviewMode"
+                | "contextCompaction" => return Ok(None),
+                _ => return Err(CodexContractError::UnexpectedItemVariant),
+            }
+            if required_string(item, "status")? != "inProgress" {
                 return Err(CodexContractError::UnexpectedItemVariant);
             }
             let _ = required_string(item, "command")?;
             let _ = required_array(item, "commandActions")?;
             let _ = required_string(item, "cwd")?;
-            let _ = required_u64(params, "startedAtMs")?;
             Ok(Some(CodexTurnObservation::CommandStarted {
                 thread_id: observed_thread_id,
                 turn_id: observed_turn_id,
