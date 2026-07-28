@@ -43,6 +43,7 @@ use crate::{
 };
 
 pub const CODEX_APP_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+pub const CODEX_TURN_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 pub const MAX_CODEX_APP_SERVER_STDERR_BYTES: usize = 64 * 1024;
 pub const MAX_CODEX_PENDING_NOTIFICATIONS: usize = 64;
 pub const MAX_CODEX_PENDING_NOTIFICATION_BYTES: usize = 1024 * 1024;
@@ -116,6 +117,7 @@ pub struct CodexAppServer {
     notifications: VecDeque<Vec<u8>>,
     next_request_id: u64,
     request_timeout: Duration,
+    turn_observation_timeout: Duration,
     validated_profile: Option<ProviderFingerprint>,
     staged_executable: Option<StagedExecutable>,
     started_thread_ids: BTreeSet<CodexManagedThreadId>,
@@ -388,7 +390,7 @@ impl CodexAppServer {
         };
         let expected_thread_id = active.started.thread_id.clone();
         let expected_turn_id = active.started.turn_id.clone();
-        let deadline = Instant::now() + self.request_timeout;
+        let deadline = Instant::now() + self.turn_observation_timeout;
 
         for _ in 0..MAX_CODEX_OBSERVATION_FRAMES {
             let frame = self.next_notification_until(deadline)?;
@@ -691,11 +693,13 @@ impl CodexAppServer {
         executable: &Path,
         arguments: &[OsString],
         request_timeout: Duration,
+        turn_observation_timeout: Duration,
     ) -> Result<Self, CodexAppServerError> {
         Self::spawn_and_handshake_with_reader_hook(
             executable,
             arguments,
             request_timeout,
+            turn_observation_timeout,
             || Ok(()),
         )
     }
@@ -704,6 +708,7 @@ impl CodexAppServer {
         executable: &Path,
         arguments: &[OsString],
         request_timeout: Duration,
+        turn_observation_timeout: Duration,
         before_stderr_reader: impl FnOnce() -> io::Result<()>,
     ) -> Result<Self, CodexAppServerError> {
         let mut command = Command::new(executable);
@@ -792,6 +797,7 @@ impl CodexAppServer {
             notifications: VecDeque::new(),
             next_request_id: 1,
             request_timeout,
+            turn_observation_timeout,
             validated_profile: None,
             staged_executable: None,
             started_thread_ids: BTreeSet::new(),
@@ -1242,6 +1248,7 @@ fn connect_from_probe(
             OsString::from("stdio://"),
         ],
         CODEX_APP_SERVER_REQUEST_TIMEOUT,
+        CODEX_TURN_OBSERVATION_TIMEOUT,
     )?;
     server.validated_profile = Some(validated_profile);
     server.staged_executable = Some(staged_executable);
@@ -2526,6 +2533,55 @@ done
     }
 
     #[test]
+    fn turn_observation_can_outlive_the_control_request_timeout() {
+        let _process_guard = test_process_guard();
+        assert_eq!(CODEX_APP_SERVER_REQUEST_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(CODEX_TURN_OBSERVATION_TIMEOUT, Duration::from_secs(5 * 60));
+        let directory = TestDirectory::new("turn-observation-separate-timeout");
+        let executable = directory.0.join("codex");
+        write_script(
+            &executable,
+            r#"#!/bin/sh
+printf '%s' "$$" > "$0.pgid"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"managed-1","sessionId":"managed-1"},"sandbox":{"type":"readOnly","networkAccess":false},"approvalPolicy":"never"}}' ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-1"}}}'
+      /bin/sleep 0.1
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"managed-1","turn":{"id":"turn-1","items":[],"status":"completed"}}}'
+      ;;
+  esac
+done
+"#,
+        );
+        let mut server =
+            connect_fake(&executable, Duration::from_secs(1)).expect("separate timeout handshake");
+        let thread = server.start_read_only(TEST_CWD).expect("managed thread");
+        let turn = server
+            .start_turn(&thread.thread_id, "Wait for completion.")
+            .expect("turn start");
+        server.request_timeout = Duration::from_millis(20);
+        server.turn_observation_timeout = Duration::from_secs(1);
+        let started = Instant::now();
+
+        assert_eq!(
+            server
+                .wait_for_turn_observation()
+                .expect("delayed terminal"),
+            CodexTurnObservation::Terminal {
+                thread_id: thread.thread_id,
+                turn_id: turn.turn_id,
+                outcome: crate::CodexTurnTerminalOutcome::Completed,
+            }
+        );
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        server.shutdown().expect("turn shutdown");
+        assert_process_group_gone(&executable);
+    }
+
+    #[test]
     fn turn_observation_timeout_closes_the_connection() {
         let _process_guard = test_process_guard();
         let directory = TestDirectory::new("turn-observation-timeout");
@@ -2549,7 +2605,7 @@ done
         server
             .start_turn(&thread.thread_id, "Wait.")
             .expect("turn start");
-        server.request_timeout = Duration::from_millis(200);
+        server.turn_observation_timeout = Duration::from_millis(200);
         let error = server
             .wait_for_turn_observation()
             .expect_err("observation must time out");
@@ -2787,6 +2843,7 @@ done
                 OsString::from("stdio://"),
             ],
             Duration::from_secs(1),
+            Duration::from_secs(1),
         )
         .expect("staged original must handshake");
         server.staged_executable = Some(staged);
@@ -2930,6 +2987,7 @@ while IFS= read -r line; do :; done
                 OsString::from("--listen"),
                 OsString::from("stdio://"),
             ],
+            Duration::from_secs(1),
             Duration::from_secs(1),
             || {
                 let deadline = Instant::now() + Duration::from_secs(1);
@@ -3269,6 +3327,7 @@ exit 9
                 OsString::from("--listen"),
                 OsString::from("stdio://"),
             ],
+            timeout,
             timeout,
         )
     }
