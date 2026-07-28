@@ -10,14 +10,16 @@ use std::{
 
 use flit_bridge::codex_recovery::{
     CodexRecoveryAttempt, CodexRecoveryConnector, CodexRecoveryError, CodexRecoveryProvider,
-    CodexRecoveryProviderError, reconcile_live_codex_sessions,
+    CodexRecoveryProviderError, observe_codex_sessions, persist_codex_recovery_observations,
+    reconcile_live_codex_sessions, unknown_codex_recovery_observations,
 };
 use flit_providers::{
     CodexManagedScope, CodexManagedThreadConflict, CodexManagedThreadId, CodexManagedThreads,
     CodexThreadRead, CodexThreadState, MAX_CODEX_MANAGED_THREADS, ProviderFingerprint,
 };
 use flit_store::{
-    InitialManagedSessionConnection, ManagedRunIntent, ProjectRegistration,
+    InitialManagedSessionConnection, MAX_LIVE_MANAGED_SESSIONS, ManagedRunIntent,
+    ManagedSessionTermination, ManagedTurnTerminalOutcome, ProjectRegistration,
     ProjectTrustConfirmation, Store,
 };
 use serde_json::{Map, Value, json};
@@ -111,6 +113,186 @@ impl CodexRecoveryConnector for FakeConnector {
             .and_then(VecDeque::pop_front)
             .expect("scripted connector result")
     }
+}
+
+#[test]
+fn provider_observation_is_store_free_until_exact_cas_persistence() {
+    let directory = TestDirectory::new("split-observation");
+    let executable = PathBuf::from("/private/tmp/flit-codex-split-observation");
+    let (mut store, project_path) = trusted_store(&directory);
+    seed_live_session(
+        &mut store,
+        &project_path,
+        &executable,
+        "split-observation",
+        Some(EXECUTABLE_VERSION),
+    );
+    let before_observation = store.latest_ingest_seq().expect("initial cursor");
+    let log = Rc::new(RefCell::new(FakeLog::default()));
+    let provider = fake_provider(
+        &executable,
+        list_result(&["split-observation"], &[], &[], &project_path),
+        BTreeMap::from([(
+            "thread-split-observation".to_owned(),
+            Ok(thread_read(
+                "split-observation",
+                CodexThreadState::Completed,
+                Some("turn-split-observation"),
+            )),
+        )]),
+        Rc::clone(&log),
+    );
+    let mut connector = connector(&executable, Ok(provider), Rc::clone(&log));
+    let sessions = store
+        .live_managed_sessions(MAX_LIVE_MANAGED_SESSIONS)
+        .expect("startup session snapshot");
+
+    let observations =
+        observe_codex_sessions(sessions, &mut connector).expect("bounded exact observations");
+    assert_eq!(
+        store.latest_ingest_seq().expect("cursor after observation"),
+        before_observation
+    );
+    assert!(
+        store
+            .managed_session("session-split-observation")
+            .expect("session")
+            .expect("session")
+            .ended_at
+            .is_none()
+    );
+
+    let summary = persist_codex_recovery_observations(
+        &mut store,
+        &attempt("attempt-split-observation"),
+        observations,
+    )
+    .expect("persist exact observation");
+    assert_eq!(summary.examined, 1);
+    assert_eq!(summary.completed, 1);
+    assert_eq!(
+        store
+            .managed_session("session-split-observation")
+            .expect("session")
+            .expect("session")
+            .end_reason
+            .as_deref(),
+        Some("completed")
+    );
+}
+
+#[test]
+fn delayed_observation_cannot_overwrite_a_terminalized_session() {
+    let directory = TestDirectory::new("delayed-conflict");
+    let executable = PathBuf::from("/private/tmp/flit-codex-delayed-conflict");
+    let (mut store, project_path) = trusted_store(&directory);
+    seed_live_session(
+        &mut store,
+        &project_path,
+        &executable,
+        "delayed-conflict",
+        Some(EXECUTABLE_VERSION),
+    );
+    let log = Rc::new(RefCell::new(FakeLog::default()));
+    let provider = fake_provider(
+        &executable,
+        list_result(&["delayed-conflict"], &[], &[], &project_path),
+        BTreeMap::from([(
+            "thread-delayed-conflict".to_owned(),
+            Ok(thread_read(
+                "delayed-conflict",
+                CodexThreadState::Completed,
+                Some("turn-delayed-observation"),
+            )),
+        )]),
+        Rc::clone(&log),
+    );
+    let mut connector = connector(&executable, Ok(provider), Rc::clone(&log));
+    let sessions = store
+        .live_managed_sessions(MAX_LIVE_MANAGED_SESSIONS)
+        .expect("startup session snapshot");
+    let observations =
+        observe_codex_sessions(sessions, &mut connector).expect("bounded exact observations");
+
+    store
+        .terminate_managed_session(ManagedSessionTermination {
+            run_id: "run-delayed-conflict".to_owned(),
+            session_id: "session-delayed-conflict".to_owned(),
+            external_session_key: "thread-delayed-conflict".to_owned(),
+            provider_turn_id: "turn-current-terminal".to_owned(),
+            contract_version: format!("codex-app-server/{EXECUTABLE_VERSION}"),
+            stream_seq: 2,
+            ended_at: "2026-07-24T11:00:04Z".to_owned(),
+            terminal_event_id: "event-delayed-current-terminal".to_owned(),
+            outcome: ManagedTurnTerminalOutcome::Interrupted,
+        })
+        .expect("terminalize exact session after observation");
+    let terminal_cursor = store.latest_ingest_seq().expect("terminal cursor");
+
+    assert!(matches!(
+        persist_codex_recovery_observations(
+            &mut store,
+            &attempt("attempt-delayed-conflict"),
+            observations,
+        ),
+        Err(CodexRecoveryError::Store(_))
+    ));
+    assert_eq!(
+        store.latest_ingest_seq().expect("cursor after stale CAS"),
+        terminal_cursor
+    );
+    assert_eq!(
+        run_event_types(&store, "run-delayed-conflict")
+            .last()
+            .map(String::as_str),
+        Some("run.interrupted")
+    );
+}
+
+#[test]
+fn unknown_batch_is_provider_free_and_rejects_an_unbounded_snapshot() {
+    let directory = TestDirectory::new("unknown-batch");
+    let executable = PathBuf::from("/private/tmp/flit-codex-unknown-batch");
+    let (mut store, project_path) = trusted_store(&directory);
+    seed_live_session(
+        &mut store,
+        &project_path,
+        &executable,
+        "unknown-batch",
+        None,
+    );
+    let before_unknown = store.latest_ingest_seq().expect("initial cursor");
+    let sessions = store
+        .live_managed_sessions(MAX_LIVE_MANAGED_SESSIONS)
+        .expect("startup session snapshot");
+    let repeated = vec![sessions[0].clone(); MAX_LIVE_MANAGED_SESSIONS + 1];
+    assert!(matches!(
+        unknown_codex_recovery_observations(repeated),
+        Err(CodexRecoveryError::SessionLimitExceeded)
+    ));
+
+    let observations =
+        unknown_codex_recovery_observations(sessions).expect("bounded Unknown observations");
+    assert_eq!(
+        store
+            .latest_ingest_seq()
+            .expect("cursor before persistence"),
+        before_unknown
+    );
+    let summary = persist_codex_recovery_observations(
+        &mut store,
+        &attempt("attempt-unknown-batch"),
+        observations,
+    )
+    .expect("persist Unknown observations");
+    assert_eq!(summary.examined, 1);
+    assert_eq!(summary.unknown, 1);
+    assert_eq!(
+        run_event_types(&store, "run-unknown-batch")
+            .last()
+            .map(String::as_str),
+        Some("diagnostic.sequence_gap")
+    );
 }
 
 #[test]

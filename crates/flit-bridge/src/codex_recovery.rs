@@ -41,10 +41,26 @@ pub struct CodexRecoverySummary {
     pub limit_reached: bool,
 }
 
+#[derive(Clone, Debug)]
+struct CodexRecoveryObservation {
+    session: ManagedSession,
+    state: ManagedReconciliationState,
+    latest_turn_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CodexRecoveryObservationBatch {
+    examined: usize,
+    limit_reached: bool,
+    observations: Vec<CodexRecoveryObservation>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CodexRecoveryError {
     #[error("invalid Codex recovery attempt field: {0}")]
     InvalidAttempt(&'static str),
+    #[error("Codex recovery session snapshot exceeds the fixed bound")]
+    SessionLimitExceeded,
     #[error("Codex recovery persistence failed")]
     Store(#[from] StoreError),
 }
@@ -123,33 +139,30 @@ pub fn reconcile_live_codex_sessions<C: CodexRecoveryConnector>(
 ) -> Result<CodexRecoverySummary, CodexRecoveryError> {
     validate_attempt(attempt)?;
     let sessions = store.live_managed_sessions(MAX_LIVE_MANAGED_SESSIONS)?;
-    let mut summary = CodexRecoverySummary {
+    let observations = observe_codex_sessions(sessions, connector)?;
+    persist_codex_recovery_observations(store, attempt, observations)
+}
+
+pub fn observe_codex_sessions<C: CodexRecoveryConnector>(
+    sessions: Vec<ManagedSession>,
+    connector: &mut C,
+) -> Result<CodexRecoveryObservationBatch, CodexRecoveryError> {
+    if sessions.len() > MAX_LIVE_MANAGED_SESSIONS {
+        return Err(CodexRecoveryError::SessionLimitExceeded);
+    }
+    let mut observations = CodexRecoveryObservationBatch {
         examined: sessions.len(),
         limit_reached: sessions.len() == MAX_LIVE_MANAGED_SESSIONS,
-        ..CodexRecoverySummary::default()
+        observations: Vec::with_capacity(sessions.len()),
     };
     let mut executable_groups = BTreeMap::<ExecutableGroup, Vec<ManagedSession>>::new();
     for session in sessions {
         let Some(path) = session.executable_path.clone() else {
-            persist_reconciliation(
-                store,
-                attempt,
-                &session,
-                ManagedReconciliationState::Unknown,
-                None,
-                &mut summary,
-            )?;
+            observations.push(&session, ManagedReconciliationState::Unknown, None);
             continue;
         };
         let Some(version) = session.executable_version.clone() else {
-            persist_reconciliation(
-                store,
-                attempt,
-                &session,
-                ManagedReconciliationState::Unknown,
-                None,
-                &mut summary,
-            )?;
+            observations.push(&session, ManagedReconciliationState::Unknown, None);
             continue;
         };
         executable_groups
@@ -164,7 +177,7 @@ pub fn reconcile_live_codex_sessions<C: CodexRecoveryConnector>(
     for (executable, sessions) in executable_groups {
         let executable_path = Path::new(&executable.path_spelling);
         let Ok(mut provider) = connector.connect(executable_path) else {
-            persist_unknown_group(store, attempt, sessions, &mut summary)?;
+            observations.push_unknown_group(sessions);
             continue;
         };
         let profile_matches = provider.validated_profile().is_some_and(|profile| {
@@ -172,7 +185,7 @@ pub fn reconcile_live_codex_sessions<C: CodexRecoveryConnector>(
                 && profile.executable_version == executable.version
         });
         if !profile_matches {
-            persist_unknown_group(store, attempt, sessions, &mut summary)?;
+            observations.push_unknown_group(sessions);
             continue;
         }
 
@@ -184,20 +197,78 @@ pub fn reconcile_live_codex_sessions<C: CodexRecoveryConnector>(
                 .push(session);
         }
         for (cwd, sessions) in cwd_groups {
-            reconcile_cwd_group(store, &mut provider, attempt, &cwd, sessions, &mut summary)?;
+            observe_cwd_group(&mut provider, &cwd, sessions, &mut observations);
         }
+    }
+    Ok(observations)
+}
+
+pub fn unknown_codex_recovery_observations(
+    sessions: Vec<ManagedSession>,
+) -> Result<CodexRecoveryObservationBatch, CodexRecoveryError> {
+    if sessions.len() > MAX_LIVE_MANAGED_SESSIONS {
+        return Err(CodexRecoveryError::SessionLimitExceeded);
+    }
+    let mut observations = CodexRecoveryObservationBatch {
+        examined: sessions.len(),
+        limit_reached: sessions.len() == MAX_LIVE_MANAGED_SESSIONS,
+        observations: Vec::with_capacity(sessions.len()),
+    };
+    observations.push_unknown_group(sessions);
+    Ok(observations)
+}
+
+pub fn persist_codex_recovery_observations(
+    store: &mut Store,
+    attempt: &CodexRecoveryAttempt,
+    observations: CodexRecoveryObservationBatch,
+) -> Result<CodexRecoverySummary, CodexRecoveryError> {
+    validate_attempt(attempt)?;
+    let mut summary = CodexRecoverySummary {
+        examined: observations.examined,
+        limit_reached: observations.limit_reached,
+        ..CodexRecoverySummary::default()
+    };
+    for observation in observations.observations {
+        persist_reconciliation(
+            store,
+            attempt,
+            &observation.session,
+            observation.state,
+            observation.latest_turn_id.as_deref(),
+            &mut summary,
+        )?;
     }
     Ok(summary)
 }
 
-fn reconcile_cwd_group<P: CodexRecoveryProvider>(
-    store: &mut Store,
+impl CodexRecoveryObservationBatch {
+    fn push(
+        &mut self,
+        session: &ManagedSession,
+        state: ManagedReconciliationState,
+        latest_turn_id: Option<String>,
+    ) {
+        self.observations.push(CodexRecoveryObservation {
+            session: session.clone(),
+            state,
+            latest_turn_id,
+        });
+    }
+
+    fn push_unknown_group(&mut self, sessions: Vec<ManagedSession>) {
+        for session in sessions {
+            self.push(&session, ManagedReconciliationState::Unknown, None);
+        }
+    }
+}
+
+fn observe_cwd_group<P: CodexRecoveryProvider>(
     provider: &mut P,
-    attempt: &CodexRecoveryAttempt,
     cwd: &Path,
     sessions: Vec<ManagedSession>,
-    summary: &mut CodexRecoverySummary,
-) -> Result<(), CodexRecoveryError> {
+    observations: &mut CodexRecoveryObservationBatch,
+) {
     let mut exact_sessions = BTreeMap::<CodexManagedThreadId, ManagedSession>::new();
     let mut invalid_sessions = Vec::new();
     for session in sessions {
@@ -208,42 +279,27 @@ fn reconcile_cwd_group<P: CodexRecoveryProvider>(
             Ok(_) | Err(_) => invalid_sessions.push(session),
         }
     }
-    persist_unknown_group(store, attempt, invalid_sessions, summary)?;
+    observations.push_unknown_group(invalid_sessions);
     if exact_sessions.is_empty() {
-        return Ok(());
+        return;
     }
     let scope = match CodexManagedScope::new(cwd.to_owned(), exact_sessions.keys().cloned()) {
         Ok(scope) => scope,
         Err(_) => {
-            persist_unknown_group(
-                store,
-                attempt,
-                exact_sessions.into_values().collect(),
-                summary,
-            )?;
-            return Ok(());
+            observations.push_unknown_group(exact_sessions.into_values().collect());
+            return;
         }
     };
     let listed = match provider.list_managed(&scope) {
         Ok(listed) => listed,
         Err(_) => {
-            persist_unknown_group(
-                store,
-                attempt,
-                exact_sessions.into_values().collect(),
-                summary,
-            )?;
-            return Ok(());
+            observations.push_unknown_group(exact_sessions.into_values().collect());
+            return;
         }
     };
     let Some(partition) = exact_partition(exact_sessions.keys(), cwd, &listed) else {
-        persist_unknown_group(
-            store,
-            attempt,
-            exact_sessions.into_values().collect(),
-            summary,
-        )?;
-        return Ok(());
+        observations.push_unknown_group(exact_sessions.into_values().collect());
+        return;
     };
 
     for (thread_id, session) in exact_sessions {
@@ -253,42 +309,20 @@ fn reconcile_cwd_group<P: CodexRecoveryProvider>(
             .expect("validated exact partition")
         {
             ListDisposition::Missing => {
-                persist_reconciliation(
-                    store,
-                    attempt,
-                    &session,
-                    ManagedReconciliationState::Missing,
-                    None,
-                    summary,
-                )?;
+                observations.push(&session, ManagedReconciliationState::Missing, None);
             }
             ListDisposition::ScopeConflict => {
-                persist_reconciliation(
-                    store,
-                    attempt,
-                    &session,
-                    ManagedReconciliationState::ScopeConflict,
-                    None,
-                    summary,
-                )?;
+                observations.push(&session, ManagedReconciliationState::ScopeConflict, None);
             }
             ListDisposition::Matched => {
                 let (state, latest_turn_id) = match provider.read_managed(&thread_id) {
                     Ok(read) if read.thread_id == thread_id => map_thread_read(read),
                     Ok(_) | Err(_) => (ManagedReconciliationState::Unknown, None),
                 };
-                persist_reconciliation(
-                    store,
-                    attempt,
-                    &session,
-                    state,
-                    latest_turn_id.as_deref(),
-                    summary,
-                )?;
+                observations.push(&session, state, latest_turn_id);
             }
         }
     }
-    Ok(())
 }
 
 fn exact_partition<'a>(
@@ -383,25 +417,6 @@ fn map_thread_read(read: CodexThreadRead) -> (ManagedReconciliationState, Option
         | (CodexThreadState::Failed, None)
         | (CodexThreadState::Interrupted, None) => (ManagedReconciliationState::Unknown, None),
     }
-}
-
-fn persist_unknown_group(
-    store: &mut Store,
-    attempt: &CodexRecoveryAttempt,
-    sessions: Vec<ManagedSession>,
-    summary: &mut CodexRecoverySummary,
-) -> Result<(), CodexRecoveryError> {
-    for session in sessions {
-        persist_reconciliation(
-            store,
-            attempt,
-            &session,
-            ManagedReconciliationState::Unknown,
-            None,
-            summary,
-        )?;
-    }
-    Ok(())
 }
 
 fn persist_reconciliation(
