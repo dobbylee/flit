@@ -4,7 +4,7 @@ use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: &str = "1.10";
+pub const PROTOCOL_VERSION: &str = "1.11";
 pub const EVENT_PROTOCOL_VERSION: &str = "1.0";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -218,6 +218,46 @@ pub enum DashboardReadResponse {
         events: Vec<DashboardEventRecord>,
         runs: Vec<DashboardRunRecord>,
     },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RunDetailReadRequest {
+    pub run_id: String,
+    pub expected_run_version: u64,
+    pub after_cursor: u64,
+    pub requested_event_limit: u32,
+    pub client_protocol_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RunEvidenceRecord {
+    pub cursor: u64,
+    pub event_id: String,
+    pub session_id: Option<String>,
+    pub event_type: String,
+    pub source_kind: EventSourceKind,
+    pub confidence: f64,
+    pub observed_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RunDetailReadResponse {
+    pub protocol_version: String,
+    pub event_schema_version: String,
+    pub run_id: String,
+    pub run_version: u64,
+    pub next_cursor: u64,
+    pub has_more: bool,
+    pub history_status: CapabilityStatus,
+    pub open_in_provider_status: CapabilityStatus,
+    pub events: Vec<RunEvidenceRecord>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ManagedRunOpenInProviderRequest {
+    pub run_id: String,
+    pub expected_run_version: u64,
+    pub client_protocol_version: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -484,9 +524,12 @@ pub enum CommandErrorCode {
     ProjectIdentityMismatch,
     StorageUnavailable,
     InvalidRunRequest,
+    RunNotFound,
+    RunVersionStale,
     RunConflict,
     ProjectNotTrusted,
     ProviderUnavailable,
+    CapabilityUnsupported,
     ProviderStartFailed,
     ProviderStartUnknown,
     ManagedRunNotActive,
@@ -642,9 +685,12 @@ impl CommandError {
             CommandErrorCode::ProjectIdentityMismatch => "errors.projectIdentityMismatch",
             CommandErrorCode::StorageUnavailable => "errors.storageUnavailable",
             CommandErrorCode::InvalidRunRequest => "errors.invalidRunRequest",
+            CommandErrorCode::RunNotFound => "errors.runNotFound",
+            CommandErrorCode::RunVersionStale => "errors.runVersionStale",
             CommandErrorCode::RunConflict => "errors.runConflict",
             CommandErrorCode::ProjectNotTrusted => "errors.projectNotTrusted",
             CommandErrorCode::ProviderUnavailable => "errors.providerUnavailable",
+            CommandErrorCode::CapabilityUnsupported => "errors.capabilityUnsupported",
             CommandErrorCode::ProviderStartFailed => "errors.providerStartFailed",
             CommandErrorCode::ProviderStartUnknown => "errors.providerStartUnknown",
             CommandErrorCode::ManagedRunNotActive => "errors.managedRunNotActive",
@@ -1058,6 +1104,90 @@ enum FlitDashboardReadResponse: Codable, Equatable, Sendable {
     }
 }
 
+struct FlitRunDetailReadRequest: Codable, Equatable, Sendable {
+    let runId: String
+    let expectedRunVersion: UInt64
+    let afterCursor: UInt64
+    let requestedEventLimit: UInt32
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case runId = "run_id"
+        case expectedRunVersion = "expected_run_version"
+        case afterCursor = "after_cursor"
+        case requestedEventLimit = "requested_event_limit"
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+enum FlitEventSourceKind: String, Codable, Sendable {
+    case core
+    case providerAdapter = "provider_adapter"
+    case gitWatcher = "git_watcher"
+    case fileWatcher = "file_watcher"
+    case classifier
+    case policy
+    case ui
+    case notifier
+    case recovery
+}
+
+struct FlitRunEvidenceRecord: Codable, Equatable, Sendable {
+    let cursor: UInt64
+    let eventId: String
+    let sessionId: String?
+    let eventType: String
+    let sourceKind: FlitEventSourceKind
+    let confidence: Double
+    let observedAt: String
+
+    private enum CodingKeys: String, CodingKey {
+        case cursor
+        case eventId = "event_id"
+        case sessionId = "session_id"
+        case eventType = "event_type"
+        case sourceKind = "source_kind"
+        case confidence
+        case observedAt = "observed_at"
+    }
+}
+
+struct FlitRunDetailReadResponse: Codable, Equatable, Sendable {
+    let protocolVersion: String
+    let eventSchemaVersion: String
+    let runId: String
+    let runVersion: UInt64
+    let nextCursor: UInt64
+    let hasMore: Bool
+    let historyStatus: FlitCapabilityStatus
+    let openInProviderStatus: FlitCapabilityStatus
+    let events: [FlitRunEvidenceRecord]
+
+    private enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case eventSchemaVersion = "event_schema_version"
+        case runId = "run_id"
+        case runVersion = "run_version"
+        case nextCursor = "next_cursor"
+        case hasMore = "has_more"
+        case historyStatus = "history_status"
+        case openInProviderStatus = "open_in_provider_status"
+        case events
+    }
+}
+
+struct FlitManagedRunOpenInProviderRequest: Codable, Equatable, Sendable {
+    let runId: String
+    let expectedRunVersion: UInt64
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case runId = "run_id"
+        case expectedRunVersion = "expected_run_version"
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
 enum FlitCommandErrorCode: String, Codable, Sendable {
     case protocolMismatch = "PROTOCOL_MISMATCH"
     case invalidProjectRequest = "INVALID_PROJECT_REQUEST"
@@ -1068,9 +1198,12 @@ enum FlitCommandErrorCode: String, Codable, Sendable {
     case projectIdentityMismatch = "PROJECT_IDENTITY_MISMATCH"
     case storageUnavailable = "STORAGE_UNAVAILABLE"
     case invalidRunRequest = "INVALID_RUN_REQUEST"
+    case runNotFound = "RUN_NOT_FOUND"
+    case runVersionStale = "RUN_VERSION_STALE"
     case runConflict = "RUN_CONFLICT"
     case projectNotTrusted = "PROJECT_NOT_TRUSTED"
     case providerUnavailable = "PROVIDER_UNAVAILABLE"
+    case capabilityUnsupported = "CAPABILITY_UNSUPPORTED"
     case providerStartFailed = "PROVIDER_START_FAILED"
     case providerStartUnknown = "PROVIDER_START_UNKNOWN"
     case managedRunNotActive = "MANAGED_RUN_NOT_ACTIVE"

@@ -11,8 +11,9 @@ use flit_protocol::{
 };
 use flit_store::{
     AppendEventOutcome, MAX_DASHBOARD_DELTA_EVENTS, MAX_DASHBOARD_DELTA_RUNS,
-    MAX_DASHBOARD_DELTA_SOURCE_BYTES, MAX_DASHBOARD_SNAPSHOT_SOURCE_BYTES, RunSnapshot,
-    RunSnapshotDraft, Store, StoreError, WriteRunSnapshotOutcome,
+    MAX_DASHBOARD_DELTA_SOURCE_BYTES, MAX_DASHBOARD_SNAPSHOT_SOURCE_BYTES,
+    MAX_RUN_DETAIL_SOURCE_BYTES, RunSnapshot, RunSnapshotDraft, Store, StoreError,
+    WriteRunSnapshotOutcome,
 };
 use rusqlite::{Connection, params};
 use serde_json::{Map, json};
@@ -561,6 +562,118 @@ fn dashboard_delta_reads_only_bounded_locators_not_large_event_content() {
     assert_eq!(page.events[0].event_id, "event-large-payload");
     assert_eq!(page.events[0].run_id, RUN_A);
     assert_eq!(page.events[0].event_type, "run.event_observed");
+}
+
+#[test]
+fn run_detail_evidence_is_exact_bounded_and_capability_receipt_owned() {
+    let database = TestDatabase::new("run-detail");
+    let mut store = database.open();
+    let mut first_event = event(RUN_A, "event-a-1", 1);
+    first_event.payload.insert(
+        "raw_provider_content".to_owned(),
+        serde_json::Value::String("secret-not-returned".repeat(10_000)),
+    );
+    let first = append(&mut store, first_event);
+    append(&mut store, event(RUN_B, "event-b-1", 1));
+    let third = append(&mut store, event(RUN_A, "event-a-2", 2));
+    store
+        .write_run_snapshot(snapshot(RUN_A, third, "Running", "Testing", 1.0))
+        .expect("Run A snapshot");
+
+    let first_page = store
+        .run_evidence_through(RUN_A, 0, third, 1)
+        .expect("first evidence page");
+    assert!(first_page.has_more);
+    assert_eq!(first_page.events.len(), 1);
+    assert_eq!(first_page.events[0].cursor, first);
+    assert_eq!(first_page.events[0].event_id, "event-a-1");
+    assert_eq!(first_page.events[0].source_kind, "core");
+    let second_page = store
+        .run_evidence_through(RUN_A, first, third, 1)
+        .expect("second evidence page");
+    assert!(!second_page.has_more);
+    assert_eq!(second_page.events.len(), 1);
+    assert_eq!(second_page.events[0].cursor, third);
+    let empty_page = store
+        .run_evidence_through(RUN_A, third, third, 1)
+        .expect("empty evidence page");
+    assert!(!empty_page.has_more);
+    assert!(empty_page.events.is_empty());
+
+    let no_session = store
+        .managed_run_detail_context(RUN_A)
+        .expect("Run context without session");
+    assert_eq!(no_session.run_version, third);
+    assert_eq!(no_session.history_status, "unavailable");
+    assert_eq!(no_session.open_in_provider_status, "unavailable");
+
+    drop(store);
+    let connection = Connection::open(database.path()).expect("session receipt connection");
+    connection
+        .execute(
+            "INSERT INTO agent_sessions(
+                id, run_id, ordinal, provider_kind, external_session_key, session_fingerprint,
+                executable_version, cwd, capabilities_json, started_at
+             ) VALUES(
+                'session-detail', ?1, 1, 'codex', 'thread-detail', 'fingerprint-detail',
+                '0.145.0', '/private/tmp/flit-snapshots',
+                '{\"history\":\"unsupported\",\"open_in_provider\":\"unsupported\"}', ?2
+             )",
+            params![RUN_A, APPLIED_AT],
+        )
+        .expect("stored capability receipt");
+    drop(connection);
+
+    let reopened = database.open();
+    let context = reopened
+        .managed_run_detail_context(RUN_A)
+        .expect("Run context");
+    assert_eq!(context.run_version, third);
+    assert_eq!(context.history_status, "unsupported");
+    assert_eq!(context.open_in_provider_status, "unsupported");
+}
+
+#[test]
+fn run_detail_fails_closed_on_oversized_locator_or_malformed_capability() {
+    let database = TestDatabase::new("run-detail-corruption");
+    let mut store = database.open();
+    let version = append(&mut store, event(RUN_A, "event-a", 1));
+    store
+        .write_run_snapshot(snapshot(RUN_A, version, "Running", "Editing", 0.9))
+        .expect("Run A snapshot");
+    drop(store);
+
+    let connection = Connection::open(database.path()).expect("corruption connection");
+    connection
+        .execute(
+            "UPDATE events SET event_id = ?2 WHERE run_id = ?1",
+            params![RUN_A, "x".repeat(MAX_RUN_DETAIL_SOURCE_BYTES + 1)],
+        )
+        .expect("oversized evidence locator");
+    connection
+        .execute(
+            "INSERT INTO agent_sessions(
+                id, run_id, ordinal, provider_kind, external_session_key, session_fingerprint,
+                executable_version, cwd, capabilities_json, started_at
+             ) VALUES(
+                'session-detail', ?1, 1, 'codex', 'thread-detail', 'fingerprint-detail',
+                '0.145.0', '/private/tmp/flit-snapshots',
+                '{\"history\":true,\"open_in_provider\":\"unsupported\"}', ?2
+             )",
+            params![RUN_A, APPLIED_AT],
+        )
+        .expect("malformed capability receipt");
+    drop(connection);
+
+    let reopened = database.open();
+    assert!(matches!(
+        reopened.run_evidence_through(RUN_A, 0, version, 1),
+        Err(StoreError::RunDetailReadTooLarge { .. })
+    ));
+    assert!(matches!(
+        reopened.managed_run_detail_context(RUN_A),
+        Err(StoreError::StoredManagedSessionInvalid { .. })
+    ));
 }
 
 #[test]

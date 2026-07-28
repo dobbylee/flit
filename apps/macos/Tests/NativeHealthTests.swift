@@ -277,6 +277,28 @@ struct NativeHealthTests {
                 && !currentDelta.hasMore,
             "native current Dashboard delta must converge without a callback stream"
         )
+        let missingDetailRequest = FlitRunDetailReadRequest(
+            runId: "run-missing",
+            expectedRunVersion: 1,
+            afterCursor: 0,
+            requestedEventLimit: 50,
+            clientProtocolVersion: requestVersion
+        )
+        let missingDetailError = try JSONDecoder().decode(
+            FlitCommandError.self,
+            from: Data(
+                try runDetailReadJson(
+                    requestJson: String(
+                        data: try JSONEncoder().encode(missingDetailRequest),
+                        encoding: .utf8
+                    )!
+                ).utf8
+            )
+        )
+        try require(
+            missingDetailError.code == .runNotFound,
+            "native Run detail must return a typed missing-Run boundary"
+        )
 
         let inspectionFixture = try decodeFixture(
             FlitProjectInspectionResponse.self,
@@ -402,6 +424,29 @@ struct NativeHealthTests {
                 && resyncFixture.reason == .coreInstanceMismatch,
             "generated Dashboard fixtures must preserve snapshot, delta, and resync facts"
         )
+        _ = try decodeFixture(
+            FlitRunDetailReadRequest.self,
+            at: "\(fixtureRoot)/run_detail_read.request.json"
+        )
+        let runDetailFixture = try decodeFixture(
+            FlitRunDetailReadResponse.self,
+            at: "\(fixtureRoot)/run_detail_read.response.json"
+        )
+        _ = try decodeFixture(
+            FlitManagedRunOpenInProviderRequest.self,
+            at: "\(fixtureRoot)/managed_run_open_in_provider.request.json"
+        )
+        _ = try decodeFixture(
+            [FlitCommandError].self,
+            at: "\(fixtureRoot)/run_detail_and_provider_open_errors.json"
+        )
+        try require(
+            runDetailFixture.historyStatus == .unsupported
+                && runDetailFixture.openInProviderStatus == .unsupported
+                && runDetailFixture.events.count == 2
+                && runDetailFixture.events[0].sourceKind == .core,
+            "generated Run detail must preserve structured evidence and capability facts"
+        )
         let invalidChangeVariants: [(String, String, Any)] = [
             (
                 "dashboard_read.initial.response.json",
@@ -441,6 +486,9 @@ struct NativeHealthTests {
             ("dashboard_read.initial.response.json", "runs"),
             ("dashboard_read.delta.response.json", "events"),
             ("dashboard_read.delta.response.json", "runs"),
+            ("run_detail_read.response.json", "events"),
+            ("run_detail_read.response.json", "history_status"),
+            ("run_detail_read.response.json", "open_in_provider_status"),
         ] {
             let data = try Data(
                 contentsOf: URL(fileURLWithPath: "\(fixtureRoot)/\(name)")

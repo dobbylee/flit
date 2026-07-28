@@ -13,15 +13,16 @@ use std::{
 use flit_protocol::{
     CapabilityStatus as ProtocolCapabilityStatus, CommandError, CommandErrorCode,
     DashboardEventRecord, DashboardReadRequest, DashboardReadResponse, DashboardRunRecord,
-    DashboardSnapshotReason, EVENT_PROTOCOL_VERSION, FingerprintAxis as ProtocolFingerprintAxis,
-    HealthStatus, ManagedRunObserveRequest, ManagedRunObserveResponse,
-    ManagedRunPermissionRespondRequest, ManagedRunPermissionRespondResponse,
-    ManagedRunStartRequest, PROTOCOL_VERSION, ProjectInspectionResponse,
-    ProjectListCursor as ProjectListCursorResponse, ProjectRecord, ProjectRegistrationResponse,
-    ProjectRegistrationStatus, ProjectTrustResponse, ProjectTrustStatus, ProjectsListResponse,
-    ProviderCapability as ProtocolProviderCapability, ProviderCapabilityEntry,
-    ProviderCompatibility as ProtocolProviderCompatibility, ProviderDiagnosticsResponse,
-    ProviderKind as ProtocolProviderKind, ProviderUnavailableReason, SystemHealthResponse,
+    DashboardSnapshotReason, EVENT_PROTOCOL_VERSION, EventSourceKind,
+    FingerprintAxis as ProtocolFingerprintAxis, HealthStatus, ManagedRunObserveRequest,
+    ManagedRunObserveResponse, ManagedRunOpenInProviderRequest, ManagedRunPermissionRespondRequest,
+    ManagedRunPermissionRespondResponse, ManagedRunStartRequest, PROTOCOL_VERSION,
+    ProjectInspectionResponse, ProjectListCursor as ProjectListCursorResponse, ProjectRecord,
+    ProjectRegistrationResponse, ProjectRegistrationStatus, ProjectTrustResponse,
+    ProjectTrustStatus, ProjectsListResponse, ProviderCapability as ProtocolProviderCapability,
+    ProviderCapabilityEntry, ProviderCompatibility as ProtocolProviderCompatibility,
+    ProviderDiagnosticsResponse, ProviderKind as ProtocolProviderKind, ProviderUnavailableReason,
+    RunDetailReadRequest, RunDetailReadResponse, RunEvidenceRecord, SystemHealthResponse,
 };
 use flit_providers::{
     CapabilityStatus, CodexCompatibilityProbe, CodexCompatibilityProbeError,
@@ -32,11 +33,11 @@ use flit_providers::{
 use flit_store::{
     AppendEventOutcome, DashboardChangeSummary as StoreDashboardChangeSummary,
     DashboardRunSnapshot as StoreDashboardRunSnapshot, MAX_DASHBOARD_DELTA_EVENTS,
-    MAX_PROJECT_PAGE_SIZE, ManagedPermissionDecision, ManagedPermissionDeliveryUnknownReason,
-    ManagedPermissionResponseAttemptOutcome, ManagedPermissionResponseResult,
-    ManagedPermissionResponseResultKind, Project, ProjectDirectoryInspection,
-    ProjectListCursor as StoreProjectListCursor, ProjectRegistration, ProjectRegistrationOutcome,
-    ProjectTrustConfirmation, ProjectTrustOutcome, Store, StoreError,
+    MAX_PROJECT_PAGE_SIZE, MAX_RUN_DETAIL_EVENTS, ManagedPermissionDecision,
+    ManagedPermissionDeliveryUnknownReason, ManagedPermissionResponseAttemptOutcome,
+    ManagedPermissionResponseResult, ManagedPermissionResponseResultKind, Project,
+    ProjectDirectoryInspection, ProjectListCursor as StoreProjectListCursor, ProjectRegistration,
+    ProjectRegistrationOutcome, ProjectTrustConfirmation, ProjectTrustOutcome, Store, StoreError,
 };
 use sha2::{Digest, Sha256};
 
@@ -58,6 +59,7 @@ const MAX_PROVIDER_DIAGNOSTICS_RESPONSE_BYTES: usize = 65_536;
 const MAX_MANAGED_RUN_REQUEST_BYTES: usize = 128 * 1_024;
 const MAX_DASHBOARD_REQUEST_BYTES: usize = 64 * 1_024;
 const MAX_DASHBOARD_RESPONSE_BYTES: usize = 8 * 1_024 * 1_024;
+const MAX_RUN_DETAIL_RESPONSE_BYTES: usize = 2 * 1_024 * 1_024;
 const MAX_CORE_INSTANCE_ID_BYTES: usize = 256;
 const DASHBOARD_DELTA_RETENTION_EVENTS: u64 = 2_000;
 
@@ -104,6 +106,16 @@ pub enum BridgeError {
     DashboardResponseTooLarge,
     #[error("the managed Run request or response exceeds the native bridge limit")]
     ManagedRunResponseTooLarge,
+    #[error("the managed Run request is invalid")]
+    InvalidRunRequest,
+    #[error("the managed Run was not found")]
+    RunNotFound,
+    #[error("the managed Run version is stale")]
+    RunVersionStale,
+    #[error("the provider capability is unsupported")]
+    CapabilityUnsupported,
+    #[error("the provider capability is unavailable")]
+    ProviderUnavailable,
     #[error("the embedded Rust Core could not serialize the response")]
     SerializationFailure,
 }
@@ -502,6 +514,11 @@ fn project_command_error(error: &BridgeError) -> Option<CommandError> {
         | BridgeError::InvalidDashboardRequest
         | BridgeError::DashboardResponseTooLarge
         | BridgeError::ManagedRunResponseTooLarge
+        | BridgeError::InvalidRunRequest
+        | BridgeError::RunNotFound
+        | BridgeError::RunVersionStale
+        | BridgeError::CapabilityUnsupported
+        | BridgeError::ProviderUnavailable
         | BridgeError::SerializationFailure => return None,
     };
     Some(CommandError::for_code(code))
@@ -1149,6 +1166,222 @@ fn dashboard_read_with(
 #[uniffi::export]
 pub fn dashboard_read_json(request_json: String) -> Result<String, BridgeError> {
     protect(|| dashboard_read_with(&CORE, &request_json))
+}
+
+fn run_command_error(error: &BridgeError) -> Option<CommandError> {
+    let code = match error {
+        BridgeError::ProtocolMismatch => CommandErrorCode::ProtocolMismatch,
+        BridgeError::InvalidRunRequest => CommandErrorCode::InvalidRunRequest,
+        BridgeError::RunNotFound => CommandErrorCode::RunNotFound,
+        BridgeError::RunVersionStale => CommandErrorCode::RunVersionStale,
+        BridgeError::CapabilityUnsupported => CommandErrorCode::CapabilityUnsupported,
+        BridgeError::ProviderUnavailable => CommandErrorCode::ProviderUnavailable,
+        BridgeError::StorageFailure => CommandErrorCode::StorageUnavailable,
+        _ => return None,
+    };
+    Some(CommandError::for_code(code))
+}
+
+fn run_command_json<T: serde::Serialize>(
+    operation: impl FnOnce() -> Result<T, BridgeError>,
+) -> Result<String, BridgeError> {
+    match operation() {
+        Ok(response) => bounded_json(
+            &response,
+            MAX_RUN_DETAIL_RESPONSE_BYTES,
+            BridgeError::ManagedRunResponseTooLarge,
+        ),
+        Err(error) => match run_command_error(&error) {
+            Some(command_error) => bounded_json(
+                &command_error,
+                MAX_RUN_DETAIL_RESPONSE_BYTES,
+                BridgeError::ManagedRunResponseTooLarge,
+            ),
+            None => Err(error),
+        },
+    }
+}
+
+fn stored_capability_status(status: &str) -> Result<ProtocolCapabilityStatus, BridgeError> {
+    match status {
+        "supported" => Ok(ProtocolCapabilityStatus::Supported),
+        "degraded" => Ok(ProtocolCapabilityStatus::Degraded),
+        "unsupported" => Ok(ProtocolCapabilityStatus::Unsupported),
+        "unknown" => Ok(ProtocolCapabilityStatus::Unknown),
+        "unavailable" => Ok(ProtocolCapabilityStatus::Unavailable),
+        _ => Err(BridgeError::StorageFailure),
+    }
+}
+
+fn evidence_source_kind(kind: &str) -> Result<EventSourceKind, BridgeError> {
+    match kind {
+        "core" => Ok(EventSourceKind::Core),
+        "provider_adapter" => Ok(EventSourceKind::ProviderAdapter),
+        "git_watcher" => Ok(EventSourceKind::GitWatcher),
+        "file_watcher" => Ok(EventSourceKind::FileWatcher),
+        "classifier" => Ok(EventSourceKind::Classifier),
+        "policy" => Ok(EventSourceKind::Policy),
+        "ui" => Ok(EventSourceKind::Ui),
+        "notifier" => Ok(EventSourceKind::Notifier),
+        "recovery" => Ok(EventSourceKind::Recovery),
+        _ => Err(BridgeError::StorageFailure),
+    }
+}
+
+fn provider_open_error(status: ProtocolCapabilityStatus) -> BridgeError {
+    match status {
+        ProtocolCapabilityStatus::Unsupported => BridgeError::CapabilityUnsupported,
+        ProtocolCapabilityStatus::Supported
+        | ProtocolCapabilityStatus::Degraded
+        | ProtocolCapabilityStatus::Unknown
+        | ProtocolCapabilityStatus::Unavailable => BridgeError::ProviderUnavailable,
+    }
+}
+
+fn validate_run_detail_request(request: &RunDetailReadRequest) -> Result<usize, BridgeError> {
+    let limit = usize::try_from(request.requested_event_limit)
+        .map_err(|_| BridgeError::InvalidRunRequest)?;
+    if request.run_id.trim().is_empty()
+        || request.run_id.len() > MAX_PROJECT_ID_BYTES
+        || request.run_id.contains('\0')
+        || request.expected_run_version == 0
+        || request.expected_run_version > flit_protocol::MAX_JSON_SAFE_INTEGER
+        || request.after_cursor > request.expected_run_version
+        || !(1..=MAX_RUN_DETAIL_EVENTS).contains(&limit)
+    {
+        return Err(BridgeError::InvalidRunRequest);
+    }
+    Ok(limit)
+}
+
+fn run_detail_read_with(
+    core_manager: &CoreManager,
+    request_json: &str,
+) -> Result<String, BridgeError> {
+    if request_json.len() > MAX_MANAGED_RUN_REQUEST_BYTES {
+        return run_command_json(|| -> Result<RunDetailReadResponse, _> {
+            Err(BridgeError::InvalidRunRequest)
+        });
+    }
+    let request = serde_json::from_str::<RunDetailReadRequest>(request_json)
+        .map_err(|_| BridgeError::InvalidRunRequest);
+    run_command_json(|| {
+        let request = request?;
+        if request.client_protocol_version != PROTOCOL_VERSION {
+            return Err(BridgeError::ProtocolMismatch);
+        }
+        let limit = validate_run_detail_request(&request)?;
+        core_manager.with_ready_core(|core| {
+            let context = core
+                .store
+                .managed_run_detail_context(&request.run_id)
+                .map_err(|error| match error {
+                    StoreError::MissingRun { .. } => BridgeError::RunNotFound,
+                    _ => BridgeError::StorageFailure,
+                })?;
+            if context.run_version != request.expected_run_version {
+                return Err(BridgeError::RunVersionStale);
+            }
+            let page = core
+                .store
+                .run_evidence_through(
+                    &request.run_id,
+                    request.after_cursor,
+                    request.expected_run_version,
+                    limit,
+                )
+                .map_err(|error| match error {
+                    StoreError::MissingRun { .. } => BridgeError::RunNotFound,
+                    StoreError::RunDetailReadTooLarge { .. } => {
+                        BridgeError::ManagedRunResponseTooLarge
+                    }
+                    _ => BridgeError::StorageFailure,
+                })?;
+            let events = page
+                .events
+                .into_iter()
+                .map(|event| {
+                    Ok(RunEvidenceRecord {
+                        cursor: event.cursor,
+                        event_id: event.event_id,
+                        session_id: event.session_id,
+                        event_type: event.event_type,
+                        source_kind: evidence_source_kind(&event.source_kind)?,
+                        confidence: event.confidence,
+                        observed_at: event.observed_at,
+                    })
+                })
+                .collect::<Result<Vec<_>, BridgeError>>()?;
+            let next_cursor = events
+                .last()
+                .map_or(request.after_cursor, |event| event.cursor);
+            Ok(RunDetailReadResponse {
+                protocol_version: PROTOCOL_VERSION.to_owned(),
+                event_schema_version: EVENT_PROTOCOL_VERSION.to_owned(),
+                run_id: request.run_id,
+                run_version: context.run_version,
+                next_cursor,
+                has_more: page.has_more,
+                history_status: stored_capability_status(&context.history_status)?,
+                open_in_provider_status: stored_capability_status(
+                    &context.open_in_provider_status,
+                )?,
+                events,
+            })
+        })
+    })
+}
+
+#[uniffi::export]
+pub fn run_detail_read_json(request_json: String) -> Result<String, BridgeError> {
+    protect(|| run_detail_read_with(&CORE, &request_json))
+}
+
+fn managed_run_open_in_provider_with(
+    core_manager: &CoreManager,
+    request_json: &str,
+) -> Result<String, BridgeError> {
+    if request_json.len() > MAX_MANAGED_RUN_REQUEST_BYTES {
+        return run_command_json(|| -> Result<serde_json::Value, _> {
+            Err(BridgeError::InvalidRunRequest)
+        });
+    }
+    let request = serde_json::from_str::<ManagedRunOpenInProviderRequest>(request_json)
+        .map_err(|_| BridgeError::InvalidRunRequest);
+    run_command_json(|| -> Result<serde_json::Value, BridgeError> {
+        let request = request?;
+        if request.client_protocol_version != PROTOCOL_VERSION {
+            return Err(BridgeError::ProtocolMismatch);
+        }
+        if request.run_id.trim().is_empty()
+            || request.run_id.len() > MAX_PROJECT_ID_BYTES
+            || request.run_id.contains('\0')
+            || request.expected_run_version == 0
+            || request.expected_run_version > flit_protocol::MAX_JSON_SAFE_INTEGER
+        {
+            return Err(BridgeError::InvalidRunRequest);
+        }
+        core_manager.with_ready_core(|core| {
+            let context = core
+                .store
+                .managed_run_detail_context(&request.run_id)
+                .map_err(|error| match error {
+                    StoreError::MissingRun { .. } => BridgeError::RunNotFound,
+                    _ => BridgeError::StorageFailure,
+                })?;
+            if context.run_version != request.expected_run_version {
+                return Err(BridgeError::RunVersionStale);
+            }
+            Err(provider_open_error(stored_capability_status(
+                &context.open_in_provider_status,
+            )?))
+        })
+    })
+}
+
+#[uniffi::export]
+pub fn managed_run_open_in_provider_json(request_json: String) -> Result<String, BridgeError> {
+    protect(|| managed_run_open_in_provider_with(&CORE, &request_json))
 }
 
 #[uniffi::export]
@@ -1916,8 +2149,9 @@ mod tests {
     };
 
     use flit_protocol::{
-        ManagedRunPermissionDecision, ManagedRunPermissionMode, ManagedRunPermissionRespondRequest,
-        ManagedRunPermissionRespondResponse, ManagedRunStartResponse, SystemHealthRequest,
+        ManagedRunOpenInProviderRequest, ManagedRunPermissionDecision, ManagedRunPermissionMode,
+        ManagedRunPermissionRespondRequest, ManagedRunPermissionRespondResponse,
+        ManagedRunStartResponse, RunDetailReadRequest, RunDetailReadResponse, SystemHealthRequest,
     };
     use flit_providers::{
         CodexManagedItemId, CodexManagedThreadId, CodexManagedTurnId, CodexManualStartedThread,
@@ -2189,7 +2423,13 @@ mod tests {
                         executable_path: Some(PathBuf::from("/private/tmp/codex")),
                         executable_version: Some("0.145.0".to_owned()),
                         cwd: project,
-                        capabilities: serde_json::Map::new(),
+                        capabilities: serde_json::Map::from_iter([
+                            ("history".to_owned(), serde_json::json!("unsupported")),
+                            (
+                                "open_in_provider".to_owned(),
+                                serde_json::json!("unsupported"),
+                            ),
+                        ]),
                         contract_version: "codex-app-server/0.145.0".to_owned(),
                         started_at: "2026-07-27T12:00:01Z".to_owned(),
                         connected_event_id: "event-observe-session-connected".to_owned(),
@@ -2563,6 +2803,152 @@ mod tests {
                 Ok(())
             })
             .expect("unchanged Dashboard Store");
+    }
+
+    #[test]
+    fn run_detail_pages_structured_evidence_and_provider_open_is_exactly_unsupported() {
+        assert_eq!(
+            provider_open_error(ProtocolCapabilityStatus::Unsupported),
+            BridgeError::CapabilityUnsupported
+        );
+        for status in [
+            ProtocolCapabilityStatus::Supported,
+            ProtocolCapabilityStatus::Degraded,
+            ProtocolCapabilityStatus::Unknown,
+            ProtocolCapabilityStatus::Unavailable,
+        ] {
+            assert_eq!(
+                provider_open_error(status),
+                BridgeError::ProviderUnavailable
+            );
+        }
+        let (_directory, manager, _) = observation_core("run-detail");
+        let (run_version, ingest_cursor) = manager
+            .with_ready_core(|core| {
+                let context = core
+                    .store
+                    .managed_run_detail_context("run-observe")
+                    .map_err(|_| BridgeError::StorageFailure)?;
+                let cursor = core
+                    .store
+                    .latest_ingest_seq()
+                    .map_err(|_| BridgeError::StorageFailure)?;
+                Ok((context.run_version, cursor))
+            })
+            .expect("Run detail context");
+
+        let first = run_detail_read_with(
+            &manager,
+            &serde_json::to_string(&RunDetailReadRequest {
+                run_id: "run-observe".to_owned(),
+                expected_run_version: run_version,
+                after_cursor: 0,
+                requested_event_limit: 2,
+                client_protocol_version: PROTOCOL_VERSION.to_owned(),
+            })
+            .expect("first detail request"),
+        )
+        .expect("first detail page");
+        assert!(!first.contains("\"payload\""));
+        assert!(!first.contains("\"source\""));
+        assert!(!first.contains("/private/tmp"));
+        let first: RunDetailReadResponse = serde_json::from_str(&first).expect("first detail JSON");
+        assert_eq!(first.run_id, "run-observe");
+        assert_eq!(first.run_version, run_version);
+        assert_eq!(first.history_status, ProtocolCapabilityStatus::Unsupported);
+        assert_eq!(
+            first.open_in_provider_status,
+            ProtocolCapabilityStatus::Unsupported
+        );
+        assert_eq!(first.events.len(), 2);
+        assert!(first.has_more);
+        assert!(first.events[0].cursor < first.events[1].cursor);
+
+        let second = run_detail_read_with(
+            &manager,
+            &serde_json::to_string(&RunDetailReadRequest {
+                run_id: "run-observe".to_owned(),
+                expected_run_version: run_version,
+                after_cursor: first.next_cursor,
+                requested_event_limit: 2,
+                client_protocol_version: PROTOCOL_VERSION.to_owned(),
+            })
+            .expect("second detail request"),
+        )
+        .expect("second detail page");
+        let second: RunDetailReadResponse =
+            serde_json::from_str(&second).expect("second detail JSON");
+        assert!(!second.has_more);
+        assert_eq!(second.next_cursor, run_version);
+        assert_eq!(second.events.len(), 1);
+
+        let open = managed_run_open_in_provider_with(
+            &manager,
+            &serde_json::to_string(&ManagedRunOpenInProviderRequest {
+                run_id: "run-observe".to_owned(),
+                expected_run_version: run_version,
+                client_protocol_version: PROTOCOL_VERSION.to_owned(),
+            })
+            .expect("provider-open request"),
+        )
+        .expect("provider-open command error");
+        assert_eq!(
+            command_error(&open),
+            CommandError::for_code(CommandErrorCode::CapabilityUnsupported)
+        );
+        let stale = managed_run_open_in_provider_with(
+            &manager,
+            &serde_json::to_string(&ManagedRunOpenInProviderRequest {
+                run_id: "run-observe".to_owned(),
+                expected_run_version: run_version - 1,
+                client_protocol_version: PROTOCOL_VERSION.to_owned(),
+            })
+            .expect("stale provider-open request"),
+        )
+        .expect("stale provider-open command error");
+        assert_eq!(
+            command_error(&stale),
+            CommandError::for_code(CommandErrorCode::RunVersionStale)
+        );
+        let missing = managed_run_open_in_provider_with(
+            &manager,
+            &serde_json::to_string(&ManagedRunOpenInProviderRequest {
+                run_id: "run-missing".to_owned(),
+                expected_run_version: run_version,
+                client_protocol_version: PROTOCOL_VERSION.to_owned(),
+            })
+            .expect("missing provider-open request"),
+        )
+        .expect("missing provider-open command error");
+        assert_eq!(
+            command_error(&missing),
+            CommandError::for_code(CommandErrorCode::RunNotFound)
+        );
+        manager
+            .with_ready_core(|core| {
+                assert_eq!(
+                    core.store
+                        .latest_ingest_seq()
+                        .map_err(|_| BridgeError::StorageFailure)?,
+                    ingest_cursor
+                );
+                assert!(core.managed_runtimes.contains_key("run-observe"));
+                Ok(())
+            })
+            .expect("provider-open has no side effect");
+
+        for response in [
+            run_detail_read_with(&manager, "{}").expect("malformed detail command error"),
+            managed_run_open_in_provider_with(&manager, "{}")
+                .expect("malformed provider-open command error"),
+            run_detail_read_with(&manager, &" ".repeat(MAX_MANAGED_RUN_REQUEST_BYTES + 1))
+                .expect("oversized detail command error"),
+        ] {
+            assert_eq!(
+                command_error(&response),
+                CommandError::for_code(CommandErrorCode::InvalidRunRequest)
+            );
+        }
     }
 
     #[test]

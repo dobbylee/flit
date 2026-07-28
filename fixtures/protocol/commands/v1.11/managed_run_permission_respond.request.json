@@ -1,0 +1,13 @@
+{
+  "run_id": "run-1",
+  "request_id": "request-1",
+  "request_version": 4,
+  "response_attempt_id": "attempt-1",
+  "decision": "allow_once",
+  "submitted_at": "2026-07-27T12:00:02Z",
+  "finished_at": "2026-07-27T12:00:03Z",
+  "submitted_event_id": "event-response-submitted",
+  "resolved_event_id": "event-response-resolved",
+  "delivery_unknown_event_id": "event-response-unknown",
+  "client_protocol_version": "1.11"
+}

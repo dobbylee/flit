@@ -3,13 +3,14 @@ use std::{collections::BTreeSet, fs, path::PathBuf};
 use flit_protocol::{
     CapabilityStatus, CommandError, DashboardReadRequest, DashboardReadResponse,
     EVENT_PROTOCOL_VERSION, EventEnvelope, EventProtocolVersion, MAX_JSON_SAFE_INTEGER,
-    ManagedRunObserveRequest, ManagedRunObserveResponse, ManagedRunPermissionRespondRequest,
-    ManagedRunPermissionRespondResponse, ManagedRunStartRequest, ManagedRunStartResponse,
-    PROTOCOL_VERSION, ProjectInspectionRequest, ProjectInspectionResponse,
-    ProjectRegistrationRequest, ProjectRegistrationResponse, ProjectTrustRequest,
-    ProjectTrustResponse, ProjectsListRequest, ProjectsListResponse, ProviderCompatibility,
-    ProviderDiagnosticsRequest, ProviderDiagnosticsResponse, ProviderUnavailableReason,
-    SystemHealthRequest, SystemHealthResponse, event_schema_id, event_schema_relative_path,
+    ManagedRunObserveRequest, ManagedRunObserveResponse, ManagedRunOpenInProviderRequest,
+    ManagedRunPermissionRespondRequest, ManagedRunPermissionRespondResponse,
+    ManagedRunStartRequest, ManagedRunStartResponse, PROTOCOL_VERSION, ProjectInspectionRequest,
+    ProjectInspectionResponse, ProjectRegistrationRequest, ProjectRegistrationResponse,
+    ProjectTrustRequest, ProjectTrustResponse, ProjectsListRequest, ProjectsListResponse,
+    ProviderCompatibility, ProviderDiagnosticsRequest, ProviderDiagnosticsResponse,
+    ProviderUnavailableReason, RunDetailReadRequest, RunDetailReadResponse, SystemHealthRequest,
+    SystemHealthResponse, event_schema_id, event_schema_relative_path,
     generated_swift_command_contract,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -331,6 +332,55 @@ fn current_dashboard_read_fixtures_round_trip_every_delivery() {
 }
 
 #[test]
+fn current_run_detail_and_provider_open_fixtures_are_exact_and_path_free() {
+    let manifest = read_command_compatibility_manifest();
+    let current = &manifest.current;
+    assert_fixture_round_trip::<RunDetailReadRequest>(&command_fixture(
+        current,
+        "run_detail_read.request.json",
+    ));
+    assert_fixture_round_trip::<RunDetailReadResponse>(&command_fixture(
+        current,
+        "run_detail_read.response.json",
+    ));
+    assert_fixture_round_trip::<ManagedRunOpenInProviderRequest>(&command_fixture(
+        current,
+        "managed_run_open_in_provider.request.json",
+    ));
+    assert_fixture_round_trip::<Vec<CommandError>>(&command_fixture(
+        current,
+        "run_detail_and_provider_open_errors.json",
+    ));
+    let response: RunDetailReadResponse = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "run_detail_read.response.json",
+        )))
+        .expect("Run detail response should be readable"),
+    )
+    .expect("Run detail response should match Rust types");
+    assert_eq!(response.history_status, CapabilityStatus::Unsupported);
+    assert_eq!(
+        response.open_in_provider_status,
+        CapabilityStatus::Unsupported
+    );
+    assert_eq!(response.events.len(), 2);
+    let rendered = serde_json::to_string(&response).expect("Run detail should serialize");
+    for forbidden in [
+        "\"payload\"",
+        "\"source\"",
+        "canonical_path",
+        "executable_path",
+        "provider_thread_id",
+    ] {
+        assert!(
+            !rendered.contains(forbidden),
+            "Run detail must not expose {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn current_provider_diagnostics_fixtures_are_exhaustive_and_path_free() {
     let manifest = read_command_compatibility_manifest();
     let current = &manifest.current;
@@ -618,6 +668,10 @@ fn generated_swift_project_contract_is_current_and_required_fields_fail_closed()
         "FlitDashboardChangeSummary",
         "FlitDashboardEventRecord",
         "FlitDashboardReadResponse",
+        "FlitRunDetailReadRequest",
+        "FlitRunEvidenceRecord",
+        "FlitRunDetailReadResponse",
+        "FlitManagedRunOpenInProviderRequest",
         "FlitCommandError",
         "FlitProviderDiagnosticsRequest",
         "FlitProviderDiagnosticsResponse",

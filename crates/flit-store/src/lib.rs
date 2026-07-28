@@ -67,6 +67,8 @@ pub const MAX_DASHBOARD_DELTA_RUNS: usize = MAX_DASHBOARD_DELTA_EVENTS;
 pub const MAX_DASHBOARD_DELTA_SOURCE_BYTES: usize = 1_048_576;
 pub const MAX_DASHBOARD_SNAPSHOT_RUNS: usize = 1_000;
 pub const MAX_DASHBOARD_SNAPSHOT_SOURCE_BYTES: usize = 1_048_576;
+pub const MAX_RUN_DETAIL_EVENTS: usize = 50;
+pub const MAX_RUN_DETAIL_SOURCE_BYTES: usize = 1_048_576;
 pub const MAX_DASHBOARD_PROJECTION_EVENTS: usize = 100_000;
 pub const MAX_DASHBOARD_PROJECTION_SOURCE_BYTES: usize = 8 * 1_048_576;
 
@@ -338,6 +340,31 @@ pub struct DashboardEventLocator {
 pub struct DashboardEventLocatorPage {
     pub upper_bound: u64,
     pub events: Vec<DashboardEventLocator>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunEvidenceLocator {
+    pub cursor: u64,
+    pub event_id: String,
+    pub session_id: Option<String>,
+    pub event_type: String,
+    pub source_kind: String,
+    pub confidence: f64,
+    pub observed_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RunEvidencePage {
+    pub upper_bound: u64,
+    pub has_more: bool,
+    pub events: Vec<RunEvidenceLocator>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedRunDetailContext {
+    pub run_version: u64,
+    pub history_status: String,
+    pub open_in_provider_status: String,
 }
 
 impl Store {
@@ -1658,6 +1685,57 @@ impl Store {
         load_managed_run(&self.connection, run_id)
     }
 
+    pub fn managed_run_detail_context(
+        &self,
+        run_id: &str,
+    ) -> Result<ManagedRunDetailContext, StoreError> {
+        if run_id.trim().is_empty() {
+            return Err(StoreError::InvalidRunDetailRequest { field: "run_id" });
+        }
+        let run =
+            load_managed_run(&self.connection, run_id)?.ok_or_else(|| StoreError::MissingRun {
+                run_id: run_id.to_owned(),
+            })?;
+        let snapshot = load_run_snapshot(&self.connection, run_id)?.ok_or_else(|| {
+            StoreError::StoredRunSnapshotInvalid {
+                run_id: run_id.to_owned(),
+                field: "row",
+            }
+        })?;
+        let session_id = self
+            .connection
+            .query_row(
+                "SELECT id FROM agent_sessions WHERE run_id = ?1 ORDER BY ordinal DESC LIMIT 1",
+                [run_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)?;
+        let Some(session_id) = session_id else {
+            return Ok(ManagedRunDetailContext {
+                run_version: snapshot.version,
+                history_status: "unavailable".to_owned(),
+                open_in_provider_status: "unavailable".to_owned(),
+            });
+        };
+        let session = load_managed_session(&self.connection, &session_id)?.ok_or_else(|| {
+            StoreError::MissingSession {
+                session_id: session_id.clone(),
+            }
+        })?;
+        if session.run_id != run_id || session.provider_kind != run.provider_kind {
+            return Err(StoreError::StoredManagedSessionInvalid {
+                session_id,
+                field: "managed_identity",
+            });
+        }
+        Ok(ManagedRunDetailContext {
+            run_version: snapshot.version,
+            history_status: stored_capability_status(&session, "history")?,
+            open_in_provider_status: stored_capability_status(&session, "open_in_provider")?,
+        })
+    }
+
     pub fn managed_session(&self, session_id: &str) -> Result<Option<ManagedSession>, StoreError> {
         if session_id.trim().is_empty() {
             return Err(StoreError::InvalidInitialManagedSession { field: "id" });
@@ -2161,6 +2239,176 @@ impl Store {
             events,
         })
     }
+
+    pub fn run_evidence_through(
+        &self,
+        run_id: &str,
+        cursor: u64,
+        upper_bound: u64,
+        limit: usize,
+    ) -> Result<RunEvidencePage, StoreError> {
+        if run_id.trim().is_empty()
+            || cursor > upper_bound
+            || upper_bound > MAX_JSON_SAFE_INTEGER
+            || !(1..=MAX_RUN_DETAIL_EVENTS).contains(&limit)
+        {
+            return Err(StoreError::InvalidRunDetailRequest { field: "range" });
+        }
+        if !run_exists(&self.connection, run_id)? {
+            return Err(StoreError::MissingRun {
+                run_id: run_id.to_owned(),
+            });
+        }
+        let latest = self.latest_ingest_seq()?;
+        if upper_bound > latest {
+            return Err(StoreError::InvalidRunDetailRequest {
+                field: "upper_bound",
+            });
+        }
+        let (count, source_bytes) = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(
+                    LENGTH(CAST(event_id AS BLOB))
+                    + COALESCE(LENGTH(CAST(session_id AS BLOB)), 0)
+                    + LENGTH(CAST(event_type AS BLOB))
+                    + LENGTH(CAST(observed_at AS BLOB))
+                    + COALESCE(LENGTH(CAST(source_kind AS BLOB)), 0)
+                    + 8
+                ), 0)
+                 FROM (
+                    SELECT event_id, session_id, event_type, observed_at,
+                           json_extract(source_json, '$.kind') AS source_kind
+                    FROM events
+                    WHERE run_id = ?1 AND ingest_seq > ?2 AND ingest_seq <= ?3
+                    ORDER BY ingest_seq
+                    LIMIT ?4
+                 )",
+                params![run_id, cursor as i64, upper_bound as i64, limit as i64],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(StoreError::Sqlite)?;
+        if count < 0
+            || source_bytes < 0
+            || usize::try_from(count).map_or(true, |count| count > limit)
+            || usize::try_from(source_bytes)
+                .map_or(true, |bytes| bytes > MAX_RUN_DETAIL_SOURCE_BYTES)
+        {
+            return Err(StoreError::RunDetailReadTooLarge {
+                count,
+                source_bytes,
+            });
+        }
+
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT ingest_seq, event_id, session_id, event_type,
+                        json_extract(source_json, '$.kind'), confidence, observed_at
+                 FROM events
+                 WHERE run_id = ?1 AND ingest_seq > ?2 AND ingest_seq <= ?3
+                 ORDER BY ingest_seq
+                 LIMIT ?4",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let events = statement
+            .query_map(
+                params![run_id, cursor as i64, upper_bound as i64, limit as i64],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, f64>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .map_err(StoreError::Sqlite)?
+            .map(|stored| {
+                let (
+                    cursor,
+                    event_id,
+                    session_id,
+                    event_type,
+                    source_kind,
+                    confidence,
+                    observed_at,
+                ) = stored.map_err(StoreError::Sqlite)?;
+                let cursor =
+                    u64::try_from(cursor).map_err(|_| StoreError::StoredRunEvidenceInvalid {
+                        run_id: run_id.to_owned(),
+                        field: "cursor",
+                    })?;
+                if event_id.trim().is_empty()
+                    || session_id
+                        .as_deref()
+                        .is_some_and(|session_id| session_id.trim().is_empty())
+                    || event_type.trim().is_empty()
+                    || source_kind.trim().is_empty()
+                    || !confidence.is_finite()
+                    || !(0.0..=1.0).contains(&confidence)
+                    || observed_at.trim().is_empty()
+                {
+                    return Err(StoreError::StoredRunEvidenceInvalid {
+                        run_id: run_id.to_owned(),
+                        field: "locator",
+                    });
+                }
+                Ok(RunEvidenceLocator {
+                    cursor,
+                    event_id,
+                    session_id,
+                    event_type,
+                    source_kind,
+                    confidence,
+                    observed_at,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        let next_cursor = events.last().map_or(cursor, |event| event.cursor);
+        let has_more = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM events
+                    WHERE run_id = ?1 AND ingest_seq > ?2 AND ingest_seq <= ?3
+                    LIMIT 1
+                 )",
+                params![run_id, next_cursor as i64, upper_bound as i64],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(RunEvidencePage {
+            upper_bound,
+            has_more,
+            events,
+        })
+    }
+}
+
+fn stored_capability_status(
+    session: &ManagedSession,
+    capability: &'static str,
+) -> Result<String, StoreError> {
+    let status = session
+        .capabilities
+        .get(capability)
+        .and_then(Value::as_str)
+        .filter(|status| {
+            matches!(
+                *status,
+                "supported" | "degraded" | "unsupported" | "unknown" | "unavailable"
+            )
+        })
+        .ok_or_else(|| StoreError::StoredManagedSessionInvalid {
+            session_id: session.id.clone(),
+            field: capability,
+        })?;
+    Ok(status.to_owned())
 }
 
 fn validate_snapshot(snapshot: &RunSnapshotDraft) -> Result<(), StoreError> {
@@ -4674,6 +4922,17 @@ pub enum StoreError {
         upper_bound: u64,
         limit: usize,
     },
+    InvalidRunDetailRequest {
+        field: &'static str,
+    },
+    RunDetailReadTooLarge {
+        count: i64,
+        source_bytes: i64,
+    },
+    StoredRunEvidenceInvalid {
+        run_id: String,
+        field: &'static str,
+    },
     InvalidDashboardSnapshotCursor {
         upper_bound: u64,
     },
@@ -5036,6 +5295,20 @@ impl fmt::Display for StoreError {
             } => write!(
                 formatter,
                 "invalid Run event range: cursor {cursor}, upper bound {upper_bound}, limit {limit}"
+            ),
+            Self::InvalidRunDetailRequest { field } => {
+                write!(formatter, "invalid Run detail request field: {field}")
+            }
+            Self::RunDetailReadTooLarge {
+                count,
+                source_bytes,
+            } => write!(
+                formatter,
+                "Run detail read exceeds its source bound: {count} rows, {source_bytes} bytes"
+            ),
+            Self::StoredRunEvidenceInvalid { run_id, field } => write!(
+                formatter,
+                "stored Run evidence {run_id} has an invalid {field} field"
             ),
             Self::InvalidDashboardSnapshotCursor { upper_bound } => write!(
                 formatter,

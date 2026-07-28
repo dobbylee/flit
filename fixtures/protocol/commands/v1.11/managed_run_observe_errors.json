@@ -1,0 +1,10 @@
+[
+  {
+    "code": "MANAGED_RUN_NOT_ACTIVE",
+    "message_key": "errors.managedRunNotActive"
+  },
+  {
+    "code": "PROVIDER_OBSERVATION_UNKNOWN",
+    "message_key": "errors.providerObservationUnknown"
+  }
+]
