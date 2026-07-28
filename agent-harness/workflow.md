@@ -60,6 +60,12 @@ Choose focused checks that execute the changed risk:
 | Core bridge | Contract, ownership/error, reconnect, and bounded cursor tests |
 | Rules or design | `./scripts/validate-docs.sh` |
 
+Phase 2's deterministic fake journey and release-profile four-Run latency gate:
+
+```bash
+./scripts/test-phase2.sh
+```
+
 Full native validation:
 
 ```bash

@@ -54,6 +54,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 pub mod codex_recovery;
 mod managed_start;
+#[cfg(test)]
+mod phase2_journey;
 
 const DATABASE_FILE_NAME: &str = "flit.sqlite3";
 const LOCK_FILE_NAME: &str = "core.lock";

@@ -1,0 +1,56 @@
+{
+  "scenario_version": 1,
+  "dataset_seed": 240204,
+  "runs": [
+    {
+      "run_id": "run-fake-manual",
+      "session_id": "session-fake-manual",
+      "title": "Manual exact permission",
+      "permission_mode": "manual",
+      "thread_id": "thread-fake-manual",
+      "turn_id": "turn-fake-manual",
+      "observation": {
+        "kind": "manual_permission",
+        "command_item_id": "command-fake-manual",
+        "permission_item_id": "permission-fake-manual",
+        "provider_request_id": 41,
+        "started_at_ms": 240204001
+      }
+    },
+    {
+      "run_id": "run-fake-provider-auto",
+      "session_id": "session-fake-provider-auto",
+      "title": "ProviderAuto factual outcome",
+      "permission_mode": "provider_auto",
+      "thread_id": "thread-fake-provider-auto",
+      "turn_id": "turn-fake-provider-auto",
+      "observation": {
+        "kind": "provider_auto_outcome",
+        "review_id": "review-fake-provider-auto",
+        "target_item_id": "target-fake-provider-auto"
+      }
+    },
+    {
+      "run_id": "run-fake-working-a",
+      "session_id": "session-fake-working-a",
+      "title": "Working fake Run A",
+      "permission_mode": "manual",
+      "thread_id": "thread-fake-working-a",
+      "turn_id": "turn-fake-working-a",
+      "observation": {
+        "kind": "idle"
+      }
+    },
+    {
+      "run_id": "run-fake-working-b",
+      "session_id": "session-fake-working-b",
+      "title": "Working fake Run B",
+      "permission_mode": "provider_auto",
+      "thread_id": "thread-fake-working-b",
+      "turn_id": "turn-fake-working-b",
+      "observation": {
+        "kind": "idle"
+      }
+    }
+  ]
+}
