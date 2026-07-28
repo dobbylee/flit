@@ -85,6 +85,41 @@ private final class RecordingCloseToTrayAlertPresenter: CloseToTrayAlertPresenti
 }
 
 @MainActor
+private final class RecordingExplicitQuitAlertPresenter: ExplicitQuitAlertPresenting {
+    private(set) var contents: [ExplicitQuitAlertContent] = []
+    private var completions: [(ExplicitQuitChoice) -> Void] = []
+
+    func present(
+        _ content: ExplicitQuitAlertContent,
+        for window: NSWindow,
+        completion: @escaping (ExplicitQuitChoice) -> Void
+    ) {
+        contents.append(content)
+        completions.append(completion)
+    }
+
+    func choose(_ choice: ExplicitQuitChoice) {
+        guard !completions.isEmpty else { return }
+        completions.removeFirst()(choice)
+    }
+}
+
+private func changingQuitImpact(
+    _ response: FlitQuitImpactResponse,
+    cursor: UInt64
+) throws -> FlitQuitImpactResponse {
+    let data = try JSONEncoder().encode(response)
+    guard var object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        throw NativeHealthTestFailure.failed("Quit impact response must be an object")
+    }
+    object["cursor"] = cursor
+    return try JSONDecoder().decode(
+        FlitQuitImpactResponse.self,
+        from: try JSONSerialization.data(withJSONObject: object)
+    )
+}
+
+@MainActor
 private func requireCommandError(
     _ text: String,
     code: FlitCommandErrorCode,
@@ -706,6 +741,167 @@ struct NativeHealthTests {
                     ],
             "generated Quit impact contract must preserve exact per-Run outcomes"
         )
+        let exactQuitContent = ExplicitQuitAlertContent.make(for: .exact(quitImpactFixture))
+        try require(
+            quitImpactFixture.runs.allSatisfy { exactQuitContent.message.contains($0.title) }
+                && exactQuitContent.message.contains("continues in Codex")
+                && exactQuitContent.message.contains("stops when Flit quits (Codex)")
+                && exactQuitContent.message.contains(
+                    "outcome after Quit is unknown (Codex)"
+                )
+                && exactQuitContent.message.contains(
+                    FoundationCopy.text(.quitMonitoringBoundary)
+                ),
+            "active Quit copy must render every exact Run outcome and the Flit boundary"
+        )
+        let unavailableQuitContent = ExplicitQuitAlertContent.make(for: .unavailable)
+        try require(
+            unavailableQuitContent.message.contains(
+                FoundationCopy.text(.quitImpactUnavailable)
+            )
+                && unavailableQuitContent.message.contains(
+                    FoundationCopy.text(.quitMonitoringBoundary)
+                ),
+            "unavailable Quit copy must disclose unknown provider impact and the Flit boundary"
+        )
+
+        let explicitQuitWindow = NSWindow()
+        let emptyQuitPresenter = RecordingExplicitQuitAlertPresenter()
+        let emptyQuitCoordinator = ExplicitQuitCoordinator(
+            previewLoader: { .exact(emptyQuitImpact) },
+            presenter: emptyQuitPresenter
+        )
+        var emptyQuitDecisions: [Bool] = []
+        let emptyQuitDisposition = emptyQuitCoordinator.requestQuit(
+            for: explicitQuitWindow,
+            completion: { emptyQuitDecisions.append($0) }
+        )
+        try require(
+            emptyQuitDisposition == .terminateNow
+                && emptyQuitDecisions.isEmpty
+                && emptyQuitPresenter.contents.isEmpty,
+            "an exact empty Quit preview must terminate immediately without an alert"
+        )
+
+        let activeQuitPresenter = RecordingExplicitQuitAlertPresenter()
+        let activeQuitCoordinator = ExplicitQuitCoordinator(
+            previewLoader: { .exact(quitImpactFixture) },
+            presenter: activeQuitPresenter
+        )
+        var activeQuitDecisions: [Bool] = []
+        let activeQuitDisposition = activeQuitCoordinator.requestQuit(
+            for: explicitQuitWindow,
+            completion: { activeQuitDecisions.append($0) }
+        )
+        let duplicateQuitDisposition = activeQuitCoordinator.requestQuit(
+            for: explicitQuitWindow,
+            completion: { activeQuitDecisions.append($0) }
+        )
+        try require(
+            activeQuitDisposition == .pending
+                && duplicateQuitDisposition == .pending
+                && activeQuitPresenter.contents == [exactQuitContent]
+                && activeQuitDecisions.isEmpty,
+            "an active Quit preview must present one alert and suppress duplicate requests"
+        )
+        activeQuitPresenter.choose(.confirm)
+        try require(
+            activeQuitDecisions == [true],
+            "an unchanged active Quit preview must terminate after confirmation"
+        )
+
+        let changedQuitImpact = try changingQuitImpact(
+            quitImpactFixture,
+            cursor: quitImpactFixture.cursor + 1
+        )
+        var staleQuitPreviews: [ExplicitQuitPreview] = [
+            .exact(quitImpactFixture),
+            .exact(changedQuitImpact),
+            .exact(changedQuitImpact),
+        ]
+        let staleQuitPresenter = RecordingExplicitQuitAlertPresenter()
+        let staleQuitCoordinator = ExplicitQuitCoordinator(
+            previewLoader: { staleQuitPreviews.removeFirst() },
+            presenter: staleQuitPresenter
+        )
+        var staleQuitDecisions: [Bool] = []
+        _ = staleQuitCoordinator.requestQuit(
+            for: explicitQuitWindow,
+            completion: { staleQuitDecisions.append($0) }
+        )
+        staleQuitPresenter.choose(.confirm)
+        try require(
+            staleQuitPresenter.contents.count == 2 && staleQuitDecisions.isEmpty,
+            "a changed Quit preview must replace the alert without terminating"
+        )
+        staleQuitPresenter.choose(.confirm)
+        try require(
+            staleQuitDecisions == [true],
+            "the changed Quit preview must require a fresh matching confirmation"
+        )
+
+        var clearedQuitPreviews: [ExplicitQuitPreview] = [
+            .exact(quitImpactFixture),
+            .exact(emptyQuitImpact),
+            .exact(emptyQuitImpact),
+        ]
+        let clearedQuitPresenter = RecordingExplicitQuitAlertPresenter()
+        let clearedQuitCoordinator = ExplicitQuitCoordinator(
+            previewLoader: { clearedQuitPreviews.removeFirst() },
+            presenter: clearedQuitPresenter
+        )
+        var clearedQuitDecisions: [Bool] = []
+        _ = clearedQuitCoordinator.requestQuit(
+            for: explicitQuitWindow,
+            completion: { clearedQuitDecisions.append($0) }
+        )
+        clearedQuitPresenter.choose(.confirm)
+        try require(
+            clearedQuitPresenter.contents.count == 2
+                && clearedQuitPresenter.contents[1].message.contains(
+                    FoundationCopy.text(.quitNoActiveRuns)
+                )
+                && clearedQuitDecisions.isEmpty,
+            "a stale preview that becomes empty must still require fresh confirmation"
+        )
+        clearedQuitPresenter.choose(.confirm)
+        try require(
+            clearedQuitDecisions == [true],
+            "the newly empty preview must terminate only after its own confirmation"
+        )
+
+        let cancelledQuitPresenter = RecordingExplicitQuitAlertPresenter()
+        let cancelledQuitCoordinator = ExplicitQuitCoordinator(
+            previewLoader: { .exact(quitImpactFixture) },
+            presenter: cancelledQuitPresenter
+        )
+        var cancelledQuitDecisions: [Bool] = []
+        _ = cancelledQuitCoordinator.requestQuit(
+            for: explicitQuitWindow,
+            completion: { cancelledQuitDecisions.append($0) }
+        )
+        cancelledQuitPresenter.choose(.cancel)
+        try require(
+            cancelledQuitDecisions == [false],
+            "cancelling an explicit Quit must never terminate"
+        )
+
+        let unavailableQuitPresenter = RecordingExplicitQuitAlertPresenter()
+        let unavailableQuitCoordinator = ExplicitQuitCoordinator(
+            previewLoader: { .unavailable },
+            presenter: unavailableQuitPresenter
+        )
+        var unavailableQuitDecisions: [Bool] = []
+        _ = unavailableQuitCoordinator.requestQuit(
+            for: explicitQuitWindow,
+            completion: { unavailableQuitDecisions.append($0) }
+        )
+        unavailableQuitPresenter.choose(.confirm)
+        try require(
+            unavailableQuitPresenter.contents == [unavailableQuitContent]
+                && unavailableQuitDecisions == [true],
+            "repeated unavailable Quit reads must require explicit unknown-impact confirmation"
+        )
         for (name, compatibility) in [
             (
                 "provider_diagnostics.supported.response.json",
@@ -1313,10 +1509,22 @@ struct NativeHealthTests {
             "menu-bar actions must invoke exactly one lifecycle handler"
         )
 
+        let lifecycleQuitPresenter = RecordingExplicitQuitAlertPresenter()
+        let lifecycleQuitCoordinator = ExplicitQuitCoordinator(
+            previewLoader: { .exact(quitImpactFixture) },
+            presenter: lifecycleQuitPresenter
+        )
+        var applicationTerminationRequestCount = 0
+        var lifecycleTerminationReplies: [Bool] = []
         let lifecycleDelegate = AppDelegate(
             closeToTrayPreference: CloseToTrayPreference(defaults: lifecycleDefaults),
             closeToTrayAlertPresenter: closePresenter,
-            dataDirectoryProvider: { dataDirectory }
+            dataDirectoryProvider: { dataDirectory },
+            explicitQuitCoordinator: lifecycleQuitCoordinator,
+            applicationTerminator: { applicationTerminationRequestCount += 1 },
+            terminationReplyHandler: { _, shouldTerminate in
+                lifecycleTerminationReplies.append(shouldTerminate)
+            }
         )
         lifecycleDelegate.applicationDidFinishLaunching(
             Notification(name: NSApplication.didFinishLaunchingNotification)
@@ -1355,6 +1563,139 @@ struct NativeHealthTests {
                 && retainedWindow.isVisible
                 && coreConstructionCount() == constructionCountBeforeClose,
             "Dock reopen must restore the retained window without reconstructing Core"
+        )
+        lifecycleDelegate.testQuitFromStatusItem()
+        try require(
+            applicationTerminationRequestCount == 1
+                && lifecycleQuitPresenter.contents.isEmpty,
+            "actual menu-bar Quit must request application-level termination"
+        )
+        guard
+            let mainMenuQuitItem = NSApplication.shared.mainMenu?
+                .items.first?.submenu?.items.first
+        else {
+            throw NativeHealthTestFailure.failed(
+                "application menu must expose explicit Quit"
+            )
+        }
+        try require(
+            mainMenuQuitItem.identifier?.rawValue == "flit.mainMenu.quit"
+                && mainMenuQuitItem.target === lifecycleDelegate,
+            "application-menu Quit must target the shared explicit Quit coordinator"
+        )
+        _ = mainMenuQuitItem.target?.perform(
+            mainMenuQuitItem.action,
+            with: mainMenuQuitItem
+        )
+        try require(
+            applicationTerminationRequestCount == 2
+                && lifecycleQuitPresenter.contents.isEmpty,
+            "application-menu Quit must share the status-item system termination path"
+        )
+        try require(
+            lifecycleDelegate.applicationShouldTerminate(NSApplication.shared)
+                == .terminateLater
+                && lifecycleDelegate.applicationShouldTerminate(NSApplication.shared)
+                    == .terminateLater
+                && lifecycleQuitPresenter.contents == [exactQuitContent]
+                && lifecycleTerminationReplies.isEmpty,
+            "system termination must present one active-Run confirmation and defer its reply"
+        )
+        lifecycleQuitPresenter.choose(.cancel)
+        try require(
+            lifecycleTerminationReplies == [false],
+            "cancelled system termination must reply false"
+        )
+        try require(
+            lifecycleDelegate.applicationShouldTerminate(NSApplication.shared)
+                == .terminateLater,
+            "a new system termination request must reopen exact confirmation"
+        )
+        lifecycleQuitPresenter.choose(.confirm)
+        try require(
+            lifecycleTerminationReplies == [false, true],
+            "confirmed unchanged system termination must reply true"
+        )
+
+        let unavailableDelegatePresenter = RecordingExplicitQuitAlertPresenter()
+        var unavailableDelegateReplies: [Bool] = []
+        let unavailableDelegate = AppDelegate(
+            dataDirectoryProvider: { dataDirectory },
+            explicitQuitCoordinator: ExplicitQuitCoordinator(
+                previewLoader: { .unavailable },
+                presenter: unavailableDelegatePresenter
+            ),
+            applicationTerminator: {},
+            terminationReplyHandler: { _, shouldTerminate in
+                unavailableDelegateReplies.append(shouldTerminate)
+            }
+        )
+        try require(
+            unavailableDelegate.applicationShouldTerminate(NSApplication.shared)
+                == .terminateLater
+                && unavailableDelegatePresenter.contents == [unavailableQuitContent],
+            "system termination with unavailable impact must defer behind its warning"
+        )
+        unavailableDelegatePresenter.choose(.confirm)
+        try require(
+            unavailableDelegateReplies == [true],
+            "confirmed repeated unavailable impact must complete system termination"
+        )
+
+        var changedDelegatePreviews: [ExplicitQuitPreview] = [
+            .exact(quitImpactFixture),
+            .exact(changedQuitImpact),
+            .exact(changedQuitImpact),
+        ]
+        let changedDelegatePresenter = RecordingExplicitQuitAlertPresenter()
+        var changedDelegateReplies: [Bool] = []
+        let changedDelegate = AppDelegate(
+            dataDirectoryProvider: { dataDirectory },
+            explicitQuitCoordinator: ExplicitQuitCoordinator(
+                previewLoader: { changedDelegatePreviews.removeFirst() },
+                presenter: changedDelegatePresenter
+            ),
+            applicationTerminator: {},
+            terminationReplyHandler: { _, shouldTerminate in
+                changedDelegateReplies.append(shouldTerminate)
+            }
+        )
+        try require(
+            changedDelegate.applicationShouldTerminate(NSApplication.shared)
+                == .terminateLater,
+            "system termination with active Runs must defer"
+        )
+        changedDelegatePresenter.choose(.confirm)
+        try require(
+            changedDelegatePresenter.contents.count == 2
+                && changedDelegateReplies.isEmpty,
+            "changed system termination impact must replace its confirmation"
+        )
+        changedDelegatePresenter.choose(.confirm)
+        try require(
+            changedDelegateReplies == [true],
+            "fresh confirmation of changed impact must complete system termination"
+        )
+
+        let emptyDelegatePresenter = RecordingExplicitQuitAlertPresenter()
+        var emptyDelegateReplies: [Bool] = []
+        let emptyDelegate = AppDelegate(
+            dataDirectoryProvider: { dataDirectory },
+            explicitQuitCoordinator: ExplicitQuitCoordinator(
+                previewLoader: { .exact(emptyQuitImpact) },
+                presenter: emptyDelegatePresenter
+            ),
+            applicationTerminator: {},
+            terminationReplyHandler: { _, shouldTerminate in
+                emptyDelegateReplies.append(shouldTerminate)
+            }
+        )
+        try require(
+            emptyDelegate.applicationShouldTerminate(NSApplication.shared)
+                == .terminateNow
+                && emptyDelegatePresenter.contents.isEmpty
+                && emptyDelegateReplies.isEmpty,
+            "system termination with an exact empty preview must proceed immediately"
         )
         lifecycleDefaults.removePersistentDomain(forName: defaultsSuite)
 

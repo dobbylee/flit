@@ -76,6 +76,7 @@ esac
     "$GENERATION_A/FlitProtocol.swift" \
     "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/ApplicationLifecycle.swift" \
     "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/AppDelegate.swift" \
+    "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/ExplicitQuit.swift" \
     "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/FoundationCopy.swift" \
     "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/SystemHealthClient.swift" \
     "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/DashboardPresentation.swift" \

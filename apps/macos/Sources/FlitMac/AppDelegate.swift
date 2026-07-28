@@ -7,17 +7,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let closeToTrayPreference: CloseToTrayPreference
     private let closeToTrayAlertPresenter: any CloseToTrayAlertPresenting
     private let dataDirectoryProvider: @MainActor () -> String
+    private let explicitQuitCoordinator: ExplicitQuitCoordinator
+    private let applicationTerminator: @MainActor () -> Void
+    private let terminationReplyHandler: @MainActor (NSApplication, Bool) -> Void
+    private var terminationReplyPending = false
 
     init(
         closeToTrayPreference: CloseToTrayPreference = CloseToTrayPreference(),
         closeToTrayAlertPresenter: any CloseToTrayAlertPresenting =
             AppKitCloseToTrayAlertPresenter(),
         dataDirectoryProvider: @escaping @MainActor () -> String =
-            AppDelegate.defaultDataDirectory
+            AppDelegate.defaultDataDirectory,
+        explicitQuitCoordinator: ExplicitQuitCoordinator = ExplicitQuitCoordinator(),
+        applicationTerminator: @escaping @MainActor () -> Void = {
+            NSApplication.shared.terminate(nil)
+        },
+        terminationReplyHandler: @escaping @MainActor (NSApplication, Bool) -> Void = {
+            application, shouldTerminate in
+            application.reply(toApplicationShouldTerminate: shouldTerminate)
+        }
     ) {
         self.closeToTrayPreference = closeToTrayPreference
         self.closeToTrayAlertPresenter = closeToTrayAlertPresenter
         self.dataDirectoryProvider = dataDirectoryProvider
+        self.explicitQuitCoordinator = explicitQuitCoordinator
+        self.applicationTerminator = applicationTerminator
+        self.terminationReplyHandler = terminationReplyHandler
         super.init()
     }
 
@@ -30,6 +45,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
+    }
+
+    func applicationShouldTerminate(
+        _ sender: NSApplication
+    ) -> NSApplication.TerminateReply {
+        guard !terminationReplyPending else { return .terminateLater }
+        showMainWindow()
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        guard let window = windowController?.window else { return .terminateCancel }
+
+        let disposition = explicitQuitCoordinator.requestQuit(for: window) {
+            [weak self, weak sender] shouldTerminate in
+            guard let self, let sender else { return }
+            self.terminationReplyPending = false
+            self.terminationReplyHandler(sender, shouldTerminate)
+        }
+        switch disposition {
+        case .terminateNow:
+            return .terminateNow
+        case .pending:
+            terminationReplyPending = true
+            return .terminateLater
+        }
     }
 
     func applicationShouldHandleReopen(
@@ -93,8 +131,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self?.showMainWindow()
                 NSApplication.shared.activate(ignoringOtherApps: true)
             },
-            quitHandler: {
-                NSApplication.shared.terminate(nil)
+            quitHandler: { [weak self] in
+                self?.requestExplicitQuit(nil)
             }
         )
     }
@@ -117,13 +155,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         mainMenu.addItem(applicationItem)
 
         let applicationMenu = NSMenu()
-        applicationMenu.addItem(
-            withTitle: FoundationCopy.text(.menuQuit),
-            action: #selector(NSApplication.terminate(_:)),
+        let quitItem = NSMenuItem(
+            title: FoundationCopy.text(.menuQuit),
+            action: #selector(requestExplicitQuit(_:)),
             keyEquivalent: "q"
         )
+        quitItem.target = self
+        quitItem.identifier = NSUserInterfaceItemIdentifier("flit.mainMenu.quit")
+        applicationMenu.addItem(quitItem)
         applicationItem.submenu = applicationMenu
         NSApplication.shared.mainMenu = mainMenu
+    }
+
+    @objc
+    private func requestExplicitQuit(_ sender: Any?) {
+        applicationTerminator()
     }
 
     #if FLIT_NATIVE_TESTS
@@ -133,6 +179,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         func testOpenFromStatusItem() {
             statusItemController?.openFlit(nil)
+        }
+
+        func testQuitFromStatusItem() {
+            statusItemController?.quitFlit(nil)
         }
     #endif
 }

@@ -23,6 +23,16 @@ enum FoundationCopyKey: String {
     case menuBarTooltip = "lifecycle.menuBar.tooltip"
     case menuOpen = "lifecycle.menu.open"
     case menuQuit = "lifecycle.menu.quit"
+    case quitActiveRuns = "lifecycle.quit.activeRuns"
+    case quitCancel = "lifecycle.quit.cancel"
+    case quitConfirm = "lifecycle.quit.confirm"
+    case quitImpactUnavailable = "lifecycle.quit.impactUnavailable"
+    case quitMonitoringBoundary = "lifecycle.quit.monitoringBoundary"
+    case quitNoActiveRuns = "lifecycle.quit.noActiveRuns"
+    case quitRunContinues = "lifecycle.quit.run.continues"
+    case quitRunStops = "lifecycle.quit.run.stops"
+    case quitRunUnknown = "lifecycle.quit.run.unknown"
+    case quitTitle = "lifecycle.quit.title"
     case noControls = "foundation.noControls"
     case phase = "foundation.phase"
     case statusChecking = "foundation.status.checking"
@@ -60,6 +70,18 @@ enum FoundationCopy {
         .menuBarTooltip: "Open Flit",
         .menuOpen: "Open Flit",
         .menuQuit: "Quit Flit",
+        .quitActiveRuns: "Active provider Runs:",
+        .quitCancel: "Cancel",
+        .quitConfirm: "Quit Flit",
+        .quitImpactUnavailable:
+            "Flit could not verify active provider Runs. Their execution outcome after Quit is unknown.",
+        .quitMonitoringBoundary:
+            "Flit monitoring and notifications stop when you quit.",
+        .quitNoActiveRuns: "No provider Runs are active.",
+        .quitRunContinues: "• %@ — continues in %@",
+        .quitRunStops: "• %@ — stops when Flit quits (%@)",
+        .quitRunUnknown: "• %@ — outcome after Quit is unknown (%@)",
+        .quitTitle: "Quit Flit?",
         .noControls: "No agent controls yet",
         .phase: "Flit · Phase 2",
         .statusChecking: "Checking foundation",
