@@ -13,10 +13,16 @@ enum FoundationCopyKey: String {
     case dashboardSectionPossiblyStuck = "dashboard.section.possiblyStuck"
     case dashboardSectionWorking = "dashboard.section.working"
     case dashboardUnavailable = "dashboard.unavailable"
+    case closeToTrayAcknowledgement = "lifecycle.closeToTray.acknowledgement"
+    case closeToTrayMessage = "lifecycle.closeToTray.message"
+    case closeToTrayTitle = "lifecycle.closeToTray.title"
     case boundaryChecking = "foundation.boundary.checking"
     case boundaryReady = "foundation.boundary.ready"
     case boundaryUnavailable = "foundation.boundary.unavailable"
     case local = "foundation.local"
+    case menuBarTooltip = "lifecycle.menuBar.tooltip"
+    case menuOpen = "lifecycle.menu.open"
+    case menuQuit = "lifecycle.menu.quit"
     case noControls = "foundation.noControls"
     case phase = "foundation.phase"
     case statusChecking = "foundation.status.checking"
@@ -40,6 +46,10 @@ enum FoundationCopy {
         .dashboardSectionPossiblyStuck: "Possibly Stuck",
         .dashboardSectionWorking: "Working",
         .dashboardUnavailable: "Dashboard unavailable",
+        .closeToTrayAcknowledgement: "Keep Flit Running",
+        .closeToTrayMessage:
+            "Flit stays available in the menu bar so local monitoring can continue. Use Quit Flit to stop Flit monitoring and notifications.",
+        .closeToTrayTitle: "Flit is still running",
         .boundaryChecking:
             "Verifying the local Core and Store. Provider monitoring has not started.",
         .boundaryReady:
@@ -47,6 +57,9 @@ enum FoundationCopy {
         .boundaryUnavailable:
             "Flit could not open its local Core and Store safely. No agent controls are available.",
         .local: "Local by design",
+        .menuBarTooltip: "Open Flit",
+        .menuOpen: "Open Flit",
+        .menuQuit: "Quit Flit",
         .noControls: "No agent controls yet",
         .phase: "Flit · Phase 2",
         .statusChecking: "Checking foundation",

@@ -64,6 +64,27 @@ private func requireDecodingFailure<T: Decodable>(
 }
 
 @MainActor
+private final class RecordingCloseToTrayAlertPresenter: CloseToTrayAlertPresenting {
+    private(set) var contents: [CloseToTrayAlertContent] = []
+    private var completion: (() -> Void)?
+
+    func present(
+        _ content: CloseToTrayAlertContent,
+        for window: NSWindow,
+        completion: @escaping () -> Void
+    ) {
+        contents.append(content)
+        self.completion = completion
+    }
+
+    func acknowledge() {
+        let pending = completion
+        completion = nil
+        pending?()
+    }
+}
+
+@MainActor
 private func requireCommandError(
     _ text: String,
     code: FlitCommandErrorCode,
@@ -1184,6 +1205,117 @@ struct NativeHealthTests {
             size: NSSize(width: 720, height: 560),
             expectedPanelWidth: 624
         )
+
+        let defaultsSuite = "dev.flit.native-health.\(ProcessInfo.processInfo.processIdentifier)"
+        guard let lifecycleDefaults = UserDefaults(suiteName: defaultsSuite) else {
+            throw NativeHealthTestFailure.failed(
+                "native lifecycle test defaults must be available"
+            )
+        }
+        lifecycleDefaults.removePersistentDomain(forName: defaultsSuite)
+        let closePreference = CloseToTrayPreference(defaults: lifecycleDefaults)
+        let closePresenter = RecordingCloseToTrayAlertPresenter()
+        let firstCloseDelegate = AppDelegate(
+            closeToTrayPreference: closePreference,
+            closeToTrayAlertPresenter: closePresenter,
+            dataDirectoryProvider: { dataDirectory }
+        )
+        let firstCloseWindow = NSWindow()
+        firstCloseWindow.orderFront(nil)
+        try require(
+            !firstCloseDelegate.windowShouldClose(firstCloseWindow)
+                && firstCloseWindow.isVisible
+                && closePresenter.contents == [.current],
+            "first window close must present the exact one-time explanation before hiding"
+        )
+        closePresenter.acknowledge()
+        try require(
+            !firstCloseWindow.isVisible,
+            "acknowledging the first-close explanation must hide the window"
+        )
+        firstCloseWindow.orderFront(nil)
+        try require(
+            !firstCloseDelegate.windowShouldClose(firstCloseWindow)
+                && !firstCloseWindow.isVisible
+                && closePresenter.contents.count == 1,
+            "repeated window close must hide without repeating the explanation"
+        )
+
+        var statusOpenCount = 0
+        var statusQuitCount = 0
+        let statusController = ApplicationStatusItemController(
+            openHandler: { statusOpenCount += 1 },
+            quitHandler: { statusQuitCount += 1 }
+        )
+        let statusMenuItems = statusController.statusItem.menu?.items ?? []
+        try require(
+            statusController.statusItem.button?.title == "Flit"
+                && statusController.statusItem.button?.accessibilityIdentifier()
+                    == "flit.statusItem",
+            "menu-bar item must expose a stable visible and accessibility identity"
+        )
+        try require(
+            statusMenuItems.map(\.title)
+                == [
+                    FoundationCopy.text(.menuOpen),
+                    "",
+                    FoundationCopy.text(.menuQuit),
+                ]
+                && statusMenuItems[0].identifier?.rawValue == "flit.statusItem.open"
+                && statusMenuItems[2].identifier?.rawValue == "flit.statusItem.quit",
+            "menu-bar item must expose stable Open and Quit entries"
+        )
+        statusController.openFlit(nil)
+        statusController.quitFlit(nil)
+        try require(
+            statusOpenCount == 1 && statusQuitCount == 1,
+            "menu-bar actions must invoke exactly one lifecycle handler"
+        )
+
+        let lifecycleDelegate = AppDelegate(
+            closeToTrayPreference: CloseToTrayPreference(defaults: lifecycleDefaults),
+            closeToTrayAlertPresenter: closePresenter,
+            dataDirectoryProvider: { dataDirectory }
+        )
+        lifecycleDelegate.applicationDidFinishLaunching(
+            Notification(name: NSApplication.didFinishLaunchingNotification)
+        )
+        guard let retainedWindow = lifecycleDelegate.testMainWindow else {
+            throw NativeHealthTestFailure.failed(
+                "application launch must retain its main window"
+            )
+        }
+        let retainedWindowIdentity = ObjectIdentifier(retainedWindow)
+        let constructionCountBeforeClose = coreConstructionCount()
+        try require(
+            !lifecycleDelegate.applicationShouldTerminateAfterLastWindowClosed(
+                NSApplication.shared
+            )
+                && !lifecycleDelegate.windowShouldClose(retainedWindow)
+                && !retainedWindow.isVisible,
+            "last-window close must hide without terminating the app-process Core"
+        )
+        lifecycleDelegate.testOpenFromStatusItem()
+        try require(
+            lifecycleDelegate.testMainWindow.map(ObjectIdentifier.init)
+                == retainedWindowIdentity
+                && retainedWindow.isVisible
+                && coreConstructionCount() == constructionCountBeforeClose,
+            "actual menu-bar Open must restore the retained window and Core"
+        )
+        _ = lifecycleDelegate.windowShouldClose(retainedWindow)
+        try require(
+            lifecycleDelegate.applicationShouldHandleReopen(
+                NSApplication.shared,
+                hasVisibleWindows: false
+            )
+                && lifecycleDelegate.testMainWindow.map(ObjectIdentifier.init)
+                    == retainedWindowIdentity
+                && retainedWindow.isVisible
+                && coreConstructionCount() == constructionCountBeforeClose,
+            "Dock reopen must restore the retained window without reconstructing Core"
+        )
+        lifecycleDefaults.removePersistentDomain(forName: defaultsSuite)
 
         let result: [String: Any] = [
             "core_construction_count": coreConstructionCount(),

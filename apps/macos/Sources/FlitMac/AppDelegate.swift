@@ -1,11 +1,29 @@
 import AppKit
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var windowController: NSWindowController?
+    private var statusItemController: ApplicationStatusItemController?
+    private let closeToTrayPreference: CloseToTrayPreference
+    private let closeToTrayAlertPresenter: any CloseToTrayAlertPresenting
+    private let dataDirectoryProvider: @MainActor () -> String
+
+    init(
+        closeToTrayPreference: CloseToTrayPreference = CloseToTrayPreference(),
+        closeToTrayAlertPresenter: any CloseToTrayAlertPresenting =
+            AppKitCloseToTrayAlertPresenter(),
+        dataDirectoryProvider: @escaping @MainActor () -> String =
+            AppDelegate.defaultDataDirectory
+    ) {
+        self.closeToTrayPreference = closeToTrayPreference
+        self.closeToTrayAlertPresenter = closeToTrayAlertPresenter
+        self.dataDirectoryProvider = dataDirectoryProvider
+        super.init()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         configureMainMenu()
+        configureStatusItem()
         showMainWindow()
         NSApplication.shared.activate(ignoringOtherApps: true)
     }
@@ -24,6 +42,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if closeToTrayPreference.consumeExplanationIfNeeded() {
+            closeToTrayAlertPresenter.present(
+                .current,
+                for: sender
+            ) { [weak sender] in
+                sender?.orderOut(nil)
+            }
+        } else {
+            sender.orderOut(nil)
+        }
+        return false
+    }
+
     private func showMainWindow() {
         if let window = windowController?.window {
             window.makeKeyAndOrderFront(nil)
@@ -33,7 +65,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let client = SystemHealthClient()
         do {
             try initializeCore(
-                dataDirectory: applicationDataDirectory(),
+                dataDirectory: dataDirectoryProvider(),
                 clientProtocolVersion: client.clientProtocolVersion
             )
         } catch {
@@ -47,6 +79,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.setContentSize(NSSize(width: 1_280, height: 720))
         window.minSize = NSSize(width: 720, height: 560)
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+        window.delegate = self
         window.center()
 
         let controller = NSWindowController(window: window)
@@ -54,7 +87,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.showWindow(nil)
     }
 
-    private func applicationDataDirectory() -> String {
+    private func configureStatusItem() {
+        statusItemController = ApplicationStatusItemController(
+            openHandler: { [weak self] in
+                self?.showMainWindow()
+                NSApplication.shared.activate(ignoringOtherApps: true)
+            },
+            quitHandler: {
+                NSApplication.shared.terminate(nil)
+            }
+        )
+    }
+
+    private static func defaultDataDirectory() -> String {
         guard
             let applicationSupport = FileManager.default.urls(
                 for: .applicationSupportDirectory,
@@ -73,11 +118,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let applicationMenu = NSMenu()
         applicationMenu.addItem(
-            withTitle: "Quit Flit",
+            withTitle: FoundationCopy.text(.menuQuit),
             action: #selector(NSApplication.terminate(_:)),
             keyEquivalent: "q"
         )
         applicationItem.submenu = applicationMenu
         NSApplication.shared.mainMenu = mainMenu
     }
+
+    #if FLIT_NATIVE_TESTS
+        var testMainWindow: NSWindow? {
+            windowController?.window
+        }
+
+        func testOpenFromStatusItem() {
+            statusItemController?.openFlit(nil)
+        }
+    #endif
 }

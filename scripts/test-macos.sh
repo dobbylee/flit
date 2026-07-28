@@ -66,6 +66,7 @@ esac
     -O \
     -whole-module-optimization \
     -swift-version 6 \
+    -D FLIT_NATIVE_TESTS \
     -strict-concurrency=complete \
     -warnings-as-errors \
     -module-cache-path "$TEST_MODULE_CACHE" \
@@ -73,6 +74,8 @@ esac
     -Xcc "-fmodule-map-file=$GENERATION_A/FlitBridgeFFI.modulemap" \
     "$GENERATION_A/FlitBridge.swift" \
     "$GENERATION_A/FlitProtocol.swift" \
+    "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/ApplicationLifecycle.swift" \
+    "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/AppDelegate.swift" \
     "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/FoundationCopy.swift" \
     "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/SystemHealthClient.swift" \
     "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/DashboardPresentation.swift" \
