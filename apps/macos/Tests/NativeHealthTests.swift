@@ -324,6 +324,21 @@ struct NativeHealthTests {
                 && managedRunResponse.providerTurnId == "codex-turn-1",
             "generated managed Run response must preserve provider identities"
         )
+        let providerAutoRequest = try decodeFixture(
+            FlitManagedRunStartRequest.self,
+            at: "\(fixtureRoot)/managed_run_start.provider_auto.request.json"
+        )
+        let providerAutoResponse = try decodeFixture(
+            FlitManagedRunStartResponse.self,
+            at: "\(fixtureRoot)/managed_run_start.provider_auto.response.json"
+        )
+        try require(
+            providerAutoRequest.permissionMode == .providerAuto
+                && providerAutoResponse.permissionMode == .providerAuto
+                && providerAutoResponse.providerConfiguration
+                    == "readOnly+on-request+auto_review",
+            "generated managed Run contract must preserve exact ProviderAuto configuration"
+        )
         let managedRunErrors = try decodeFixture(
             [FlitCommandError].self,
             at: "\(fixtureRoot)/managed_run_errors.json"
@@ -340,6 +355,10 @@ struct NativeHealthTests {
             (
                 "managed_run_observe.permission_requested.response.json",
                 FlitManagedRunObservationStatus.permissionRequested
+            ),
+            (
+                "managed_run_observe.provider_outcome_resolved.response.json",
+                FlitManagedRunObservationStatus.providerOutcomeResolved
             ),
             (
                 "managed_run_observe.turn_completed.response.json",
@@ -392,6 +411,44 @@ struct NativeHealthTests {
             FlitManagedRunObserveResponse.self,
             from: try JSONSerialization.data(withJSONObject: permissionWithTerminalField),
             "permission observation must reject terminal fields"
+        )
+        let providerOutcomeData = try Data(
+            contentsOf: URL(
+                fileURLWithPath:
+                    "\(fixtureRoot)/managed_run_observe.provider_outcome_resolved.response.json"
+            )
+        )
+        guard
+            let providerOutcome = try JSONSerialization.jsonObject(
+                with: providerOutcomeData
+            ) as? [String: Any]
+        else {
+            throw NativeHealthTestFailure.failed("provider outcome must be an object")
+        }
+        for requiredField in [
+            "provider_item_id",
+            "provider_decision_id",
+            "request_id",
+            "request_version",
+            "request_event_id",
+            "provider_decision",
+            "terminal_outcome",
+            "event_version",
+        ] {
+            var missing = providerOutcome
+            missing.removeValue(forKey: requiredField)
+            try requireDecodingFailure(
+                FlitManagedRunObserveResponse.self,
+                from: try JSONSerialization.data(withJSONObject: missing),
+                "provider outcome must require \(requiredField)"
+            )
+        }
+        var providerOutcomeWithClientRequest = providerOutcome
+        providerOutcomeWithClientRequest["provider_request_id"] = 7
+        try requireDecodingFailure(
+            FlitManagedRunObserveResponse.self,
+            from: try JSONSerialization.data(withJSONObject: providerOutcomeWithClientRequest),
+            "provider outcome must reject a client request identity"
         )
         let terminalObservationData = try Data(
             contentsOf: URL(

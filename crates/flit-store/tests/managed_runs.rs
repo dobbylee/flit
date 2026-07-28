@@ -14,8 +14,9 @@ use flit_store::{
     MAX_LIVE_MANAGED_SESSIONS, ManagedPermissionDecision, ManagedPermissionDeliveryUnknownReason,
     ManagedPermissionResolutionKind, ManagedPermissionResponseAttempt,
     ManagedPermissionResponseAttemptOutcome, ManagedPermissionResponseResult,
-    ManagedPermissionResponseResultKind, ManagedProviderObservation,
-    ManagedProviderObservationKind, ManagedReconciliationState, ManagedRunIntent,
+    ManagedPermissionResponseResultKind, ManagedProviderDecision, ManagedProviderObservation,
+    ManagedProviderObservationKind, ManagedProviderOutcome, ManagedProviderOutcomeCommit,
+    ManagedProviderTerminalOutcome, ManagedReconciliationState, ManagedRunIntent,
     ManagedRunIntentOutcome, ManagedRunStartFailure, ManagedRunStartFailureOutcome,
     ManagedSessionReconciliation, ManagedSessionReconciliationOutcome, ManagedSessionTermination,
     ManagedSessionTerminationOutcome, ManagedTurnTerminalOutcome, ProjectRegistration,
@@ -456,6 +457,113 @@ fn managed_provider_observations_are_exact_ordered_idempotent_and_content_safe()
             .expect("terminal duplicate"),
         AppendEventOutcome::Duplicate(_)
     ));
+}
+
+#[test]
+fn provider_owned_outcome_atomically_records_request_and_fact_without_response_attempt() {
+    let directory = TestDirectory::new("provider-outcome");
+    let (mut store, database, project_path) = trusted_store(&directory);
+    store
+        .create_managed_run_intent(run_intent(
+            "run-1",
+            "event-run-created",
+            "event-start-requested",
+        ))
+        .expect("managed Run");
+    store
+        .connect_initial_managed_session(session_connection(
+            "session-1",
+            "run-1",
+            "thread-1",
+            &project_path,
+        ))
+        .expect("managed session");
+
+    let outcome = ManagedProviderOutcome {
+        run_id: "run-1".to_owned(),
+        session_id: "session-1".to_owned(),
+        external_session_key: "thread-1".to_owned(),
+        provider_turn_id: "turn-1".to_owned(),
+        provider_item_id: "item-1".to_owned(),
+        provider_decision_id: "review-1".to_owned(),
+        request_id: "request-provider-auto-1".to_owned(),
+        permission_mode_version: 1,
+        provider_configuration: "readOnly+on-request+auto_review".to_owned(),
+        decision: ManagedProviderDecision::Allowed,
+        terminal_outcome: ManagedProviderTerminalOutcome::RequestResolved,
+        contract_version: "codex-app-server/0.145.0".to_owned(),
+        observed_at: STARTED_AT.to_owned(),
+        request_event_id: "event-provider-auto-request".to_owned(),
+        outcome_event_id: "event-provider-auto-resolved".to_owned(),
+    };
+    let (request, resolved) = match store
+        .commit_managed_provider_outcome(outcome.clone())
+        .expect("commit provider-owned outcome")
+    {
+        ManagedProviderOutcomeCommit::Inserted {
+            request_event,
+            outcome_event,
+        } => (request_event, outcome_event),
+        other => panic!("unexpected provider outcome: {other:?}"),
+    };
+    assert_eq!(request.event_type, "permission.requested");
+    assert_eq!(request.stream_seq, 2);
+    assert_eq!(request.payload["permission_mode"], "provider_auto");
+    assert_eq!(request.payload["response_supported"], false);
+    assert!(request.payload.get("provider_request_id").is_none());
+    assert_eq!(resolved.event_type, "permission.provider_outcome_resolved");
+    assert_eq!(resolved.stream_seq, 3);
+    assert_eq!(resolved.payload["request_version"], request.ingest_seq);
+    assert_eq!(resolved.payload["provider_decision"], "allowed");
+    assert_eq!(resolved.payload["provider_decision_id"], "review-1");
+    assert_eq!(resolved.payload["terminal_outcome"], "request_resolved");
+    let rendered = serde_json::to_string(&[&request, &resolved]).expect("event JSON");
+    for forbidden in [
+        "response_attempt_id",
+        "delivery_plan_fingerprint",
+        "risk_level",
+        "scope",
+        "sensitive reason",
+    ] {
+        assert!(!rendered.contains(forbidden));
+    }
+
+    assert!(matches!(
+        store
+            .commit_managed_provider_outcome(outcome.clone())
+            .expect("exact duplicate"),
+        ManagedProviderOutcomeCommit::Duplicate {
+            ref request_event,
+            ref outcome_event,
+        } if request_event == &request && outcome_event == &resolved
+    ));
+    let mut conflict = outcome;
+    conflict.provider_decision_id = "review-conflict".to_owned();
+    assert!(matches!(
+        store.commit_managed_provider_outcome(conflict),
+        Err(StoreError::ManagedProviderOutcomeConflict { .. })
+    ));
+    assert_eq!(store.latest_ingest_seq().expect("stable cursor"), 5);
+
+    drop(store);
+    let reopened = Store::open(&database, ENDED_AT).expect("reopen Store");
+    let events = reopened
+        .run_events_through("run-1", 0, 5, 10)
+        .expect("reopened events");
+    assert_eq!(
+        events
+            .events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "run.created",
+            "run.start_requested",
+            "session.connected",
+            "permission.requested",
+            "permission.provider_outcome_resolved",
+        ]
+    );
 }
 
 #[test]

@@ -150,6 +150,65 @@ pub struct ManagedProviderObservation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedProviderDecision {
+    Allowed,
+    Denied,
+}
+
+impl ManagedProviderDecision {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Denied => "denied",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedProviderTerminalOutcome {
+    RequestResolved,
+}
+
+impl ManagedProviderTerminalOutcome {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::RequestResolved => "request_resolved",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedProviderOutcome {
+    pub run_id: String,
+    pub session_id: String,
+    pub external_session_key: String,
+    pub provider_turn_id: String,
+    pub provider_item_id: String,
+    pub provider_decision_id: String,
+    pub request_id: String,
+    pub permission_mode_version: u64,
+    pub provider_configuration: String,
+    pub decision: ManagedProviderDecision,
+    pub terminal_outcome: ManagedProviderTerminalOutcome,
+    pub contract_version: String,
+    pub observed_at: String,
+    pub request_event_id: String,
+    pub outcome_event_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ManagedProviderOutcomeCommit {
+    Inserted {
+        request_event: EventEnvelope,
+        outcome_event: EventEnvelope,
+    },
+    Duplicate {
+        request_event: EventEnvelope,
+        outcome_event: EventEnvelope,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManagedPermissionDecision {
     AllowOnce,
     Deny,
@@ -464,6 +523,44 @@ pub(crate) fn validate_provider_observation(
         ManagedProviderObservationKind::TurnCompleted
         | ManagedProviderObservationKind::TurnInterrupted => Ok(()),
     }
+}
+
+pub(crate) fn validate_provider_outcome(
+    outcome: &ManagedProviderOutcome,
+) -> Result<(), &'static str> {
+    for (field, value) in [
+        ("run_id", outcome.run_id.as_str()),
+        ("session_id", outcome.session_id.as_str()),
+        (
+            "external_session_key",
+            outcome.external_session_key.as_str(),
+        ),
+        ("provider_turn_id", outcome.provider_turn_id.as_str()),
+        ("provider_item_id", outcome.provider_item_id.as_str()),
+        (
+            "provider_decision_id",
+            outcome.provider_decision_id.as_str(),
+        ),
+        ("request_id", outcome.request_id.as_str()),
+        (
+            "provider_configuration",
+            outcome.provider_configuration.as_str(),
+        ),
+        ("contract_version", outcome.contract_version.as_str()),
+        ("request_event_id", outcome.request_event_id.as_str()),
+        ("outcome_event_id", outcome.outcome_event_id.as_str()),
+    ] {
+        validate_id(value).map_err(|()| field)?;
+    }
+    if outcome.permission_mode_version == 0
+        || outcome.permission_mode_version > flit_protocol::MAX_JSON_SAFE_INTEGER
+    {
+        return Err("permission_mode_version");
+    }
+    if outcome.request_event_id == outcome.outcome_event_id {
+        return Err("event_ids");
+    }
+    validate_timestamp(&outcome.observed_at).map_err(|()| "observed_at")
 }
 
 pub(crate) fn validate_permission_response_attempt(

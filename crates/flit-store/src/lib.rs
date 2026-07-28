@@ -24,8 +24,9 @@ pub use managed_runs::{
     MAX_MANAGED_METADATA_JSON_VALUES, ManagedPermissionDecision,
     ManagedPermissionDeliveryUnknownReason, ManagedPermissionResolutionKind,
     ManagedPermissionResponseAttempt, ManagedPermissionResponseAttemptOutcome,
-    ManagedPermissionResponseResult, ManagedPermissionResponseResultKind,
-    ManagedProviderObservation, ManagedProviderObservationKind, ManagedReconciliationState,
+    ManagedPermissionResponseResult, ManagedPermissionResponseResultKind, ManagedProviderDecision,
+    ManagedProviderObservation, ManagedProviderObservationKind, ManagedProviderOutcome,
+    ManagedProviderOutcomeCommit, ManagedProviderTerminalOutcome, ManagedReconciliationState,
     ManagedRun, ManagedRunIntent, ManagedRunIntentOutcome, ManagedRunStartFailure,
     ManagedRunStartFailureOutcome, ManagedSession, ManagedSessionReconciliation,
     ManagedSessionReconciliationOutcome, ManagedSessionTermination,
@@ -864,6 +865,110 @@ impl Store {
             .expect("one managed provider observation must produce one outcome");
         transaction.commit().map_err(StoreError::Sqlite)?;
         Ok(outcome)
+    }
+
+    pub fn commit_managed_provider_outcome(
+        &mut self,
+        outcome: ManagedProviderOutcome,
+    ) -> Result<ManagedProviderOutcomeCommit, StoreError> {
+        managed_runs::validate_provider_outcome(&outcome)
+            .map_err(|field| StoreError::InvalidManagedProviderOutcome { field })?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+        let (run, session) = load_managed_response_scope(
+            &transaction,
+            &outcome.run_id,
+            &outcome.session_id,
+            &outcome.external_session_key,
+        )?;
+
+        let stored_request = load_event_by_id(&transaction, &outcome.request_event_id)?;
+        let stored_outcome = load_event_by_id(&transaction, &outcome.outcome_event_id)?;
+        match (stored_request, stored_outcome) {
+            (Some(request_event), Some(outcome_event)) => {
+                let expected_request =
+                    managed_provider_outcome_request_event(&outcome, request_event.stream_seq);
+                let expected_outcome = managed_provider_outcome_resolved_event(
+                    &outcome,
+                    request_event.ingest_seq,
+                    outcome_event.stream_seq,
+                );
+                if UnsequencedEventEnvelope::from(request_event.clone()) != expected_request
+                    || UnsequencedEventEnvelope::from(outcome_event.clone()) != expected_outcome
+                {
+                    return Err(StoreError::ManagedProviderOutcomeConflict {
+                        request_id: outcome.request_id,
+                    });
+                }
+                transaction.commit().map_err(StoreError::Sqlite)?;
+                return Ok(ManagedProviderOutcomeCommit::Duplicate {
+                    request_event,
+                    outcome_event,
+                });
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(StoreError::ManagedProviderOutcomeConflict {
+                    request_id: outcome.request_id,
+                });
+            }
+            (None, None) => {}
+        }
+
+        if managed_provider_outcome_identity_exists(
+            &transaction,
+            &outcome.run_id,
+            &outcome.session_id,
+            &outcome.request_id,
+            &outcome.provider_decision_id,
+        )? {
+            return Err(StoreError::ManagedProviderOutcomeConflict {
+                request_id: outcome.request_id,
+            });
+        }
+        if run.ended_at.is_some() || session.ended_at.is_some() || session.end_reason.is_some() {
+            return Err(StoreError::ManagedSessionNotLive {
+                session_id: outcome.session_id,
+            });
+        }
+
+        let request_stream_seq =
+            next_managed_session_stream_seq(&transaction, &outcome.session_id)?;
+        let request = managed_provider_outcome_request_event(&outcome, request_stream_seq);
+        let mut request_outcomes = append_event_batch_in_transaction(&transaction, vec![request])?;
+        let request_event = match request_outcomes
+            .pop()
+            .expect("one provider outcome request must produce one outcome")
+        {
+            AppendEventOutcome::Inserted(event) => event,
+            AppendEventOutcome::Duplicate(_) => {
+                unreachable!("provider outcome duplicates are handled before append")
+            }
+        };
+
+        let outcome_stream_seq =
+            next_managed_session_stream_seq(&transaction, &outcome.session_id)?;
+        let resolved = managed_provider_outcome_resolved_event(
+            &outcome,
+            request_event.ingest_seq,
+            outcome_stream_seq,
+        );
+        let mut outcome_outcomes = append_event_batch_in_transaction(&transaction, vec![resolved])?;
+        let outcome_event = match outcome_outcomes
+            .pop()
+            .expect("one provider outcome resolution must produce one outcome")
+        {
+            AppendEventOutcome::Inserted(event) => event,
+            AppendEventOutcome::Duplicate(_) => {
+                unreachable!("provider outcome duplicates are handled before append")
+            }
+        };
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(ManagedProviderOutcomeCommit::Inserted {
+            request_event,
+            outcome_event,
+        })
     }
 
     pub fn submit_managed_permission_response(
@@ -1926,6 +2031,93 @@ fn managed_provider_observation_event(
     }
 }
 
+fn managed_provider_outcome_request_event(
+    outcome: &ManagedProviderOutcome,
+    stream_seq: u64,
+) -> UnsequencedEventEnvelope {
+    let payload = json!({
+        "action_kind": "filesystem.write",
+        "blocking": false,
+        "evidence_unavailable_reason": "raw_provider_content_not_retained",
+        "permission_mode": "provider_auto",
+        "permission_mode_version": outcome.permission_mode_version,
+        "provider_configuration": outcome.provider_configuration,
+        "provider_item_id": outcome.provider_item_id,
+        "provider_turn_id": outcome.provider_turn_id,
+        "request_id": outcome.request_id,
+        "response_supported": false,
+    })
+    .as_object()
+    .expect("object literal")
+    .clone();
+    managed_provider_outcome_event(
+        outcome,
+        outcome.request_event_id.clone(),
+        stream_seq,
+        "permission.requested",
+        payload,
+    )
+}
+
+fn managed_provider_outcome_resolved_event(
+    outcome: &ManagedProviderOutcome,
+    request_version: u64,
+    stream_seq: u64,
+) -> UnsequencedEventEnvelope {
+    let payload = json!({
+        "evidence_unavailable_reason": "raw_provider_content_not_retained",
+        "permission_mode": "provider_auto",
+        "permission_mode_version": outcome.permission_mode_version,
+        "provider_configuration": outcome.provider_configuration,
+        "provider_decision": outcome.decision.as_str(),
+        "provider_decision_id": outcome.provider_decision_id,
+        "provider_item_id": outcome.provider_item_id,
+        "provider_turn_id": outcome.provider_turn_id,
+        "request_id": outcome.request_id,
+        "request_version": request_version,
+        "terminal_outcome": outcome.terminal_outcome.as_str(),
+    })
+    .as_object()
+    .expect("object literal")
+    .clone();
+    managed_provider_outcome_event(
+        outcome,
+        outcome.outcome_event_id.clone(),
+        stream_seq,
+        "permission.provider_outcome_resolved",
+        payload,
+    )
+}
+
+fn managed_provider_outcome_event(
+    outcome: &ManagedProviderOutcome,
+    event_id: String,
+    stream_seq: u64,
+    event_type: &str,
+    payload: Map<String, Value>,
+) -> UnsequencedEventEnvelope {
+    UnsequencedEventEnvelope {
+        protocol_version: EventProtocolVersion::V1_0,
+        event_id,
+        run_id: outcome.run_id.clone(),
+        session_id: NullableSessionId::Id(outcome.session_id.clone()),
+        stream_seq,
+        occurred_at: outcome.observed_at.clone(),
+        observed_at: outcome.observed_at.clone(),
+        event_type: event_type.to_owned(),
+        source: EventSource {
+            kind: EventSourceKind::ProviderAdapter,
+            provider: Some(MANAGED_PROVIDER_KIND_CODEX.to_owned()),
+            contract_version: Some(outcome.contract_version.clone()),
+            extensions: BTreeMap::new(),
+        },
+        confidence: 1.0,
+        evidence_ids: Vec::new(),
+        payload,
+        extensions: BTreeMap::new(),
+    }
+}
+
 fn managed_permission_response_submitted_event(
     attempt: &ManagedPermissionResponseAttempt,
     stream_seq: u64,
@@ -2456,6 +2648,24 @@ fn managed_permission_request_is_current(
         .map_err(StoreError::Sqlite)?
         .is_some();
     Ok(!later)
+}
+
+fn managed_provider_outcome_identity_exists(
+    connection: &Connection,
+    run_id: &str,
+    session_id: &str,
+    request_id: &str,
+    provider_decision_id: &str,
+) -> Result<bool, StoreError> {
+    connection
+        .query_row(
+            "SELECT 1 FROM events INDEXED BY events_by_run_seq WHERE run_id = ?1 AND session_id = ?2 AND ((event_type = 'permission.requested' AND json_extract(payload_json, '$.request_id') = ?3) OR (event_type = 'permission.provider_outcome_resolved' AND (json_extract(payload_json, '$.request_id') = ?3 OR json_extract(payload_json, '$.provider_decision_id') = ?4))) LIMIT 1",
+            params![run_id, session_id, request_id, provider_decision_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|row| row.is_some())
+        .map_err(StoreError::Sqlite)
 }
 
 fn load_managed_permission_response_events(
@@ -3626,6 +3836,12 @@ pub enum StoreError {
     InvalidManagedProviderObservation {
         field: &'static str,
     },
+    InvalidManagedProviderOutcome {
+        field: &'static str,
+    },
+    ManagedProviderOutcomeConflict {
+        request_id: String,
+    },
     InvalidManagedPermissionResponse {
         field: &'static str,
     },
@@ -3893,6 +4109,15 @@ impl fmt::Display for StoreError {
                 write!(
                     formatter,
                     "invalid managed provider observation field: {field}"
+                )
+            }
+            Self::InvalidManagedProviderOutcome { field } => {
+                write!(formatter, "invalid managed provider outcome field: {field}")
+            }
+            Self::ManagedProviderOutcomeConflict { request_id } => {
+                write!(
+                    formatter,
+                    "managed provider outcome conflicts for request: {request_id}"
                 )
             }
             Self::InvalidManagedPermissionResponse { field } => {

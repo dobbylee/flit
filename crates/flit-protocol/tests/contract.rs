@@ -275,23 +275,31 @@ fn current_provider_diagnostics_fixtures_are_exhaustive_and_path_free() {
 fn current_managed_run_start_fixtures_round_trip_every_shape() {
     let manifest = read_command_compatibility_manifest();
     let current = &manifest.current;
-    assert_fixture_round_trip::<ManagedRunStartRequest>(&command_fixture(
-        current,
+    for name in [
         "managed_run_start.request.json",
-    ));
-    assert_fixture_round_trip::<ManagedRunStartResponse>(&command_fixture(
-        current,
-        "managed_run_start.response.json",
-    ));
-    let response: ManagedRunStartResponse = serde_json::from_str(
-        &fs::read_to_string(repository_path(&command_fixture(
-            current,
+        "managed_run_start.provider_auto.request.json",
+    ] {
+        assert_fixture_round_trip::<ManagedRunStartRequest>(&command_fixture(current, name));
+    }
+    for (name, provider_configuration) in [
+        (
             "managed_run_start.response.json",
-        )))
-        .expect("managed Run response fixture should be readable"),
-    )
-    .expect("managed Run response fixture should match Rust types");
-    assert_eq!(response.provider_configuration, "readOnly+on-request+user");
+            "readOnly+on-request+user",
+        ),
+        (
+            "managed_run_start.provider_auto.response.json",
+            "readOnly+on-request+auto_review",
+        ),
+    ] {
+        let fixture = command_fixture(current, name);
+        assert_fixture_round_trip::<ManagedRunStartResponse>(&fixture);
+        let response: ManagedRunStartResponse = serde_json::from_str(
+            &fs::read_to_string(repository_path(&fixture))
+                .expect("managed Run response fixture should be readable"),
+        )
+        .expect("managed Run response fixture should match Rust types");
+        assert_eq!(response.provider_configuration, provider_configuration);
+    }
     assert_fixture_round_trip::<Vec<CommandError>>(&command_fixture(
         current,
         "managed_run_errors.json",
@@ -319,6 +327,7 @@ fn current_managed_run_observe_fixtures_round_trip_every_shape() {
     ));
     for name in [
         "managed_run_observe.permission_requested.response.json",
+        "managed_run_observe.provider_outcome_resolved.response.json",
         "managed_run_observe.turn_completed.response.json",
         "managed_run_observe.turn_interrupted.response.json",
     ] {
@@ -457,6 +466,8 @@ fn generated_swift_project_contract_is_current_and_required_fields_fail_closed()
         "FlitManagedRunStartResponse",
         "FlitManagedRunObserveRequest",
         "FlitManagedRunObservationStatus",
+        "FlitManagedRunProviderDecision",
+        "FlitManagedRunProviderTerminalOutcome",
         "FlitManagedRunObserveResponse",
         "FlitManagedRunPermissionDecision",
         "FlitManagedRunPermissionRespondRequest",
@@ -469,6 +480,7 @@ fn generated_swift_project_contract_is_current_and_required_fields_fail_closed()
         );
     }
     assert!(generated.contains("case providerAuto = \"provider_auto\""));
+    assert!(generated.contains("case providerOutcomeResolved = \"provider_outcome_resolved\""));
     assert!(generated.contains("case permissionModeConfigure = \"permission_mode_configure\""));
     assert!(generated.contains("case providerOutcomeObserve = \"provider_outcome_observe\""));
     assert!(generated.contains("let providerConfiguration: String"));

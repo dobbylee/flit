@@ -1,0 +1,13 @@
+{
+  "status": "permission_requested",
+  "protocol_version": "1.7",
+  "run_id": "run_01JZ8Y60R5M6V3Y2S0VJ3G8K1C",
+  "session_id": "ses_01JZ8Y62E8FVDMZ00HBFV3N6XP",
+  "provider_thread_id": "019fa10c-32ee-7371-96c2-0fcb5b859003",
+  "provider_turn_id": "turn_01JZ8Y6A7S6KZ0B2E9WP76M44X",
+  "provider_item_id": "item_01JZ8Y6BBQ9W2TQFJ19T5A4AXK",
+  "provider_request_id": 0,
+  "request_id": "req_codex_6b21a420",
+  "request_version": 4,
+  "event_id": "evt_codex_6b21a420"
+}

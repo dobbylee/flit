@@ -2,20 +2,22 @@ use std::{collections::BTreeMap, ffi::OsStr, path::Path};
 
 use flit_protocol::{
     ManagedRunObserveRequest, ManagedRunObserveResponse, ManagedRunPermissionDecision,
-    ManagedRunPermissionMode, ManagedRunPermissionRespondRequest, ManagedRunStartRequest,
-    ManagedRunStartResponse, PROTOCOL_VERSION,
+    ManagedRunPermissionMode, ManagedRunPermissionRespondRequest, ManagedRunProviderDecision,
+    ManagedRunProviderTerminalOutcome, ManagedRunStartRequest, ManagedRunStartResponse,
+    PROTOCOL_VERSION,
 };
 use flit_providers::{
     CapabilityStatus, CodexAppServer, CodexAppServerError, CodexContractError,
-    CodexManagedThreadId, CodexManualStartedThread, CodexStartedTurn, CodexTurnObservation,
-    CodexTurnTerminalOutcome, ProviderCapability, ProviderCompatibility, ProviderFingerprint,
-    classify_codex,
+    CodexManagedThreadId, CodexManualStartedThread, CodexProviderAutoStartedThread,
+    CodexStartedTurn, CodexTurnObservation, CodexTurnTerminalOutcome, ProviderCapability,
+    ProviderCompatibility, ProviderFingerprint, classify_codex,
 };
 use flit_store::{
     AppendEventOutcome, InitialManagedSessionConnection, ManagedPermissionDecision,
     ManagedPermissionResolutionKind, ManagedPermissionResponseAttempt,
-    ManagedPermissionResponseResult, ManagedPermissionResponseResultKind,
-    ManagedProviderObservation, ManagedProviderObservationKind, ManagedReconciliationState,
+    ManagedPermissionResponseResult, ManagedPermissionResponseResultKind, ManagedProviderDecision,
+    ManagedProviderObservation, ManagedProviderObservationKind, ManagedProviderOutcome,
+    ManagedProviderOutcomeCommit, ManagedProviderTerminalOutcome, ManagedReconciliationState,
     ManagedRunIntent, ManagedRunIntentOutcome, ManagedRunStartFailure,
     ManagedSessionReconciliation, Store, StoreError,
 };
@@ -26,8 +28,9 @@ const MAX_MANAGED_ID_BYTES: usize = 1_024;
 const MAX_MANAGED_TITLE_BYTES: usize = 4 * 1_024;
 const MAX_MANAGED_GOAL_BYTES: usize = 64 * 1_024;
 const MAX_MANAGED_TIMESTAMP_BYTES: usize = 128;
-const MANUAL_MODE_VERSION: u64 = 1;
+const PERMISSION_MODE_VERSION: u64 = 1;
 const MANUAL_PROVIDER_CONFIGURATION: &str = "readOnly+on-request+user";
+const PROVIDER_AUTO_CONFIGURATION: &str = "readOnly+on-request+auto_review";
 #[cfg(test)]
 const MAX_MANAGED_OBSERVATIONS_PER_CALL: usize =
     flit_providers::MAX_CODEX_COMMAND_STARTS_PER_TURN + 1;
@@ -43,6 +46,10 @@ pub(crate) trait ManagedCodexRuntime: Send {
         &mut self,
         cwd: &Path,
     ) -> Result<CodexManualStartedThread, ProviderStartAttemptError>;
+    fn start_provider_auto(
+        &mut self,
+        cwd: &Path,
+    ) -> Result<CodexProviderAutoStartedThread, ProviderStartAttemptError>;
     fn start_turn(
         &mut self,
         thread_id: &CodexManagedThreadId,
@@ -87,6 +94,19 @@ impl ManagedCodexRuntime for CodexAppServer {
     ) -> Result<CodexManualStartedThread, ProviderStartAttemptError> {
         CodexAppServer::start_manual(self, cwd).map_err(|error| match error {
             CodexAppServerError::ManualPolicyUnavailable
+            | CodexAppServerError::Contract(CodexContractError::ServerError) => {
+                ProviderStartAttemptError::Rejected
+            }
+            _ => ProviderStartAttemptError::Unknown,
+        })
+    }
+
+    fn start_provider_auto(
+        &mut self,
+        cwd: &Path,
+    ) -> Result<CodexProviderAutoStartedThread, ProviderStartAttemptError> {
+        CodexAppServer::start_provider_auto(self, cwd).map_err(|error| match error {
+            CodexAppServerError::ProviderAutoUnavailable
             | CodexAppServerError::Contract(CodexContractError::ServerError) => {
                 ProviderStartAttemptError::Rejected
             }
@@ -397,10 +417,14 @@ pub(crate) fn start_managed_run(
     }
     validate_project_identity(&project)?;
 
+    let permission_mode_label = match request.permission_mode {
+        ManagedRunPermissionMode::Manual => "manual",
+        ManagedRunPermissionMode::ProviderAuto => "provider_auto",
+    };
     let start_request = json!({
         "goal_sha256": sha256_hex(request.goal.as_bytes()),
-        "permission_mode": "manual",
-        "permission_mode_version": MANUAL_MODE_VERSION,
+        "permission_mode": permission_mode_label,
+        "permission_mode_version": PERMISSION_MODE_VERSION,
         "provider": "codex",
         "protocol_version": PROTOCOL_VERSION,
     })
@@ -455,14 +479,19 @@ pub(crate) fn start_managed_run(
         )?;
         return Err(ManagedStartError::ProviderUnavailable);
     }
-    let capabilities = match managed_capabilities(&profile) {
+    let capabilities = match managed_capabilities(&profile, request.permission_mode) {
         Ok(capabilities) => capabilities,
         Err(error) => {
             drop(provider);
             fail_unstarted_run(
                 store,
                 &request,
-                "manual_capability_unavailable",
+                match request.permission_mode {
+                    ManagedRunPermissionMode::Manual => "manual_capability_unavailable",
+                    ManagedRunPermissionMode::ProviderAuto => {
+                        "provider_auto_capability_unavailable"
+                    }
+                },
                 &contract_version(&profile),
             )?;
             return Err(error);
@@ -479,13 +508,24 @@ pub(crate) fn start_managed_run(
         return Err(ManagedStartError::ProjectIdentityMismatch);
     }
 
-    let started = match provider.start_manual(&project.canonical_path) {
+    let started = match request.permission_mode {
+        ManagedRunPermissionMode::Manual => provider
+            .start_manual(&project.canonical_path)
+            .map(|started| (started.thread, started.provider_configuration)),
+        ManagedRunPermissionMode::ProviderAuto => provider
+            .start_provider_auto(&project.canonical_path)
+            .map(|started| (started.thread, started.provider_configuration)),
+    };
+    let (started_thread, provider_configuration) = match started {
         Ok(started) => started,
         Err(ProviderStartAttemptError::Rejected) => {
             fail_unstarted_run(
                 store,
                 &request,
-                "manual_provider_start_failed",
+                match request.permission_mode {
+                    ManagedRunPermissionMode::Manual => "manual_provider_start_failed",
+                    ManagedRunPermissionMode::ProviderAuto => "provider_auto_provider_start_failed",
+                },
                 &contract_version(&profile),
             )?;
             return Err(ManagedStartError::ProviderStartFailed);
@@ -494,9 +534,13 @@ pub(crate) fn start_managed_run(
             return Err(ManagedStartError::ProviderStartUnknown);
         }
     };
-    if started.provider_configuration != MANUAL_PROVIDER_CONFIGURATION {
+    let expected_configuration = match request.permission_mode {
+        ManagedRunPermissionMode::Manual => MANUAL_PROVIDER_CONFIGURATION,
+        ManagedRunPermissionMode::ProviderAuto => PROVIDER_AUTO_CONFIGURATION,
+    };
+    if provider_configuration != expected_configuration {
         if provider
-            .delete_started_thread(&started.thread.thread_id)
+            .delete_started_thread(&started_thread.thread_id)
             .is_err()
         {
             return Err(ManagedStartError::ProviderStartUnknown);
@@ -504,7 +548,10 @@ pub(crate) fn start_managed_run(
         fail_unstarted_run(
             store,
             &request,
-            "manual_policy_mismatch",
+            match request.permission_mode {
+                ManagedRunPermissionMode::Manual => "manual_configuration_mismatch",
+                ManagedRunPermissionMode::ProviderAuto => "provider_auto_configuration_mismatch",
+            },
             &contract_version(&profile),
         )?;
         return Err(ManagedStartError::ProviderStartFailed);
@@ -513,7 +560,7 @@ pub(crate) fn start_managed_run(
     let connection = InitialManagedSessionConnection {
         id: request.session_id.clone(),
         run_id: request.run_id.clone(),
-        external_session_key: started.thread.thread_id.as_str().to_owned(),
+        external_session_key: started_thread.thread_id.as_str().to_owned(),
         session_fingerprint: session_fingerprint(&profile),
         executable_path: Some(profile.canonical_executable.clone()),
         executable_version: Some(profile.executable_version.clone()),
@@ -529,7 +576,7 @@ pub(crate) fn start_managed_run(
             return Err(ManagedStartError::ProviderStartUnknown);
         }
         if provider
-            .delete_started_thread(&started.thread.thread_id)
+            .delete_started_thread(&started_thread.thread_id)
             .is_err()
         {
             return Err(ManagedStartError::ProviderStartUnknown);
@@ -543,10 +590,10 @@ pub(crate) fn start_managed_run(
         return Err(ManagedStartError::ProviderStartFailed);
     }
 
-    let turn = match provider.start_turn(&started.thread.thread_id, &request.goal) {
+    let turn = match provider.start_turn(&started_thread.thread_id, &request.goal) {
         Ok(turn) => turn,
         Err(()) => {
-            record_start_unknown(store, &request, &started.thread.thread_id, &profile)?;
+            record_start_unknown(store, &request, &started_thread.thread_id, &profile)?;
             return Err(ManagedStartError::ProviderStartUnknown);
         }
     };
@@ -554,11 +601,11 @@ pub(crate) fn start_managed_run(
         protocol_version: PROTOCOL_VERSION.to_owned(),
         run_id: request.run_id.clone(),
         session_id: request.session_id,
-        provider_thread_id: started.thread.thread_id.as_str().to_owned(),
+        provider_thread_id: started_thread.thread_id.as_str().to_owned(),
         provider_turn_id: turn.turn_id.as_str().to_owned(),
-        permission_mode: ManagedRunPermissionMode::Manual,
-        permission_mode_version: MANUAL_MODE_VERSION,
-        provider_configuration: started.provider_configuration.to_owned(),
+        permission_mode: request.permission_mode,
+        permission_mode_version: PERMISSION_MODE_VERSION,
+        provider_configuration: provider_configuration.to_owned(),
     };
     runtimes.insert(
         request.run_id,
@@ -730,9 +777,87 @@ pub(crate) fn commit_managed_observation(
         }
         CodexTurnObservation::ProviderAutoReviewStarted { .. }
         | CodexTurnObservation::ProviderAutoReviewCompleted { .. }
-        | CodexTurnObservation::FileChangeCompleted { .. }
-        | CodexTurnObservation::ProviderAutoOutcome { .. } => {
+        | CodexTurnObservation::FileChangeCompleted { .. } => {
             Err(ManagedStartError::ProviderObservationUnknown)
+        }
+        CodexTurnObservation::ProviderAutoOutcome {
+            thread_id,
+            turn_id,
+            review_id,
+            target_item_id,
+        } => {
+            validate_observation_identity(&retained.response, &thread_id, &turn_id)?;
+            if retained.response.permission_mode != ManagedRunPermissionMode::ProviderAuto
+                || retained.response.permission_mode_version != PERMISSION_MODE_VERSION
+                || retained.response.provider_configuration != PROVIDER_AUTO_CONFIGURATION
+            {
+                return Err(ManagedStartError::ProviderObservationUnknown);
+            }
+            let axes = [
+                request.run_id.as_str(),
+                thread_id.as_str(),
+                turn_id.as_str(),
+                target_item_id.as_str(),
+            ];
+            let request_id = observation_id("req_codex_provider_auto_", &axes);
+            let request_event_id = observation_id("evt_codex_provider_auto_request_", &axes);
+            let outcome_event_id = observation_id(
+                "evt_codex_provider_auto_resolved_",
+                &[
+                    request.run_id.as_str(),
+                    thread_id.as_str(),
+                    turn_id.as_str(),
+                    target_item_id.as_str(),
+                    review_id.as_str(),
+                ],
+            );
+            let committed = store
+                .commit_managed_provider_outcome(ManagedProviderOutcome {
+                    run_id: request.run_id.clone(),
+                    session_id: retained.response.session_id.clone(),
+                    external_session_key: thread_id.as_str().to_owned(),
+                    provider_turn_id: turn_id.as_str().to_owned(),
+                    provider_item_id: target_item_id.as_str().to_owned(),
+                    provider_decision_id: review_id.as_str().to_owned(),
+                    request_id: request_id.clone(),
+                    permission_mode_version: PERMISSION_MODE_VERSION,
+                    provider_configuration: PROVIDER_AUTO_CONFIGURATION.to_owned(),
+                    decision: ManagedProviderDecision::Allowed,
+                    terminal_outcome: ManagedProviderTerminalOutcome::RequestResolved,
+                    contract_version: "codex-app-server/0.145.0".to_owned(),
+                    observed_at: request.observed_at.clone(),
+                    request_event_id: request_event_id.clone(),
+                    outcome_event_id: outcome_event_id.clone(),
+                })
+                .map_err(map_provider_outcome_store_error)?;
+            let (request_event, outcome_event) = match committed {
+                ManagedProviderOutcomeCommit::Inserted {
+                    request_event,
+                    outcome_event,
+                }
+                | ManagedProviderOutcomeCommit::Duplicate {
+                    request_event,
+                    outcome_event,
+                } => (request_event, outcome_event),
+            };
+            Ok(ManagedObservationCommit::Complete(Box::new(
+                ManagedRunObserveResponse::ProviderOutcomeResolved {
+                    protocol_version: PROTOCOL_VERSION.to_owned(),
+                    run_id: request.run_id.clone(),
+                    session_id: retained.response.session_id.clone(),
+                    provider_thread_id: thread_id.as_str().to_owned(),
+                    provider_turn_id: turn_id.as_str().to_owned(),
+                    provider_item_id: target_item_id.as_str().to_owned(),
+                    provider_decision_id: review_id.as_str().to_owned(),
+                    request_id,
+                    request_version: request_event.ingest_seq,
+                    request_event_id,
+                    provider_decision: ManagedRunProviderDecision::Allowed,
+                    terminal_outcome: ManagedRunProviderTerminalOutcome::RequestResolved,
+                    event_id: outcome_event_id,
+                    event_version: outcome_event.ingest_seq,
+                },
+            )))
         }
         CodexTurnObservation::Terminal {
             thread_id,
@@ -805,8 +930,7 @@ pub(crate) fn commit_managed_observation(
 fn validate_request(request: &ManagedRunStartRequest) -> Result<(), ManagedStartError> {
     if request.client_protocol_version != PROTOCOL_VERSION
         || request.provider != flit_protocol::ProviderKind::Codex
-        || request.permission_mode != ManagedRunPermissionMode::Manual
-        || request.permission_mode_version != MANUAL_MODE_VERSION
+        || request.permission_mode_version != PERMISSION_MODE_VERSION
     {
         return Err(ManagedStartError::InvalidRequest);
     }
@@ -956,13 +1080,23 @@ fn session_fingerprint(profile: &ProviderFingerprint) -> String {
 
 fn managed_capabilities(
     profile: &ProviderFingerprint,
+    permission_mode: ManagedRunPermissionMode,
 ) -> Result<Map<String, Value>, ManagedStartError> {
     let snapshot = classify_codex(profile);
     if snapshot.compatibility != ProviderCompatibility::Supported
         || snapshot.status(ProviderCapability::Launch) != CapabilityStatus::Supported
         || snapshot.status(ProviderCapability::PermissionModeConfigure)
             != CapabilityStatus::Supported
-        || snapshot.status(ProviderCapability::PermissionRespond) != CapabilityStatus::Supported
+        || match permission_mode {
+            ManagedRunPermissionMode::Manual => {
+                snapshot.status(ProviderCapability::PermissionRespond)
+                    != CapabilityStatus::Supported
+            }
+            ManagedRunPermissionMode::ProviderAuto => {
+                snapshot.status(ProviderCapability::ProviderOutcomeObserve)
+                    != CapabilityStatus::Supported
+            }
+        }
     {
         return Err(ManagedStartError::ProviderUnavailable);
     }
@@ -1047,6 +1181,17 @@ fn map_observation_store_error(error: StoreError) -> ManagedStartError {
     }
 }
 
+fn map_provider_outcome_store_error(error: StoreError) -> ManagedStartError {
+    match error {
+        StoreError::InvalidManagedProviderOutcome { .. }
+        | StoreError::ManagedProviderOutcomeConflict { .. }
+        | StoreError::ManagedSessionIdentityConflict { .. }
+        | StoreError::ManagedSessionNotLive { .. }
+        | StoreError::EventIdentityConflict { .. } => ManagedStartError::ProviderObservationUnknown,
+        _ => ManagedStartError::StorageUnavailable,
+    }
+}
+
 pub(crate) fn map_permission_store_error(error: StoreError) -> ManagedStartError {
     match error {
         StoreError::InvalidManagedPermissionResponse { .. } => ManagedStartError::InvalidRequest,
@@ -1117,6 +1262,10 @@ mod tests {
         ConnectFailure,
         ManualFailure,
         ManualUnknown,
+        ProviderAutoFailure,
+        ProviderAutoUnknown,
+        ProviderAutoWrongConfiguration,
+        ProviderAutoOutcome,
         TurnFailure,
         CleanupFailure,
         CommandThenPermission,
@@ -1130,6 +1279,7 @@ mod tests {
     struct FakeCalls {
         connects: usize,
         manual_starts: usize,
+        provider_auto_starts: usize,
         turns: usize,
         deletes: usize,
         observations: usize,
@@ -1198,6 +1348,34 @@ mod tests {
             })
         }
 
+        fn start_provider_auto(
+            &mut self,
+            cwd: &Path,
+        ) -> Result<CodexProviderAutoStartedThread, ProviderStartAttemptError> {
+            self.calls.lock().expect("calls").provider_auto_starts += 1;
+            if matches!(self.behavior, FakeBehavior::ProviderAutoFailure) {
+                return Err(ProviderStartAttemptError::Rejected);
+            }
+            if matches!(self.behavior, FakeBehavior::ProviderAutoUnknown) {
+                return Err(ProviderStartAttemptError::Unknown);
+            }
+            Ok(CodexProviderAutoStartedThread {
+                thread: CodexStartedThread {
+                    thread_id: CodexManagedThreadId::new(self.thread_id.clone())
+                        .expect("thread ID"),
+                    canonical_cwd: cwd.to_owned(),
+                },
+                provider_configuration: if matches!(
+                    self.behavior,
+                    FakeBehavior::ProviderAutoWrongConfiguration
+                ) {
+                    MANUAL_PROVIDER_CONFIGURATION
+                } else {
+                    PROVIDER_AUTO_CONFIGURATION
+                },
+            })
+        }
+
         fn start_turn(
             &mut self,
             thread_id: &CodexManagedThreadId,
@@ -1243,6 +1421,16 @@ mod tests {
                     turn_id: CodexManagedTurnId::new("turn-1").expect("turn ID"),
                     outcome: CodexTurnTerminalOutcome::Completed,
                 }),
+                FakeBehavior::ProviderAutoOutcome => {
+                    Ok(CodexTurnObservation::ProviderAutoOutcome {
+                        thread_id: CodexManagedThreadId::new(self.thread_id.clone())
+                            .expect("thread ID"),
+                        turn_id: CodexManagedTurnId::new("turn-1").expect("turn ID"),
+                        review_id: CodexManagedItemId::new("review-1").expect("review ID"),
+                        target_item_id: CodexManagedItemId::new("permission-item")
+                            .expect("item ID"),
+                    })
+                }
                 FakeBehavior::WrongObservationIdentity => Ok(
                     CodexTurnObservation::PermissionRequested(CodexPermissionRequest {
                         provider_request_id: 0,
@@ -1267,6 +1455,9 @@ mod tests {
                 | FakeBehavior::ConnectFailure
                 | FakeBehavior::ManualFailure
                 | FakeBehavior::ManualUnknown
+                | FakeBehavior::ProviderAutoFailure
+                | FakeBehavior::ProviderAutoUnknown
+                | FakeBehavior::ProviderAutoWrongConfiguration
                 | FakeBehavior::TurnFailure
                 | FakeBehavior::CleanupFailure => Err(()),
             }
@@ -1337,7 +1528,7 @@ mod tests {
             goal: "Update the Project and verify the result.".to_owned(),
             provider: flit_protocol::ProviderKind::Codex,
             permission_mode: ManagedRunPermissionMode::Manual,
-            permission_mode_version: MANUAL_MODE_VERSION,
+            permission_mode_version: PERMISSION_MODE_VERSION,
             created_at: CREATED_AT.to_owned(),
             started_at: STARTED_AT.to_owned(),
             run_created_event_id: "event-run-created".to_owned(),
@@ -1458,6 +1649,146 @@ mod tests {
     }
 
     #[test]
+    fn exact_provider_auto_start_records_factual_outcome_without_response_attempt() {
+        let (_directory, mut store, _project) = store_and_project("provider-auto-success", true);
+        let (connector, calls) = connector(FakeBehavior::ProviderAutoOutcome, "thread-1");
+        let mut runtimes = BTreeMap::new();
+        let mut start_request = request();
+        start_request.permission_mode = ManagedRunPermissionMode::ProviderAuto;
+        let response =
+            start_managed_run(&mut store, &mut runtimes, &connector, None, start_request)
+                .expect("ProviderAuto managed start");
+        assert_eq!(
+            response.permission_mode,
+            ManagedRunPermissionMode::ProviderAuto
+        );
+        assert_eq!(response.provider_configuration, PROVIDER_AUTO_CONFIGURATION);
+        let session = store
+            .managed_session("session-1")
+            .expect("session read")
+            .expect("session");
+        assert_eq!(
+            session.capabilities["provider_outcome_observe"],
+            Value::String("supported".to_owned())
+        );
+
+        let observed =
+            observe_managed_run(&mut store, &mut runtimes, observe_request()).expect("outcome");
+        let ManagedRunObserveResponse::ProviderOutcomeResolved {
+            provider_thread_id,
+            provider_turn_id,
+            provider_item_id,
+            provider_decision_id,
+            request_id,
+            request_version,
+            request_event_id,
+            provider_decision,
+            terminal_outcome,
+            event_id,
+            event_version,
+            ..
+        } = observed
+        else {
+            panic!("expected provider outcome");
+        };
+        assert_eq!(provider_thread_id, "thread-1");
+        assert_eq!(provider_turn_id, "turn-1");
+        assert_eq!(provider_item_id, "permission-item");
+        assert_eq!(provider_decision_id, "review-1");
+        assert!(request_id.starts_with("req_codex_provider_auto_"));
+        assert_eq!(request_version, 4);
+        assert!(request_event_id.starts_with("evt_codex_provider_auto_request_"));
+        assert_eq!(provider_decision, ManagedRunProviderDecision::Allowed);
+        assert_eq!(
+            terminal_outcome,
+            ManagedRunProviderTerminalOutcome::RequestResolved
+        );
+        assert!(event_id.starts_with("evt_codex_provider_auto_resolved_"));
+        assert_eq!(event_version, 5);
+        let events = store
+            .run_events_through("run-1", 0, event_version, 10)
+            .expect("provider outcome events");
+        assert_eq!(
+            events
+                .events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "run.created",
+                "run.start_requested",
+                "session.connected",
+                "permission.requested",
+                "permission.provider_outcome_resolved",
+            ]
+        );
+        let rendered = serde_json::to_string(&events.events).expect("event JSON");
+        for forbidden in [
+            "permission.response_submitted",
+            "response_attempt_id",
+            "delivery_plan_fingerprint",
+            "risk_level",
+            "scope",
+        ] {
+            assert!(!rendered.contains(forbidden));
+        }
+        let calls = calls.lock().expect("calls");
+        assert_eq!(calls.manual_starts, 0);
+        assert_eq!(calls.provider_auto_starts, 1);
+        assert_eq!(calls.observations, 1);
+        assert_eq!(runtimes.len(), 1);
+        assert!(
+            runtimes
+                .get("run-1")
+                .expect("retained ProviderAuto runtime")
+                .active_permission()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn provider_auto_start_failure_or_configuration_mismatch_fails_closed() {
+        for (label, behavior, expected) in [
+            (
+                "provider-auto-rejected",
+                FakeBehavior::ProviderAutoFailure,
+                ManagedStartError::ProviderStartFailed,
+            ),
+            (
+                "provider-auto-unknown",
+                FakeBehavior::ProviderAutoUnknown,
+                ManagedStartError::ProviderStartUnknown,
+            ),
+            (
+                "provider-auto-mismatch",
+                FakeBehavior::ProviderAutoWrongConfiguration,
+                ManagedStartError::ProviderStartFailed,
+            ),
+        ] {
+            let (_directory, mut store, _project) = store_and_project(label, true);
+            let (connector, calls) = connector(behavior, "thread-1");
+            let mut runtimes = BTreeMap::new();
+            let mut start_request = request();
+            start_request.permission_mode = ManagedRunPermissionMode::ProviderAuto;
+            assert_eq!(
+                start_managed_run(&mut store, &mut runtimes, &connector, None, start_request,),
+                Err(expected)
+            );
+            let calls = calls.lock().expect("calls");
+            assert_eq!(calls.manual_starts, 0);
+            assert_eq!(calls.provider_auto_starts, 1);
+            assert_eq!(
+                calls.deletes,
+                usize::from(matches!(
+                    behavior,
+                    FakeBehavior::ProviderAutoWrongConfiguration
+                ))
+            );
+            assert_eq!(calls.turns, 0);
+        }
+    }
+
+    #[test]
     fn prevalidation_rejects_before_provider_side_effects() {
         let (_directory, mut store, project) = store_and_project("prevalidation", false);
         let (connector, calls) = connector(FakeBehavior::Success, "thread-1");
@@ -1484,6 +1815,7 @@ mod tests {
 
         let mut automatic = request();
         automatic.permission_mode = ManagedRunPermissionMode::ProviderAuto;
+        automatic.permission_mode_version = 2;
         assert_eq!(
             start_managed_run(&mut store, &mut runtimes, &connector, None, automatic,),
             Err(ManagedStartError::InvalidRequest)
@@ -1811,6 +2143,12 @@ mod tests {
             (
                 "observe-oversized-timestamp",
                 FakeBehavior::OversizedObservationTimestamp,
+                false,
+                Some(ManagedStartError::ProviderObservationUnknown),
+            ),
+            (
+                "observe-provider-auto-in-manual-mode",
+                FakeBehavior::ProviderAutoOutcome,
                 false,
                 Some(ManagedStartError::ProviderObservationUnknown),
             ),

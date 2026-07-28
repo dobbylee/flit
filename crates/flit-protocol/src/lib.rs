@@ -4,7 +4,7 @@ use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: &str = "1.6";
+pub const PROTOCOL_VERSION: &str = "1.7";
 pub const EVENT_PROTOCOL_VERSION: &str = "1.0";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -284,6 +284,22 @@ pub enum ManagedRunObserveResponse {
         request_version: u64,
         event_id: String,
     },
+    ProviderOutcomeResolved {
+        protocol_version: String,
+        run_id: String,
+        session_id: String,
+        provider_thread_id: String,
+        provider_turn_id: String,
+        provider_item_id: String,
+        provider_decision_id: String,
+        request_id: String,
+        request_version: u64,
+        request_event_id: String,
+        provider_decision: ManagedRunProviderDecision,
+        terminal_outcome: ManagedRunProviderTerminalOutcome,
+        event_id: String,
+        event_version: u64,
+    },
     TurnCompleted {
         protocol_version: String,
         run_id: String,
@@ -302,6 +318,19 @@ pub enum ManagedRunObserveResponse {
         event_id: String,
         event_version: u64,
     },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedRunProviderDecision {
+    Allowed,
+    Denied,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedRunProviderTerminalOutcome {
+    RequestResolved,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -899,8 +928,18 @@ struct FlitManagedRunObserveRequest: Codable, Equatable, Sendable {
 
 enum FlitManagedRunObservationStatus: String, Codable, Sendable {
     case permissionRequested = "permission_requested"
+    case providerOutcomeResolved = "provider_outcome_resolved"
     case turnCompleted = "turn_completed"
     case turnInterrupted = "turn_interrupted"
+}
+
+enum FlitManagedRunProviderDecision: String, Codable, Sendable {
+    case allowed
+    case denied
+}
+
+enum FlitManagedRunProviderTerminalOutcome: String, Codable, Sendable {
+    case requestResolved = "request_resolved"
 }
 
 enum FlitManagedRunObserveResponse: Codable, Equatable, Sendable {
@@ -915,6 +954,22 @@ enum FlitManagedRunObserveResponse: Codable, Equatable, Sendable {
         requestId: String,
         requestVersion: UInt64,
         eventId: String
+    )
+    case providerOutcomeResolved(
+        protocolVersion: String,
+        runId: String,
+        sessionId: String,
+        providerThreadId: String,
+        providerTurnId: String,
+        providerItemId: String,
+        providerDecisionId: String,
+        requestId: String,
+        requestVersion: UInt64,
+        requestEventId: String,
+        providerDecision: FlitManagedRunProviderDecision,
+        terminalOutcome: FlitManagedRunProviderTerminalOutcome,
+        eventId: String,
+        eventVersion: UInt64
     )
     case turnCompleted(
         protocolVersion: String,
@@ -939,6 +994,8 @@ enum FlitManagedRunObserveResponse: Codable, Equatable, Sendable {
         switch self {
         case .permissionRequested:
             .permissionRequested
+        case .providerOutcomeResolved:
+            .providerOutcomeResolved
         case .turnCompleted:
             .turnCompleted
         case .turnInterrupted:
@@ -955,8 +1012,12 @@ enum FlitManagedRunObserveResponse: Codable, Equatable, Sendable {
         case providerTurnId = "provider_turn_id"
         case providerItemId = "provider_item_id"
         case providerRequestId = "provider_request_id"
+        case providerDecisionId = "provider_decision_id"
         case requestId = "request_id"
         case requestVersion = "request_version"
+        case requestEventId = "request_event_id"
+        case providerDecision = "provider_decision"
+        case terminalOutcome = "terminal_outcome"
         case eventId = "event_id"
         case eventVersion = "event_version"
     }
@@ -972,11 +1033,17 @@ enum FlitManagedRunObserveResponse: Codable, Equatable, Sendable {
         let eventId = try values.decode(String.self, forKey: .eventId)
         switch status {
         case .permissionRequested:
-            guard !values.contains(.eventVersion) else {
+            for key in [
+                CodingKeys.providerDecisionId,
+                .requestEventId,
+                .providerDecision,
+                .terminalOutcome,
+                .eventVersion,
+            ] where values.contains(key) {
                 throw DecodingError.dataCorruptedError(
-                    forKey: .eventVersion,
+                    forKey: key,
                     in: values,
-                    debugDescription: "permission observation must not contain terminal fields"
+                    debugDescription: "permission observation must not contain outcome fields"
                 )
             }
             self = .permissionRequested(
@@ -991,12 +1058,46 @@ enum FlitManagedRunObserveResponse: Codable, Equatable, Sendable {
                 requestVersion: try values.decode(UInt64.self, forKey: .requestVersion),
                 eventId: eventId
             )
+        case .providerOutcomeResolved:
+            guard !values.contains(.providerRequestId) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .providerRequestId,
+                    in: values,
+                    debugDescription: "provider outcome must not contain a client request identity"
+                )
+            }
+            self = .providerOutcomeResolved(
+                protocolVersion: protocolVersion,
+                runId: runId,
+                sessionId: sessionId,
+                providerThreadId: providerThreadId,
+                providerTurnId: providerTurnId,
+                providerItemId: try values.decode(String.self, forKey: .providerItemId),
+                providerDecisionId: try values.decode(String.self, forKey: .providerDecisionId),
+                requestId: try values.decode(String.self, forKey: .requestId),
+                requestVersion: try values.decode(UInt64.self, forKey: .requestVersion),
+                requestEventId: try values.decode(String.self, forKey: .requestEventId),
+                providerDecision: try values.decode(
+                    FlitManagedRunProviderDecision.self,
+                    forKey: .providerDecision
+                ),
+                terminalOutcome: try values.decode(
+                    FlitManagedRunProviderTerminalOutcome.self,
+                    forKey: .terminalOutcome
+                ),
+                eventId: eventId,
+                eventVersion: try values.decode(UInt64.self, forKey: .eventVersion)
+            )
         case .turnCompleted, .turnInterrupted:
             for key in [
                 CodingKeys.providerItemId,
                 .providerRequestId,
+                .providerDecisionId,
                 .requestId,
                 .requestVersion,
+                .requestEventId,
+                .providerDecision,
+                .terminalOutcome,
             ] where values.contains(key) {
                 throw DecodingError.dataCorruptedError(
                     forKey: key,
@@ -1055,6 +1156,36 @@ enum FlitManagedRunObserveResponse: Codable, Equatable, Sendable {
             try values.encode(requestId, forKey: .requestId)
             try values.encode(requestVersion, forKey: .requestVersion)
             try values.encode(eventId, forKey: .eventId)
+        case let .providerOutcomeResolved(
+            protocolVersion,
+            runId,
+            sessionId,
+            providerThreadId,
+            providerTurnId,
+            providerItemId,
+            providerDecisionId,
+            requestId,
+            requestVersion,
+            requestEventId,
+            providerDecision,
+            terminalOutcome,
+            eventId,
+            eventVersion
+        ):
+            try values.encode(protocolVersion, forKey: .protocolVersion)
+            try values.encode(runId, forKey: .runId)
+            try values.encode(sessionId, forKey: .sessionId)
+            try values.encode(providerThreadId, forKey: .providerThreadId)
+            try values.encode(providerTurnId, forKey: .providerTurnId)
+            try values.encode(providerItemId, forKey: .providerItemId)
+            try values.encode(providerDecisionId, forKey: .providerDecisionId)
+            try values.encode(requestId, forKey: .requestId)
+            try values.encode(requestVersion, forKey: .requestVersion)
+            try values.encode(requestEventId, forKey: .requestEventId)
+            try values.encode(providerDecision, forKey: .providerDecision)
+            try values.encode(terminalOutcome, forKey: .terminalOutcome)
+            try values.encode(eventId, forKey: .eventId)
+            try values.encode(eventVersion, forKey: .eventVersion)
         case let .turnCompleted(
             protocolVersion,
             runId,

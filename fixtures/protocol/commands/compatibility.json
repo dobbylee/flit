@@ -1,10 +1,10 @@
 {
   "current": {
-    "version": "1.6",
-    "directory": "fixtures/protocol/commands/v1.6"
+    "version": "1.7",
+    "directory": "fixtures/protocol/commands/v1.7"
   },
   "previous_minor": {
-    "version": "1.5",
-    "directory": "fixtures/protocol/commands/v1.5"
+    "version": "1.6",
+    "directory": "fixtures/protocol/commands/v1.6"
   }
 }

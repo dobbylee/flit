@@ -257,7 +257,9 @@ fn codex_0_145_0_capabilities() -> Vec<CapabilityEntry> {
     for entry in &mut capabilities {
         if matches!(
             entry.capability,
-            ProviderCapability::PermissionRespond | ProviderCapability::PermissionModeConfigure
+            ProviderCapability::PermissionRespond
+                | ProviderCapability::PermissionModeConfigure
+                | ProviderCapability::ProviderOutcomeObserve
         ) {
             entry.status = CapabilityStatus::Supported;
         }

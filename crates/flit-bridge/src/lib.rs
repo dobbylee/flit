@@ -945,7 +945,7 @@ fn start_managed_run_in_core(
 }
 
 enum TakenManagedRuntime {
-    Cached(ManagedRunObserveResponse),
+    Cached(Box<ManagedRunObserveResponse>),
     Runtime(Box<managed_start::RetainedManagedRun>),
     Error(managed_start::ManagedStartError),
 }
@@ -1029,7 +1029,7 @@ where
         if let Some(permission) = runtime.cached_permission() {
             core.managed_runtimes
                 .insert(request.run_id.clone(), runtime);
-            return Ok(TakenManagedRuntime::Cached(permission));
+            return Ok(TakenManagedRuntime::Cached(Box::new(permission)));
         }
         core.managed_observations_in_flight
             .insert(request.run_id.clone());
@@ -1047,7 +1047,7 @@ where
     let mut runtime = match taken {
         TakenManagedRuntime::Cached(response) => {
             return bounded_json(
-                &response,
+                response.as_ref(),
                 MAX_PROJECT_RESPONSE_BYTES,
                 BridgeError::ManagedRunResponseTooLarge,
             );
@@ -1084,6 +1084,7 @@ where
                 let retain_runtime = matches!(
                     response.as_ref(),
                     ManagedRunObserveResponse::PermissionRequested { .. }
+                        | ManagedRunObserveResponse::ProviderOutcomeResolved { .. }
                 );
                 core_manager.with_ready_core(|core| {
                     core.managed_observations_in_flight.remove(&request.run_id);
@@ -1641,9 +1642,9 @@ mod tests {
     use flit_providers::{
         CodexManagedItemId, CodexManagedThreadId, CodexManagedTurnId, CodexManualStartedThread,
         CodexPermissionDecision, CodexPermissionDelivery, CodexPermissionRequest,
-        CodexRuntimeFingerprint, CodexStartedTurn, CodexTurnObservation, CodexTurnTerminalOutcome,
-        ProviderFingerprint, classify_codex, validated_codex_0_144_6_fingerprint,
-        validated_codex_0_145_0_fingerprint,
+        CodexProviderAutoStartedThread, CodexRuntimeFingerprint, CodexStartedTurn,
+        CodexTurnObservation, CodexTurnTerminalOutcome, ProviderFingerprint, classify_codex,
+        validated_codex_0_144_6_fingerprint, validated_codex_0_145_0_fingerprint,
     };
     use flit_store::{
         InitialManagedSessionConnection, ManagedRunIntent, ProjectRegistration,
@@ -1685,6 +1686,14 @@ mod tests {
             &mut self,
             _cwd: &Path,
         ) -> Result<CodexManualStartedThread, managed_start::ProviderStartAttemptError> {
+            panic!("detached test runtime must not start a thread")
+        }
+
+        fn start_provider_auto(
+            &mut self,
+            _cwd: &Path,
+        ) -> Result<CodexProviderAutoStartedThread, managed_start::ProviderStartAttemptError>
+        {
             panic!("detached test runtime must not start a thread")
         }
 
@@ -1824,6 +1833,15 @@ mod tests {
             thread_id: CodexManagedThreadId::new("thread-observe").expect("thread ID"),
             turn_id: CodexManagedTurnId::new("turn-observe").expect("turn ID"),
             outcome: CodexTurnTerminalOutcome::Completed,
+        }
+    }
+
+    fn provider_auto_observation() -> CodexTurnObservation {
+        CodexTurnObservation::ProviderAutoOutcome {
+            thread_id: CodexManagedThreadId::new("thread-observe").expect("thread ID"),
+            turn_id: CodexManagedTurnId::new("turn-observe").expect("turn ID"),
+            review_id: CodexManagedItemId::new("review-observe").expect("review ID"),
+            target_item_id: CodexManagedItemId::new("item-observe").expect("item ID"),
         }
     }
 
@@ -2061,7 +2079,7 @@ mod tests {
             }),
             Some(&ProviderCapabilityEntry {
                 capability: ProtocolProviderCapability::ProviderOutcomeObserve,
-                status: ProtocolCapabilityStatus::Unsupported,
+                status: ProtocolCapabilityStatus::Supported,
             })
         );
 
@@ -2240,6 +2258,75 @@ mod tests {
         );
         assert_runtime_state(&manager, true);
         assert_eq!(expected_start.run_id, "run-observe");
+    }
+
+    #[test]
+    fn detached_provider_outcome_returns_durable_fact_and_restores_runtime() {
+        let (_directory, manager, mut response) = observation_core("detached-provider-outcome");
+        response.permission_mode = ManagedRunPermissionMode::ProviderAuto;
+        response.provider_configuration = "readOnly+on-request+auto_review".to_owned();
+        manager
+            .with_ready_core(|core| {
+                core.managed_runtimes.insert(
+                    "run-observe".to_owned(),
+                    managed_start::RetainedManagedRun::for_test(
+                        response,
+                        Box::new(DetachedTestRuntime),
+                    ),
+                );
+                Ok(())
+            })
+            .expect("replace retained ProviderAuto runtime");
+
+        let response = managed_run_observe_with(
+            &manager,
+            observation_request_json(),
+            |_runtime| Ok(provider_auto_observation()),
+            managed_start::commit_managed_observation,
+        )
+        .expect("provider outcome response");
+        let observed: ManagedRunObserveResponse =
+            serde_json::from_str(&response).expect("provider outcome JSON");
+        assert!(matches!(
+            observed,
+            ManagedRunObserveResponse::ProviderOutcomeResolved {
+                request_version: 4,
+                event_version: 5,
+                provider_decision: flit_protocol::ManagedRunProviderDecision::Allowed,
+                terminal_outcome: flit_protocol::ManagedRunProviderTerminalOutcome::RequestResolved,
+                ..
+            }
+        ));
+        assert_runtime_state(&manager, true);
+        manager
+            .with_ready_core(|core| {
+                let events = core
+                    .store
+                    .run_events_through("run-observe", 0, 5, 10)
+                    .expect("provider outcome events");
+                assert_eq!(
+                    events
+                        .events
+                        .iter()
+                        .map(|event| event.event_type.as_str())
+                        .collect::<Vec<_>>(),
+                    [
+                        "run.created",
+                        "run.start_requested",
+                        "session.connected",
+                        "permission.requested",
+                        "permission.provider_outcome_resolved",
+                    ]
+                );
+                assert!(
+                    events
+                        .events
+                        .iter()
+                        .all(|event| { event.payload.get("response_attempt_id").is_none() })
+                );
+                Ok(())
+            })
+            .expect("inspect provider outcome Store");
     }
 
     #[test]
