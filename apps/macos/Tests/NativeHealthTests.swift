@@ -367,10 +367,20 @@ struct NativeHealthTests {
             FlitDashboardReadResponse.self,
             at: "\(fixtureRoot)/dashboard_read.resync.response.json"
         )
+        let unavailableChangesDashboardFixture = try decodeFixture(
+            FlitDashboardReadResponse.self,
+            at: "\(fixtureRoot)/dashboard_read.unavailable_changes.response.json"
+        )
         guard
             case let .snapshot(initialSnapshotFixture) = initialDashboardFixture,
             case let .delta(deltaFixture) = deltaDashboardFixture,
-            case let .snapshot(resyncFixture) = resyncDashboardFixture
+            case let .snapshot(resyncFixture) = resyncDashboardFixture,
+            case let .snapshot(unavailableSnapshotFixture) =
+                unavailableChangesDashboardFixture,
+            case let .available(files, insertions, deletions) =
+                initialSnapshotFixture.runs[0].changes,
+            case let .unavailable(unavailableReason) =
+                unavailableSnapshotFixture.runs[0].changes
         else {
             throw NativeHealthTestFailure.failed(
                 "generated Dashboard fixtures must preserve tagged delivery variants"
@@ -380,13 +390,49 @@ struct NativeHealthTests {
             initialSnapshotFixture.reason == .initial
                 && initialSnapshotFixture.runs.count == 1
                 && initialSnapshotFixture.runs[0].attentionOpenCount == 2
-                && initialSnapshotFixture.runs[0].changes.files == 3
-                && initialSnapshotFixture.runs[0].changes.insertions == 42
-                && initialSnapshotFixture.runs[0].changes.deletions == 7
+                && files == 3
+                && insertions == 42
+                && deletions == 7
+                && unavailableReason == "git_observation_not_configured"
                 && deltaFixture.events.count == 1
                 && resyncFixture.reason == .coreInstanceMismatch,
             "generated Dashboard fixtures must preserve snapshot, delta, and resync facts"
         )
+        let invalidChangeVariants: [(String, String, Any)] = [
+            (
+                "dashboard_read.initial.response.json",
+                "reason",
+                "not_unavailable"
+            ),
+            (
+                "dashboard_read.unavailable_changes.response.json",
+                "files",
+                0
+            ),
+        ]
+        for (name, forbiddenField, forbiddenValue) in invalidChangeVariants {
+            let data = try Data(
+                contentsOf: URL(fileURLWithPath: "\(fixtureRoot)/\(name)")
+            )
+            guard
+                var object = try JSONSerialization.jsonObject(with: data)
+                    as? [String: Any],
+                var runs = object["runs"] as? [[String: Any]],
+                var changes = runs[0]["changes"] as? [String: Any]
+            else {
+                throw NativeHealthTestFailure.failed(
+                    "Dashboard change fixture must contain one Run"
+                )
+            }
+            changes[forbiddenField] = forbiddenValue
+            runs[0]["changes"] = changes
+            object["runs"] = runs
+            try requireDecodingFailure(
+                FlitDashboardReadResponse.self,
+                from: try JSONSerialization.data(withJSONObject: object),
+                "Dashboard changes availability must reject \(forbiddenField)"
+            )
+        }
         for (name, requiredField) in [
             ("dashboard_read.initial.response.json", "runs"),
             ("dashboard_read.delta.response.json", "events"),

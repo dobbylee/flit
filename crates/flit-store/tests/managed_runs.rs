@@ -10,8 +10,9 @@ use flit_protocol::{
     EventProtocolVersion, EventSource, EventSourceKind, NullableSessionId, UnsequencedEventEnvelope,
 };
 use flit_store::{
-    AppendEventOutcome, InitialManagedSessionConnection, InitialManagedSessionOutcome,
-    MAX_LIVE_MANAGED_SESSIONS, ManagedPermissionDecision, ManagedPermissionDeliveryUnknownReason,
+    AppendEventOutcome, DashboardChangeSummary, InitialManagedSessionConnection,
+    InitialManagedSessionOutcome, MAX_DASHBOARD_PROJECTION_SOURCE_BYTES, MAX_LIVE_MANAGED_SESSIONS,
+    ManagedPermissionDecision, ManagedPermissionDeliveryUnknownReason,
     ManagedPermissionResolutionKind, ManagedPermissionResponseAttempt,
     ManagedPermissionResponseAttemptOutcome, ManagedPermissionResponseResult,
     ManagedPermissionResponseResultKind, ManagedProviderDecision, ManagedProviderObservation,
@@ -22,6 +23,7 @@ use flit_store::{
     ManagedSessionTerminationOutcome, ManagedTurnTerminalOutcome, ProjectRegistration,
     ProjectTrustConfirmation, Store, StoreError,
 };
+use rusqlite::Connection;
 use serde_json::{Map, Value, json};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -41,6 +43,277 @@ impl TestDirectory {
         fs::create_dir(&path).expect("test directory");
         Self(path)
     }
+}
+
+#[test]
+fn managed_events_atomically_advance_truthful_dashboard_projection_and_reopen() {
+    let directory = TestDirectory::new("dashboard-projection");
+    let (mut store, database, project_path) = trusted_store(&directory);
+    store
+        .create_managed_run_intent(run_intent(
+            "run-1",
+            "event-run-created",
+            "event-start-requested",
+        ))
+        .expect("managed Run");
+    let starting = store
+        .run_snapshot("run-1")
+        .expect("starting snapshot")
+        .expect("starting projection");
+    assert_eq!(starting.version, 2);
+    assert_eq!(starting.lifecycle, "Starting");
+    assert_eq!(starting.activity, "Unknown");
+    assert_eq!(starting.dashboard_bucket, "Working");
+    assert_eq!(
+        starting.snapshot["changes"],
+        json!({
+            "availability": "unavailable",
+            "reason": "git_observation_not_configured"
+        })
+    );
+
+    store
+        .connect_initial_managed_session(session_connection(
+            "session-1",
+            "run-1",
+            "thread-1",
+            &project_path,
+        ))
+        .expect("managed session");
+    let running = store
+        .run_snapshot("run-1")
+        .expect("running snapshot")
+        .expect("running projection");
+    assert_eq!(running.version, 3);
+    assert_eq!(running.lifecycle, "Running");
+
+    let request = match store
+        .append_managed_provider_observation(ManagedProviderObservation {
+            run_id: "run-1".to_owned(),
+            session_id: "session-1".to_owned(),
+            external_session_key: "thread-1".to_owned(),
+            provider_turn_id: "turn-1".to_owned(),
+            contract_version: "codex-app-server/0.145.0".to_owned(),
+            event_id: "event-permission-requested".to_owned(),
+            observed_at: "2026-07-24T10:00:02Z".to_owned(),
+            kind: ManagedProviderObservationKind::PermissionRequested {
+                request_id: "request-permission".to_owned(),
+                provider_request_id: 17,
+                provider_item_id: "permission-item".to_owned(),
+                provider_started_at_ms: 42,
+            },
+        })
+        .expect("permission request")
+    {
+        AppendEventOutcome::Inserted(event) => event,
+        other => panic!("unexpected permission request: {other:?}"),
+    };
+    let waiting = store
+        .run_snapshot("run-1")
+        .expect("waiting snapshot")
+        .expect("waiting projection");
+    assert_eq!(waiting.version, request.ingest_seq);
+    assert_eq!(waiting.activity, "Waiting");
+    assert_eq!(waiting.attention_level, "ActionRequired");
+    assert_eq!(waiting.dashboard_bucket, "NeedsAttention");
+    assert_eq!(waiting.snapshot["attention"]["open_count"], 1);
+
+    let attempt = permission_attempt(
+        &request,
+        "attempt-projection",
+        ManagedPermissionDecision::Deny,
+    );
+    store
+        .submit_managed_permission_response(attempt.clone())
+        .expect("submit response");
+    let result = permission_result(
+        &attempt,
+        "event-response-resolved-projection",
+        ManagedPermissionResponseResultKind::Resolved(ManagedPermissionResolutionKind::Declined),
+    );
+    let resolved = store
+        .finish_managed_permission_response(result)
+        .expect("finish response");
+    let resolved_event = match resolved {
+        AppendEventOutcome::Inserted(event) => event,
+        other => panic!("unexpected response result: {other:?}"),
+    };
+    let projection = store
+        .run_snapshot("run-1")
+        .expect("resolved snapshot")
+        .expect("resolved projection");
+    assert_eq!(projection.version, resolved_event.ingest_seq);
+    assert_eq!(projection.attention_level, "None");
+    assert_eq!(projection.dashboard_bucket, "Working");
+
+    let dashboard = store
+        .dashboard_run_snapshots_through(resolved_event.ingest_seq)
+        .expect("Dashboard projection");
+    assert_eq!(
+        dashboard[0].changes,
+        DashboardChangeSummary::Unavailable {
+            reason: "git_observation_not_configured".to_owned(),
+        }
+    );
+    drop(store);
+
+    let reopened = Store::open(&database, CREATED_AT).expect("reopen projection Store");
+    assert_eq!(
+        reopened
+            .run_snapshot("run-1")
+            .expect("reopened snapshot")
+            .expect("reopened projection"),
+        projection
+    );
+}
+
+#[test]
+fn startup_rebuilds_missing_projection_but_same_version_corruption_fails_closed() {
+    let directory = TestDirectory::new("dashboard-rebuild");
+    let (mut store, database, _project_path) = trusted_store(&directory);
+    store
+        .create_managed_run_intent(run_intent(
+            "run-rebuild",
+            "event-rebuild-created",
+            "event-rebuild-requested",
+        ))
+        .expect("managed Run");
+    let expected = store
+        .run_snapshot("run-rebuild")
+        .expect("projection read")
+        .expect("projection");
+    drop(store);
+
+    let connection = Connection::open(&database).expect("projection delete connection");
+    connection
+        .execute("DELETE FROM run_snapshots WHERE run_id = 'run-rebuild'", [])
+        .expect("delete derived projection");
+    drop(connection);
+    let rebuilt = Store::open(&database, CREATED_AT).expect("rebuild missing projection");
+    assert_eq!(
+        rebuilt
+            .run_snapshot("run-rebuild")
+            .expect("rebuilt read")
+            .expect("rebuilt projection"),
+        expected
+    );
+    drop(rebuilt);
+
+    let connection = Connection::open(&database).expect("projection corruption connection");
+    connection
+        .execute(
+            "UPDATE run_snapshots SET snapshot_json = '{}' WHERE run_id = 'run-rebuild'",
+            [],
+        )
+        .expect("corrupt same-version projection");
+    drop(connection);
+    assert!(matches!(
+        Store::open(&database, CREATED_AT),
+        Err(StoreError::StoredRunSnapshotInvalid { .. })
+    ));
+    let connection = Connection::open(&database).expect("inspect corrupt projection");
+    let stored: String = connection
+        .query_row(
+            "SELECT snapshot_json FROM run_snapshots WHERE run_id = 'run-rebuild'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("stored corrupt projection");
+    assert_eq!(stored, "{}");
+}
+
+#[test]
+fn startup_projection_source_bound_counts_utf8_bytes_before_hydration() {
+    let directory = TestDirectory::new("dashboard-projection-byte-bound");
+    let (mut store, database, _project_path) = trusted_store(&directory);
+    store
+        .create_managed_run_intent(run_intent(
+            "run-byte-bound",
+            "event-byte-bound-created",
+            "event-byte-bound-requested",
+        ))
+        .expect("managed Run");
+    drop(store);
+
+    let payload = serde_json::to_string(&json!({
+        "large": "é".repeat(MAX_DASHBOARD_PROJECTION_SOURCE_BYTES / 2 + 1)
+    }))
+    .expect("multibyte payload");
+    assert!(payload.chars().count() < MAX_DASHBOARD_PROJECTION_SOURCE_BYTES);
+    assert!(payload.len() > MAX_DASHBOARD_PROJECTION_SOURCE_BYTES);
+    let connection = Connection::open(&database).expect("projection byte-bound connection");
+    connection
+        .execute(
+            "UPDATE events SET payload_json = ?1 WHERE run_id = 'run-byte-bound' AND event_type = 'run.start_requested'",
+            [payload],
+        )
+        .expect("install multibyte projection payload");
+    drop(connection);
+
+    assert!(matches!(
+        Store::open(&database, CREATED_AT),
+        Err(StoreError::DashboardProjectionReadTooLarge {
+            run_id,
+            source_bytes,
+            ..
+        }) if run_id == "run-byte-bound"
+            && source_bytes > MAX_DASHBOARD_PROJECTION_SOURCE_BYTES as i64
+    ));
+}
+
+#[test]
+fn projection_failure_rolls_back_new_event_without_repairing_prior_history() {
+    let directory = TestDirectory::new("dashboard-projection-rollback");
+    let (mut store, database, project_path) = trusted_store(&directory);
+    store
+        .create_managed_run_intent(run_intent(
+            "run-projection-rollback",
+            "event-projection-rollback-created",
+            "event-projection-rollback-requested",
+        ))
+        .expect("managed Run");
+    store
+        .connect_initial_managed_session(session_connection(
+            "session-projection-rollback",
+            "run-projection-rollback",
+            "thread-projection-rollback",
+            &project_path,
+        ))
+        .expect("managed session");
+    let cursor = store.latest_ingest_seq().expect("projection cursor");
+
+    let connection = Connection::open(&database).expect("history corruption connection");
+    connection
+        .execute(
+            "UPDATE events SET session_id = NULL WHERE run_id = 'run-projection-rollback' AND event_type = 'session.connected'",
+            [],
+        )
+        .expect("corrupt connected identity");
+    drop(connection);
+
+    assert!(matches!(
+        store.append_event(session_event(
+            "event-projection-rollback-command",
+            "run-projection-rollback",
+            "session-projection-rollback",
+            2,
+            "command.started",
+        )),
+        Err(StoreError::DashboardProjection { .. })
+    ));
+    assert_eq!(
+        store.latest_ingest_seq().expect("rolled back cursor"),
+        cursor
+    );
+    let connection = Connection::open(&database).expect("inspect rolled-back event");
+    let appended: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE event_id = 'event-projection-rollback-command'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("rolled-back event count");
+    assert_eq!(appended, 0);
 }
 
 #[test]

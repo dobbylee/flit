@@ -4,7 +4,7 @@ use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: &str = "1.8";
+pub const PROTOCOL_VERSION: &str = "1.9";
 pub const EVENT_PROTOCOL_VERSION: &str = "1.0";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -172,10 +172,16 @@ pub struct DashboardRunRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct DashboardChangeSummary {
-    pub files: u64,
-    pub insertions: u64,
-    pub deletions: u64,
+#[serde(tag = "availability", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DashboardChangeSummary {
+    Available {
+        files: u64,
+        insertions: u64,
+        deletions: u64,
+    },
+    Unavailable {
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -880,10 +886,79 @@ struct FlitDashboardRunRecord: Codable, Equatable, Sendable {
     }
 }
 
-struct FlitDashboardChangeSummary: Codable, Equatable, Sendable {
-    let files: UInt64
-    let insertions: UInt64
-    let deletions: UInt64
+enum FlitDashboardChangeAvailability: String, Codable, Sendable {
+    case available
+    case unavailable
+}
+
+enum FlitDashboardChangeSummary: Codable, Equatable, Sendable {
+    case available(files: UInt64, insertions: UInt64, deletions: UInt64)
+    case unavailable(reason: String)
+
+    private enum CodingKeys: String, CodingKey {
+        case availability
+        case files
+        case insertions
+        case deletions
+        case reason
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(
+            FlitDashboardChangeAvailability.self,
+            forKey: .availability
+        ) {
+        case .available:
+            guard !container.contains(.reason) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .reason,
+                    in: container,
+                    debugDescription: "Available changes cannot include an unavailable reason"
+                )
+            }
+            self = .available(
+                files: try container.decode(UInt64.self, forKey: .files),
+                insertions: try container.decode(UInt64.self, forKey: .insertions),
+                deletions: try container.decode(UInt64.self, forKey: .deletions)
+            )
+        case .unavailable:
+            guard
+                !container.contains(.files),
+                !container.contains(.insertions),
+                !container.contains(.deletions)
+            else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .availability,
+                    in: container,
+                    debugDescription: "Unavailable changes cannot include numeric counts"
+                )
+            }
+            self = .unavailable(
+                reason: try container.decode(String.self, forKey: .reason)
+            )
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case let .available(files, insertions, deletions):
+            try container.encode(
+                FlitDashboardChangeAvailability.available,
+                forKey: .availability
+            )
+            try container.encode(files, forKey: .files)
+            try container.encode(insertions, forKey: .insertions)
+            try container.encode(deletions, forKey: .deletions)
+        case let .unavailable(reason):
+            try container.encode(
+                FlitDashboardChangeAvailability.unavailable,
+                forKey: .availability
+            )
+            try container.encode(reason, forKey: .reason)
+        }
+    }
 }
 
 struct FlitDashboardEventRecord: Codable, Equatable, Sendable {

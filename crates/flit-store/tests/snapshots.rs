@@ -336,7 +336,12 @@ fn dashboard_snapshot_and_global_delta_share_one_fixed_cursor_order() {
         .insert("open_count".to_owned(), json!(2));
     run_a_snapshot.snapshot.insert(
         "changes".to_owned(),
-        json!({"files": 3, "insertions": 42, "deletions": 7}),
+        json!({
+            "availability": "available",
+            "files": 3,
+            "insertions": 42,
+            "deletions": 7
+        }),
     );
     store
         .write_run_snapshot(run_a_snapshot)
@@ -366,9 +371,14 @@ fn dashboard_snapshot_and_global_delta_share_one_fixed_cursor_order() {
         [RUN_A, RUN_B]
     );
     assert_eq!(current[0].attention_open_count, 2);
-    assert_eq!(current[0].change_files, 3);
-    assert_eq!(current[0].change_insertions, 42);
-    assert_eq!(current[0].change_deletions, 7);
+    assert_eq!(
+        current[0].changes,
+        flit_store::DashboardChangeSummary::Available {
+            files: 3,
+            insertions: 42,
+            deletions: 7,
+        }
+    );
 
     let first_page = store
         .dashboard_event_locators_through(0, third, 2)
@@ -587,6 +597,7 @@ fn snapshot(
         "last_progress_at": last_progress_at,
         "last_liveness_at": last_liveness_at,
         "changes": {
+            "availability": "available",
             "files": 0,
             "insertions": 0,
             "deletions": 0

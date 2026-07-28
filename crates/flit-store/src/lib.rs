@@ -6,6 +6,10 @@ use std::{
     time::Duration,
 };
 
+use flit_core::projection::{
+    ChangeSummary as CoreChangeSummary, ProjectionError, ProjectionEvent,
+    replay_dashboard_projection,
+};
 use flit_protocol::{
     EventEnvelope, EventProtocolVersion, EventSource, EventSourceKind, MAX_JSON_SAFE_INTEGER,
     NullableSessionId, UnsequencedEventEnvelope,
@@ -59,6 +63,8 @@ pub const MAX_DASHBOARD_DELTA_EVENTS: usize = 50;
 pub const MAX_DASHBOARD_DELTA_SOURCE_BYTES: usize = 1_048_576;
 pub const MAX_DASHBOARD_SNAPSHOT_RUNS: usize = 1_000;
 pub const MAX_DASHBOARD_SNAPSHOT_SOURCE_BYTES: usize = 1_048_576;
+pub const MAX_DASHBOARD_PROJECTION_EVENTS: usize = 100_000;
+pub const MAX_DASHBOARD_PROJECTION_SOURCE_BYTES: usize = 8 * 1_048_576;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectionPolicy {
@@ -126,10 +132,20 @@ pub struct DashboardRunSnapshot {
     pub started_at: Option<String>,
     pub ended_at: Option<String>,
     pub attention_open_count: u64,
-    pub change_files: u64,
-    pub change_insertions: u64,
-    pub change_deletions: u64,
+    pub changes: DashboardChangeSummary,
     pub projection: RunSnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DashboardChangeSummary {
+    Available {
+        files: u64,
+        insertions: u64,
+        deletions: u64,
+    },
+    Unavailable {
+        reason: String,
+    },
 }
 
 impl From<RunSnapshotDraft> for RunSnapshot {
@@ -338,6 +354,7 @@ impl Store {
         validate_schema(&connection)?;
         validate_integrity(&connection)?;
         validate_connection_policy(&connection)?;
+        rebuild_managed_dashboard_projections(&mut connection)?;
         Ok(Self { connection })
     }
 
@@ -1714,82 +1731,13 @@ impl Store {
         &mut self,
         draft: RunSnapshotDraft,
     ) -> Result<WriteRunSnapshotOutcome, StoreError> {
-        validate_snapshot(&draft)?;
-        let snapshot_json = serde_json::to_string(&draft.snapshot).map_err(StoreError::Json)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(StoreError::Sqlite)?;
-        validate_snapshot_version(&transaction, &draft.run_id, draft.version)?;
-
-        let existing = load_run_snapshot(&transaction, &draft.run_id)?;
-        if let Some(existing) = existing {
-            if draft.version < existing.version {
-                return Err(StoreError::StaleRunSnapshot {
-                    run_id: draft.run_id,
-                    stored_version: existing.version,
-                    received_version: draft.version,
-                });
-            }
-            if draft.version == existing.version {
-                if RunSnapshotDraft::from(existing.clone()) == draft {
-                    return Ok(WriteRunSnapshotOutcome::Duplicate(existing));
-                }
-                return Err(StoreError::RunSnapshotConflict {
-                    run_id: draft.run_id,
-                    version: draft.version,
-                });
-            }
-            let changed = transaction
-                .execute(
-                    "UPDATE run_snapshots SET version = ?2, lifecycle = ?3, activity = ?4, activity_confidence = ?5, attention_level = ?6, dashboard_bucket = ?7, last_progress_at = ?8, last_liveness_at = ?9, snapshot_json = ?10, updated_at = ?11 WHERE run_id = ?1 AND version = ?12",
-                    params![
-                        draft.run_id,
-                        draft.version as i64,
-                        draft.lifecycle,
-                        draft.activity,
-                        draft.activity_confidence,
-                        draft.attention_level,
-                        draft.dashboard_bucket,
-                        draft.last_progress_at,
-                        draft.last_liveness_at,
-                        snapshot_json,
-                        draft.updated_at,
-                        existing.version as i64,
-                    ],
-                )
-                .map_err(StoreError::Sqlite)?;
-            if changed != 1 {
-                return Err(StoreError::RunSnapshotConcurrentChange {
-                    run_id: draft.run_id,
-                });
-            }
-            let snapshot = RunSnapshot::from(draft);
-            transaction.commit().map_err(StoreError::Sqlite)?;
-            return Ok(WriteRunSnapshotOutcome::Replaced(snapshot));
-        }
-
-        transaction
-            .execute(
-                "INSERT INTO run_snapshots(run_id, version, lifecycle, activity, activity_confidence, attention_level, dashboard_bucket, last_progress_at, last_liveness_at, snapshot_json, updated_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![
-                    draft.run_id,
-                    draft.version as i64,
-                    draft.lifecycle,
-                    draft.activity,
-                    draft.activity_confidence,
-                    draft.attention_level,
-                    draft.dashboard_bucket,
-                    draft.last_progress_at,
-                    draft.last_liveness_at,
-                    snapshot_json,
-                    draft.updated_at,
-                ],
-            )
-            .map_err(StoreError::Sqlite)?;
-        let snapshot = RunSnapshot::from(draft);
+        let outcome = write_run_snapshot_on(&transaction, draft)?;
         transaction.commit().map_err(StoreError::Sqlite)?;
-        Ok(WriteRunSnapshotOutcome::Inserted(snapshot))
+        Ok(outcome)
     }
 
     pub fn run_snapshot(&self, run_id: &str) -> Result<Option<RunSnapshot>, StoreError> {
@@ -1910,13 +1858,41 @@ impl Store {
                             run_id: projection.run_id.clone(),
                             field: "changes",
                         })?;
-                    let count = |key: &str, field: &'static str| {
-                        changes.get(key).and_then(Value::as_u64).ok_or_else(|| {
-                            StoreError::StoredRunSnapshotInvalid {
-                                run_id: projection.run_id.clone(),
-                                field,
+                    let changes = match changes.get("availability").and_then(Value::as_str) {
+                        Some("available") => {
+                            let count = |key: &str, field: &'static str| {
+                                changes.get(key).and_then(Value::as_u64).ok_or_else(|| {
+                                    StoreError::StoredRunSnapshotInvalid {
+                                        run_id: projection.run_id.clone(),
+                                        field,
+                                    }
+                                })
+                            };
+                            DashboardChangeSummary::Available {
+                                files: count("files", "changes.files")?,
+                                insertions: count("insertions", "changes.insertions")?,
+                                deletions: count("deletions", "changes.deletions")?,
                             }
-                        })
+                        }
+                        Some("unavailable") => {
+                            let reason = changes
+                                .get("reason")
+                                .and_then(Value::as_str)
+                                .filter(|reason| !reason.trim().is_empty())
+                                .ok_or_else(|| StoreError::StoredRunSnapshotInvalid {
+                                    run_id: projection.run_id.clone(),
+                                    field: "changes.reason",
+                                })?;
+                            DashboardChangeSummary::Unavailable {
+                                reason: reason.to_owned(),
+                            }
+                        }
+                        _ => {
+                            return Err(StoreError::StoredRunSnapshotInvalid {
+                                run_id: projection.run_id.clone(),
+                                field: "changes.availability",
+                            });
+                        }
                     };
                     Ok(DashboardRunSnapshot {
                         project_id,
@@ -1926,9 +1902,7 @@ impl Store {
                         started_at,
                         ended_at,
                         attention_open_count,
-                        change_files: count("files", "changes.files")?,
-                        change_insertions: count("insertions", "changes.insertions")?,
-                        change_deletions: count("deletions", "changes.deletions")?,
+                        changes,
                         projection,
                     })
                 },
@@ -3223,7 +3197,269 @@ fn append_event_batch_in_transaction(
             event.with_ingest_seq(ingest_seq),
         ));
     }
+    let run_ids = outcomes
+        .iter()
+        .map(|outcome| match outcome {
+            AppendEventOutcome::Inserted(event) | AppendEventOutcome::Duplicate(event) => {
+                event.run_id.as_str()
+            }
+        })
+        .collect::<BTreeSet<_>>();
+    for run_id in run_ids {
+        refresh_managed_dashboard_projection(transaction, run_id)?;
+    }
     Ok(outcomes)
+}
+
+fn rebuild_managed_dashboard_projections(connection: &mut Connection) -> Result<(), StoreError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(StoreError::Sqlite)?;
+    let run_ids = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT DISTINCT run_id
+                 FROM events
+                 WHERE event_type = 'run.created'
+                 ORDER BY run_id",
+            )
+            .map_err(StoreError::Sqlite)?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(StoreError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::Sqlite)?
+    };
+    for run_id in run_ids {
+        refresh_managed_dashboard_projection(&transaction, &run_id)?;
+    }
+    transaction.commit().map_err(StoreError::Sqlite)
+}
+
+fn refresh_managed_dashboard_projection(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<Option<WriteRunSnapshotOutcome>, StoreError> {
+    let events = load_run_event_history(connection, run_id)?;
+    let Some(first) = events.first() else {
+        return Ok(None);
+    };
+    if first.event_type != "run.created" {
+        return Ok(None);
+    }
+    let projection =
+        replay_dashboard_projection(&events).map_err(|source| StoreError::DashboardProjection {
+            run_id: run_id.to_owned(),
+            source,
+        })?;
+    let changes = match projection.changes {
+        CoreChangeSummary::Available {
+            files,
+            insertions,
+            deletions,
+        } => json!({
+            "availability": "available",
+            "files": files,
+            "insertions": insertions,
+            "deletions": deletions,
+        }),
+        CoreChangeSummary::Unavailable { reason } => json!({
+            "availability": "unavailable",
+            "reason": reason,
+        }),
+    };
+    let snapshot = json!({
+        "run_id": projection.run_id,
+        "version": projection.version,
+        "lifecycle": projection.lifecycle,
+        "activity": {
+            "kind": projection.activity,
+            "confidence": projection.activity_confidence,
+        },
+        "attention": {
+            "level": projection.attention_level,
+            "open_count": projection.attention_open_count,
+        },
+        "dashboard_bucket": projection.dashboard_bucket,
+        "last_progress_at": projection.last_progress_at,
+        "last_liveness_at": projection.last_liveness_at,
+        "changes": changes,
+    })
+    .as_object()
+    .expect("Dashboard projection is an object")
+    .clone();
+    let draft = RunSnapshotDraft {
+        run_id: projection.run_id,
+        version: projection.version,
+        lifecycle: projection.lifecycle,
+        activity: projection.activity,
+        activity_confidence: projection.activity_confidence,
+        attention_level: projection.attention_level,
+        dashboard_bucket: projection.dashboard_bucket,
+        last_progress_at: projection.last_progress_at,
+        last_liveness_at: projection.last_liveness_at,
+        snapshot,
+        updated_at: projection.updated_at,
+    };
+    write_run_snapshot_on(connection, draft).map(Some)
+}
+
+fn load_run_event_history(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<Vec<ProjectionEvent>, StoreError> {
+    let (count, source_bytes) = connection
+        .query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(
+                        LENGTH(CAST(event_id AS BLOB)) +
+                        LENGTH(CAST(run_id AS BLOB)) +
+                        COALESCE(LENGTH(CAST(session_id AS BLOB)), 0) +
+                        LENGTH(CAST(observed_at AS BLOB)) +
+                        LENGTH(CAST(event_type AS BLOB)) +
+                        LENGTH(CAST(payload_json AS BLOB))
+                    ), 0)
+             FROM events
+             WHERE run_id = ?1",
+            [run_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(StoreError::Sqlite)?;
+    validate_dashboard_projection_source(run_id, count, source_bytes)?;
+
+    let mut statement = connection
+        .prepare(
+            "SELECT ingest_seq, event_id, session_id, observed_at, event_type, payload_json
+             FROM events INDEXED BY events_by_run_seq
+             WHERE run_id = ?1
+             ORDER BY ingest_seq",
+        )
+        .map_err(StoreError::Sqlite)?;
+    let stored = statement
+        .query_map([run_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .map_err(StoreError::Sqlite)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::Sqlite)?;
+    stored
+        .into_iter()
+        .map(
+            |(ingest_seq, event_id, session_id, observed_at, event_type, payload_json)| {
+                let ingest_seq = assigned_sequence(ingest_seq)?;
+                Ok(ProjectionEvent {
+                    event_id,
+                    run_id: run_id.to_owned(),
+                    session_id,
+                    ingest_seq,
+                    observed_at,
+                    event_type,
+                    payload: stored_json(ingest_seq, "payload_json", &payload_json)?,
+                })
+            },
+        )
+        .collect()
+}
+
+fn validate_dashboard_projection_source(
+    run_id: &str,
+    count: i64,
+    source_bytes: i64,
+) -> Result<(), StoreError> {
+    if count < 0
+        || source_bytes < 0
+        || usize::try_from(count).map_or(true, |count| count > MAX_DASHBOARD_PROJECTION_EVENTS)
+        || usize::try_from(source_bytes)
+            .map_or(true, |bytes| bytes > MAX_DASHBOARD_PROJECTION_SOURCE_BYTES)
+    {
+        return Err(StoreError::DashboardProjectionReadTooLarge {
+            run_id: run_id.to_owned(),
+            count,
+            source_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn write_run_snapshot_on(
+    connection: &Connection,
+    draft: RunSnapshotDraft,
+) -> Result<WriteRunSnapshotOutcome, StoreError> {
+    validate_snapshot(&draft)?;
+    let snapshot_json = serde_json::to_string(&draft.snapshot).map_err(StoreError::Json)?;
+    validate_snapshot_version(connection, &draft.run_id, draft.version)?;
+
+    let existing = load_run_snapshot(connection, &draft.run_id)?;
+    if let Some(existing) = existing {
+        if draft.version < existing.version {
+            return Err(StoreError::StaleRunSnapshot {
+                run_id: draft.run_id,
+                stored_version: existing.version,
+                received_version: draft.version,
+            });
+        }
+        if draft.version == existing.version {
+            if RunSnapshotDraft::from(existing.clone()) == draft {
+                return Ok(WriteRunSnapshotOutcome::Duplicate(existing));
+            }
+            return Err(StoreError::RunSnapshotConflict {
+                run_id: draft.run_id,
+                version: draft.version,
+            });
+        }
+        let changed = connection
+            .execute(
+                "UPDATE run_snapshots SET version = ?2, lifecycle = ?3, activity = ?4, activity_confidence = ?5, attention_level = ?6, dashboard_bucket = ?7, last_progress_at = ?8, last_liveness_at = ?9, snapshot_json = ?10, updated_at = ?11 WHERE run_id = ?1 AND version = ?12",
+                params![
+                    draft.run_id,
+                    draft.version as i64,
+                    draft.lifecycle,
+                    draft.activity,
+                    draft.activity_confidence,
+                    draft.attention_level,
+                    draft.dashboard_bucket,
+                    draft.last_progress_at,
+                    draft.last_liveness_at,
+                    snapshot_json,
+                    draft.updated_at,
+                    existing.version as i64,
+                ],
+            )
+            .map_err(StoreError::Sqlite)?;
+        if changed != 1 {
+            return Err(StoreError::RunSnapshotConcurrentChange {
+                run_id: draft.run_id,
+            });
+        }
+        return Ok(WriteRunSnapshotOutcome::Replaced(RunSnapshot::from(draft)));
+    }
+
+    connection
+        .execute(
+            "INSERT INTO run_snapshots(run_id, version, lifecycle, activity, activity_confidence, attention_level, dashboard_bucket, last_progress_at, last_liveness_at, snapshot_json, updated_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                draft.run_id,
+                draft.version as i64,
+                draft.lifecycle,
+                draft.activity,
+                draft.activity_confidence,
+                draft.attention_level,
+                draft.dashboard_bucket,
+                draft.last_progress_at,
+                draft.last_liveness_at,
+                snapshot_json,
+                draft.updated_at,
+            ],
+        )
+        .map_err(StoreError::Sqlite)?;
+    Ok(WriteRunSnapshotOutcome::Inserted(RunSnapshot::from(draft)))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -3284,14 +3520,34 @@ fn validate_snapshot_json(snapshot: &RunSnapshotDraft) -> Result<(), StoreError>
         .get("changes")
         .and_then(Value::as_object)
         .ok_or(StoreError::InvalidRunSnapshot { field: "changes" })?;
-    for field in ["files", "insertions", "deletions"] {
-        if changes
-            .get(field)
-            .and_then(Value::as_u64)
-            .is_none_or(|count| count > MAX_JSON_SAFE_INTEGER)
-        {
-            return Err(StoreError::InvalidRunSnapshot { field: "changes" });
+    match changes.get("availability").and_then(Value::as_str) {
+        Some("available") => {
+            for field in ["files", "insertions", "deletions"] {
+                if changes
+                    .get(field)
+                    .and_then(Value::as_u64)
+                    .is_none_or(|count| count > MAX_JSON_SAFE_INTEGER)
+                {
+                    return Err(StoreError::InvalidRunSnapshot { field: "changes" });
+                }
+            }
+            if changes.contains_key("reason") {
+                return Err(StoreError::InvalidRunSnapshot { field: "changes" });
+            }
         }
+        Some("unavailable") => {
+            if changes
+                .get("reason")
+                .and_then(Value::as_str)
+                .is_none_or(|reason| reason.trim().is_empty())
+                || ["files", "insertions", "deletions"]
+                    .iter()
+                    .any(|field| changes.contains_key(*field))
+            {
+                return Err(StoreError::InvalidRunSnapshot { field: "changes" });
+            }
+        }
+        _ => return Err(StoreError::InvalidRunSnapshot { field: "changes" }),
     }
     string_matches("dashboard_bucket", &snapshot.dashboard_bucket)?;
     validate_optional_snapshot_field(
@@ -4277,6 +4533,15 @@ pub enum StoreError {
         run_id: String,
         source: serde_json::Error,
     },
+    DashboardProjection {
+        run_id: String,
+        source: ProjectionError,
+    },
+    DashboardProjectionReadTooLarge {
+        run_id: String,
+        count: i64,
+        source_bytes: i64,
+    },
     InvalidRunEventRange {
         cursor: u64,
         upper_bound: u64,
@@ -4620,6 +4885,20 @@ impl fmt::Display for StoreError {
                     "stored Run snapshot {run_id} has invalid JSON: {source}"
                 )
             }
+            Self::DashboardProjection { run_id, source } => {
+                write!(
+                    formatter,
+                    "Dashboard projection failed for Run {run_id}: {source}"
+                )
+            }
+            Self::DashboardProjectionReadTooLarge {
+                run_id,
+                count,
+                source_bytes,
+            } => write!(
+                formatter,
+                "Dashboard projection source for Run {run_id} exceeds the fixed bound: {count} events, {source_bytes} bytes"
+            ),
             Self::InvalidRunEventRange {
                 cursor,
                 upper_bound,
@@ -4782,6 +5061,7 @@ impl Error for StoreError {
             Self::Sqlite(error) => Some(error),
             Self::StoredJson { source, .. } => Some(source),
             Self::StoredRunSnapshotJson { source, .. } => Some(source),
+            Self::DashboardProjection { source, .. } => Some(source),
             Self::StoredManagedRunJson { source, .. } => Some(source),
             Self::StoredManagedSessionJson { source, .. } => Some(source),
             Self::Json(error) => Some(error),
@@ -4831,6 +5111,36 @@ mod tests {
                     self.path.display()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn dashboard_projection_source_bounds_fail_closed() {
+        assert!(validate_dashboard_projection_source("run-1", 0, 0).is_ok());
+        assert!(
+            validate_dashboard_projection_source(
+                "run-1",
+                MAX_DASHBOARD_PROJECTION_EVENTS as i64,
+                MAX_DASHBOARD_PROJECTION_SOURCE_BYTES as i64,
+            )
+            .is_ok()
+        );
+        for (count, source_bytes) in [
+            (-1, 0),
+            (0, -1),
+            (MAX_DASHBOARD_PROJECTION_EVENTS as i64 + 1, 0),
+            (0, MAX_DASHBOARD_PROJECTION_SOURCE_BYTES as i64 + 1),
+        ] {
+            assert!(matches!(
+                validate_dashboard_projection_source("run-1", count, source_bytes),
+                Err(StoreError::DashboardProjectionReadTooLarge {
+                    run_id,
+                    count: rejected_count,
+                    source_bytes: rejected_bytes,
+                }) if run_id == "run-1"
+                    && rejected_count == count
+                    && rejected_bytes == source_bytes
+            ));
         }
     }
 

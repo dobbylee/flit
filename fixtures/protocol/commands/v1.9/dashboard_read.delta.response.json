@@ -1,0 +1,19 @@
+{
+  "delivery": "delta",
+  "protocol_version": "1.9",
+  "event_schema_version": "1.0",
+  "core_instance_id": "core-instance-1",
+  "requested_after_cursor": 3,
+  "retained_after_cursor": 0,
+  "next_cursor": 4,
+  "has_more": false,
+  "events": [
+    {
+      "cursor": 4,
+      "event_id": "event-dashboard-4",
+      "run_id": "run-dashboard-1",
+      "event_type": "run.event_observed",
+      "observed_at": "2026-07-28T00:00:03.000Z"
+    }
+  ]
+}

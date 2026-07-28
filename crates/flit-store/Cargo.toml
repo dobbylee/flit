@@ -8,6 +8,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+flit-core = { path = "../flit-core" }
 flit-protocol = { path = "../flit-protocol" }
 rusqlite = { version = "=0.39.0", default-features = false, features = ["bundled"] }
 serde = { version = "=1.0.229" }

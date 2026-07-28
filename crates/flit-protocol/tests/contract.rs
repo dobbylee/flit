@@ -190,6 +190,7 @@ fn current_dashboard_read_fixtures_round_trip_every_delivery() {
     }
     for name in [
         "dashboard_read.initial.response.json",
+        "dashboard_read.unavailable_changes.response.json",
         "dashboard_read.delta.response.json",
         "dashboard_read.resync.response.json",
     ] {
@@ -241,6 +242,55 @@ fn current_dashboard_read_fixtures_round_trip_every_delivery() {
         assert!(
             serde_json::from_value::<DashboardReadResponse>(missing_projection).is_err(),
             "Dashboard Run must require {required}"
+        );
+    }
+
+    let unavailable: DashboardReadResponse = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "dashboard_read.unavailable_changes.response.json",
+        )))
+        .expect("unavailable changes fixture should be readable"),
+    )
+    .expect("unavailable changes fixture should match Rust types");
+    assert!(matches!(
+        unavailable,
+        DashboardReadResponse::Snapshot { runs, .. }
+            if matches!(
+                &runs[0].changes,
+                flit_protocol::DashboardChangeSummary::Unavailable { reason }
+                    if reason == "git_observation_not_configured"
+            )
+    ));
+
+    for invalid_changes in [
+        serde_json::json!({
+            "availability": "estimated",
+            "reason": "not_exact"
+        }),
+        serde_json::json!({
+            "availability": "available",
+            "insertions": 1,
+            "deletions": 1
+        }),
+        serde_json::json!({
+            "availability": "unavailable",
+            "reason": "git_observation_not_configured",
+            "files": 0
+        }),
+    ] {
+        let mut invalid: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(repository_path(&command_fixture(
+                current,
+                "dashboard_read.initial.response.json",
+            )))
+            .expect("Dashboard snapshot fixture should be readable"),
+        )
+        .expect("Dashboard snapshot fixture should be JSON");
+        invalid["runs"][0]["changes"] = invalid_changes;
+        assert!(
+            serde_json::from_value::<DashboardReadResponse>(invalid).is_err(),
+            "Dashboard changes availability must fail closed"
         );
     }
 }

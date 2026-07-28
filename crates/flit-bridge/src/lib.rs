@@ -30,12 +30,13 @@ use flit_providers::{
     probe_codex_compatibility_on_path,
 };
 use flit_store::{
-    AppendEventOutcome, DashboardRunSnapshot as StoreDashboardRunSnapshot,
-    MAX_DASHBOARD_DELTA_EVENTS, MAX_PROJECT_PAGE_SIZE, ManagedPermissionDecision,
-    ManagedPermissionDeliveryUnknownReason, ManagedPermissionResponseAttemptOutcome,
-    ManagedPermissionResponseResult, ManagedPermissionResponseResultKind, Project,
-    ProjectDirectoryInspection, ProjectListCursor as StoreProjectListCursor, ProjectRegistration,
-    ProjectRegistrationOutcome, ProjectTrustConfirmation, ProjectTrustOutcome, Store, StoreError,
+    AppendEventOutcome, DashboardChangeSummary as StoreDashboardChangeSummary,
+    DashboardRunSnapshot as StoreDashboardRunSnapshot, MAX_DASHBOARD_DELTA_EVENTS,
+    MAX_PROJECT_PAGE_SIZE, ManagedPermissionDecision, ManagedPermissionDeliveryUnknownReason,
+    ManagedPermissionResponseAttemptOutcome, ManagedPermissionResponseResult,
+    ManagedPermissionResponseResultKind, Project, ProjectDirectoryInspection,
+    ProjectListCursor as StoreProjectListCursor, ProjectRegistration, ProjectRegistrationOutcome,
+    ProjectTrustConfirmation, ProjectTrustOutcome, Store, StoreError,
 };
 use sha2::{Digest, Sha256};
 
@@ -939,6 +940,20 @@ fn dashboard_run_record(
         "codex" => ProtocolProviderKind::Codex,
         _ => return Err(BridgeError::StorageFailure),
     };
+    let changes = match snapshot.changes {
+        StoreDashboardChangeSummary::Available {
+            files,
+            insertions,
+            deletions,
+        } => flit_protocol::DashboardChangeSummary::Available {
+            files,
+            insertions,
+            deletions,
+        },
+        StoreDashboardChangeSummary::Unavailable { reason } => {
+            flit_protocol::DashboardChangeSummary::Unavailable { reason }
+        }
+    };
     Ok(DashboardRunRecord {
         run_id: snapshot.projection.run_id,
         project_id: snapshot.project_id,
@@ -956,11 +971,7 @@ fn dashboard_run_record(
         last_liveness_at: snapshot.projection.last_liveness_at,
         started_at: snapshot.started_at,
         ended_at: snapshot.ended_at,
-        changes: flit_protocol::DashboardChangeSummary {
-            files: snapshot.change_files,
-            insertions: snapshot.change_insertions,
-            deletions: snapshot.change_deletions,
-        },
+        changes,
         updated_at: snapshot.projection.updated_at,
     })
 }
@@ -1897,7 +1908,7 @@ mod tests {
     };
     use flit_store::{
         InitialManagedSessionConnection, ManagedRunIntent, ProjectRegistration,
-        ProjectTrustConfirmation, RunSnapshotDraft,
+        ProjectTrustConfirmation,
     };
 
     use super::*;
@@ -2191,58 +2202,9 @@ mod tests {
             .expect("runtime state");
     }
 
-    fn seed_dashboard_projection(manager: &CoreManager) {
-        manager
-            .with_ready_core(|core| {
-                let version = core.store.latest_ingest_seq().expect("Dashboard cursor");
-                let snapshot = serde_json::json!({
-                    "run_id": "run-observe",
-                    "version": version,
-                    "lifecycle": "Running",
-                    "activity": {
-                        "kind": "Testing",
-                        "confidence": 1.0
-                    },
-                    "attention": {
-                        "level": "None",
-                        "open_count": 2
-                    },
-                    "dashboard_bucket": "Working",
-                    "last_progress_at": "2026-07-27T12:00:01Z",
-                    "last_liveness_at": "2026-07-27T12:00:01Z",
-                    "changes": {
-                        "files": 3,
-                        "insertions": 42,
-                        "deletions": 7
-                    }
-                });
-                core.store
-                    .write_run_snapshot(RunSnapshotDraft {
-                        run_id: "run-observe".to_owned(),
-                        version,
-                        lifecycle: "Running".to_owned(),
-                        activity: "Testing".to_owned(),
-                        activity_confidence: 1.0,
-                        attention_level: "None".to_owned(),
-                        dashboard_bucket: "Working".to_owned(),
-                        last_progress_at: Some("2026-07-27T12:00:01Z".to_owned()),
-                        last_liveness_at: Some("2026-07-27T12:00:01Z".to_owned()),
-                        snapshot: snapshot
-                            .as_object()
-                            .expect("Dashboard snapshot object")
-                            .clone(),
-                        updated_at: "2026-07-27T12:00:01Z".to_owned(),
-                    })
-                    .expect("write Dashboard projection");
-                Ok(())
-            })
-            .expect("seed Dashboard projection");
-    }
-
     #[test]
     fn dashboard_initial_delta_and_resync_are_exact_and_bounded() {
         let (directory, manager, _) = observation_core("dashboard-read");
-        seed_dashboard_projection(&manager);
         let initial = dashboard_read_with(
             &manager,
             &serde_json::to_string(&DashboardReadRequest {
@@ -2276,10 +2238,14 @@ mod tests {
                     assert_eq!(runs[0].run_id, "run-observe");
                     assert_eq!(runs[0].project_display_name, "Observation Project");
                     assert_eq!(runs[0].version, next_cursor);
-                    assert_eq!(runs[0].attention_open_count, 2);
-                    assert_eq!(runs[0].changes.files, 3);
-                    assert_eq!(runs[0].changes.insertions, 42);
-                    assert_eq!(runs[0].changes.deletions, 7);
+                    assert_eq!(runs[0].activity, "Unknown");
+                    assert_eq!(runs[0].attention_open_count, 0);
+                    assert_eq!(
+                        runs[0].changes,
+                        flit_protocol::DashboardChangeSummary::Unavailable {
+                            reason: "git_observation_not_configured".to_owned(),
+                        }
+                    );
                     assert!(core_instance_id.starts_with("core-"));
                     assert!(
                         !core_instance_id
