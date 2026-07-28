@@ -712,11 +712,14 @@ impl CommandError {
 
 #[must_use]
 pub fn generated_swift_command_contract() -> String {
-    SWIFT_COMMAND_CONTRACT_TEMPLATE.replace("__PROTOCOL_VERSION__", PROTOCOL_VERSION)
+    SWIFT_COMMAND_CONTRACT_TEMPLATE
+        .replace("__PROTOCOL_VERSION__", PROTOCOL_VERSION)
+        .replace("__EVENT_SCHEMA_VERSION__", EVENT_PROTOCOL_VERSION)
 }
 
 const SWIFT_COMMAND_CONTRACT_TEMPLATE: &str = r#"// Generated from flit_protocol command contracts. Do not edit.
 let flitClientProtocolVersion = "__PROTOCOL_VERSION__"
+let flitEventSchemaVersion = "__EVENT_SCHEMA_VERSION__"
 
 struct FlitProjectInspectionRequest: Codable, Equatable, Sendable {
     let selectedPath: String

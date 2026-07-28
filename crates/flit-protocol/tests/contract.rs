@@ -652,6 +652,9 @@ fn generated_swift_project_contract_is_current_and_required_fields_fail_closed()
     assert!(generated.contains(&format!(
         "let flitClientProtocolVersion = \"{PROTOCOL_VERSION}\""
     )));
+    assert!(generated.contains(&format!(
+        "let flitEventSchemaVersion = \"{EVENT_PROTOCOL_VERSION}\""
+    )));
     for type_name in [
         "FlitProjectInspectionRequest",
         "FlitProjectInspectionResponse",

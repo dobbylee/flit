@@ -75,6 +75,7 @@ esac
     "$GENERATION_A/FlitProtocol.swift" \
     "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/FoundationCopy.swift" \
     "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/SystemHealthClient.swift" \
+    "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/DashboardPresentation.swift" \
     "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/FoundationStatusBadge.swift" \
     "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/FoundationViewController.swift" \
     "$REPOSITORY_ROOT/apps/macos/Tests/NativeHealthTests.swift" \

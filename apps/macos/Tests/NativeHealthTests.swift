@@ -28,6 +28,27 @@ private func decodeFixture<T: Decodable>(_ type: T.Type, at path: String) throws
     try JSONDecoder().decode(type, from: Data(contentsOf: URL(fileURLWithPath: path)))
 }
 
+private func decodeDashboardFixture(
+    at path: String,
+    replacing field: String,
+    with value: String
+) throws -> FlitDashboardReadResponse {
+    let data = try Data(contentsOf: URL(fileURLWithPath: path))
+    guard var object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        throw NativeHealthTestFailure.failed("Dashboard fixture must be an object")
+    }
+    object[field] = value
+    return try JSONDecoder().decode(
+        FlitDashboardReadResponse.self,
+        from: try JSONSerialization.data(withJSONObject: object)
+    )
+}
+
+@MainActor
+private func descendants(of view: NSView) -> [NSView] {
+    view.subviews.flatMap { [$0] + descendants(of: $0) }
+}
+
 @MainActor
 private func requireDecodingFailure<T: Decodable>(
     _ type: T.Type,
@@ -79,6 +100,10 @@ private func requireFoundationLayout(
     try require(
         panelFrame.minX >= 48 && panelFrame.maxX <= size.width - 48,
         "foundation panel must preserve 48-point side margins"
+    )
+    try require(
+        panelFrame.minY >= 0 && panelFrame.maxY <= controller.view.bounds.maxY,
+        "foundation panel must remain reachable at height \(size.height)"
     )
 }
 
@@ -394,6 +419,38 @@ struct NativeHealthTests {
             FlitDashboardReadResponse.self,
             at: "\(fixtureRoot)/dashboard_read.unavailable_changes.response.json"
         )
+        let overflowFixtureData = try Data(
+            contentsOf: URL(
+                fileURLWithPath: "\(fixtureRoot)/dashboard_read.initial.response.json"
+            )
+        )
+        guard
+            var overflowFixtureObject = try JSONSerialization.jsonObject(
+                with: overflowFixtureData
+            ) as? [String: Any],
+            let overflowBaseRun = (overflowFixtureObject["runs"] as? [[String: Any]])?.first
+        else {
+            throw NativeHealthTestFailure.failed(
+                "Dashboard overflow fixture must contain one Run"
+            )
+        }
+        let overflowFirstRunId = "overflow-needs-attention-0"
+        overflowFixtureObject["runs"] = (0..<8).map { index -> [String: Any] in
+            var run = overflowBaseRun
+            let needsAttention = index < 4
+            run["run_id"] = needsAttention
+                ? "overflow-needs-attention-\(index)"
+                : "overflow-finished-\(index)"
+            run["dashboard_bucket"] = needsAttention ? "NeedsAttention" : "Finished"
+            run["title"] = needsAttention
+                ? "Needs Attention \(index)"
+                : "Finished \(index)"
+            return run
+        }
+        let overflowDashboardFixture = try JSONDecoder().decode(
+            FlitDashboardReadResponse.self,
+            from: try JSONSerialization.data(withJSONObject: overflowFixtureObject)
+        )
         guard
             case let .snapshot(initialSnapshotFixture) = initialDashboardFixture,
             case let .delta(deltaFixture) = deltaDashboardFixture,
@@ -423,6 +480,81 @@ struct NativeHealthTests {
                 && deltaFixture.runs[0].version == deltaFixture.nextCursor
                 && resyncFixture.reason == .coreInstanceMismatch,
             "generated Dashboard fixtures must preserve snapshot, delta, and resync facts"
+        )
+        try require(
+            DashboardSection.allCases.map(\.rawValue)
+                == ["NeedsAttention", "PossiblyStuck", "Working", "Finished"],
+            "native Dashboard section order must match the Core-owned buckets"
+        )
+        var presentation = DashboardPresentationState()
+        try presentation.apply(initialDashboardFixture)
+        let initialWorkingRuns = try presentation.runs(in: .working)
+        try require(
+            initialWorkingRuns.count == 1
+                && presentation.cursor == initialSnapshotFixture.nextCursor,
+            "native snapshot must replace presentation state with exact Core records"
+        )
+        try presentation.apply(deltaDashboardFixture)
+        let deltaWorkingRuns = try presentation.runs(in: .working)
+        try require(
+            deltaWorkingRuns[0].version == deltaFixture.nextCursor
+                && presentation.cursor == deltaFixture.nextCursor,
+            "native delta must upsert the supplied Core projection without reducing locators"
+        )
+        for (fixtureName, field) in [
+            ("dashboard_read.initial.response.json", "protocol_version"),
+            ("dashboard_read.initial.response.json", "event_schema_version"),
+            ("dashboard_read.delta.response.json", "protocol_version"),
+            ("dashboard_read.delta.response.json", "event_schema_version"),
+        ] {
+            var mismatchPresentation = DashboardPresentationState()
+            try mismatchPresentation.apply(initialDashboardFixture)
+            let beforeInstance = mismatchPresentation.coreInstanceId
+            let beforeCursor = mismatchPresentation.cursor
+            let beforeRuns = mismatchPresentation.runsById
+            let mismatched = try decodeDashboardFixture(
+                at: "\(fixtureRoot)/\(fixtureName)",
+                replacing: field,
+                with: "999.0"
+            )
+            do {
+                try mismatchPresentation.apply(mismatched)
+                throw NativeHealthTestFailure.failed(
+                    "native Dashboard must reject mismatched \(field)"
+                )
+            } catch let error as DashboardPresentationError {
+                try require(
+                    error == .contractMismatch,
+                    "native Dashboard must type mismatched \(field) as a contract failure"
+                )
+            }
+            try require(
+                mismatchPresentation.coreInstanceId == beforeInstance
+                    && mismatchPresentation.cursor == beforeCursor
+                    && mismatchPresentation.runsById == beforeRuns,
+                "contract mismatch must not mutate native Dashboard state"
+            )
+        }
+        try presentation.apply(resyncDashboardFixture)
+        try require(
+            presentation.runsById.isEmpty
+                && presentation.coreInstanceId == resyncFixture.coreInstanceId,
+            "native resync snapshot must replace stale presentation state"
+        )
+        var unknownPresentation = DashboardPresentationState()
+        try unknownPresentation.apply(unavailableChangesDashboardFixture)
+        let unknownRun = try unknownPresentation.runs(in: .working)[0]
+        guard
+            unknownRun.activity == "Unknown",
+            case let .unavailable(reason) = unknownRun.changes
+        else {
+            throw NativeHealthTestFailure.failed(
+                "native presentation must preserve Unknown and unavailable facts"
+            )
+        }
+        try require(
+            reason == "git_observation_not_configured",
+            "native presentation must not invent zero changes"
         )
         _ = try decodeFixture(
             FlitRunDetailReadRequest.self,
@@ -967,6 +1099,76 @@ struct NativeHealthTests {
         try require(
             controller.view.accessibilityIdentifier() == "flit.foundation.root",
             "foundation root must expose a stable accessibility identifier"
+        )
+        let fixtureController = FoundationViewController(
+            client: client,
+            dashboardClient: DashboardClient(
+                fixtureLoader: { unavailableChangesDashboardFixture }
+            )
+        )
+        _ = fixtureController.view
+        let fixtureViews = descendants(of: fixtureController.view)
+        let fixtureIdentifiers = Set(
+            fixtureViews.compactMap { $0.accessibilityIdentifier() }
+        )
+        try require(
+            fixtureIdentifiers.contains("flit.dashboard.scroll")
+                && fixtureIdentifiers.contains("flit.dashboard.section.Working")
+                && fixtureIdentifiers.contains("flit.dashboard.run.\(unknownRun.runId)"),
+            "fixture-backed Dashboard must expose stable scroll, section, and Run identifiers"
+        )
+        let fixtureCopy = fixtureViews.compactMap { ($0 as? NSTextField)?.stringValue }
+        try require(
+            fixtureCopy.contains(FoundationCopy.text(.dashboardActivityUnknown))
+                && fixtureCopy.contains(
+                    FoundationCopy.format(
+                        .dashboardAttention,
+                        unknownRun.attentionLevel,
+                        unknownRun.attentionOpenCount
+                    )
+                )
+                && fixtureCopy.contains(
+                    FoundationCopy.format(.dashboardChangesUnavailable, reason)
+                ),
+            "fixture-backed Run card must render exact Unknown, attention, and unavailable facts"
+        )
+        let overflowController = FoundationViewController(
+            client: client,
+            dashboardClient: DashboardClient(
+                fixtureLoader: { overflowDashboardFixture }
+            )
+        )
+        _ = overflowController.view
+        let overflowWindow = NSWindow(contentViewController: overflowController)
+        overflowWindow.setContentSize(NSSize(width: 1_280, height: 720))
+        overflowWindow.contentView?.layoutSubtreeIfNeeded()
+        let overflowViews = descendants(of: overflowController.view)
+        guard
+            let overflowScroll = overflowViews.first(where: {
+                $0.accessibilityIdentifier() == "flit.dashboard.scroll"
+            }) as? NSScrollView,
+            let overflowDocument = overflowScroll.documentView,
+            let attentionHeading = overflowViews.first(where: {
+                $0.accessibilityIdentifier() == "flit.dashboard.section.NeedsAttention"
+            }),
+            let attentionCard = overflowViews.first(where: {
+                $0.accessibilityIdentifier()
+                    == "flit.dashboard.run.\(overflowFirstRunId)"
+            })
+        else {
+            throw NativeHealthTestFailure.failed(
+                "overflow Dashboard must expose its scroll view and priority content"
+            )
+        }
+        let initialVisibleRect = overflowScroll.contentView.bounds
+        try require(
+            initialVisibleRect.intersects(
+                attentionHeading.convert(attentionHeading.bounds, to: overflowDocument)
+            )
+                && initialVisibleRect.intersects(
+                    attentionCard.convert(attentionCard.bounds, to: overflowDocument)
+                ),
+            "overflow Dashboard must open on Needs Attention content"
         )
         let layoutWindow = NSWindow(contentViewController: controller)
         layoutWindow.minSize = NSSize(width: 720, height: 560)

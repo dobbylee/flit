@@ -1,16 +1,24 @@
 import AppKit
 import SwiftUI
 
+private final class FlippedDashboardDocumentView: NSView {
+    override var isFlipped: Bool { true }
+}
+
 @MainActor
 final class FoundationViewController: NSViewController {
     private let client: SystemHealthClient
+    private let dashboardClient: DashboardClient
     private var state: FoundationState = .checking
+    private var dashboardState = DashboardPresentationState()
     private var statusHost: NSHostingView<FoundationStatusBadge>?
     private var boundaryLabel: NSTextField?
     private var foundationPanel: NSStackView?
+    private var dashboardStack: NSStackView?
 
-    init(client: SystemHealthClient) {
+    init(client: SystemHealthClient, dashboardClient: DashboardClient = DashboardClient()) {
         self.client = client
+        self.dashboardClient = dashboardClient
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -77,7 +85,42 @@ final class FoundationViewController: NSViewController {
         )
         identify(footer, as: "flit.foundation.footer")
 
-        [mark, phase, title, summary, host, boundary, footer].forEach { arrangedView in
+        let dashboard = NSStackView()
+        identify(dashboard, as: "flit.dashboard.sections")
+        dashboard.orientation = .vertical
+        dashboard.alignment = .leading
+        dashboard.spacing = 12
+        dashboard.translatesAutoresizingMaskIntoConstraints = false
+        dashboardStack = dashboard
+
+        let dashboardDocument = FlippedDashboardDocumentView()
+        dashboardDocument.addSubview(dashboard)
+        let dashboardScroll = NSScrollView()
+        identify(dashboardScroll, as: "flit.dashboard.scroll")
+        dashboardScroll.borderType = .noBorder
+        dashboardScroll.drawsBackground = false
+        dashboardScroll.hasHorizontalScroller = false
+        dashboardScroll.hasVerticalScroller = true
+        dashboardScroll.documentView = dashboardDocument
+        dashboardScroll.translatesAutoresizingMaskIntoConstraints = false
+        let preferredDashboardHeight = dashboardScroll.heightAnchor.constraint(
+            equalToConstant: 206
+        )
+        preferredDashboardHeight.priority = .defaultHigh
+        NSLayoutConstraint.activate([
+            dashboard.widthAnchor.constraint(equalTo: dashboardDocument.widthAnchor),
+            dashboard.topAnchor.constraint(equalTo: dashboardDocument.topAnchor),
+            dashboard.leadingAnchor.constraint(equalTo: dashboardDocument.leadingAnchor),
+            dashboard.trailingAnchor.constraint(equalTo: dashboardDocument.trailingAnchor),
+            dashboard.bottomAnchor.constraint(equalTo: dashboardDocument.bottomAnchor),
+            dashboardDocument.widthAnchor.constraint(equalTo: dashboardScroll.contentView.widthAnchor),
+            dashboardScroll.widthAnchor.constraint(equalToConstant: 528),
+            dashboardScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 32),
+            preferredDashboardHeight,
+        ])
+
+        [mark, phase, title, summary, host, boundary, dashboardScroll, footer].forEach {
+            arrangedView in
             panel.addArrangedSubview(arrangedView)
         }
         panel.setCustomSpacing(30, after: mark)
@@ -89,10 +132,12 @@ final class FoundationViewController: NSViewController {
             equalTo: root.widthAnchor,
             constant: -96
         )
-        availableWidth.priority = NSLayoutConstraint.Priority(749)
+        availableWidth.priority = NSLayoutConstraint.Priority(999)
         NSLayoutConstraint.activate([
             panel.centerXAnchor.constraint(equalTo: root.centerXAnchor),
             panel.centerYAnchor.constraint(equalTo: root.centerYAnchor),
+            panel.topAnchor.constraint(greaterThanOrEqualTo: root.topAnchor, constant: 24),
+            panel.bottomAnchor.constraint(lessThanOrEqualTo: root.bottomAnchor, constant: -24),
             panel.widthAnchor.constraint(lessThanOrEqualToConstant: 680),
             panel.widthAnchor.constraint(lessThanOrEqualTo: root.widthAnchor, constant: -96),
             availableWidth,
@@ -126,11 +171,121 @@ final class FoundationViewController: NSViewController {
         switch client.load() {
         case .ready:
             state = .ready
+            loadDashboard()
         case .unavailable:
             state = .unavailable
+            renderDashboardFailure(FoundationCopy.text(.dashboardUnavailable))
         }
         statusHost?.rootView = FoundationStatusBadge(state: state)
         boundaryLabel?.stringValue = FoundationCopy.text(state.boundaryCopy)
+    }
+
+    private func loadDashboard() {
+        do {
+            try dashboardState.apply(dashboardClient.loadInitial())
+            renderDashboard()
+        } catch {
+            renderDashboardFailure(FoundationCopy.text(.dashboardUnavailable))
+        }
+    }
+
+    private func renderDashboard() {
+        guard let dashboardStack else { return }
+        dashboardStack.arrangedSubviews.forEach { view in
+            dashboardStack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+        for section in DashboardSection.allCases {
+            let heading = label(section.title, size: 14, weight: .semibold)
+            identify(heading, as: "flit.dashboard.section.\(section.rawValue)")
+            dashboardStack.addArrangedSubview(heading)
+            do {
+                let runs = try dashboardState.runs(in: section)
+                if runs.isEmpty {
+                    let empty = label(
+                        FoundationCopy.text(.dashboardNoRuns),
+                        size: 12,
+                        weight: .regular,
+                        color: .secondaryLabelColor
+                    )
+                    dashboardStack.addArrangedSubview(empty)
+                } else {
+                    for run in runs {
+                        dashboardStack.addArrangedSubview(runCard(run))
+                    }
+                }
+            } catch {
+                renderDashboardFailure(FoundationCopy.text(.dashboardDataUnavailable))
+                return
+            }
+        }
+    }
+
+    private func renderDashboardFailure(_ message: String) {
+        guard let dashboardStack else { return }
+        dashboardStack.arrangedSubviews.forEach { view in
+            dashboardStack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+        let failure = label(message, size: 13, weight: .semibold, color: .systemRed)
+        identify(failure, as: "flit.dashboard.unavailable")
+        dashboardStack.addArrangedSubview(failure)
+    }
+
+    private func runCard(_ run: FlitDashboardRunRecord) -> NSView {
+        let card = NSStackView()
+        identify(card, as: "flit.dashboard.run.\(run.runId)")
+        card.orientation = .vertical
+        card.alignment = .leading
+        card.spacing = 4
+        card.edgeInsets = NSEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
+        card.wantsLayer = true
+        card.layer?.cornerRadius = 10
+        card.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        card.addArrangedSubview(label(run.title, size: 14, weight: .semibold))
+        card.addArrangedSubview(
+            label(
+                "\(run.projectDisplayName) · \(run.provider.rawValue) · \(run.lifecycle)",
+                size: 12,
+                weight: .regular,
+                color: .secondaryLabelColor
+            )
+        )
+        let activity = run.activity == "Unknown"
+            ? FoundationCopy.text(.dashboardActivityUnknown)
+            : FoundationCopy.format(
+                .dashboardActivity,
+                run.activity,
+                Int(run.activityConfidence * 100)
+            )
+        card.addArrangedSubview(label(activity, size: 12, weight: .regular))
+        card.addArrangedSubview(
+            label(
+                FoundationCopy.format(
+                    .dashboardAttention,
+                    run.attentionLevel,
+                    run.attentionOpenCount
+                ),
+                size: 12,
+                weight: .regular
+            )
+        )
+        let changes: String
+        switch run.changes {
+        case let .available(files, insertions, deletions):
+            changes = FoundationCopy.format(
+                .dashboardChanges,
+                files,
+                insertions,
+                deletions
+            )
+        case let .unavailable(reason):
+            changes = FoundationCopy.format(.dashboardChangesUnavailable, reason)
+        }
+        card.addArrangedSubview(
+            label(changes, size: 12, weight: .regular, color: .secondaryLabelColor)
+        )
+        return card
     }
 
     private func label(

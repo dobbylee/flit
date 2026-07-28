@@ -1,6 +1,18 @@
 import Foundation
 
 enum FoundationCopyKey: String {
+    case dashboardActivity = "dashboard.activity"
+    case dashboardActivityUnknown = "dashboard.activity.unknown"
+    case dashboardAttention = "dashboard.attention"
+    case dashboardChanges = "dashboard.changes"
+    case dashboardChangesUnavailable = "dashboard.changes.unavailable"
+    case dashboardDataUnavailable = "dashboard.data.unavailable"
+    case dashboardNoRuns = "dashboard.noRuns"
+    case dashboardSectionFinished = "dashboard.section.finished"
+    case dashboardSectionNeedsAttention = "dashboard.section.needsAttention"
+    case dashboardSectionPossiblyStuck = "dashboard.section.possiblyStuck"
+    case dashboardSectionWorking = "dashboard.section.working"
+    case dashboardUnavailable = "dashboard.unavailable"
     case boundaryChecking = "foundation.boundary.checking"
     case boundaryReady = "foundation.boundary.ready"
     case boundaryUnavailable = "foundation.boundary.unavailable"
@@ -16,6 +28,18 @@ enum FoundationCopyKey: String {
 
 enum FoundationCopy {
     private static let values: [FoundationCopyKey: String] = [
+        .dashboardActivity: "Activity: %@ · %d%% confidence",
+        .dashboardActivityUnknown: "Activity: Unknown",
+        .dashboardAttention: "Attention: %@ · %llu open",
+        .dashboardChanges: "Changes: %llu files · +%llu −%llu",
+        .dashboardChangesUnavailable: "Changes unavailable: %@",
+        .dashboardDataUnavailable: "Dashboard data unavailable",
+        .dashboardNoRuns: "No Runs",
+        .dashboardSectionFinished: "Finished",
+        .dashboardSectionNeedsAttention: "Needs Attention",
+        .dashboardSectionPossiblyStuck: "Possibly Stuck",
+        .dashboardSectionWorking: "Working",
+        .dashboardUnavailable: "Dashboard unavailable",
         .boundaryChecking:
             "Verifying the local Core and Store. Provider monitoring has not started.",
         .boundaryReady:
@@ -37,5 +61,9 @@ enum FoundationCopy {
             preconditionFailure("Missing foundation copy for \(key.rawValue)")
         }
         return value
+    }
+
+    static func format(_ key: FoundationCopyKey, _ arguments: CVarArg...) -> String {
+        String(format: text(key), arguments: arguments)
     }
 }
