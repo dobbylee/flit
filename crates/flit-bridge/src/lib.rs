@@ -7,6 +7,7 @@ use std::{
         LazyLock, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
     },
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -33,13 +34,19 @@ use flit_providers::{
 use flit_store::{
     AppendEventOutcome, DashboardChangeSummary as StoreDashboardChangeSummary,
     DashboardRunSnapshot as StoreDashboardRunSnapshot, MAX_DASHBOARD_DELTA_EVENTS,
-    MAX_PROJECT_PAGE_SIZE, MAX_RUN_DETAIL_EVENTS, ManagedPermissionDecision,
-    ManagedPermissionDeliveryUnknownReason, ManagedPermissionResponseAttemptOutcome,
-    ManagedPermissionResponseResult, ManagedPermissionResponseResultKind, Project,
-    ProjectDirectoryInspection, ProjectListCursor as StoreProjectListCursor, ProjectRegistration,
-    ProjectRegistrationOutcome, ProjectTrustConfirmation, ProjectTrustOutcome, Store, StoreError,
+    MAX_LIVE_MANAGED_SESSIONS, MAX_PROJECT_PAGE_SIZE, MAX_RUN_DETAIL_EVENTS,
+    ManagedPermissionDecision, ManagedPermissionDeliveryUnknownReason,
+    ManagedPermissionResponseAttemptOutcome, ManagedPermissionResponseResult,
+    ManagedPermissionResponseResultKind, ManagedSession, Project, ProjectDirectoryInspection,
+    ProjectListCursor as StoreProjectListCursor, ProjectRegistration, ProjectRegistrationOutcome,
+    ProjectTrustConfirmation, ProjectTrustOutcome, Store, StoreError,
 };
 use sha2::{Digest, Sha256};
+
+use crate::codex_recovery::{
+    CodexRecoveryAttempt, ExactCodexRecoveryConnector, observe_codex_sessions,
+    persist_codex_recovery_observations, unknown_codex_recovery_observations,
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -127,6 +134,7 @@ struct FoundationCore {
     // Rust drops fields in declaration order, so stop providers and close SQLite before the guard.
     managed_runtimes: BTreeMap<String, managed_start::RetainedManagedRun>,
     managed_observations_in_flight: BTreeSet<String>,
+    startup_recovery_sessions: Option<Vec<ManagedSession>>,
     store: Store,
     provider_health: HealthStatus,
     _guard: File,
@@ -241,6 +249,19 @@ impl CoreManager {
         }
     }
 
+    fn take_startup_recovery(&self) -> Option<(String, String, Vec<ManagedSession>)> {
+        let mut state = self.lock_state();
+        let CoreState::Ready(core) = &mut *state else {
+            return None;
+        };
+        let sessions = core.startup_recovery_sessions.take()?;
+        if sessions.is_empty() {
+            return None;
+        }
+        let observed_at = core.store.current_utc_timestamp().ok()?;
+        Some((core.core_instance_id.clone(), observed_at, sessions))
+    }
+
     fn lock_state(&self) -> MutexGuard<'_, CoreState> {
         self.state
             .lock()
@@ -286,18 +307,36 @@ impl FoundationCore {
         make_owner_only_file_if_present(&wal_path)?;
         make_owner_only_file_if_present(&shared_memory_path)?;
         let _database_file = open_owner_only_file(&database_path)?;
-        let store = Store::open_with_system_time(&database_path)
+        let mut store = Store::open_with_system_time(&database_path)
             .map_err(|_| BridgeError::StorageFailure)?;
         make_owner_only_file(&database_path)?;
         make_owner_only_file_if_present(&wal_path)?;
         make_owner_only_file_if_present(&shared_memory_path)?;
+        let core_instance_id = core_instance_id(&canonical_data_directory);
+        let startup_recovery_sessions = store
+            .live_managed_sessions(MAX_LIVE_MANAGED_SESSIONS)
+            .map_err(|_| BridgeError::StorageFailure)?;
+        if !startup_recovery_sessions.is_empty() {
+            let unknown_observations =
+                unknown_codex_recovery_observations(startup_recovery_sessions.clone())
+                    .map_err(|_| BridgeError::StorageFailure)?;
+            let attempt = CodexRecoveryAttempt {
+                id: format!("startup-gap-{core_instance_id}"),
+                observed_at: store
+                    .current_utc_timestamp()
+                    .map_err(|_| BridgeError::StorageFailure)?,
+            };
+            persist_codex_recovery_observations(&mut store, &attempt, unknown_observations)
+                .map_err(|_| BridgeError::StorageFailure)?;
+        }
 
         Ok(Self {
             requested_data_directory,
-            core_instance_id: core_instance_id(&canonical_data_directory),
+            core_instance_id,
             canonical_data_directory,
             managed_runtimes: BTreeMap::new(),
             managed_observations_in_flight: BTreeSet::new(),
+            startup_recovery_sessions: Some(startup_recovery_sessions),
             store,
             provider_health: HealthStatus::NotConfigured,
             _guard: guard,
@@ -698,11 +737,42 @@ pub fn initialize_core(
         if client_protocol_version != PROTOCOL_VERSION {
             return Err(BridgeError::ProtocolMismatch);
         }
-        if CORE.initialize(&data_directory)? == InitializationOutcome::Initialized {
+        let outcome = CORE.initialize(&data_directory)?;
+        if outcome == InitializationOutcome::Initialized {
             CORE_CONSTRUCTIONS.fetch_add(1, Ordering::SeqCst);
+            if let Some((core_instance_id, observed_at, sessions)) = CORE.take_startup_recovery() {
+                spawn_startup_recovery(core_instance_id, observed_at, sessions);
+            }
         }
         Ok(())
     })
+}
+
+fn spawn_startup_recovery(
+    core_instance_id: String,
+    observed_at: String,
+    sessions: Vec<ManagedSession>,
+) {
+    let _ = thread::Builder::new()
+        .name("flit-startup-recovery".to_owned())
+        .spawn(move || {
+            let mut connector = ExactCodexRecoveryConnector;
+            let Ok(observations) = observe_codex_sessions(sessions, &mut connector) else {
+                return;
+            };
+            let _ = CORE.with_ready_core(|core| {
+                if core.core_instance_id != core_instance_id {
+                    return Ok(());
+                }
+                let attempt = CodexRecoveryAttempt {
+                    id: format!("startup-exact-{core_instance_id}"),
+                    observed_at,
+                };
+                persist_codex_recovery_observations(&mut core.store, &attempt, observations)
+                    .map_err(|_| BridgeError::StorageFailure)?;
+                Ok(())
+            });
+        });
 }
 
 #[uniffi::export]
@@ -3605,7 +3675,7 @@ mod tests {
                 .expect("restart response JSON"),
             ManagedRunPermissionRespondResponse::DeliveryUnknown {
                 submitted_version: 5,
-                outcome_version: 6,
+                outcome_version: 7,
                 ..
             }
         ));
@@ -3614,8 +3684,12 @@ mod tests {
             .with_ready_core(|core| {
                 let events = core
                     .store
-                    .run_events_through("run-observe", 0, 6, 10)
+                    .run_events_through("run-observe", 0, 7, 10)
                     .expect("restart events");
+                assert_eq!(
+                    events.events[events.events.len() - 2].event_type,
+                    "diagnostic.sequence_gap"
+                );
                 assert_eq!(
                     events.events.last().expect("restart outcome").event_type,
                     "permission.delivery_unknown"

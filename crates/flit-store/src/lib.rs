@@ -368,6 +368,14 @@ pub struct ManagedRunDetailContext {
 }
 
 impl Store {
+    pub fn current_utc_timestamp(&self) -> Result<String, StoreError> {
+        self.connection
+            .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(StoreError::Sqlite)
+    }
+
     pub fn open_with_system_time(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let clock = Connection::open_in_memory().map_err(StoreError::Sqlite)?;
         let applied_at = clock

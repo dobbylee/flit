@@ -133,6 +133,22 @@ fn system_time_open_records_a_utc_migration_timestamp() {
 }
 
 #[test]
+fn store_exposes_a_bounded_utc_timestamp_for_core_owned_events() {
+    let database = TestDatabase::new("current-utc-timestamp");
+    let store = Store::open_with_system_time(database.path()).expect("open Store");
+    let timestamp = store.current_utc_timestamp().expect("current timestamp");
+
+    assert_eq!(timestamp.len(), 24);
+    assert!(timestamp.ends_with('Z'));
+    assert_eq!(timestamp.as_bytes()[4], b'-');
+    assert_eq!(timestamp.as_bytes()[7], b'-');
+    assert_eq!(timestamp.as_bytes()[10], b'T');
+    assert_eq!(timestamp.as_bytes()[13], b':');
+    assert_eq!(timestamp.as_bytes()[16], b':');
+    assert_eq!(timestamp.as_bytes()[19], b'.');
+}
+
+#[test]
 fn invalid_applied_at_is_rejected_before_a_database_file_is_created() {
     let database = TestDatabase::new("invalid-time");
     assert!(matches!(
