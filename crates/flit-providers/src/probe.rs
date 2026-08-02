@@ -9,8 +9,12 @@ use crate::{
     CodexSchemaProbeError, CodexVersionProbeError, ExecutableInspection, ExecutableInspectionError,
     ProviderCapabilitySnapshot, ProviderFingerprint, classify_codex, inspect_codex_at,
     inspect_codex_on_path, probe_codex_schema, probe_codex_version,
-    profile::{codex_0_144_6_bundled_evidence, codex_0_145_0_bundled_evidence},
+    profile::{
+        codex_0_144_6_bundled_evidence, codex_0_145_0_bundled_evidence,
+        codex_0_146_0_bundled_evidence,
+    },
     validated_codex_0_144_6_fingerprint, validated_codex_0_145_0_fingerprint,
+    validated_codex_0_146_0_fingerprint,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,10 +56,11 @@ fn probe_codex_compatibility(
 ) -> Result<CodexCompatibilityProbe, CodexCompatibilityProbeError> {
     let version = probe_codex_version(inspection).map_err(CodexCompatibilityProbeError::Version)?;
     let schema = probe_codex_schema(inspection).map_err(CodexCompatibilityProbeError::Schema)?;
-    let evidence = if version.executable_version == "0.145.0" {
-        codex_0_145_0_bundled_evidence()
-    } else {
-        codex_0_144_6_bundled_evidence()
+    let evidence = match version.executable_version.as_str() {
+        "0.144.6" => codex_0_144_6_bundled_evidence(),
+        "0.145.0" => codex_0_145_0_bundled_evidence(),
+        "0.146.0" => codex_0_146_0_bundled_evidence(),
+        _ => codex_0_146_0_bundled_evidence(),
     };
     let v2_schema_sha256 = select_v2_schema_digest(&version.executable_version, &schema);
     let runtime_fingerprint = CodexRuntimeFingerprint {
@@ -79,7 +84,7 @@ fn probe_codex_compatibility(
 }
 
 fn select_v2_schema_digest(version: &str, schema: &crate::CodexSchemaProbe) -> String {
-    if version == "0.145.0" {
+    if matches!(version, "0.145.0" | "0.146.0") {
         schema.v2_schema_canonical_sha256.clone()
     } else {
         schema.v2_schema_sha256.clone()
@@ -91,10 +96,11 @@ fn classify_runtime_fingerprint(
     evidence: crate::profile::BundledProfileEvidence,
 ) -> Result<(Option<ProviderFingerprint>, ProviderCapabilitySnapshot), CodexCompatibilityProbeError>
 {
-    let expected = if runtime_fingerprint.executable_version == "0.145.0" {
-        validated_codex_0_145_0_fingerprint()
-    } else {
-        validated_codex_0_144_6_fingerprint()
+    let expected = match runtime_fingerprint.executable_version.as_str() {
+        "0.144.6" => validated_codex_0_144_6_fingerprint(),
+        "0.145.0" => validated_codex_0_145_0_fingerprint(),
+        "0.146.0" => validated_codex_0_146_0_fingerprint(),
+        _ => validated_codex_0_146_0_fingerprint(),
     };
     if evidence.method_allowlist_sha256 != expected.method_allowlist_sha256
         || evidence.fixture_sha256 != expected.fixture_sha256
@@ -325,6 +331,7 @@ mod tests {
         };
 
         assert_eq!(select_v2_schema_digest("0.145.0", &schema), "canonical");
+        assert_eq!(select_v2_schema_digest("0.146.0", &schema), "canonical");
         assert_eq!(select_v2_schema_digest("0.144.6", &schema), "raw");
         assert_eq!(select_v2_schema_digest("9.9.9", &schema), "raw");
     }
@@ -347,6 +354,38 @@ mod tests {
 
         let mut drifted = crate::profile::codex_0_145_0_bundled_evidence();
         drifted.method_allowlist_sha256 = "0".repeat(64);
+        assert!(matches!(
+            classify_runtime_fingerprint(&runtime, drifted),
+            Err(CodexCompatibilityProbeError::BundledEvidenceMismatch)
+        ));
+    }
+
+    #[test]
+    fn exact_current_runtime_requires_current_bundled_evidence() {
+        let expected = crate::validated_codex_0_146_0_fingerprint();
+        let runtime = CodexRuntimeFingerprint {
+            canonical_executable: expected.canonical_executable.clone(),
+            executable_version: expected.executable_version.clone(),
+            executable_sha256: expected.executable_sha256.clone(),
+            combined_schema_sha256: expected.combined_schema_sha256.clone(),
+            v2_schema_sha256: expected.v2_schema_sha256.clone(),
+        };
+        let evidence = crate::profile::codex_0_146_0_bundled_evidence();
+        let (validated, snapshot) =
+            classify_runtime_fingerprint(&runtime, evidence).expect("current profile");
+        assert_eq!(validated, Some(expected));
+        assert_eq!(snapshot.compatibility, ProviderCompatibility::Supported);
+        assert_eq!(
+            snapshot.status(crate::ProviderCapability::PermissionRespond),
+            CapabilityStatus::Supported
+        );
+        assert_eq!(
+            snapshot.status(crate::ProviderCapability::ProviderOutcomeObserve),
+            CapabilityStatus::Unsupported
+        );
+
+        let mut drifted = crate::profile::codex_0_146_0_bundled_evidence();
+        drifted.fixture_sha256 = "0".repeat(64);
         assert!(matches!(
             classify_runtime_fingerprint(&runtime, drifted),
             Err(CodexCompatibilityProbeError::BundledEvidenceMismatch)

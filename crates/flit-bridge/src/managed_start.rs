@@ -145,6 +145,7 @@ impl ManagedCodexRuntime for CodexAppServer {
 pub(crate) struct RetainedManagedRun {
     request_digest: String,
     response: ManagedRunStartResponse,
+    contract_version: String,
     provider: Box<dyn ManagedCodexRuntime>,
     active_permission: Option<RetainedPermission>,
 }
@@ -194,6 +195,10 @@ impl RetainedManagedRun {
         self.response.clone()
     }
 
+    pub(crate) fn contract_version(&self) -> &str {
+        &self.contract_version
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(
         response: ManagedRunStartResponse,
@@ -202,6 +207,7 @@ impl RetainedManagedRun {
         Self {
             request_digest: "test-runtime".to_owned(),
             response,
+            contract_version: "codex-app-server/0.145.0".to_owned(),
             provider,
             active_permission: None,
         }
@@ -277,8 +283,13 @@ pub(crate) fn prepare_permission_response(
             ManagedPermissionResolutionKind::Declined,
         ),
     };
-    let delivery_plan_fingerprint =
-        permission_delivery_plan_fingerprint(request, session_id, native, store_decision);
+    let delivery_plan_fingerprint = permission_delivery_plan_fingerprint(
+        request,
+        session_id,
+        native,
+        store_decision,
+        retained.contract_version(),
+    );
     Ok(PreparedPermissionResponse {
         attempt: ManagedPermissionResponseAttempt {
             run_id: request.run_id.clone(),
@@ -293,7 +304,7 @@ pub(crate) fn prepare_permission_response(
             response_attempt_id: request.response_attempt_id.clone(),
             decision: store_decision,
             delivery_plan_fingerprint,
-            contract_version: "codex-app-server/0.145.0".to_owned(),
+            contract_version: retained.contract_version().to_owned(),
             submitted_at: request.submitted_at.clone(),
             submitted_event_id: request.submitted_event_id.clone(),
         },
@@ -363,6 +374,7 @@ fn permission_delivery_plan_fingerprint(
     session_id: &str,
     native: &flit_providers::CodexPermissionRequest,
     decision: ManagedPermissionDecision,
+    contract_version: &str,
 ) -> String {
     let provider_request_id = native.provider_request_id.to_string();
     let request_version = request.request_version.to_string();
@@ -371,7 +383,7 @@ fn permission_delivery_plan_fingerprint(
         ManagedPermissionDecision::Deny => "deny",
     };
     let parts = [
-        "codex-app-server/0.145.0",
+        contract_version,
         request.run_id.as_str(),
         session_id,
         native.thread_id.as_str(),
@@ -470,15 +482,6 @@ pub(crate) fn start_managed_run(
         )?;
         return Err(ManagedStartError::ProviderUnavailable);
     };
-    if profile.executable_version != "0.145.0" {
-        fail_unstarted_run(
-            store,
-            &request,
-            "unsupported_provider_profile",
-            &contract_version(&profile),
-        )?;
-        return Err(ManagedStartError::ProviderUnavailable);
-    }
     let capabilities = match managed_capabilities(&profile, request.permission_mode) {
         Ok(capabilities) => capabilities,
         Err(error) => {
@@ -607,11 +610,13 @@ pub(crate) fn start_managed_run(
         permission_mode_version: PERMISSION_MODE_VERSION,
         provider_configuration: provider_configuration.to_owned(),
     };
+    let retained_contract_version = contract_version(&profile);
     runtimes.insert(
         request.run_id,
         RetainedManagedRun {
             request_digest,
             response: response.clone(),
+            contract_version: retained_contract_version,
             provider,
             active_permission: None,
         },
@@ -626,7 +631,7 @@ pub(crate) fn observe_managed_run(
     request: ManagedRunObserveRequest,
 ) -> Result<ManagedRunObserveResponse, ManagedStartError> {
     validate_observe_request(&request)?;
-    let (result, start_response) = {
+    let (result, start_response, contract_version) = {
         let retained = runtimes
             .get_mut(&request.run_id)
             .ok_or(ManagedStartError::RunNotActive)?;
@@ -636,10 +641,11 @@ pub(crate) fn observe_managed_run(
         (
             observe_retained_runtime(store, retained, &request),
             retained.response.clone(),
+            retained.contract_version.clone(),
         )
     };
     let result = if result == Err(ManagedStartError::ProviderObservationUnknown) {
-        record_observation_unknown(store, &request, &start_response)?;
+        record_observation_unknown(store, &request, &start_response, &contract_version)?;
         Err(ManagedStartError::ProviderObservationUnknown)
     } else {
         result
@@ -713,7 +719,7 @@ pub(crate) fn commit_managed_observation(
                     session_id: retained.response.session_id.clone(),
                     external_session_key: thread_id.as_str().to_owned(),
                     provider_turn_id: turn_id.as_str().to_owned(),
-                    contract_version: "codex-app-server/0.145.0".to_owned(),
+                    contract_version: retained.contract_version.clone(),
                     event_id,
                     observed_at: request.observed_at.clone(),
                     kind: ManagedProviderObservationKind::CommandStarted {
@@ -745,7 +751,7 @@ pub(crate) fn commit_managed_observation(
                     session_id: retained.response.session_id.clone(),
                     external_session_key: permission.thread_id.as_str().to_owned(),
                     provider_turn_id: permission.turn_id.as_str().to_owned(),
-                    contract_version: "codex-app-server/0.145.0".to_owned(),
+                    contract_version: retained.contract_version.clone(),
                     event_id: event_id.clone(),
                     observed_at: request.observed_at.clone(),
                     kind: ManagedProviderObservationKind::PermissionRequested {
@@ -824,7 +830,7 @@ pub(crate) fn commit_managed_observation(
                     provider_configuration: PROVIDER_AUTO_CONFIGURATION.to_owned(),
                     decision: ManagedProviderDecision::Allowed,
                     terminal_outcome: ManagedProviderTerminalOutcome::RequestResolved,
-                    contract_version: "codex-app-server/0.145.0".to_owned(),
+                    contract_version: retained.contract_version.clone(),
                     observed_at: request.observed_at.clone(),
                     request_event_id: request_event_id.clone(),
                     outcome_event_id: outcome_event_id.clone(),
@@ -890,7 +896,7 @@ pub(crate) fn commit_managed_observation(
                     session_id: retained.response.session_id.clone(),
                     external_session_key: thread_id.as_str().to_owned(),
                     provider_turn_id: turn_id.as_str().to_owned(),
-                    contract_version: "codex-app-server/0.145.0".to_owned(),
+                    contract_version: retained.contract_version.clone(),
                     event_id: event_id.clone(),
                     observed_at: request.observed_at.clone(),
                     kind,
@@ -1006,6 +1012,7 @@ pub(crate) fn record_observation_unknown(
     store: &mut Store,
     request: &ManagedRunObserveRequest,
     response: &ManagedRunStartResponse,
+    contract_version: &str,
 ) -> Result<(), ManagedStartError> {
     store
         .reconcile_managed_session(ManagedSessionReconciliation {
@@ -1014,7 +1021,7 @@ pub(crate) fn record_observation_unknown(
             external_session_key: response.provider_thread_id.clone(),
             state: ManagedReconciliationState::Unknown,
             latest_turn_id: Some(response.provider_turn_id.clone()),
-            contract_version: "codex-app-server/0.145.0".to_owned(),
+            contract_version: contract_version.to_owned(),
             observed_at: request.observed_at.clone(),
             gap_event_id: observation_id(
                 "evt_codex_observation_unknown_",
@@ -1223,7 +1230,7 @@ mod tests {
 
     use flit_providers::{
         CodexManagedItemId, CodexManagedTurnId, CodexPermissionRequest, CodexStartedThread,
-        validated_codex_0_145_0_fingerprint,
+        validated_codex_0_145_0_fingerprint, validated_codex_0_146_0_fingerprint,
     };
     use flit_store::{
         InitialManagedSessionConnection, ManagedRunIntent, ProjectRegistration,
@@ -1288,6 +1295,7 @@ mod tests {
     struct FakeConnector {
         behavior: FakeBehavior,
         calls: Arc<Mutex<FakeCalls>>,
+        profile: ProviderFingerprint,
         thread_id: String,
         replace_project_on_connect: Option<PathBuf>,
     }
@@ -1316,7 +1324,7 @@ mod tests {
             Ok(Box::new(FakeRuntime {
                 behavior: self.behavior,
                 calls: Arc::clone(&self.calls),
-                profile: validated_codex_0_145_0_fingerprint(),
+                profile: self.profile.clone(),
                 thread_id: self.thread_id.clone(),
             }))
         }
@@ -1557,11 +1565,22 @@ mod tests {
             FakeConnector {
                 behavior,
                 calls: Arc::clone(&calls),
+                profile: validated_codex_0_145_0_fingerprint(),
                 thread_id: thread_id.to_owned(),
                 replace_project_on_connect: None,
             },
             calls,
         )
+    }
+
+    fn connector_with_profile(
+        behavior: FakeBehavior,
+        thread_id: &str,
+        profile: ProviderFingerprint,
+    ) -> (FakeConnector, Arc<Mutex<FakeCalls>>) {
+        let (mut connector, calls) = connector(behavior, thread_id);
+        connector.profile = profile;
+        (connector, calls)
     }
 
     #[test]
@@ -1646,6 +1665,71 @@ mod tests {
         assert_eq!(calls.manual_starts, 1);
         assert_eq!(calls.turns, 1);
         assert_eq!(calls.deletes, 0);
+    }
+
+    #[test]
+    fn current_profile_starts_manual_with_exact_contract_and_blocks_provider_auto() {
+        let (_directory, mut store, _project) = store_and_project("current-manual", true);
+        let (connector, calls) = connector_with_profile(
+            FakeBehavior::CommandThenPermission,
+            "thread-current",
+            validated_codex_0_146_0_fingerprint(),
+        );
+        let mut runtimes = BTreeMap::new();
+        let response = start_managed_run(&mut store, &mut runtimes, &connector, None, request())
+            .expect("current Manual start");
+        assert_eq!(response.provider_thread_id, "thread-current");
+        assert_eq!(
+            runtimes
+                .get("run-1")
+                .expect("retained current runtime")
+                .contract_version(),
+            "codex-app-server/0.146.0"
+        );
+        assert_eq!(
+            store
+                .managed_session("session-1")
+                .expect("current session read")
+                .expect("current session")
+                .executable_version
+                .as_deref(),
+            Some("0.146.0")
+        );
+        assert_eq!(calls.lock().expect("calls").manual_starts, 1);
+        assert!(matches!(
+            observe_managed_run(&mut store, &mut runtimes, observe_request())
+                .expect("current Manual observation"),
+            ManagedRunObserveResponse::PermissionRequested { .. }
+        ));
+        let latest = store.latest_ingest_seq().expect("current latest cursor");
+        let events = store
+            .run_events_through("run-1", 0, latest, 20)
+            .expect("current Run events");
+        let permission = events
+            .events
+            .iter()
+            .find(|event| event.event_type == "permission.requested")
+            .expect("current permission event");
+        assert_eq!(
+            permission.source.contract_version.as_deref(),
+            Some("codex-app-server/0.146.0")
+        );
+
+        let (_directory, mut store, _project) = store_and_project("current-auto", true);
+        let (connector, calls) = connector_with_profile(
+            FakeBehavior::ProviderAutoOutcome,
+            "thread-current-auto",
+            validated_codex_0_146_0_fingerprint(),
+        );
+        let mut runtimes = BTreeMap::new();
+        let mut auto_request = request();
+        auto_request.permission_mode = ManagedRunPermissionMode::ProviderAuto;
+        assert_eq!(
+            start_managed_run(&mut store, &mut runtimes, &connector, None, auto_request,),
+            Err(ManagedStartError::ProviderUnavailable)
+        );
+        assert_eq!(calls.lock().expect("calls").provider_auto_starts, 0);
+        assert!(runtimes.is_empty());
     }
 
     #[test]

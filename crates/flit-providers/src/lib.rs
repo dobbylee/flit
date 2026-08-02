@@ -213,11 +213,31 @@ pub fn validated_codex_0_145_0_fingerprint() -> ProviderFingerprint {
     }
 }
 
+pub fn validated_codex_0_146_0_fingerprint() -> ProviderFingerprint {
+    ProviderFingerprint {
+        canonical_executable: PathBuf::from("/opt/homebrew/Caskroom/codex/0.146.0/bin/codex"),
+        executable_version: "0.146.0".to_owned(),
+        executable_sha256: "ae1d3ffe6d48aec6a4dc3f50e7eb8e0d11962485a6a9406c5a7012139383da02"
+            .to_owned(),
+        combined_schema_sha256: "d3992fec1398afdbec658da2c720c6993fbf3c1ce4900785694d2196679eddfc"
+            .to_owned(),
+        v2_schema_sha256: "e554a74bd59d38d16acb1744750b2999156ee3d65d0fe906b22ab52edf17fbbc"
+            .to_owned(),
+        method_allowlist_sha256: "0de966cd124a25c926df49f4b697e588d51947c31c4e2febe2175338f6319d42"
+            .to_owned(),
+        fixture_sha256: "841a238a58e5a0acabfbf6e5f9db86058e51929d36c6f29180cbfa7a3bb2b941"
+            .to_owned(),
+        smoke_run_id: "2026-08-02-arm64-phase2-closure".to_owned(),
+    }
+}
+
 pub fn classify_codex(fingerprint: &ProviderFingerprint) -> ProviderCapabilitySnapshot {
     let legacy_mismatches =
         fingerprint_mismatches(fingerprint, &validated_codex_0_144_6_fingerprint());
     let manual_mismatches =
         fingerprint_mismatches(fingerprint, &validated_codex_0_145_0_fingerprint());
+    let current_mismatches =
+        fingerprint_mismatches(fingerprint, &validated_codex_0_146_0_fingerprint());
     if legacy_mismatches.is_empty() {
         ProviderCapabilitySnapshot {
             provider: ProviderKind::Codex,
@@ -232,12 +252,18 @@ pub fn classify_codex(fingerprint: &ProviderFingerprint) -> ProviderCapabilitySn
             capabilities: codex_0_145_0_capabilities(),
             fingerprint_mismatches: Vec::new(),
         }
+    } else if current_mismatches.is_empty() {
+        ProviderCapabilitySnapshot {
+            provider: ProviderKind::Codex,
+            compatibility: ProviderCompatibility::Supported,
+            capabilities: codex_0_146_0_capabilities(),
+            fingerprint_mismatches: Vec::new(),
+        }
     } else {
-        let fingerprint_mismatches = if legacy_mismatches.len() <= manual_mismatches.len() {
-            legacy_mismatches
-        } else {
-            manual_mismatches
-        };
+        let fingerprint_mismatches = [legacy_mismatches, manual_mismatches, current_mismatches]
+            .into_iter()
+            .min_by_key(Vec::len)
+            .expect("fixed Codex profile set");
         ProviderCapabilitySnapshot {
             provider: ProviderKind::Codex,
             compatibility: ProviderCompatibility::Unknown,
@@ -250,6 +276,16 @@ pub fn classify_codex(fingerprint: &ProviderFingerprint) -> ProviderCapabilitySn
             fingerprint_mismatches,
         }
     }
+}
+
+fn codex_0_146_0_capabilities() -> Vec<CapabilityEntry> {
+    let mut capabilities = codex_0_145_0_capabilities();
+    for entry in &mut capabilities {
+        if entry.capability == ProviderCapability::ProviderOutcomeObserve {
+            entry.status = CapabilityStatus::Unsupported;
+        }
+    }
+    capabilities
 }
 
 fn codex_0_145_0_capabilities() -> Vec<CapabilityEntry> {

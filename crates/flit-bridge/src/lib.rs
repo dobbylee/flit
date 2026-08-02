@@ -1830,12 +1830,14 @@ fn finish_managed_observation_unknown(
     error: managed_start::ManagedStartError,
 ) -> Result<String, BridgeError> {
     let start_response = runtime.start_response();
+    let contract_version = runtime.contract_version().to_owned();
     let recorded = core_manager.with_ready_core(|core| {
         core.managed_observations_in_flight.remove(&request.run_id);
         Ok(managed_start::record_observation_unknown(
             &mut core.store,
             &request,
             &start_response,
+            &contract_version,
         ))
     })?;
     drop(runtime);
@@ -2156,7 +2158,10 @@ fn stored_permission_submit_matches(
         && event.occurred_at == request.submitted_at
         && event.source.kind == flit_protocol::EventSourceKind::Core
         && event.source.provider.as_deref() == Some("codex")
-        && event.source.contract_version.as_deref() == Some("codex-app-server/0.145.0")
+        && matches!(
+            event.source.contract_version.as_deref(),
+            Some("codex-app-server/0.145.0" | "codex-app-server/0.146.0")
+        )
         && stored_permission_payload_matches(event, request)
 }
 

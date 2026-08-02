@@ -3,7 +3,7 @@ use std::{collections::BTreeSet, path::PathBuf};
 use flit_providers::{
     CapabilityEntry, CapabilityStatus, FingerprintAxis, ProviderCapability, ProviderCompatibility,
     ProviderFingerprint, classify_codex, validated_codex_0_144_6_fingerprint,
-    validated_codex_0_145_0_fingerprint,
+    validated_codex_0_145_0_fingerprint, validated_codex_0_146_0_fingerprint,
 };
 
 #[test]
@@ -81,6 +81,86 @@ fn exact_profile_enables_configuration_manual_response_and_provider_outcome() {
         snapshot.status(ProviderCapability::ProviderOutcomeObserve),
         CapabilityStatus::Supported
     );
+}
+
+#[test]
+fn current_exact_profile_keeps_manual_supported_and_provider_auto_fail_closed() {
+    let snapshot = classify_codex(&validated_codex_0_146_0_fingerprint());
+    assert_eq!(snapshot.compatibility, ProviderCompatibility::Supported);
+    assert_eq!(
+        snapshot.status(ProviderCapability::PermissionModeConfigure),
+        CapabilityStatus::Supported
+    );
+    assert_eq!(
+        snapshot.status(ProviderCapability::PermissionRespond),
+        CapabilityStatus::Supported
+    );
+    assert_eq!(
+        snapshot.status(ProviderCapability::ProviderOutcomeObserve),
+        CapabilityStatus::Unsupported
+    );
+}
+
+#[test]
+fn every_current_profile_axis_drift_disables_all_capabilities() {
+    let cases = [
+        (
+            FingerprintAxis::CanonicalExecutable,
+            mutate_current_fingerprint(|fingerprint| {
+                fingerprint.canonical_executable =
+                    "/opt/homebrew/Caskroom/codex/other/codex".into();
+            }),
+        ),
+        (
+            FingerprintAxis::ExecutableVersion,
+            mutate_current_fingerprint(|fingerprint| {
+                fingerprint.executable_version = "0.146.1".to_owned();
+            }),
+        ),
+        (
+            FingerprintAxis::ExecutableSha256,
+            mutate_current_fingerprint(|fingerprint| {
+                fingerprint.executable_sha256 = other_digest();
+            }),
+        ),
+        (
+            FingerprintAxis::CombinedSchemaSha256,
+            mutate_current_fingerprint(|fingerprint| {
+                fingerprint.combined_schema_sha256 = other_digest();
+            }),
+        ),
+        (
+            FingerprintAxis::V2SchemaSha256,
+            mutate_current_fingerprint(|fingerprint| {
+                fingerprint.v2_schema_sha256 = other_digest();
+            }),
+        ),
+        (
+            FingerprintAxis::MethodAllowlistSha256,
+            mutate_current_fingerprint(|fingerprint| {
+                fingerprint.method_allowlist_sha256 = other_digest();
+            }),
+        ),
+        (
+            FingerprintAxis::FixtureSha256,
+            mutate_current_fingerprint(|fingerprint| {
+                fingerprint.fixture_sha256 = other_digest();
+            }),
+        ),
+        (
+            FingerprintAxis::SmokeRunId,
+            mutate_current_fingerprint(|fingerprint| {
+                fingerprint.smoke_run_id = "different-smoke".to_owned();
+            }),
+        ),
+    ];
+
+    for (axis, fingerprint) in cases {
+        let snapshot = classify_codex(&fingerprint);
+        assert_eq!(snapshot.compatibility, ProviderCompatibility::Unknown);
+        assert_eq!(snapshot.fingerprint_mismatches, [axis]);
+        assert!(!snapshot.has_available_capability());
+    }
 }
 
 #[test]
@@ -177,6 +257,14 @@ fn mutate_fingerprint(
     mutation: impl FnOnce(&mut flit_providers::ProviderFingerprint),
 ) -> flit_providers::ProviderFingerprint {
     let mut fingerprint = validated_codex_0_144_6_fingerprint();
+    mutation(&mut fingerprint);
+    fingerprint
+}
+
+fn mutate_current_fingerprint(
+    mutation: impl FnOnce(&mut flit_providers::ProviderFingerprint),
+) -> flit_providers::ProviderFingerprint {
+    let mut fingerprint = validated_codex_0_146_0_fingerprint();
     mutation(&mut fingerprint);
     fingerprint
 }

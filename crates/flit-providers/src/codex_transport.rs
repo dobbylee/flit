@@ -167,10 +167,8 @@ impl CodexAppServer {
         &mut self,
         canonical_cwd: impl AsRef<Path>,
     ) -> Result<CodexManualStartedThread, CodexAppServerError> {
-        if self
-            .validated_profile
-            .as_ref()
-            .is_none_or(|profile| profile.executable_version != "0.145.0")
+        if !self.profile_supports(ProviderCapability::PermissionModeConfigure)
+            || !self.profile_supports(ProviderCapability::PermissionRespond)
         {
             return Err(CodexAppServerError::ManualPolicyUnavailable);
         }
@@ -201,10 +199,8 @@ impl CodexAppServer {
         &mut self,
         canonical_cwd: impl AsRef<Path>,
     ) -> Result<CodexProviderAutoStartedThread, CodexAppServerError> {
-        if self
-            .validated_profile
-            .as_ref()
-            .is_none_or(|profile| profile != &crate::validated_codex_0_145_0_fingerprint())
+        if !self.profile_supports(ProviderCapability::PermissionModeConfigure)
+            || !self.profile_supports(ProviderCapability::ProviderOutcomeObserve)
         {
             return Err(CodexAppServerError::ProviderAutoUnavailable);
         }
@@ -577,11 +573,7 @@ impl CodexAppServer {
         expected_request: &CodexPermissionRequest,
         decision: CodexPermissionDecision,
     ) -> Result<CodexPermissionDelivery, CodexAppServerError> {
-        if self
-            .validated_profile
-            .as_ref()
-            .is_none_or(|profile| profile != &crate::validated_codex_0_145_0_fingerprint())
-        {
+        if !self.profile_supports(ProviderCapability::PermissionRespond) {
             return Err(CodexAppServerError::PermissionResponseUnavailable);
         }
         let Some(active) = self.active_turn.as_ref() else {
@@ -683,6 +675,12 @@ impl CodexAppServer {
 
     pub fn validated_profile(&self) -> Option<&ProviderFingerprint> {
         self.validated_profile.as_ref()
+    }
+
+    fn profile_supports(&self, capability: ProviderCapability) -> bool {
+        self.validated_profile.as_ref().is_some_and(|profile| {
+            crate::classify_codex(profile).status(capability) == CapabilityStatus::Supported
+        })
     }
 
     pub fn shutdown(mut self) -> Result<(), CodexAppServerError> {
@@ -1982,6 +1980,44 @@ done
             server.shutdown().expect("permission shutdown");
             assert_process_group_gone(&executable);
         }
+    }
+
+    #[test]
+    fn current_profile_allows_manual_but_rejects_provider_auto_before_start_side_effect() {
+        let _process_guard = test_process_guard();
+        let directory = TestDirectory::new("current-manual-only");
+        let executable = directory.0.join("codex");
+        write_script(
+            &executable,
+            &format!(
+                r#"#!/bin/sh
+printf '%s' "$$" > "$0.pgid"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{{"id":1,"result":{{}}}}' ;;
+    *'"method":"thread/start"'*)
+      printf '%s\n' "$line" >> "$0.starts"
+      printf '%s\n' '{{"id":2,"result":{{"thread":{{"id":"managed-1","sessionId":"managed-1"}},"cwd":"{TEST_CWD}","sandbox":{{"type":"readOnly","networkAccess":false}},"approvalPolicy":"on-request","approvalsReviewer":"user"}}}}'
+      ;;
+  esac
+done
+"#
+            ),
+        );
+        let mut server = connect_fake(&executable, Duration::from_secs(1)).expect("handshake");
+        server.validated_profile = Some(crate::validated_codex_0_146_0_fingerprint());
+        server
+            .start_manual(TEST_CWD)
+            .expect("current Manual thread");
+        assert!(matches!(
+            server.start_provider_auto(TEST_CWD),
+            Err(CodexAppServerError::ProviderAutoUnavailable)
+        ));
+        let starts = fs::read_to_string(format!("{}.starts", executable.display()))
+            .expect("start request log");
+        assert_eq!(starts.lines().count(), 1);
+        server.shutdown().expect("current profile shutdown");
+        assert_process_group_gone(&executable);
     }
 
     #[test]
