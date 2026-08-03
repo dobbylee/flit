@@ -352,6 +352,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "flit-git"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+]
+
+[[package]]
 name = "flit-protocol"
 version = "0.1.0"
 dependencies = [
