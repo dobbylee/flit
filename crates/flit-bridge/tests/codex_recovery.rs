@@ -13,6 +13,7 @@ use flit_bridge::codex_recovery::{
     CodexRecoveryProviderError, observe_codex_sessions, persist_codex_recovery_observations,
     reconcile_live_codex_sessions, unknown_codex_recovery_observations,
 };
+use flit_protocol::{GitBaselinePayload, GitBaselineUnavailableReason};
 use flit_providers::{
     CodexManagedScope, CodexManagedThreadConflict, CodexManagedThreadId, CodexManagedThreads,
     CodexThreadRead, CodexThreadState, MAX_CODEX_MANAGED_THREADS, ProviderFingerprint,
@@ -428,6 +429,7 @@ fn exact_partition_reconciles_terminal_and_unknown_states_and_retry_is_stable() 
         run_event_types(&store, "run-completed"),
         [
             "run.created",
+            "git.snapshot_recorded",
             "run.start_requested",
             "session.connected",
             "diagnostic.sequence_gap",
@@ -438,6 +440,7 @@ fn exact_partition_reconciles_terminal_and_unknown_states_and_retry_is_stable() 
         run_event_types(&store, "run-missing"),
         [
             "run.created",
+            "git.snapshot_recorded",
             "run.start_requested",
             "session.connected",
             "diagnostic.sequence_gap",
@@ -1106,9 +1109,14 @@ fn seed_live_session(
             title: format!("Run {label}"),
             goal: Some("Reconcile this managed Run.".to_owned()),
             start_request: object(json!({"prompt_sha256": format!("digest-{label}")})),
-            baseline_head: None,
+            git_baseline: GitBaselinePayload::Unavailable {
+                project_id: "project-1".to_owned(),
+                reason: GitBaselineUnavailableReason::RunnerUnavailable,
+            },
+            git_baseline_observed_at: CREATED_AT.to_owned(),
             created_at: CREATED_AT.to_owned(),
             run_created_event_id: format!("event-{label}-created"),
+            git_baseline_event_id: format!("event-{label}-git-baseline"),
             start_requested_event_id: format!("event-{label}-requested"),
         })
         .expect("managed Run");

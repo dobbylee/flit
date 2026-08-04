@@ -5,7 +5,9 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use flit_protocol::{EventEnvelope, NullableSessionId, UnsequencedEventEnvelope};
+use flit_protocol::{
+    EventEnvelope, EventProtocolVersion, NullableSessionId, UnsequencedEventEnvelope,
+};
 use flit_store::{AppendEventOutcome, MAX_EVENT_APPEND_BATCH, Store, StoreError};
 use rusqlite::{Connection, params};
 use serde_json::json;
@@ -222,6 +224,7 @@ fn event(event_id: &str, stream_seq: u64) -> UnsequencedEventEnvelope {
     ))
     .expect("current event fixture");
     let mut event = UnsequencedEventEnvelope::from(event);
+    event.protocol_version = EventProtocolVersion::V1_1;
     event.event_id = event_id.to_owned();
     event.stream_seq = stream_seq;
     event

@@ -7,7 +7,10 @@ use std::{
 };
 
 use flit_bridge::{core_construction_count, dashboard_read_json, initialize_core};
-use flit_protocol::{DashboardReadRequest, DashboardReadResponse, PROTOCOL_VERSION};
+use flit_protocol::{
+    DashboardReadRequest, DashboardReadResponse, GitBaselinePayload, GitBaselineUnavailableReason,
+    PROTOCOL_VERSION,
+};
 use flit_store::{
     InitialManagedSessionConnection, ManagedRunIntent, ProjectRegistration,
     ProjectTrustConfirmation, Store,
@@ -86,9 +89,14 @@ fn startup_persists_unknown_before_ready_then_reconciles_once_in_background() {
             title: "Recover at startup".to_owned(),
             goal: Some("Recover this exact managed Run.".to_owned()),
             start_request: object(json!({"prompt_sha256": "startup-digest"})),
-            baseline_head: None,
+            git_baseline: GitBaselinePayload::Unavailable {
+                project_id: "project-startup".to_owned(),
+                reason: GitBaselineUnavailableReason::RunnerUnavailable,
+            },
+            git_baseline_observed_at: CREATED_AT.to_owned(),
             created_at: CREATED_AT.to_owned(),
             run_created_event_id: "event-startup-created".to_owned(),
+            git_baseline_event_id: "event-startup-git-baseline".to_owned(),
             start_requested_event_id: "event-startup-requested".to_owned(),
         })
         .expect("managed Run");

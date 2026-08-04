@@ -21,5 +21,8 @@ sha2 = "=0.10.9"
 thiserror = "=2.0.19"
 uniffi = { version = "=0.32.0", default-features = false }
 
+[dev-dependencies]
+rusqlite = { version = "=0.39.0", default-features = false, features = ["bundled"] }
+
 [lints]
 workspace = true

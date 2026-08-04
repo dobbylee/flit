@@ -1,0 +1,31 @@
+{
+  "protocol_version": "1.1",
+  "event_id": "event-run-managed-1-git-baseline",
+  "run_id": "run-managed-1",
+  "session_id": null,
+  "stream_seq": 2,
+  "ingest_seq": 2,
+  "occurred_at": "2026-07-27T12:00:00Z",
+  "observed_at": "2026-07-27T12:00:00Z",
+  "type": "git.snapshot_recorded",
+  "source": {
+    "kind": "core",
+    "contract_version": "git-baseline/1.0"
+  },
+  "confidence": 1.0,
+  "evidence_ids": [],
+  "payload": {
+    "availability": "available",
+    "project_id": "project-1",
+    "head": {
+      "availability": "available",
+      "oid": "0123456789abcdef0123456789abcdef01234567"
+    },
+    "dirty": {
+      "staged": 1,
+      "unstaged": 2,
+      "untracked": 1,
+      "entries": 3
+    }
+  }
+}

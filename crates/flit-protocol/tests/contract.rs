@@ -2,8 +2,8 @@ use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use flit_protocol::{
     CapabilityStatus, CommandError, DashboardReadRequest, DashboardReadResponse,
-    EVENT_PROTOCOL_VERSION, EventEnvelope, EventProtocolVersion, GitObservationRequest,
-    GitObservationResponse, MAX_JSON_SAFE_INTEGER, ManagedRunObserveRequest,
+    EVENT_PROTOCOL_VERSION, EventEnvelope, EventProtocolVersion, GitBaselinePayload,
+    GitObservationRequest, GitObservationResponse, MAX_JSON_SAFE_INTEGER, ManagedRunObserveRequest,
     ManagedRunObserveResponse, ManagedRunOpenInProviderRequest, ManagedRunPermissionRespondRequest,
     ManagedRunPermissionRespondResponse, ManagedRunStartRequest, ManagedRunStartResponse,
     PROTOCOL_VERSION, ProjectInspectionRequest, ProjectInspectionResponse,
@@ -616,6 +616,23 @@ fn current_managed_run_start_fixtures_round_trip_every_shape() {
     ] {
         assert_fixture_round_trip::<ManagedRunStartRequest>(&command_fixture(current, name));
     }
+    let request_path = command_fixture(current, "managed_run_start.request.json");
+    let request: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repository_path(&request_path))
+            .expect("managed Run request fixture should be readable"),
+    )
+    .expect("managed Run request fixture should be JSON");
+    for required in ["git_baseline_observed_at", "git_baseline_event_id"] {
+        let mut missing = request.clone();
+        missing
+            .as_object_mut()
+            .expect("managed Run request should be an object")
+            .remove(required);
+        assert!(
+            serde_json::from_value::<ManagedRunStartRequest>(missing).is_err(),
+            "managed Run start must require {required}"
+        );
+    }
     for (name, provider_configuration) in [
         (
             "managed_run_start.response.json",
@@ -672,6 +689,61 @@ fn current_managed_run_observe_fixtures_round_trip_every_shape() {
         current,
         "managed_run_observe_errors.json",
     ));
+
+    let provider_auto_start: ManagedRunStartResponse = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "managed_run_start.provider_auto.response.json",
+        )))
+        .expect("ProviderAuto start fixture should be readable"),
+    )
+    .expect("ProviderAuto start fixture should match Rust types");
+    let provider_auto_observation: ManagedRunObserveResponse = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "managed_run_observe.provider_outcome_resolved.response.json",
+        )))
+        .expect("ProviderAuto observation fixture should be readable"),
+    )
+    .expect("ProviderAuto observation fixture should match Rust types");
+    match provider_auto_observation {
+        ManagedRunObserveResponse::ProviderOutcomeResolved {
+            run_id,
+            session_id,
+            request_version,
+            event_version,
+            ..
+        } => {
+            assert_eq!(run_id, provider_auto_start.run_id);
+            assert_eq!(session_id, provider_auto_start.session_id);
+            assert_eq!(request_version, 5);
+            assert_eq!(event_version, 6);
+        }
+        _ => panic!("ProviderAuto observation fixture should be a resolved outcome"),
+    }
+
+    for (name, expected_version) in [
+        ("managed_run_observe.permission_requested.response.json", 5),
+        ("managed_run_observe.turn_completed.response.json", 5),
+        ("managed_run_observe.turn_interrupted.response.json", 5),
+    ] {
+        let response: ManagedRunObserveResponse = serde_json::from_str(
+            &fs::read_to_string(repository_path(&command_fixture(current, name)))
+                .expect("managed observation fixture should be readable"),
+        )
+        .expect("managed observation fixture should match Rust types");
+        let version = match response {
+            ManagedRunObserveResponse::PermissionRequested {
+                request_version, ..
+            } => request_version,
+            ManagedRunObserveResponse::TurnCompleted { event_version, .. }
+            | ManagedRunObserveResponse::TurnInterrupted { event_version, .. } => event_version,
+            ManagedRunObserveResponse::ProviderOutcomeResolved { .. } => {
+                panic!("fixture should represent the named observation shape")
+            }
+        };
+        assert_eq!(version, expected_version, "stale version in {name}");
+    }
 }
 
 #[test]
@@ -694,6 +766,43 @@ fn current_managed_permission_response_fixtures_round_trip_every_shape() {
         current,
         "managed_run_permission_respond_errors.json",
     ));
+
+    let request: ManagedRunPermissionRespondRequest = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "managed_run_permission_respond.request.json",
+        )))
+        .expect("permission response request fixture should be readable"),
+    )
+    .expect("permission response request fixture should match Rust types");
+    assert_eq!(request.request_version, 5);
+    for name in [
+        "managed_run_permission_respond.delivered.response.json",
+        "managed_run_permission_respond.delivery_unknown.response.json",
+    ] {
+        let response: ManagedRunPermissionRespondResponse = serde_json::from_str(
+            &fs::read_to_string(repository_path(&command_fixture(current, name)))
+                .expect("permission response fixture should be readable"),
+        )
+        .expect("permission response fixture should match Rust types");
+        let (request_version, submitted_version, outcome_version) = match response {
+            ManagedRunPermissionRespondResponse::Delivered {
+                request_version,
+                submitted_version,
+                outcome_version,
+                ..
+            }
+            | ManagedRunPermissionRespondResponse::DeliveryUnknown {
+                request_version,
+                submitted_version,
+                outcome_version,
+                ..
+            } => (request_version, submitted_version, outcome_version),
+        };
+        assert_eq!(request_version, 5, "stale request version in {name}");
+        assert_eq!(submitted_version, 6, "stale submit version in {name}");
+        assert_eq!(outcome_version, 7, "stale outcome version in {name}");
+    }
 }
 
 #[test]
@@ -902,6 +1011,39 @@ fn current_event_fixture_round_trips_without_losing_unknown_fields() {
 }
 
 #[test]
+fn current_git_baseline_event_payload_is_exact_and_mixed_variants_fail_closed() {
+    let manifest = read_compatibility_manifest();
+    let fixture: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repository_path(&manifest.current.fixture))
+            .expect("current event fixture should be readable"),
+    )
+    .expect("current event fixture should contain valid JSON");
+    let payload = fixture["payload"].clone();
+    let decoded: GitBaselinePayload =
+        serde_json::from_value(payload.clone()).expect("Git baseline payload");
+    assert_eq!(serde_json::to_value(decoded).unwrap(), payload);
+
+    let mut mixed = payload.clone();
+    mixed["reason"] = serde_json::json!("process_unavailable");
+    assert!(serde_json::from_value::<GitBaselinePayload>(mixed).is_err());
+
+    let unavailable = serde_json::json!({
+        "availability": "unavailable",
+        "project_id": "project-1",
+        "reason": "not_repository"
+    });
+    assert!(serde_json::from_value::<GitBaselinePayload>(unavailable.clone()).is_ok());
+    let mut mixed_unavailable = unavailable;
+    mixed_unavailable["dirty"] = serde_json::json!({
+        "staged": 0,
+        "unstaged": 0,
+        "untracked": 0,
+        "entries": 0
+    });
+    assert!(serde_json::from_value::<GitBaselinePayload>(mixed_unavailable).is_err());
+}
+
+#[test]
 fn event_schema_accepts_current_fixture_and_rejects_invalid_boundaries() {
     let manifest = read_compatibility_manifest();
     let schema: serde_json::Value = serde_json::from_str(
@@ -1018,7 +1160,7 @@ fn current_contract_snapshot() -> CurrentContractSnapshot {
             .expect("current fixture should be readable"),
     )
     .expect("current fixture should contain valid JSON");
-    let serialized_version = serde_json::to_value(EventProtocolVersion::V1_0)
+    let serialized_version = serde_json::to_value(EventProtocolVersion::V1_1)
         .expect("event version should serialize")
         .as_str()
         .expect("event version should serialize as a string")

@@ -7,7 +7,9 @@ use std::{
 };
 
 use flit_protocol::{
-    EventProtocolVersion, EventSource, EventSourceKind, NullableSessionId, UnsequencedEventEnvelope,
+    EventProtocolVersion, EventSource, EventSourceKind, GitBaselinePayload,
+    GitBaselineUnavailableReason, GitDirtySummary, GitHead, NullableSessionId,
+    UnsequencedEventEnvelope,
 };
 use flit_store::{
     AppendEventOutcome, DashboardChangeSummary, InitialManagedSessionConnection,
@@ -60,7 +62,7 @@ fn managed_events_atomically_advance_truthful_dashboard_projection_and_reopen() 
         .run_snapshot("run-1")
         .expect("starting snapshot")
         .expect("starting projection");
-    assert_eq!(starting.version, 2);
+    assert_eq!(starting.version, 3);
     assert_eq!(starting.lifecycle, "Starting");
     assert_eq!(starting.activity, "Unknown");
     assert_eq!(starting.dashboard_bucket, "Working");
@@ -84,7 +86,7 @@ fn managed_events_atomically_advance_truthful_dashboard_projection_and_reopen() 
         .run_snapshot("run-1")
         .expect("running snapshot")
         .expect("running projection");
-    assert_eq!(running.version, 3);
+    assert_eq!(running.version, 4);
     assert_eq!(running.lifecycle, "Running");
 
     let request = match store
@@ -338,8 +340,8 @@ fn managed_start_failure_is_terminal_idempotent_and_reopens_without_a_session() 
     assert_eq!(failed_run.started_at, None);
     assert_eq!(failed_run.ended_at.as_deref(), Some(ENDED_AT));
     assert_eq!(failed_event.event_type, "run.failed");
-    assert_eq!(failed_event.ingest_seq, 3);
-    assert_eq!(failed_event.stream_seq, 3);
+    assert_eq!(failed_event.ingest_seq, 4);
+    assert_eq!(failed_event.stream_seq, 4);
     assert_eq!(failed_event.payload["reason"], "provider_start_failed");
     assert_eq!(failed_event.payload["stage"], "provider_start");
     assert_eq!(failed_event.source.kind, EventSourceKind::ProviderAdapter);
@@ -352,9 +354,9 @@ fn managed_start_failure_is_terminal_idempotent_and_reopens_without_a_session() 
         store
             .fail_managed_run_start(failure)
             .expect("exact duplicate"),
-        ManagedRunStartFailureOutcome::Duplicate { event, .. } if event.ingest_seq == 3
+        ManagedRunStartFailureOutcome::Duplicate { event, .. } if event.ingest_seq == 4
     ));
-    assert_eq!(store.latest_ingest_seq().expect("duplicate cursor"), 3);
+    assert_eq!(store.latest_ingest_seq().expect("duplicate cursor"), 4);
 
     let mut mismatch = start_failure("run-failed-start", "event-other-terminal");
     mismatch.reason = "different_failure".to_owned();
@@ -362,7 +364,7 @@ fn managed_start_failure_is_terminal_idempotent_and_reopens_without_a_session() 
         store.fail_managed_run_start(mismatch),
         Err(StoreError::ManagedRunTerminalConflict { .. })
     ));
-    assert_eq!(store.latest_ingest_seq().expect("conflict cursor"), 3);
+    assert_eq!(store.latest_ingest_seq().expect("conflict cursor"), 4);
     assert!(matches!(
         store.connect_initial_managed_session(session_connection(
             "session-after-failure",
@@ -490,14 +492,18 @@ fn managed_run_and_exact_session_are_atomic_idempotent_and_reopen() {
             .iter()
             .map(|event| event.event_type.as_str())
             .collect::<Vec<_>>(),
-        ["run.created", "run.start_requested"]
+        [
+            "run.created",
+            "git.snapshot_recorded",
+            "run.start_requested"
+        ]
     );
     assert_eq!(
         created_events
             .iter()
             .map(|event| event.ingest_seq)
             .collect::<Vec<_>>(),
-        [1, 2]
+        [1, 2, 3]
     );
     assert_eq!(
         created_run.goal.as_deref(),
@@ -518,7 +524,7 @@ fn managed_run_and_exact_session_are_atomic_idempotent_and_reopen() {
     assert!(matches!(
         duplicate,
         ManagedRunIntentOutcome::Duplicate { ref events, .. }
-            if events.iter().map(|event| event.ingest_seq).collect::<Vec<_>>() == [1, 2]
+            if events.iter().map(|event| event.ingest_seq).collect::<Vec<_>>() == [1, 2, 3]
     ));
     for (created_event_id, requested_event_id) in [
         ("event-run-created-retry", "event-start-requested"),
@@ -535,16 +541,20 @@ fn managed_run_and_exact_session_are_atomic_idempotent_and_reopen() {
             )),
             Err(StoreError::ManagedRunIdentityConflict { .. })
         ));
-        assert_eq!(store.latest_ingest_seq().expect("retry cursor"), 2);
+        assert_eq!(store.latest_ingest_seq().expect("retry cursor"), 3);
         assert_eq!(
             store
-                .run_events_through("run-1", 0, 2, 10)
+                .run_events_through("run-1", 0, 3, 10)
                 .expect("original Run events")
                 .events
                 .iter()
                 .map(|event| event.event_id.as_str())
                 .collect::<Vec<_>>(),
-            ["event-run-created", "event-start-requested"]
+            [
+                "event-run-created",
+                "event-run-created-git-baseline",
+                "event-start-requested"
+            ]
         );
     }
 
@@ -559,7 +569,7 @@ fn managed_run_and_exact_session_are_atomic_idempotent_and_reopen() {
     assert_eq!(session.ordinal, 1);
     assert_eq!(session.external_session_key, "codex-thread-1");
     assert_eq!(connected_event.event_type, "session.connected");
-    assert_eq!(connected_event.ingest_seq, 3);
+    assert_eq!(connected_event.ingest_seq, 4);
     assert_eq!(
         store
             .managed_run("run-1")
@@ -574,7 +584,7 @@ fn managed_run_and_exact_session_are_atomic_idempotent_and_reopen() {
         store
             .connect_initial_managed_session(connection)
             .expect("duplicate session"),
-        InitialManagedSessionOutcome::Duplicate { event, .. } if event.ingest_seq == 3
+        InitialManagedSessionOutcome::Duplicate { event, .. } if event.ingest_seq == 4
     ));
 
     drop(store);
@@ -596,14 +606,91 @@ fn managed_run_and_exact_session_are_atomic_idempotent_and_reopen() {
     );
     assert_eq!(
         reopened
-            .run_events_through("run-1", 0, 3, 10)
+            .run_events_through("run-1", 0, 4, 10)
             .expect("reopened event page")
             .events
             .iter()
             .map(|event| event.event_type.as_str())
             .collect::<Vec<_>>(),
-        ["run.created", "run.start_requested", "session.connected"]
+        [
+            "run.created",
+            "git.snapshot_recorded",
+            "run.start_requested",
+            "session.connected"
+        ]
     );
+}
+
+#[test]
+fn managed_git_baseline_is_atomic_content_free_and_first_receipt_wins_retries() {
+    let directory = TestDirectory::new("git-baseline");
+    let (mut store, _database, _project_path) = trusted_store(&directory);
+    let mut intent = run_intent(
+        "run-git-baseline",
+        "event-git-run-created",
+        "event-git-start-requested",
+    );
+    intent.git_baseline = GitBaselinePayload::Available {
+        project_id: "project-1".to_owned(),
+        head: GitHead::Available {
+            oid: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+        },
+        dirty: GitDirtySummary {
+            staged: 1,
+            unstaged: 1,
+            untracked: 0,
+            entries: 1,
+        },
+    };
+    let (run, events) = match store
+        .create_managed_run_intent(intent.clone())
+        .expect("available baseline intent")
+    {
+        ManagedRunIntentOutcome::Created { run, events } => (run, events),
+        other => panic!("unexpected baseline outcome: {other:?}"),
+    };
+    assert_eq!(
+        run.baseline_head.as_deref(),
+        Some("0123456789abcdef0123456789abcdef01234567")
+    );
+    assert_eq!(events[1].event_type, "git.snapshot_recorded");
+    assert_eq!(events[1].source.kind, EventSourceKind::Core);
+    assert_eq!(
+        events[1].source.contract_version.as_deref(),
+        Some("git-baseline/1.0")
+    );
+    assert_eq!(events[1].payload["availability"], "available");
+    assert_eq!(events[1].payload["dirty"]["entries"], 1);
+    let rendered = serde_json::to_string(&events[1]).expect("baseline JSON");
+    for forbidden in [
+        directory.0.to_string_lossy().as_ref(),
+        "stderr",
+        "environment",
+    ] {
+        assert!(!rendered.contains(forbidden));
+    }
+
+    intent.git_baseline = GitBaselinePayload::Unavailable {
+        project_id: "project-1".to_owned(),
+        reason: GitBaselineUnavailableReason::ProcessUnavailable,
+    };
+    let duplicate = store
+        .create_managed_run_intent(intent.clone())
+        .expect("retry keeps first baseline");
+    assert!(matches!(
+        duplicate,
+        ManagedRunIntentOutcome::Duplicate { ref events, .. }
+            if events[1].payload["availability"] == "available"
+                && events[1].ingest_seq == 2
+    ));
+    assert_eq!(store.latest_ingest_seq().expect("baseline cursor"), 3);
+
+    intent.git_baseline_event_id = "event-conflicting-git-baseline".to_owned();
+    assert!(matches!(
+        store.create_managed_run_intent(intent),
+        Err(StoreError::ManagedRunIdentityConflict { .. })
+    ));
+    assert_eq!(store.latest_ingest_seq().expect("conflict cursor"), 3);
 }
 
 #[test]
@@ -816,12 +903,12 @@ fn provider_owned_outcome_atomically_records_request_and_fact_without_response_a
         store.commit_managed_provider_outcome(conflict),
         Err(StoreError::ManagedProviderOutcomeConflict { .. })
     ));
-    assert_eq!(store.latest_ingest_seq().expect("stable cursor"), 5);
+    assert_eq!(store.latest_ingest_seq().expect("stable cursor"), 6);
 
     drop(store);
     let reopened = Store::open(&database, ENDED_AT).expect("reopen Store");
     let events = reopened
-        .run_events_through("run-1", 0, 5, 10)
+        .run_events_through("run-1", 0, 6, 10)
         .expect("reopened events");
     assert_eq!(
         events
@@ -831,6 +918,7 @@ fn provider_owned_outcome_atomically_records_request_and_fact_without_response_a
             .collect::<Vec<_>>(),
         [
             "run.created",
+            "git.snapshot_recorded",
             "run.start_requested",
             "session.connected",
             "permission.requested",
@@ -844,7 +932,7 @@ fn managed_permission_response_attempt_and_resolution_are_exact_durable_and_idem
     let directory = TestDirectory::new("permission-response-resolved");
     let (mut store, database, project_path) = trusted_store(&directory);
     let request = open_permission_request(&mut store, &project_path);
-    assert_eq!(request.ingest_seq, 4);
+    assert_eq!(request.ingest_seq, 5);
 
     let attempt = permission_attempt(&request, "attempt-1", ManagedPermissionDecision::AllowOnce);
     let submitted = match store
@@ -856,7 +944,7 @@ fn managed_permission_response_attempt_and_resolution_are_exact_durable_and_idem
     };
     assert_eq!(submitted.event_type, "permission.response_submitted");
     assert_eq!(submitted.stream_seq, 3);
-    assert_eq!(submitted.payload["request_version"], 4);
+    assert_eq!(submitted.payload["request_version"], 5);
     assert_eq!(submitted.payload["decision"], "allow_once");
     assert_eq!(submitted.payload["response_attempt_id"], "attempt-1");
     assert_eq!(
@@ -922,12 +1010,12 @@ fn managed_permission_response_attempt_and_resolution_are_exact_durable_and_idem
             terminal_event: Some(ref terminal),
         } if event == &submitted && terminal.as_ref() == &resolved
     ));
-    assert_eq!(store.latest_ingest_seq().expect("stable event cursor"), 6);
+    assert_eq!(store.latest_ingest_seq().expect("stable event cursor"), 7);
 
     drop(store);
     let reopened = Store::open(&database, ENDED_AT).expect("reopen Store");
     let events = reopened
-        .run_events_through("run-1", 0, 6, 10)
+        .run_events_through("run-1", 0, 7, 10)
         .expect("reopened events");
     assert_eq!(
         events
@@ -937,6 +1025,7 @@ fn managed_permission_response_attempt_and_resolution_are_exact_durable_and_idem
             .collect::<Vec<_>>(),
         [
             "run.created",
+            "git.snapshot_recorded",
             "run.start_requested",
             "session.connected",
             "permission.requested",
@@ -971,7 +1060,7 @@ fn managed_permission_response_rejects_stale_wrong_and_second_attempts_without_m
         store.submit_managed_permission_response(missing),
         Err(StoreError::ManagedPermissionRequestStale { .. })
     ));
-    assert_eq!(store.latest_ingest_seq().expect("unchanged cursor"), 4);
+    assert_eq!(store.latest_ingest_seq().expect("unchanged cursor"), 5);
 
     store
         .submit_managed_permission_response(attempt.clone())
@@ -1017,10 +1106,10 @@ fn managed_permission_response_rejects_stale_wrong_and_second_attempts_without_m
         .finish_managed_permission_response(unknown)
         .expect("record delivery unknown");
     let events = store
-        .run_events_through("run-1", 0, 6, 10)
+        .run_events_through("run-1", 0, 7, 10)
         .expect("delivery unknown events");
     assert_eq!(
-        events.events[5].payload["delivery_plan_fingerprint"],
+        events.events[6].payload["delivery_plan_fingerprint"],
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     );
     let resolved_after_unknown = permission_result(
@@ -1034,7 +1123,7 @@ fn managed_permission_response_rejects_stale_wrong_and_second_attempts_without_m
     ));
     assert_eq!(
         store.latest_ingest_seq().expect("one attempt and outcome"),
-        6
+        7
     );
 }
 
@@ -1107,7 +1196,7 @@ fn managed_permission_response_lookup_stays_exact_after_large_unrelated_history(
     ));
     assert_eq!(
         store.latest_ingest_seq().expect("large history cursor"),
-        3 + (128 * 3) + 3
+        4 + (128 * 3) + 3
     );
 }
 
@@ -1146,7 +1235,7 @@ fn managed_permission_response_requires_submit_and_a_live_current_request() {
         Err(StoreError::ManagedPermissionRequestStale { .. }
             | StoreError::ManagedSessionNotLive { .. })
     ));
-    assert_eq!(store.latest_ingest_seq().expect("terminal cursor"), 5);
+    assert_eq!(store.latest_ingest_seq().expect("terminal cursor"), 6);
 
     let newer_directory = TestDirectory::new("permission-response-newer-request");
     let (mut newer_store, _database, newer_project_path) = trusted_store(&newer_directory);
@@ -1179,7 +1268,7 @@ fn managed_permission_response_requires_submit_and_a_live_current_request() {
     ));
     assert_eq!(
         newer_store.latest_ingest_seq().expect("new request cursor"),
-        5
+        6
     );
 }
 
@@ -1287,7 +1376,7 @@ fn untrusted_archived_and_oversized_intents_fail_before_mutation() {
             .started_at,
         None
     );
-    assert_eq!(store.latest_ingest_seq().expect("session depth cursor"), 2);
+    assert_eq!(store.latest_ingest_seq().expect("session depth cursor"), 3);
 
     drop(store);
     let raw = rusqlite::Connection::open(&database).expect("raw database");
@@ -1306,7 +1395,7 @@ fn untrusted_archived_and_oversized_intents_fail_before_mutation() {
         )),
         Err(StoreError::ArchivedProject { .. })
     ));
-    assert_eq!(store.latest_ingest_seq().expect("archived cursor"), 2);
+    assert_eq!(store.latest_ingest_seq().expect("archived cursor"), 3);
 }
 
 #[test]
@@ -1463,7 +1552,7 @@ fn external_identity_cwd_live_session_and_retry_conflicts_fail_closed() {
         );
         assert_eq!(
             store.latest_ingest_seq().expect("unchanged event cursor"),
-            5
+            7
         );
     }
 
@@ -1493,7 +1582,7 @@ fn external_identity_cwd_live_session_and_retry_conflicts_fail_closed() {
     );
     assert_eq!(
         store.latest_ingest_seq().expect("unchanged event cursor"),
-        5
+        7
     );
 }
 
@@ -1541,7 +1630,7 @@ fn managed_terminal_closes_session_and_run_atomically_idempotently_and_reopens()
     assert_eq!(run.ended_at.as_deref(), Some(ENDED_AT));
     assert_eq!(session.ended_at.as_deref(), Some(ENDED_AT));
     assert_eq!(session.end_reason.as_deref(), Some("completed"));
-    assert_eq!(event.ingest_seq, 4);
+    assert_eq!(event.ingest_seq, 5);
     assert_eq!(event.stream_seq, 2);
     assert_eq!(event.event_type, "run.completed");
     assert_eq!(event.payload["outcome"], "completed");
@@ -1556,12 +1645,12 @@ fn managed_terminal_closes_session_and_run_atomically_idempotently_and_reopens()
             ..
         } if duplicate == event
     ));
-    assert_eq!(store.latest_ingest_seq().expect("duplicate cursor"), 4);
+    assert_eq!(store.latest_ingest_seq().expect("duplicate cursor"), 5);
     assert!(matches!(
         store
             .connect_initial_managed_session(initial_connection.clone())
             .expect("terminal session-connect replay"),
-        InitialManagedSessionOutcome::Duplicate { event, .. } if event.ingest_seq == 3
+        InitialManagedSessionOutcome::Duplicate { event, .. } if event.ingest_seq == 4
     ));
 
     drop(store);
@@ -1578,7 +1667,7 @@ fn managed_terminal_closes_session_and_run_atomically_idempotently_and_reopens()
     );
     assert_eq!(
         reopened
-            .run_events_through("run-terminal", 0, 4, 10)
+            .run_events_through("run-terminal", 0, 5, 10)
             .expect("terminal event page")
             .events
             .iter()
@@ -1586,6 +1675,7 @@ fn managed_terminal_closes_session_and_run_atomically_idempotently_and_reopens()
             .collect::<Vec<_>>(),
         [
             "run.created",
+            "git.snapshot_recorded",
             "run.start_requested",
             "session.connected",
             "run.completed"
@@ -1595,7 +1685,7 @@ fn managed_terminal_closes_session_and_run_atomically_idempotently_and_reopens()
         reopened
             .connect_initial_managed_session(initial_connection)
             .expect("reopened terminal session-connect replay"),
-        InitialManagedSessionOutcome::Duplicate { event, .. } if event.ingest_seq == 3
+        InitialManagedSessionOutcome::Duplicate { event, .. } if event.ingest_seq == 4
     ));
 }
 
@@ -2001,7 +2091,7 @@ fn gap_only_reconciliation_is_explicit_idempotent_and_never_closes_rows() {
         ));
         assert_terminal_rows_open(&store, "run-gap", "session-gap");
     }
-    assert_eq!(store.latest_ingest_seq().expect("gap cursor"), 7);
+    assert_eq!(store.latest_ingest_seq().expect("gap cursor"), 8);
 
     let invalid_terminal = session_reconciliation(
         "run-gap",
@@ -2029,7 +2119,7 @@ fn gap_only_reconciliation_is_explicit_idempotent_and_never_closes_rows() {
         store.reconcile_managed_session(invalid_nonterminal),
         Err(StoreError::InvalidManagedSessionReconciliation { field: "state" })
     ));
-    assert_eq!(store.latest_ingest_seq().expect("invalid cursor"), 7);
+    assert_eq!(store.latest_ingest_seq().expect("invalid cursor"), 8);
 }
 
 #[test]
@@ -2440,9 +2530,14 @@ fn run_intent(run_id: &str, created_event_id: &str, requested_event_id: &str) ->
             "permission_mode": "manual",
             "prompt_sha256": "fixture-prompt-digest"
         })),
-        baseline_head: None,
+        git_baseline: GitBaselinePayload::Unavailable {
+            project_id: "project-1".to_owned(),
+            reason: GitBaselineUnavailableReason::RunnerUnavailable,
+        },
+        git_baseline_observed_at: CREATED_AT.to_owned(),
         created_at: CREATED_AT.to_owned(),
         run_created_event_id: created_event_id.to_owned(),
+        git_baseline_event_id: format!("{created_event_id}-git-baseline"),
         start_requested_event_id: requested_event_id.to_owned(),
     }
 }
@@ -2536,7 +2631,7 @@ fn session_event(
     event_type: &str,
 ) -> UnsequencedEventEnvelope {
     UnsequencedEventEnvelope {
-        protocol_version: EventProtocolVersion::V1_0,
+        protocol_version: EventProtocolVersion::V1_1,
         event_id: event_id.to_owned(),
         run_id: run_id.to_owned(),
         session_id: NullableSessionId::Id(session_id.to_owned()),

@@ -12,11 +12,12 @@ use std::{
 };
 
 use flit_protocol::{
-    DashboardReadRequest, DashboardReadResponse, ManagedRunObserveRequest,
-    ManagedRunObserveResponse, ManagedRunPermissionDecision, ManagedRunPermissionMode,
-    ManagedRunPermissionRespondRequest, ManagedRunPermissionRespondResponse,
-    ManagedRunProviderDecision, ManagedRunProviderTerminalOutcome, ManagedRunStartRequest,
-    ManagedRunStartResponse, ProviderKind,
+    DashboardReadRequest, DashboardReadResponse, GitBaselinePayload, GitBaselineUnavailableReason,
+    ManagedRunObserveRequest, ManagedRunObserveResponse, ManagedRunPermissionDecision,
+    ManagedRunPermissionMode, ManagedRunPermissionRespondRequest,
+    ManagedRunPermissionRespondResponse, ManagedRunProviderDecision,
+    ManagedRunProviderTerminalOutcome, ManagedRunStartRequest, ManagedRunStartResponse,
+    ProviderKind,
 };
 use flit_providers::{
     CodexManagedItemId, CodexManagedScope, CodexManagedThreadId, CodexManagedThreads,
@@ -702,8 +703,10 @@ fn start_runs(
                 },
                 permission_mode_version: 1,
                 created_at: CREATED_AT.to_owned(),
+                git_baseline_observed_at: CREATED_AT.to_owned(),
                 started_at: STARTED_AT.to_owned(),
                 run_created_event_id: format!("event-{}-created", run.run_id),
+                git_baseline_event_id: format!("event-{}-git-baseline", run.run_id),
                 start_requested_event_id: format!("event-{}-start-requested", run.run_id),
                 session_connected_event_id: format!("event-{}-connected", run.run_id),
                 start_failed_event_id: format!("event-{}-start-failed", run.run_id),
@@ -711,7 +714,18 @@ fn start_runs(
                 client_protocol_version: PROTOCOL_VERSION.to_owned(),
             };
             let rendered = manager
-                .with_ready_core(|core| start_managed_run_in_core(core, connector, None, request))
+                .with_ready_core(|core| {
+                    start_managed_run_in_core(
+                        core,
+                        connector,
+                        None,
+                        GitBaselinePayload::Unavailable {
+                            project_id: PROJECT_ID.to_owned(),
+                            reason: GitBaselineUnavailableReason::RunnerUnavailable,
+                        },
+                        request,
+                    )
+                })
                 .unwrap_or_else(|error| panic!("start fake Run {index}: {error:?}"));
             let response: ManagedRunStartResponse =
                 serde_json::from_str(&rendered).expect("managed start response");

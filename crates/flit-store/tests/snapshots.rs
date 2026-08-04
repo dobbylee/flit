@@ -739,7 +739,7 @@ fn append(store: &mut Store, event: UnsequencedEventEnvelope) -> u64 {
 
 fn event(run_id: &str, event_id: &str, stream_seq: u64) -> UnsequencedEventEnvelope {
     UnsequencedEventEnvelope {
-        protocol_version: EventProtocolVersion::V1_0,
+        protocol_version: EventProtocolVersion::V1_1,
         event_id: event_id.to_owned(),
         run_id: run_id.to_owned(),
         session_id: NullableSessionId::Null,

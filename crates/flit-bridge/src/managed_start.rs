@@ -1,10 +1,12 @@
 use std::{collections::BTreeMap, ffi::OsStr, path::Path};
 
+#[cfg(test)]
+use flit_protocol::GitBaselineUnavailableReason;
 use flit_protocol::{
-    ManagedRunObserveRequest, ManagedRunObserveResponse, ManagedRunPermissionDecision,
-    ManagedRunPermissionMode, ManagedRunPermissionRespondRequest, ManagedRunProviderDecision,
-    ManagedRunProviderTerminalOutcome, ManagedRunStartRequest, ManagedRunStartResponse,
-    PROTOCOL_VERSION,
+    GitBaselinePayload, ManagedRunObserveRequest, ManagedRunObserveResponse,
+    ManagedRunPermissionDecision, ManagedRunPermissionMode, ManagedRunPermissionRespondRequest,
+    ManagedRunProviderDecision, ManagedRunProviderTerminalOutcome, ManagedRunStartRequest,
+    ManagedRunStartResponse, PROTOCOL_VERSION,
 };
 use flit_providers::{
     CapabilityStatus, CodexAppServer, CodexAppServerError, CodexContractError,
@@ -403,11 +405,34 @@ fn permission_delivery_plan_fingerprint(
     format!("{:x}", hasher.finalize())
 }
 
+#[cfg(test)]
 pub(crate) fn start_managed_run(
     store: &mut Store,
     runtimes: &mut BTreeMap<String, RetainedManagedRun>,
     connector: &dyn ManagedCodexConnector,
     path_environment: Option<&OsStr>,
+    request: ManagedRunStartRequest,
+) -> Result<ManagedRunStartResponse, ManagedStartError> {
+    let baseline = GitBaselinePayload::Unavailable {
+        project_id: request.project_id.clone(),
+        reason: GitBaselineUnavailableReason::RunnerUnavailable,
+    };
+    start_managed_run_with_baseline(
+        store,
+        runtimes,
+        connector,
+        path_environment,
+        baseline,
+        request,
+    )
+}
+
+pub(crate) fn start_managed_run_with_baseline(
+    store: &mut Store,
+    runtimes: &mut BTreeMap<String, RetainedManagedRun>,
+    connector: &dyn ManagedCodexConnector,
+    path_environment: Option<&OsStr>,
+    git_baseline: GitBaselinePayload,
     request: ManagedRunStartRequest,
 ) -> Result<ManagedRunStartResponse, ManagedStartError> {
     validate_request(&request)?;
@@ -449,9 +474,11 @@ pub(crate) fn start_managed_run(
         title: request.title.clone(),
         goal: Some(request.goal.clone()),
         start_request,
-        baseline_head: None,
+        git_baseline,
+        git_baseline_observed_at: request.git_baseline_observed_at.clone(),
         created_at: request.created_at.clone(),
         run_created_event_id: request.run_created_event_id.clone(),
+        git_baseline_event_id: request.git_baseline_event_id.clone(),
         start_requested_event_id: request.start_requested_event_id.clone(),
     };
     match store.create_managed_run_intent(intent) {
@@ -933,7 +960,7 @@ pub(crate) fn commit_managed_observation(
     }
 }
 
-fn validate_request(request: &ManagedRunStartRequest) -> Result<(), ManagedStartError> {
+pub(crate) fn validate_request(request: &ManagedRunStartRequest) -> Result<(), ManagedStartError> {
     if request.client_protocol_version != PROTOCOL_VERSION
         || request.provider != flit_protocol::ProviderKind::Codex
         || request.permission_mode_version != PERMISSION_MODE_VERSION
@@ -945,6 +972,7 @@ fn validate_request(request: &ManagedRunStartRequest) -> Result<(), ManagedStart
         &request.session_id,
         &request.project_id,
         &request.run_created_event_id,
+        &request.git_baseline_event_id,
         &request.start_requested_event_id,
         &request.session_connected_event_id,
         &request.start_failed_event_id,
@@ -954,6 +982,7 @@ fn validate_request(request: &ManagedRunStartRequest) -> Result<(), ManagedStart
     }
     let event_ids = [
         &request.run_created_event_id,
+        &request.git_baseline_event_id,
         &request.start_requested_event_id,
         &request.session_connected_event_id,
         &request.start_failed_event_id,
@@ -967,7 +996,26 @@ fn validate_request(request: &ManagedRunStartRequest) -> Result<(), ManagedStart
     validate_text(&request.title, MAX_MANAGED_TITLE_BYTES)?;
     validate_text(&request.goal, MAX_MANAGED_GOAL_BYTES)?;
     validate_token(&request.created_at, MAX_MANAGED_TIMESTAMP_BYTES)?;
+    validate_token(
+        &request.git_baseline_observed_at,
+        MAX_MANAGED_TIMESTAMP_BYTES,
+    )?;
     validate_token(&request.started_at, MAX_MANAGED_TIMESTAMP_BYTES)
+}
+
+pub(crate) fn cached_start_response(
+    runtimes: &BTreeMap<String, RetainedManagedRun>,
+    request: &ManagedRunStartRequest,
+) -> Result<Option<ManagedRunStartResponse>, ManagedStartError> {
+    validate_request(request)?;
+    let Some(existing) = runtimes.get(&request.run_id) else {
+        return Ok(None);
+    };
+    if existing.request_digest == request_digest(request)? {
+        Ok(Some(existing.response.clone()))
+    } else {
+        Err(ManagedStartError::RunConflict)
+    }
 }
 
 pub(crate) fn validate_observe_request(
@@ -1538,8 +1586,10 @@ mod tests {
             permission_mode: ManagedRunPermissionMode::Manual,
             permission_mode_version: PERMISSION_MODE_VERSION,
             created_at: CREATED_AT.to_owned(),
+            git_baseline_observed_at: CREATED_AT.to_owned(),
             started_at: STARTED_AT.to_owned(),
             run_created_event_id: "event-run-created".to_owned(),
+            git_baseline_event_id: "event-git-baseline".to_owned(),
             start_requested_event_id: "event-start-requested".to_owned(),
             session_connected_event_id: "event-session-connected".to_owned(),
             start_failed_event_id: "event-start-failed".to_owned(),
@@ -1780,7 +1830,7 @@ mod tests {
         assert_eq!(provider_item_id, "permission-item");
         assert_eq!(provider_decision_id, "review-1");
         assert!(request_id.starts_with("req_codex_provider_auto_"));
-        assert_eq!(request_version, 4);
+        assert_eq!(request_version, 5);
         assert!(request_event_id.starts_with("evt_codex_provider_auto_request_"));
         assert_eq!(provider_decision, ManagedRunProviderDecision::Allowed);
         assert_eq!(
@@ -1788,7 +1838,7 @@ mod tests {
             ManagedRunProviderTerminalOutcome::RequestResolved
         );
         assert!(event_id.starts_with("evt_codex_provider_auto_resolved_"));
-        assert_eq!(event_version, 5);
+        assert_eq!(event_version, 6);
         let events = store
             .run_events_through("run-1", 0, event_version, 10)
             .expect("provider outcome events");
@@ -1800,6 +1850,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "run.created",
+                "git.snapshot_recorded",
                 "run.start_requested",
                 "session.connected",
                 "permission.requested",
@@ -2027,9 +2078,14 @@ mod tests {
             title: "Prior Run".to_owned(),
             goal: Some("Prior goal".to_owned()),
             start_request: Map::new(),
-            baseline_head: None,
+            git_baseline: GitBaselinePayload::Unavailable {
+                project_id: "project-1".to_owned(),
+                reason: GitBaselineUnavailableReason::RunnerUnavailable,
+            },
+            git_baseline_observed_at: CREATED_AT.to_owned(),
             created_at: CREATED_AT.to_owned(),
             run_created_event_id: "prior-created".to_owned(),
+            git_baseline_event_id: "prior-git-baseline".to_owned(),
             start_requested_event_id: "prior-start-requested".to_owned(),
         };
         store
@@ -2162,7 +2218,7 @@ mod tests {
         assert_eq!(provider_turn_id, "turn-1");
         assert_eq!(provider_item_id, "permission-item");
         assert_eq!(provider_request_id, 0);
-        assert_eq!(request_version, 5);
+        assert_eq!(request_version, 6);
         assert!(request_id.starts_with("req_codex_"));
         assert!(event_id.starts_with("evt_codex_permission_"));
 
@@ -2177,6 +2233,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "run.created",
+                "git.snapshot_recorded",
                 "run.start_requested",
                 "session.connected",
                 "command.started",

@@ -994,8 +994,12 @@ struct NativeHealthTests {
         )
         try require(
             managedRunRequest.permissionMode == .manual
-                && managedRunRequest.permissionModeVersion == 1,
-            "generated managed Run request must preserve exact Manual mode version"
+                && managedRunRequest.permissionModeVersion == 1
+                && managedRunRequest.gitBaselineEventId
+                    == "event-run-managed-1-git-baseline"
+                && managedRunRequest.gitBaselineObservedAt
+                    == "2026-07-27T12:00:00Z",
+            "generated managed Run request must preserve exact Manual mode and Git baseline identity"
         )
         let managedRunResponse = try decodeFixture(
             FlitManagedRunStartResponse.self,

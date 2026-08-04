@@ -1,6 +1,6 @@
 use std::path::{Component, Path, PathBuf};
 
-use flit_protocol::EventEnvelope;
+use flit_protocol::{EventEnvelope, GitBaselinePayload, GitHead};
 use serde_json::{Map, Value};
 
 pub const MANAGED_PROVIDER_KIND_CODEX: &str = "codex";
@@ -24,9 +24,11 @@ pub struct ManagedRunIntent {
     pub title: String,
     pub goal: Option<String>,
     pub start_request: Map<String, Value>,
-    pub baseline_head: Option<String>,
+    pub git_baseline: GitBaselinePayload,
+    pub git_baseline_observed_at: String,
     pub created_at: String,
     pub run_created_event_id: String,
+    pub git_baseline_event_id: String,
     pub start_requested_event_id: String,
 }
 
@@ -432,12 +434,41 @@ pub(crate) fn validate_run_intent(intent: &ManagedRunIntent) -> Result<(), &'sta
     validate_id(&intent.project_id).map_err(|()| "project_id")?;
     validate_text(&intent.title, MAX_MANAGED_TITLE_BYTES).map_err(|()| "title")?;
     validate_optional_text(intent.goal.as_deref(), MAX_MANAGED_GOAL_BYTES).map_err(|()| "goal")?;
-    validate_optional_token(intent.baseline_head.as_deref(), MAX_MANAGED_ID_BYTES)
-        .map_err(|()| "baseline_head")?;
+    match &intent.git_baseline {
+        GitBaselinePayload::Available {
+            project_id,
+            head,
+            dirty,
+        } => {
+            if project_id != &intent.project_id {
+                return Err("git_baseline_project_id");
+            }
+            if let GitHead::Available { oid } = head {
+                validate_token(oid, MAX_MANAGED_ID_BYTES).map_err(|()| "git_baseline_head")?;
+            }
+            if dirty.staged > dirty.entries
+                || dirty.unstaged > dirty.entries
+                || dirty.untracked > dirty.entries
+            {
+                return Err("git_baseline_dirty");
+            }
+        }
+        GitBaselinePayload::Unavailable { project_id, .. } => {
+            if project_id != &intent.project_id {
+                return Err("git_baseline_project_id");
+            }
+        }
+    }
+    validate_timestamp(&intent.git_baseline_observed_at)
+        .map_err(|()| "git_baseline_observed_at")?;
     validate_timestamp(&intent.created_at).map_err(|()| "created_at")?;
     validate_id(&intent.run_created_event_id).map_err(|()| "run_created_event_id")?;
+    validate_id(&intent.git_baseline_event_id).map_err(|()| "git_baseline_event_id")?;
     validate_id(&intent.start_requested_event_id).map_err(|()| "start_requested_event_id")?;
-    if intent.run_created_event_id == intent.start_requested_event_id {
+    if intent.run_created_event_id == intent.git_baseline_event_id
+        || intent.run_created_event_id == intent.start_requested_event_id
+        || intent.git_baseline_event_id == intent.start_requested_event_id
+    {
         return Err("event_ids");
     }
     validate_json_size(&intent.start_request).map_err(|()| "start_request")

@@ -11,8 +11,8 @@ use flit_core::projection::{
     replay_dashboard_projection,
 };
 use flit_protocol::{
-    EventEnvelope, EventProtocolVersion, EventSource, EventSourceKind, MAX_JSON_SAFE_INTEGER,
-    NullableSessionId, UnsequencedEventEnvelope,
+    EventEnvelope, EventProtocolVersion, EventSource, EventSourceKind, GitBaselinePayload, GitHead,
+    MAX_JSON_SAFE_INTEGER, NullableSessionId, UnsequencedEventEnvelope,
 };
 use rusqlite::{
     Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params, params_from_iter,
@@ -630,7 +630,7 @@ impl Store {
             .map_err(|field| StoreError::InvalidManagedRunIntent { field })?;
         let start_request_json =
             serde_json::to_string(&intent.start_request).map_err(StoreError::Json)?;
-        let events = managed_run_intent_events(&intent, start_request_json.as_bytes());
+        let mut events = managed_run_intent_events(&intent, start_request_json.as_bytes())?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -638,9 +638,12 @@ impl Store {
         let existing = load_managed_run(&transaction, &intent.id)?;
         let duplicate = if let Some(existing) = &existing {
             let stored_events = load_managed_run_intent_events(&transaction, &intent.id)?;
-            if !managed_run_matches_intent(existing, &intent) || stored_events != events {
+            if !managed_run_matches_intent(existing, &intent)
+                || !managed_run_intent_event_identity_matches(&stored_events, &events)
+            {
                 return Err(StoreError::ManagedRunIdentityConflict { run_id: intent.id });
             }
+            events = stored_events;
             true
         } else {
             let project = transaction
@@ -673,7 +676,7 @@ impl Store {
                         intent.title,
                         intent.goal,
                         start_request_json,
-                        intent.baseline_head,
+                        git_baseline_head(&intent.git_baseline),
                         intent.created_at,
                     ],
                 )
@@ -2486,7 +2489,7 @@ fn validate_snapshot(snapshot: &RunSnapshotDraft) -> Result<(), StoreError> {
 fn managed_run_intent_events(
     intent: &ManagedRunIntent,
     start_request_json: &[u8],
-) -> Vec<UnsequencedEventEnvelope> {
+) -> Result<Vec<UnsequencedEventEnvelope>, StoreError> {
     let source = EventSource {
         kind: EventSourceKind::Core,
         provider: None,
@@ -2511,9 +2514,16 @@ fn managed_run_intent_events(
     .as_object()
     .expect("object literal")
     .clone();
-    vec![
+    let baseline_payload = serde_json::to_value(&intent.git_baseline)
+        .map_err(StoreError::Json)?
+        .as_object()
+        .cloned()
+        .ok_or(StoreError::InvalidManagedRunIntent {
+            field: "git_baseline",
+        })?;
+    Ok(vec![
         UnsequencedEventEnvelope {
-            protocol_version: EventProtocolVersion::V1_0,
+            protocol_version: EventProtocolVersion::V1_1,
             event_id: intent.run_created_event_id.clone(),
             run_id: intent.id.clone(),
             session_id: NullableSessionId::Null,
@@ -2528,11 +2538,31 @@ fn managed_run_intent_events(
             extensions: BTreeMap::new(),
         },
         UnsequencedEventEnvelope {
-            protocol_version: EventProtocolVersion::V1_0,
-            event_id: intent.start_requested_event_id.clone(),
+            protocol_version: EventProtocolVersion::V1_1,
+            event_id: intent.git_baseline_event_id.clone(),
             run_id: intent.id.clone(),
             session_id: NullableSessionId::Null,
             stream_seq: 2,
+            occurred_at: intent.git_baseline_observed_at.clone(),
+            observed_at: intent.git_baseline_observed_at.clone(),
+            event_type: "git.snapshot_recorded".to_owned(),
+            source: EventSource {
+                kind: EventSourceKind::Core,
+                provider: None,
+                contract_version: Some("git-baseline/1.0".to_owned()),
+                extensions: BTreeMap::new(),
+            },
+            confidence: 1.0,
+            evidence_ids: Vec::new(),
+            payload: baseline_payload,
+            extensions: BTreeMap::new(),
+        },
+        UnsequencedEventEnvelope {
+            protocol_version: EventProtocolVersion::V1_1,
+            event_id: intent.start_requested_event_id.clone(),
+            run_id: intent.id.clone(),
+            session_id: NullableSessionId::Null,
+            stream_seq: 3,
             occurred_at: intent.created_at.clone(),
             observed_at: intent.created_at.clone(),
             event_type: "run.start_requested".to_owned(),
@@ -2542,7 +2572,21 @@ fn managed_run_intent_events(
             payload: requested_payload,
             extensions: BTreeMap::new(),
         },
-    ]
+    ])
+}
+
+fn git_baseline_head(baseline: &GitBaselinePayload) -> Option<String> {
+    match baseline {
+        GitBaselinePayload::Available {
+            head: GitHead::Available { oid },
+            ..
+        } => Some(oid.clone()),
+        GitBaselinePayload::Available {
+            head: GitHead::Unborn,
+            ..
+        }
+        | GitBaselinePayload::Unavailable { .. } => None,
+    }
 }
 
 fn managed_session_connected_event(
@@ -2557,7 +2601,7 @@ fn managed_session_connected_event(
     .expect("object literal")
     .clone();
     UnsequencedEventEnvelope {
-        protocol_version: EventProtocolVersion::V1_0,
+        protocol_version: EventProtocolVersion::V1_1,
         event_id: connection.connected_event_id.clone(),
         run_id: connection.run_id.clone(),
         session_id: NullableSessionId::Id(connection.id.clone()),
@@ -2627,7 +2671,7 @@ fn managed_provider_observation_event(
         ),
     };
     UnsequencedEventEnvelope {
-        protocol_version: EventProtocolVersion::V1_0,
+        protocol_version: EventProtocolVersion::V1_1,
         event_id: observation.event_id.clone(),
         run_id: observation.run_id.clone(),
         session_id: NullableSessionId::Id(observation.session_id.clone()),
@@ -2714,7 +2758,7 @@ fn managed_provider_outcome_event(
     payload: Map<String, Value>,
 ) -> UnsequencedEventEnvelope {
     UnsequencedEventEnvelope {
-        protocol_version: EventProtocolVersion::V1_0,
+        protocol_version: EventProtocolVersion::V1_1,
         event_id,
         run_id: outcome.run_id.clone(),
         session_id: NullableSessionId::Id(outcome.session_id.clone()),
@@ -2754,7 +2798,7 @@ fn managed_permission_response_submitted_event(
     .expect("object literal")
     .clone();
     UnsequencedEventEnvelope {
-        protocol_version: EventProtocolVersion::V1_0,
+        protocol_version: EventProtocolVersion::V1_1,
         event_id: attempt.submitted_event_id.clone(),
         run_id: attempt.run_id.clone(),
         session_id: NullableSessionId::Id(attempt.session_id.clone()),
@@ -2831,7 +2875,7 @@ fn managed_permission_response_result_event(
         Value::String(result.response_attempt_id.clone()),
     );
     UnsequencedEventEnvelope {
-        protocol_version: EventProtocolVersion::V1_0,
+        protocol_version: EventProtocolVersion::V1_1,
         event_id: result.outcome_event_id.clone(),
         run_id: result.run_id.clone(),
         session_id: NullableSessionId::Id(result.session_id.clone()),
@@ -2861,11 +2905,11 @@ fn managed_run_start_failed_event(failure: &ManagedRunStartFailure) -> Unsequenc
     .expect("object literal")
     .clone();
     UnsequencedEventEnvelope {
-        protocol_version: EventProtocolVersion::V1_0,
+        protocol_version: EventProtocolVersion::V1_1,
         event_id: failure.failed_event_id.clone(),
         run_id: failure.run_id.clone(),
         session_id: NullableSessionId::Null,
-        stream_seq: 3,
+        stream_seq: 4,
         occurred_at: failure.failed_at.clone(),
         observed_at: failure.failed_at.clone(),
         event_type: "run.failed".to_owned(),
@@ -2901,7 +2945,7 @@ fn managed_session_terminal_event(
     .expect("object literal")
     .clone();
     UnsequencedEventEnvelope {
-        protocol_version: EventProtocolVersion::V1_0,
+        protocol_version: EventProtocolVersion::V1_1,
         event_id: termination.terminal_event_id.clone(),
         run_id: termination.run_id.clone(),
         session_id: NullableSessionId::Id(termination.session_id.clone()),
@@ -2947,7 +2991,7 @@ fn managed_reconciliation_events(
     .expect("object literal")
     .clone();
     let mut events = vec![UnsequencedEventEnvelope {
-        protocol_version: EventProtocolVersion::V1_0,
+        protocol_version: EventProtocolVersion::V1_1,
         event_id: reconciliation.gap_event_id.clone(),
         run_id: reconciliation.run_id.clone(),
         session_id: NullableSessionId::Id(reconciliation.session_id.clone()),
@@ -3002,7 +3046,7 @@ fn managed_reconciliation_events(
     .expect("object literal")
     .clone();
     events.push(UnsequencedEventEnvelope {
-        protocol_version: EventProtocolVersion::V1_0,
+        protocol_version: EventProtocolVersion::V1_1,
         event_id: reconciliation
             .terminal_event_id
             .clone()
@@ -3029,8 +3073,28 @@ fn managed_run_matches_intent(run: &ManagedRun, intent: &ManagedRunIntent) -> bo
         && run.goal == intent.goal
         && run.provider_kind == MANAGED_PROVIDER_KIND_CODEX
         && run.start_request == intent.start_request
-        && run.baseline_head == intent.baseline_head
         && run.created_at == intent.created_at
+}
+
+fn managed_run_intent_event_identity_matches(
+    stored: &[UnsequencedEventEnvelope],
+    requested: &[UnsequencedEventEnvelope],
+) -> bool {
+    if stored.len() != 3 || requested.len() != 3 {
+        return false;
+    }
+    stored
+        .iter()
+        .zip(requested)
+        .enumerate()
+        .all(|(index, (stored_event, requested_event))| {
+            if index != 1 {
+                return stored_event == requested_event;
+            }
+            let mut requested_without_fresh_observation = requested_event.clone();
+            requested_without_fresh_observation.payload = stored_event.payload.clone();
+            stored_event == &requested_without_fresh_observation
+        })
 }
 
 fn managed_session_matches_connection(
@@ -3113,7 +3177,8 @@ fn load_managed_run_intent_events(
     let mut statement = connection
         .prepare(
             "SELECT ingest_seq FROM events
-             WHERE run_id = ?1 AND event_type IN ('run.created', 'run.start_requested')
+             WHERE run_id = ?1
+               AND event_type IN ('run.created', 'git.snapshot_recorded', 'run.start_requested')
              ORDER BY ingest_seq",
         )
         .map_err(StoreError::Sqlite)?;
@@ -3497,15 +3562,20 @@ fn append_event_batch_in_transaction(
         let source_json = serde_json::to_string(&event.source).map_err(StoreError::Json)?;
         let payload_json = serde_json::to_string(&event.payload).map_err(StoreError::Json)?;
         let extensions_json = serde_json::to_string(&event.extensions).map_err(StoreError::Json)?;
+        let protocol_version = match event.protocol_version {
+            EventProtocolVersion::V1_0 => "1.0",
+            EventProtocolVersion::V1_1 => "1.1",
+        };
         let session_id = match &event.session_id {
             NullableSessionId::Id(session_id) => Some(session_id.as_str()),
             NullableSessionId::Null => None,
         };
         transaction
             .execute(
-                "INSERT INTO events(event_id, protocol_version, event_type, run_id, session_id, stream_seq, occurred_at, observed_at, source_json, confidence, payload_version, payload_json, extensions_json) VALUES(?1, '1.0', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11)",
+                "INSERT INTO events(event_id, protocol_version, event_type, run_id, session_id, stream_seq, occurred_at, observed_at, source_json, confidence, payload_version, payload_json, extensions_json) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12)",
                 params![
                     event.event_id,
+                    protocol_version,
                     event.event_type,
                     event.run_id,
                     session_id,
@@ -4311,14 +4381,20 @@ fn load_event(connection: &Connection, ingest_seq: i64) -> Result<EventEnvelope,
         )
         .map_err(StoreError::Sqlite)?;
     let assigned_ingest_seq = assigned_sequence(ingest_seq)?;
-    if stored.protocol_version != "1.0" || stored.payload_version != 1 {
+    let protocol_version = match stored.protocol_version.as_str() {
+        "1.0" => EventProtocolVersion::V1_0,
+        "1.1" => EventProtocolVersion::V1_1,
+        _ => {
+            return Err(StoreError::StoredEventInvalid {
+                ingest_seq: assigned_ingest_seq,
+                field: "protocol_version",
+            });
+        }
+    };
+    if stored.payload_version != 1 {
         return Err(StoreError::StoredEventInvalid {
             ingest_seq: assigned_ingest_seq,
-            field: if stored.protocol_version != "1.0" {
-                "protocol_version"
-            } else {
-                "payload_version"
-            },
+            field: "payload_version",
         });
     }
     let stream_seq = stored
@@ -4343,7 +4419,7 @@ fn load_event(connection: &Connection, ingest_seq: i64) -> Result<EventEnvelope,
     )?;
     let evidence_ids = event_evidence_ids(connection, assigned_ingest_seq, &stored.event_id)?;
     let envelope = EventEnvelope {
-        protocol_version: EventProtocolVersion::V1_0,
+        protocol_version,
         event_id: stored.event_id,
         run_id: stored.run_id,
         session_id: stored

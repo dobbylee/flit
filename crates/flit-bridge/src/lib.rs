@@ -20,18 +20,18 @@ use flit_protocol::{
     CapabilityStatus as ProtocolCapabilityStatus, CommandError, CommandErrorCode,
     DashboardEventRecord, DashboardReadRequest, DashboardReadResponse, DashboardRunRecord,
     DashboardSnapshotReason, EVENT_PROTOCOL_VERSION, EventSourceKind,
-    FingerprintAxis as ProtocolFingerprintAxis, GitDirtySummary, GitHead, GitNotWorktreeReason,
-    GitObservationResponse, GitObservationUnavailableReason, HealthStatus,
-    ManagedRunObserveRequest, ManagedRunObserveResponse, ManagedRunOpenInProviderRequest,
-    ManagedRunPermissionRespondRequest, ManagedRunPermissionRespondResponse,
-    ManagedRunStartRequest, PROTOCOL_VERSION, ProjectInspectionResponse,
-    ProjectListCursor as ProjectListCursorResponse, ProjectRecord, ProjectRegistrationResponse,
-    ProjectRegistrationStatus, ProjectTrustResponse, ProjectTrustStatus, ProjectsListResponse,
-    ProviderCapability as ProtocolProviderCapability, ProviderCapabilityEntry,
-    ProviderCompatibility as ProtocolProviderCompatibility, ProviderDiagnosticsResponse,
-    ProviderExecutionAfterQuit, ProviderKind as ProtocolProviderKind, ProviderUnavailableReason,
-    QuitImpactReason, QuitImpactResponse, QuitImpactRun, RunDetailReadRequest,
-    RunDetailReadResponse, RunEvidenceRecord, SystemHealthResponse,
+    FingerprintAxis as ProtocolFingerprintAxis, GitBaselinePayload, GitBaselineUnavailableReason,
+    GitDirtySummary, GitHead, GitNotWorktreeReason, GitObservationResponse,
+    GitObservationUnavailableReason, HealthStatus, ManagedRunObserveRequest,
+    ManagedRunObserveResponse, ManagedRunOpenInProviderRequest, ManagedRunPermissionRespondRequest,
+    ManagedRunPermissionRespondResponse, ManagedRunStartRequest, PROTOCOL_VERSION,
+    ProjectInspectionResponse, ProjectListCursor as ProjectListCursorResponse, ProjectRecord,
+    ProjectRegistrationResponse, ProjectRegistrationStatus, ProjectTrustResponse,
+    ProjectTrustStatus, ProjectsListResponse, ProviderCapability as ProtocolProviderCapability,
+    ProviderCapabilityEntry, ProviderCompatibility as ProtocolProviderCompatibility,
+    ProviderDiagnosticsResponse, ProviderExecutionAfterQuit, ProviderKind as ProtocolProviderKind,
+    ProviderUnavailableReason, QuitImpactReason, QuitImpactResponse, QuitImpactRun,
+    RunDetailReadRequest, RunDetailReadResponse, RunEvidenceRecord, SystemHealthResponse,
 };
 use flit_providers::{
     CapabilityStatus, CodexCompatibilityProbe, CodexCompatibilityProbeError,
@@ -1205,6 +1205,64 @@ fn protocol_git_observation(
     }
 }
 
+fn managed_git_baseline(
+    project_id: &str,
+    observation: Result<NativeGitObservation, GitObservationError>,
+) -> Result<GitBaselinePayload, BridgeError> {
+    match observation {
+        Ok(NativeGitObservation::NotWorktree(reason)) => Ok(GitBaselinePayload::Unavailable {
+            project_id: project_id.to_owned(),
+            reason: match reason {
+                NativeNotWorktreeReason::NotRepository => {
+                    GitBaselineUnavailableReason::NotRepository
+                }
+                NativeNotWorktreeReason::BareRepository => {
+                    GitBaselineUnavailableReason::BareRepository
+                }
+            },
+        }),
+        Ok(NativeGitObservation::Repository(receipt)) => Ok(GitBaselinePayload::Available {
+            project_id: project_id.to_owned(),
+            head: match receipt.head {
+                NativeGitHead::Available(oid) => GitHead::Available { oid },
+                NativeGitHead::Unborn => GitHead::Unborn,
+            },
+            dirty: GitDirtySummary {
+                staged: receipt.dirty.staged,
+                unstaged: receipt.dirty.unstaged,
+                untracked: receipt.dirty.untracked,
+                entries: receipt.dirty.entries,
+            },
+        }),
+        Err(error) => {
+            let reason = git_unavailable_reason(&error);
+            if reason == GitObservationUnavailableReason::ProjectChanged {
+                return Err(BridgeError::ProjectIdentityMismatch);
+            }
+            Ok(GitBaselinePayload::Unavailable {
+                project_id: project_id.to_owned(),
+                reason: match reason {
+                    GitObservationUnavailableReason::RunnerUnavailable => {
+                        GitBaselineUnavailableReason::RunnerUnavailable
+                    }
+                    GitObservationUnavailableReason::GitUnavailable => {
+                        GitBaselineUnavailableReason::GitUnavailable
+                    }
+                    GitObservationUnavailableReason::ProjectChanged => {
+                        unreachable!("Project drift returns before baseline construction")
+                    }
+                    GitObservationUnavailableReason::ProcessUnavailable => {
+                        GitBaselineUnavailableReason::ProcessUnavailable
+                    }
+                    GitObservationUnavailableReason::MalformedOutput => {
+                        GitBaselineUnavailableReason::MalformedOutput
+                    }
+                },
+            })
+        }
+    }
+}
+
 fn git_unavailable(
     project_id: &str,
     reason: GitObservationUnavailableReason,
@@ -1801,14 +1859,13 @@ pub fn managed_run_start_json(request_json: String) -> Result<String, BridgeErro
         }
         let result = with_provider_diagnostic_lock(|| {
             let path_environment = std::env::var_os("PATH");
-            CORE.with_ready_core(|core| {
-                start_managed_run_in_core(
-                    core,
-                    &managed_start::ProductionCodexConnector,
-                    path_environment.as_deref(),
-                    request,
-                )
-            })
+            managed_run_start_with(
+                &CORE,
+                &managed_start::ProductionCodexConnector,
+                path_environment.as_deref(),
+                request,
+                observe_bundled_project,
+            )
         });
         match result {
             Err(BridgeError::StorageFailure) => project_json(&CommandError::for_code(
@@ -1819,10 +1876,75 @@ pub fn managed_run_start_json(request_json: String) -> Result<String, BridgeErro
     })
 }
 
+fn managed_run_start_with(
+    core_manager: &CoreManager,
+    connector: &dyn managed_start::ManagedCodexConnector,
+    path_environment: Option<&std::ffi::OsStr>,
+    request: ManagedRunStartRequest,
+    observe: impl FnOnce(&Path) -> Result<NativeGitObservation, GitObservationError>,
+) -> Result<String, BridgeError> {
+    if let Err(error) = managed_start::validate_request(&request) {
+        return project_json(&CommandError::for_code(managed_start_error_code(error)));
+    }
+    let cached = core_manager.with_ready_core(|core| {
+        if core
+            .managed_observations_in_flight
+            .contains(&request.run_id)
+        {
+            return Ok(Some(project_json(&CommandError::for_code(
+                CommandErrorCode::ProviderObservationUnknown,
+            ))?));
+        }
+        match managed_start::cached_start_response(&core.managed_runtimes, &request) {
+            Ok(Some(response)) => Ok(Some(bounded_json(
+                &response,
+                MAX_PROJECT_RESPONSE_BYTES,
+                BridgeError::ManagedRunResponseTooLarge,
+            )?)),
+            Ok(None) => Ok(None),
+            Err(error) => Ok(Some(project_json(&CommandError::for_code(
+                managed_start_error_code(error),
+            ))?)),
+        }
+    })?;
+    if let Some(cached) = cached {
+        return Ok(cached);
+    }
+
+    let before = match git_project_target(core_manager, &request.project_id) {
+        Ok(target) => target,
+        Err(error) => return managed_start_bridge_error_json(error),
+    };
+    let baseline = match managed_git_baseline(&request.project_id, observe(&before.canonical_path))
+    {
+        Ok(baseline) => baseline,
+        Err(error) => return managed_start_bridge_error_json(error),
+    };
+    let after = match git_project_target(core_manager, &request.project_id) {
+        Ok(target) => target,
+        Err(error) => return managed_start_bridge_error_json(error),
+    };
+    if after != before {
+        return managed_start_bridge_error_json(BridgeError::ProjectIdentityMismatch);
+    }
+
+    core_manager.with_ready_core(|core| {
+        start_managed_run_in_core(core, connector, path_environment, baseline, request)
+    })
+}
+
+fn managed_start_bridge_error_json(error: BridgeError) -> Result<String, BridgeError> {
+    match project_command_error(&error) {
+        Some(command_error) => project_json(&command_error),
+        None => Err(error),
+    }
+}
+
 fn start_managed_run_in_core(
     core: &mut FoundationCore,
     connector: &dyn managed_start::ManagedCodexConnector,
     path_environment: Option<&std::ffi::OsStr>,
+    git_baseline: GitBaselinePayload,
     request: ManagedRunStartRequest,
 ) -> Result<String, BridgeError> {
     if core
@@ -1833,11 +1955,12 @@ fn start_managed_run_in_core(
             CommandErrorCode::ProviderObservationUnknown,
         ));
     }
-    match managed_start::start_managed_run(
+    match managed_start::start_managed_run_with_baseline(
         &mut core.store,
         &mut core.managed_runtimes,
         connector,
         path_environment,
+        git_baseline,
         request,
     ) {
         Ok(response) => {
@@ -2656,6 +2779,52 @@ mod tests {
         }
     }
 
+    struct CountingFailureConnector {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl managed_start::ManagedCodexConnector for CountingFailureConnector {
+        fn connect(
+            &self,
+            _path_environment: Option<&OsStr>,
+        ) -> Result<Box<dyn managed_start::ManagedCodexRuntime>, ()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(())
+        }
+    }
+
+    fn managed_start_core(label: &str) -> (ObservationDirectory, Arc<CoreManager>, PathBuf) {
+        let directory = ObservationDirectory::new(label);
+        let project = directory.0.join("project");
+        fs::create_dir(&project).expect("Project directory");
+        let project = fs::canonicalize(project).expect("canonical Project");
+        let manager = Arc::new(CoreManager::default());
+        manager
+            .initialize(directory.0.to_str().expect("UTF-8 test path"))
+            .expect("initialize managed start Core");
+        manager
+            .with_ready_core(|core| {
+                core.store
+                    .register_project(ProjectRegistration {
+                        id: "project-observe".to_owned(),
+                        display_name: "Observation Project".to_owned(),
+                        selected_path: project.clone(),
+                        created_at: "2026-07-27T12:00:00Z".to_owned(),
+                    })
+                    .expect("register Project");
+                core.store
+                    .confirm_project_trust(ProjectTrustConfirmation {
+                        project_id: "project-observe".to_owned(),
+                        selected_path: project.clone(),
+                        confirmed_at: "2026-07-27T12:00:00Z".to_owned(),
+                    })
+                    .expect("trust Project");
+                Ok(())
+            })
+            .expect("seed managed start Core");
+        (directory, manager, project)
+    }
+
     fn fixture_at(version: &str, name: &str) -> serde_json::Value {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -2728,8 +2897,10 @@ mod tests {
             permission_mode: ManagedRunPermissionMode::Manual,
             permission_mode_version: 1,
             created_at: "2026-07-27T12:00:00Z".to_owned(),
+            git_baseline_observed_at: "2026-07-27T12:00:00Z".to_owned(),
             started_at: "2026-07-27T12:00:01Z".to_owned(),
             run_created_event_id: "event-observe-created".to_owned(),
+            git_baseline_event_id: "event-observe-git-baseline".to_owned(),
             start_requested_event_id: "event-observe-start-requested".to_owned(),
             session_connected_event_id: "event-observe-session-connected".to_owned(),
             start_failed_event_id: "event-observe-start-failed".to_owned(),
@@ -2814,9 +2985,14 @@ mod tests {
                         title: "Observe one exact permission".to_owned(),
                         goal: Some("Request one exact file change.".to_owned()),
                         start_request: serde_json::Map::new(),
-                        baseline_head: None,
+                        git_baseline: GitBaselinePayload::Unavailable {
+                            project_id: "project-observe".to_owned(),
+                            reason: GitBaselineUnavailableReason::RunnerUnavailable,
+                        },
+                        git_baseline_observed_at: "2026-07-27T12:00:00Z".to_owned(),
                         created_at: "2026-07-27T12:00:00Z".to_owned(),
                         run_created_event_id: "event-observe-created".to_owned(),
+                        git_baseline_event_id: "event-observe-git-baseline".to_owned(),
                         start_requested_event_id: "event-observe-start-requested".to_owned(),
                     })
                     .expect("create managed Run");
@@ -2896,9 +3072,14 @@ mod tests {
                             title: format!("Quit {suffix}"),
                             goal: None,
                             start_request: serde_json::Map::new(),
-                            baseline_head: None,
+                            git_baseline: GitBaselinePayload::Unavailable {
+                                project_id: "project-observe".to_owned(),
+                                reason: GitBaselineUnavailableReason::RunnerUnavailable,
+                            },
+                            git_baseline_observed_at: format!("2026-07-27T12:01:{index:02}Z"),
                             created_at: format!("2026-07-27T12:01:{index:02}Z"),
                             run_created_event_id: format!("event-{suffix}-created"),
+                            git_baseline_event_id: format!("event-{suffix}-git-baseline"),
                             start_requested_event_id: format!("event-{suffix}-requested"),
                         })
                         .expect("create Quit impact Run");
@@ -3154,6 +3335,242 @@ mod tests {
         .expect("content-free Git unavailable response");
         assert!(!rendered.contains("77"));
         assert!(!rendered.contains("stderr"));
+    }
+
+    #[test]
+    fn managed_start_persists_every_baseline_shape_before_provider_connection() {
+        #[derive(Clone, Copy)]
+        enum BaselineCase {
+            Clean,
+            Dirty,
+            Unborn,
+            NotRepository,
+            Unavailable,
+        }
+
+        for (label, case, expected_availability, expected_reason) in [
+            ("clean", BaselineCase::Clean, "available", None),
+            ("dirty", BaselineCase::Dirty, "available", None),
+            ("unborn", BaselineCase::Unborn, "available", None),
+            (
+                "not-repository",
+                BaselineCase::NotRepository,
+                "unavailable",
+                Some("not_repository"),
+            ),
+            (
+                "unavailable",
+                BaselineCase::Unavailable,
+                "unavailable",
+                Some("git_unavailable"),
+            ),
+        ] {
+            let (_directory, manager, _project) = managed_start_core(label);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let connector = CountingFailureConnector {
+                calls: Arc::clone(&calls),
+            };
+            let manager_during_observation = Arc::clone(&manager);
+            let response = managed_run_start_with(
+                &manager,
+                &connector,
+                None,
+                observation_start_request(),
+                move |project| {
+                    manager_during_observation
+                        .with_ready_core(|core| {
+                            assert_eq!(
+                                core.store.latest_ingest_seq().expect("pre-start cursor"),
+                                0
+                            );
+                            Ok(())
+                        })
+                        .expect("Git observation must not hold the Core mutex");
+                    match case {
+                        BaselineCase::Clean => Ok(NativeGitObservation::Repository(
+                            flit_git::RepositoryReceipt {
+                                canonical_root: project.to_owned(),
+                                head: NativeGitHead::Available(
+                                    "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                                ),
+                                dirty: flit_git::DirtySummary {
+                                    staged: 0,
+                                    unstaged: 0,
+                                    untracked: 0,
+                                    entries: 0,
+                                },
+                            },
+                        )),
+                        BaselineCase::Dirty => Ok(NativeGitObservation::Repository(
+                            flit_git::RepositoryReceipt {
+                                canonical_root: project.to_owned(),
+                                head: NativeGitHead::Available(
+                                    "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                                ),
+                                dirty: flit_git::DirtySummary {
+                                    staged: 1,
+                                    unstaged: 2,
+                                    untracked: 1,
+                                    entries: 3,
+                                },
+                            },
+                        )),
+                        BaselineCase::Unborn => Ok(NativeGitObservation::Repository(
+                            flit_git::RepositoryReceipt {
+                                canonical_root: project.to_owned(),
+                                head: NativeGitHead::Unborn,
+                                dirty: flit_git::DirtySummary {
+                                    staged: 0,
+                                    unstaged: 0,
+                                    untracked: 0,
+                                    entries: 0,
+                                },
+                            },
+                        )),
+                        BaselineCase::NotRepository => Ok(NativeGitObservation::NotWorktree(
+                            NativeNotWorktreeReason::NotRepository,
+                        )),
+                        BaselineCase::Unavailable => Err(GitObservationError::GitNotFound),
+                    }
+                },
+            )
+            .expect("managed start command response");
+            assert_eq!(
+                command_error(&response),
+                CommandError::for_code(CommandErrorCode::ProviderUnavailable)
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            manager
+                .with_ready_core(|core| {
+                    let events = core
+                        .store
+                        .run_events_through("run-observe", 0, 4, 10)
+                        .expect("baseline events");
+                    assert_eq!(
+                        events
+                            .events
+                            .iter()
+                            .map(|event| event.event_type.as_str())
+                            .collect::<Vec<_>>(),
+                        [
+                            "run.created",
+                            "git.snapshot_recorded",
+                            "run.start_requested",
+                            "run.failed",
+                        ]
+                    );
+                    let baseline = &events.events[1];
+                    assert_eq!(baseline.payload["availability"], expected_availability);
+                    assert_eq!(
+                        baseline
+                            .payload
+                            .get("reason")
+                            .and_then(serde_json::Value::as_str),
+                        expected_reason
+                    );
+                    assert_eq!(baseline.payload["project_id"], "project-observe");
+                    let snapshot = core
+                        .store
+                        .run_snapshot("run-observe")
+                        .expect("Run snapshot")
+                        .expect("persisted Run snapshot");
+                    assert_eq!(
+                        snapshot.snapshot["changes"],
+                        serde_json::json!({
+                            "availability": "unavailable",
+                            "reason": "git_observation_not_configured"
+                        })
+                    );
+                    Ok(())
+                })
+                .expect("inspect baseline Store");
+        }
+    }
+
+    #[test]
+    fn managed_start_blocks_project_drift_and_baseline_store_failure_before_provider() {
+        let (_drift_directory, drift_manager, project) = managed_start_core("project-drift");
+        let drift_calls = Arc::new(AtomicUsize::new(0));
+        let drift_response = managed_run_start_with(
+            &drift_manager,
+            &CountingFailureConnector {
+                calls: Arc::clone(&drift_calls),
+            },
+            None,
+            observation_start_request(),
+            move |_project| {
+                fs::rename(&project, project.with_extension("replaced"))
+                    .expect("move observed Project");
+                fs::create_dir(&project).expect("replace observed Project");
+                Ok(NativeGitObservation::NotWorktree(
+                    NativeNotWorktreeReason::NotRepository,
+                ))
+            },
+        )
+        .expect("Project drift response");
+        assert_eq!(
+            command_error(&drift_response),
+            CommandError::for_code(CommandErrorCode::ProjectIdentityMismatch)
+        );
+        assert_eq!(drift_calls.load(Ordering::SeqCst), 0);
+        drift_manager
+            .with_ready_core(|core| {
+                assert!(
+                    core.store
+                        .managed_run("run-observe")
+                        .expect("Run read")
+                        .is_none()
+                );
+                assert_eq!(core.store.latest_ingest_seq().expect("drift cursor"), 0);
+                Ok(())
+            })
+            .expect("inspect drift Store");
+
+        let (failure_directory, failure_manager, _project) = managed_start_core("store-failure");
+        let raw = rusqlite::Connection::open(failure_directory.0.join(DATABASE_FILE_NAME))
+            .expect("open raw Store connection");
+        raw.execute_batch(
+            "CREATE TRIGGER reject_git_baseline BEFORE INSERT ON events
+             WHEN NEW.event_type = 'git.snapshot_recorded'
+             BEGIN
+               SELECT RAISE(ABORT, 'injected baseline failure');
+             END;",
+        )
+        .expect("install baseline failure trigger");
+        drop(raw);
+        let failure_calls = Arc::new(AtomicUsize::new(0));
+        let failure_response = managed_run_start_with(
+            &failure_manager,
+            &CountingFailureConnector {
+                calls: Arc::clone(&failure_calls),
+            },
+            None,
+            observation_start_request(),
+            |_project| {
+                Ok(NativeGitObservation::NotWorktree(
+                    NativeNotWorktreeReason::NotRepository,
+                ))
+            },
+        )
+        .expect("baseline Store failure response");
+        assert_eq!(
+            command_error(&failure_response),
+            CommandError::for_code(CommandErrorCode::StorageUnavailable)
+        );
+        assert_eq!(failure_calls.load(Ordering::SeqCst), 0);
+        failure_manager
+            .with_ready_core(|core| {
+                assert!(
+                    core.store
+                        .managed_run("run-observe")
+                        .expect("Run read")
+                        .is_none()
+                );
+                assert_eq!(core.store.latest_ingest_seq().expect("failure cursor"), 0);
+                Ok(())
+            })
+            .expect("inspect failed baseline Store");
     }
 
     #[test]
@@ -3608,7 +4025,7 @@ mod tests {
             serde_json::from_str(&second).expect("second detail JSON");
         assert!(!second.has_more);
         assert_eq!(second.next_cursor, run_version);
-        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events.len(), 2);
 
         let open = managed_run_open_in_provider_with(
             &manager,
@@ -3983,7 +4400,16 @@ mod tests {
         );
         let start_while_observing = manager
             .with_ready_core(|core| {
-                start_managed_run_in_core(core, &PanicConnector, None, observation_start_request())
+                start_managed_run_in_core(
+                    core,
+                    &PanicConnector,
+                    None,
+                    GitBaselinePayload::Unavailable {
+                        project_id: "project-observe".to_owned(),
+                        reason: GitBaselineUnavailableReason::RunnerUnavailable,
+                    },
+                    observation_start_request(),
+                )
             })
             .expect("parallel start response");
         assert_eq!(
@@ -4052,8 +4478,8 @@ mod tests {
         assert!(matches!(
             observed,
             ManagedRunObserveResponse::ProviderOutcomeResolved {
-                request_version: 4,
-                event_version: 5,
+                request_version: 5,
+                event_version: 6,
                 provider_decision: flit_protocol::ManagedRunProviderDecision::Allowed,
                 terminal_outcome: flit_protocol::ManagedRunProviderTerminalOutcome::RequestResolved,
                 ..
@@ -4064,7 +4490,7 @@ mod tests {
             .with_ready_core(|core| {
                 let events = core
                     .store
-                    .run_events_through("run-observe", 0, 5, 10)
+                    .run_events_through("run-observe", 0, 6, 10)
                     .expect("provider outcome events");
                 assert_eq!(
                     events
@@ -4074,6 +4500,7 @@ mod tests {
                         .collect::<Vec<_>>(),
                     [
                         "run.created",
+                        "git.snapshot_recorded",
                         "run.start_requested",
                         "session.connected",
                         "permission.requested",
@@ -4136,8 +4563,8 @@ mod tests {
         assert!(matches!(
             response,
             ManagedRunPermissionRespondResponse::Delivered {
-                submitted_version: 5,
-                outcome_version: 6,
+                submitted_version: 6,
+                outcome_version: 7,
                 ..
             }
         ));
@@ -4258,7 +4685,7 @@ mod tests {
         assert_runtime_state(&manager, true);
         manager
             .with_ready_core(|core| {
-                assert_eq!(core.store.latest_ingest_seq().expect("stale cursor"), 4);
+                assert_eq!(core.store.latest_ingest_seq().expect("stale cursor"), 5);
                 Ok(())
             })
             .expect("stale Store state");
@@ -4285,7 +4712,7 @@ mod tests {
             .with_ready_core(|core| {
                 assert_eq!(
                     core.store.latest_ingest_seq().expect("missing Run cursor"),
-                    4
+                    5
                 );
                 Ok(())
             })
@@ -4332,8 +4759,8 @@ mod tests {
             serde_json::from_str::<ManagedRunPermissionRespondResponse>(&response)
                 .expect("restart response JSON"),
             ManagedRunPermissionRespondResponse::DeliveryUnknown {
-                submitted_version: 5,
-                outcome_version: 7,
+                submitted_version: 6,
+                outcome_version: 8,
                 ..
             }
         ));
@@ -4342,7 +4769,7 @@ mod tests {
             .with_ready_core(|core| {
                 let events = core
                     .store
-                    .run_events_through("run-observe", 0, 7, 10)
+                    .run_events_through("run-observe", 0, 8, 10)
                     .expect("restart events");
                 assert_eq!(
                     events.events[events.events.len() - 2].event_type,

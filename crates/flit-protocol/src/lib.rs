@@ -4,8 +4,8 @@ use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: &str = "1.13";
-pub const EVENT_PROTOCOL_VERSION: &str = "1.0";
+pub const PROTOCOL_VERSION: &str = "1.14";
+pub const EVENT_PROTOCOL_VERSION: &str = "1.1";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[must_use]
@@ -218,6 +218,92 @@ pub struct GitDirtySummary {
     pub unstaged: u32,
     pub untracked: u32,
     pub entries: u32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitBaselineUnavailableReason {
+    NotRepository,
+    BareRepository,
+    RunnerUnavailable,
+    GitUnavailable,
+    ProcessUnavailable,
+    MalformedOutput,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "availability", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GitBaselinePayload {
+    Available {
+        project_id: String,
+        head: GitHead,
+        dirty: GitDirtySummary,
+    },
+    Unavailable {
+        project_id: String,
+        reason: GitBaselineUnavailableReason,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum GitBaselineAvailableTag {
+    Available,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum GitBaselineUnavailableTag {
+    Unavailable,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitBaselineAvailableWire {
+    availability: GitBaselineAvailableTag,
+    project_id: String,
+    head: GitHead,
+    dirty: GitDirtySummary,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitBaselineUnavailableWire {
+    availability: GitBaselineUnavailableTag,
+    project_id: String,
+    reason: GitBaselineUnavailableReason,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum GitBaselinePayloadWire {
+    Available(GitBaselineAvailableWire),
+    Unavailable(GitBaselineUnavailableWire),
+}
+
+impl<'de> Deserialize<'de> for GitBaselinePayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match GitBaselinePayloadWire::deserialize(deserializer)? {
+            GitBaselinePayloadWire::Available(wire) => {
+                let _ = wire.availability;
+                Self::Available {
+                    project_id: wire.project_id,
+                    head: wire.head,
+                    dirty: wire.dirty,
+                }
+            }
+            GitBaselinePayloadWire::Unavailable(wire) => {
+                let _ = wire.availability;
+                Self::Unavailable {
+                    project_id: wire.project_id,
+                    reason: wire.reason,
+                }
+            }
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -614,8 +700,10 @@ pub struct ManagedRunStartRequest {
     pub permission_mode: ManagedRunPermissionMode,
     pub permission_mode_version: u64,
     pub created_at: String,
+    pub git_baseline_observed_at: String,
     pub started_at: String,
     pub run_created_event_id: String,
+    pub git_baseline_event_id: String,
     pub start_requested_event_id: String,
     pub session_connected_event_id: String,
     pub start_failed_event_id: String,
@@ -793,6 +881,8 @@ pub struct CommandError {
 pub enum EventProtocolVersion {
     #[serde(rename = "1.0")]
     V1_0,
+    #[serde(rename = "1.1")]
+    V1_1,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -1822,8 +1912,10 @@ struct FlitManagedRunStartRequest: Codable, Equatable, Sendable {
     let permissionMode: FlitManagedRunPermissionMode
     let permissionModeVersion: UInt64
     let createdAt: String
+    let gitBaselineObservedAt: String
     let startedAt: String
     let runCreatedEventId: String
+    let gitBaselineEventId: String
     let startRequestedEventId: String
     let sessionConnectedEventId: String
     let startFailedEventId: String
@@ -1840,8 +1932,10 @@ struct FlitManagedRunStartRequest: Codable, Equatable, Sendable {
         case permissionMode = "permission_mode"
         case permissionModeVersion = "permission_mode_version"
         case createdAt = "created_at"
+        case gitBaselineObservedAt = "git_baseline_observed_at"
         case startedAt = "started_at"
         case runCreatedEventId = "run_created_event_id"
+        case gitBaselineEventId = "git_baseline_event_id"
         case startRequestedEventId = "start_requested_event_id"
         case sessionConnectedEventId = "session_connected_event_id"
         case startFailedEventId = "start_failed_event_id"

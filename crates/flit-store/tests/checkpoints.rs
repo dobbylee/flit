@@ -204,7 +204,7 @@ fn inserted(outcome: AppendEventOutcome) -> u64 {
 
 fn event(event_id: &str, stream_seq: u64) -> UnsequencedEventEnvelope {
     UnsequencedEventEnvelope {
-        protocol_version: EventProtocolVersion::V1_0,
+        protocol_version: EventProtocolVersion::V1_1,
         event_id: event_id.to_owned(),
         run_id: RUN_ID.to_owned(),
         session_id: NullableSessionId::Null,
