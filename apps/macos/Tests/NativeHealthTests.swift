@@ -134,6 +134,36 @@ private func changingRunDetail(
     )
 }
 
+private func runEvidenceObject(
+    cursor: UInt64,
+    eventId: String,
+    sessionId: String?,
+    eventType: String,
+    category: FlitRunEvidenceCategory,
+    sourceKind: FlitEventSourceKind,
+    confidence: Double,
+    observedAt: String
+) throws -> [String: Any] {
+    let record = FlitRunEvidenceRecord(
+        cursor: cursor,
+        eventId: eventId,
+        sessionId: sessionId,
+        eventType: eventType,
+        category: category,
+        sourceKind: sourceKind,
+        confidence: confidence,
+        observedAt: observedAt
+    )
+    let data = try JSONEncoder().encode(record)
+    guard var object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        throw NativeHealthTestFailure.failed("Run evidence record must be an object")
+    }
+    if sessionId == nil {
+        object["session_id"] = NSNull()
+    }
+    return object
+}
+
 private func changingDashboard(
     _ response: FlitDashboardReadResponse,
     mutate: (inout [String: Any]) throws -> Void
@@ -879,16 +909,17 @@ struct NativeHealthTests {
             object["run_version"] = 51
             object["next_cursor"] = 50
             object["has_more"] = true
-            object["events"] = (1 ... 50).map { cursor in
-                [
-                    "cursor": cursor,
-                    "event_id": "event-full-\(cursor)",
-                    "session_id": NSNull(),
-                    "event_type": "command.started",
-                    "source_kind": "provider_adapter",
-                    "confidence": 1.0,
-                    "observed_at": "2026-07-28T00:00:00.000Z",
-                ] as [String: Any]
+            object["events"] = try (1 ... 50).map { cursor in
+                try runEvidenceObject(
+                    cursor: UInt64(cursor),
+                    eventId: "event-full-\(cursor)",
+                    sessionId: nil,
+                    eventType: "command.started",
+                    category: .command,
+                    sourceKind: .providerAdapter,
+                    confidence: 1.0,
+                    observedAt: "2026-07-28T00:00:00.000Z"
+                )
             }
         }
         var fullPagePresentation = RunDetailPresentationState()
@@ -909,15 +940,18 @@ struct NativeHealthTests {
             object["run_version"] = 51
             object["next_cursor"] = 51
             object["has_more"] = false
-            object["events"] = [[
-                "cursor": 51,
-                "event_id": "event-full-51",
-                "session_id": "session-dashboard-1",
-                "event_type": "run.completed",
-                "source_kind": "provider_adapter",
-                "confidence": 1.0,
-                "observed_at": "2026-07-28T00:00:51.000Z",
-            ]]
+            object["events"] = [
+                try runEvidenceObject(
+                    cursor: 51,
+                    eventId: "event-full-51",
+                    sessionId: "session-dashboard-1",
+                    eventType: "run.completed",
+                    category: .lifecycle,
+                    sourceKind: .providerAdapter,
+                    confidence: 1.0,
+                    observedAt: "2026-07-28T00:00:51.000Z"
+                ),
+            ]
         }
         let duplicateFinalPage = try changingRunDetail(finalPageRunDetail) { object in
             guard var events = object["events"] as? [[String: Any]] else {
@@ -975,15 +1009,18 @@ struct NativeHealthTests {
             guard var events = object["events"] as? [[String: Any]] else {
                 throw NativeHealthTestFailure.failed("Run detail events must be an array")
             }
-            events.append([
-                "cursor": 3,
-                "event_id": "event-dashboard-completed",
-                "session_id": "session-dashboard-1",
-                "event_type": "run.completed",
-                "source_kind": "provider_adapter",
-                "confidence": 1.0,
-                "observed_at": "2026-07-28T00:00:02.000Z",
-            ])
+            events.append(
+                try runEvidenceObject(
+                    cursor: 3,
+                    eventId: "event-dashboard-completed",
+                    sessionId: "session-dashboard-1",
+                    eventType: "run.completed",
+                    category: .lifecycle,
+                    sourceKind: .providerAdapter,
+                    confidence: 1.0,
+                    observedAt: "2026-07-28T00:00:02.000Z"
+                )
+            )
             object["events"] = events
             object["next_cursor"] = 3
             object["has_more"] = false
