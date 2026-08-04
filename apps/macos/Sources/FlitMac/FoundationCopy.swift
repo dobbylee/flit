@@ -14,6 +14,7 @@ enum FoundationCopyKey: String {
     case dashboardSectionPossiblyStuck = "dashboard.section.possiblyStuck"
     case dashboardSectionWorking = "dashboard.section.working"
     case dashboardUnavailable = "dashboard.unavailable"
+    case dashboardViewActivity = "dashboard.viewActivity"
     case closeToTrayAcknowledgement = "lifecycle.closeToTray.acknowledgement"
     case closeToTrayMessage = "lifecycle.closeToTray.message"
     case closeToTrayTitle = "lifecycle.closeToTray.title"
@@ -34,6 +35,15 @@ enum FoundationCopyKey: String {
     case quitRunStops = "lifecycle.quit.run.stops"
     case quitRunUnknown = "lifecycle.quit.run.unknown"
     case quitTitle = "lifecycle.quit.title"
+    case runDetailBack = "runDetail.back"
+    case runDetailCapability = "runDetail.capability"
+    case runDetailEvent = "runDetail.event"
+    case runDetailMoreEvents = "runDetail.moreEvents"
+    case runDetailNoEvents = "runDetail.noEvents"
+    case runDetailOpenInProvider = "runDetail.openInProvider"
+    case runDetailProviderHistory = "runDetail.providerHistory"
+    case runDetailTitle = "runDetail.title"
+    case runDetailUnavailable = "runDetail.unavailable"
     case noControls = "foundation.noControls"
     case phase = "foundation.phase"
     case statusChecking = "foundation.status.checking"
@@ -59,6 +69,7 @@ enum FoundationCopy {
         .dashboardSectionPossiblyStuck: "Possibly Stuck",
         .dashboardSectionWorking: "Working",
         .dashboardUnavailable: "Dashboard unavailable",
+        .dashboardViewActivity: "View activity",
         .closeToTrayAcknowledgement: "Keep Flit Running",
         .closeToTrayMessage:
             "Flit stays available in the menu bar so local monitoring can continue. Use Quit Flit to stop Flit monitoring and notifications.",
@@ -85,6 +96,15 @@ enum FoundationCopy {
         .quitRunStops: "• %@ — stops when Flit quits (%@)",
         .quitRunUnknown: "• %@ — outcome after Quit is unknown (%@)",
         .quitTitle: "Quit Flit?",
+        .runDetailBack: "Back to Dashboard",
+        .runDetailCapability: "%@: %@",
+        .runDetailEvent: "%@ · %@ · %@ · %d%% confidence",
+        .runDetailMoreEvents: "More events are available",
+        .runDetailNoEvents: "No structured activity is available",
+        .runDetailOpenInProvider: "Open in provider",
+        .runDetailProviderHistory: "Provider history",
+        .runDetailTitle: "Activity · %@",
+        .runDetailUnavailable: "Run activity unavailable",
         .noControls: "No agent controls yet",
         .phase: "Flit · Phase 2",
         .statusChecking: "Checking foundation",

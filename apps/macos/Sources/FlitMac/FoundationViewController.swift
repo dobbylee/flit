@@ -5,20 +5,45 @@ private final class FlippedDashboardDocumentView: NSView {
     override var isFlipped: Bool { true }
 }
 
+private final class RunDetailButton: NSButton {
+    let runId: String
+    let runVersion: UInt64
+    let runTitle: String
+
+    init(runId: String, runVersion: UInt64, runTitle: String) {
+        self.runId = runId
+        self.runVersion = runVersion
+        self.runTitle = runTitle
+        super.init(frame: .zero)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
+}
+
 @MainActor
 final class FoundationViewController: NSViewController {
     private let client: SystemHealthClient
     private let dashboardClient: DashboardClient
+    private let runDetailClient: RunDetailClient
     private var state: FoundationState = .checking
     private var dashboardState = DashboardPresentationState()
     private var statusHost: NSHostingView<FoundationStatusBadge>?
     private var boundaryLabel: NSTextField?
     private var foundationPanel: NSStackView?
     private var dashboardStack: NSStackView?
+    private var dashboardScroll: NSScrollView?
 
-    init(client: SystemHealthClient, dashboardClient: DashboardClient = DashboardClient()) {
+    init(
+        client: SystemHealthClient,
+        dashboardClient: DashboardClient = DashboardClient(),
+        runDetailClient: RunDetailClient = RunDetailClient()
+    ) {
         self.client = client
         self.dashboardClient = dashboardClient
+        self.runDetailClient = runDetailClient
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -103,6 +128,7 @@ final class FoundationViewController: NSViewController {
         dashboardScroll.hasVerticalScroller = true
         dashboardScroll.documentView = dashboardDocument
         dashboardScroll.translatesAutoresizingMaskIntoConstraints = false
+        self.dashboardScroll = dashboardScroll
         let preferredDashboardHeight = dashboardScroll.heightAnchor.constraint(
             equalToConstant: 206
         )
@@ -287,7 +313,168 @@ final class FoundationViewController: NSViewController {
         card.addArrangedSubview(
             label(changes, size: 12, weight: .regular, color: .secondaryLabelColor)
         )
+        let detail = RunDetailButton(
+            runId: run.runId,
+            runVersion: run.version,
+            runTitle: run.title
+        )
+        detail.title = FoundationCopy.text(.dashboardViewActivity)
+        detail.bezelStyle = .inline
+        detail.target = self
+        detail.action = #selector(showRunDetail(_:))
+        identify(detail, as: "flit.dashboard.runDetail.\(run.runId)")
+        card.addArrangedSubview(detail)
         return card
+    }
+
+    @objc private func showRunDetail(_ sender: RunDetailButton) {
+        do {
+            let response = try runDetailClient.loadFirstPage(
+                runId: sender.runId,
+                expectedRunVersion: sender.runVersion
+            )
+            var detail = RunDetailPresentationState()
+            try detail.apply(
+                response,
+                requestedRunId: sender.runId,
+                expectedRunVersion: sender.runVersion,
+                requestedAfterCursor: 0,
+                requestedEventLimit: 50
+            )
+            renderRunDetail(detail, runTitle: sender.runTitle)
+        } catch {
+            renderRunDetailFailure()
+        }
+    }
+
+    @objc private func showDashboard(_: NSButton) {
+        renderDashboard()
+    }
+
+    private func renderRunDetail(
+        _ detail: RunDetailPresentationState,
+        runTitle: String
+    ) {
+        guard
+            let dashboardStack,
+            let runId = detail.runId,
+            let historyStatus = detail.historyStatus,
+            let openInProviderStatus = detail.openInProviderStatus
+        else {
+            renderRunDetailFailure()
+            return
+        }
+        clearDashboardStack()
+        dashboardStack.addArrangedSubview(backButton())
+        let heading = label(
+            FoundationCopy.format(.runDetailTitle, runTitle),
+            size: 16,
+            weight: .semibold
+        )
+        identify(heading, as: "flit.runDetail.title.\(runId)")
+        dashboardStack.addArrangedSubview(heading)
+        dashboardStack.addArrangedSubview(
+            label(
+                FoundationCopy.format(
+                    .runDetailCapability,
+                    FoundationCopy.text(.runDetailProviderHistory),
+                    historyStatus.rawValue
+                ),
+                size: 12,
+                weight: .regular,
+                color: .secondaryLabelColor
+            )
+        )
+        dashboardStack.addArrangedSubview(
+            label(
+                FoundationCopy.format(
+                    .runDetailCapability,
+                    FoundationCopy.text(.runDetailOpenInProvider),
+                    openInProviderStatus.rawValue
+                ),
+                size: 12,
+                weight: .regular,
+                color: .secondaryLabelColor
+            )
+        )
+        if detail.events.isEmpty {
+            dashboardStack.addArrangedSubview(
+                label(
+                    FoundationCopy.text(.runDetailNoEvents),
+                    size: 12,
+                    weight: .regular,
+                    color: .secondaryLabelColor
+                )
+            )
+        } else {
+            for event in detail.events {
+                let row = label(
+                    FoundationCopy.format(
+                        .runDetailEvent,
+                        event.observedAt,
+                        event.eventType,
+                        event.sourceKind.rawValue,
+                        Int(event.confidence * 100)
+                    ),
+                    size: 12,
+                    weight: .regular
+                )
+                identify(row, as: "flit.runDetail.event.\(event.cursor)")
+                dashboardStack.addArrangedSubview(row)
+            }
+        }
+        if detail.hasMore {
+            dashboardStack.addArrangedSubview(
+                label(
+                    FoundationCopy.text(.runDetailMoreEvents),
+                    size: 12,
+                    weight: .semibold,
+                    color: .secondaryLabelColor
+                )
+            )
+        }
+        scrollDashboardToTop()
+    }
+
+    private func renderRunDetailFailure() {
+        guard let dashboardStack else { return }
+        clearDashboardStack()
+        dashboardStack.addArrangedSubview(backButton())
+        let failure = label(
+            FoundationCopy.text(.runDetailUnavailable),
+            size: 13,
+            weight: .semibold,
+            color: .systemRed
+        )
+        identify(failure, as: "flit.runDetail.unavailable")
+        dashboardStack.addArrangedSubview(failure)
+        scrollDashboardToTop()
+    }
+
+    private func backButton() -> NSButton {
+        let button = NSButton(
+            title: FoundationCopy.text(.runDetailBack),
+            target: self,
+            action: #selector(showDashboard(_:))
+        )
+        button.bezelStyle = .inline
+        identify(button, as: "flit.runDetail.back")
+        return button
+    }
+
+    private func clearDashboardStack() {
+        guard let dashboardStack else { return }
+        dashboardStack.arrangedSubviews.forEach { view in
+            dashboardStack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+    }
+
+    private func scrollDashboardToTop() {
+        guard let dashboardScroll else { return }
+        dashboardScroll.documentView?.layoutSubtreeIfNeeded()
+        dashboardScroll.contentView.scroll(to: .zero)
+        dashboardScroll.reflectScrolledClipView(dashboardScroll.contentView)
     }
 
     private func label(

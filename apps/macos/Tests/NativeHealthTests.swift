@@ -119,6 +119,21 @@ private func changingQuitImpact(
     )
 }
 
+private func changingRunDetail(
+    _ response: FlitRunDetailReadResponse,
+    mutate: (inout [String: Any]) throws -> Void
+) throws -> FlitRunDetailReadResponse {
+    let data = try JSONEncoder().encode(response)
+    guard var object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        throw NativeHealthTestFailure.failed("Run detail response must be an object")
+    }
+    try mutate(&object)
+    return try JSONDecoder().decode(
+        FlitRunDetailReadResponse.self,
+        from: try JSONSerialization.data(withJSONObject: object)
+    )
+}
+
 @MainActor
 private func requireCommandError(
     _ text: String,
@@ -669,6 +684,207 @@ struct NativeHealthTests {
                 && runDetailFixture.events.count == 2
                 && runDetailFixture.events[0].sourceKind == .core,
             "generated Run detail must preserve structured evidence and capability facts"
+        )
+        var runDetailPresentation = RunDetailPresentationState()
+        try runDetailPresentation.apply(
+            runDetailFixture,
+            requestedRunId: "run-dashboard-1",
+            expectedRunVersion: 3,
+            requestedAfterCursor: 0,
+            requestedEventLimit: 2
+        )
+        try require(
+            runDetailPresentation.runId == "run-dashboard-1"
+                && runDetailPresentation.runVersion == 3
+                && runDetailPresentation.nextCursor == 2
+                && runDetailPresentation.hasMore
+                && runDetailPresentation.events.map(\.cursor) == [1, 2]
+                && runDetailPresentation.events.map(\.eventType)
+                    == ["run.created", "run.start_requested"],
+            "native Run detail must preserve exact identity and chronological locator order"
+        )
+        let beforeRunId = runDetailPresentation.runId
+        let beforeCursor = runDetailPresentation.nextCursor
+        let beforeEventIds = runDetailPresentation.events.map(\.eventId)
+        let mismatchedRunDetail = try changingRunDetail(runDetailFixture) { object in
+            object["run_id"] = "run-mismatch"
+        }
+        do {
+            try runDetailPresentation.apply(
+                mismatchedRunDetail,
+                requestedRunId: "run-dashboard-1",
+                expectedRunVersion: 3,
+                requestedAfterCursor: 0,
+                requestedEventLimit: 2
+            )
+            throw NativeHealthTestFailure.failed(
+                "native Run detail must reject mismatched Run identity"
+            )
+        } catch let error as RunDetailPresentationError {
+            try require(
+                error == .runIdentityMismatch,
+                "Run detail identity mismatch must remain typed"
+            )
+        }
+        let reversedRunDetail = try changingRunDetail(runDetailFixture) { object in
+            guard let events = object["events"] as? [[String: Any]] else {
+                throw NativeHealthTestFailure.failed("Run detail events must be an array")
+            }
+            object["events"] = Array(events.reversed())
+        }
+        do {
+            try runDetailPresentation.apply(
+                reversedRunDetail,
+                requestedRunId: "run-dashboard-1",
+                expectedRunVersion: 3,
+                requestedAfterCursor: 0,
+                requestedEventLimit: 2
+            )
+            throw NativeHealthTestFailure.failed(
+                "native Run detail must reject non-monotonic event order"
+            )
+        } catch let error as RunDetailPresentationError {
+            try require(
+                error == .invalidEvent,
+                "Run detail order mismatch must remain typed"
+            )
+        }
+        let contractMismatchRunDetail = try changingRunDetail(runDetailFixture) { object in
+            object["protocol_version"] = "999.0"
+        }
+        let versionMismatchRunDetail = try changingRunDetail(runDetailFixture) { object in
+            object["run_version"] = 4
+        }
+        let cursorMismatchRunDetail = try changingRunDetail(runDetailFixture) { object in
+            object["next_cursor"] = 3
+        }
+        let duplicateRunDetail = try changingRunDetail(runDetailFixture) { object in
+            guard var events = object["events"] as? [[String: Any]] else {
+                throw NativeHealthTestFailure.failed("Run detail events must be an array")
+            }
+            events[1]["event_id"] = events[0]["event_id"]
+            object["events"] = events
+        }
+        let missingMoreRunDetail = try changingRunDetail(runDetailFixture) { object in
+            object["has_more"] = false
+        }
+        let exhaustedButMoreRunDetail = try changingRunDetail(runDetailFixture) { object in
+            object["run_version"] = 2
+        }
+        for (invalid, expectedVersion, requestedLimit, expectedError) in [
+            (
+                contractMismatchRunDetail,
+                UInt64(3),
+                UInt32(2),
+                RunDetailPresentationError.contractMismatch
+            ),
+            (
+                versionMismatchRunDetail,
+                UInt64(3),
+                UInt32(2),
+                RunDetailPresentationError.runVersionMismatch
+            ),
+            (
+                cursorMismatchRunDetail,
+                UInt64(3),
+                UInt32(2),
+                RunDetailPresentationError.cursorMismatch
+            ),
+            (
+                duplicateRunDetail,
+                UInt64(3),
+                UInt32(2),
+                RunDetailPresentationError.duplicateEvent
+            ),
+            (
+                missingMoreRunDetail,
+                UInt64(3),
+                UInt32(2),
+                RunDetailPresentationError.cursorMismatch
+            ),
+            (
+                exhaustedButMoreRunDetail,
+                UInt64(2),
+                UInt32(2),
+                RunDetailPresentationError.cursorMismatch
+            ),
+            (
+                runDetailFixture,
+                UInt64(3),
+                UInt32(50),
+                RunDetailPresentationError.cursorMismatch
+            ),
+        ] {
+            do {
+                try runDetailPresentation.apply(
+                    invalid,
+                    requestedRunId: "run-dashboard-1",
+                    expectedRunVersion: expectedVersion,
+                    requestedAfterCursor: 0,
+                    requestedEventLimit: requestedLimit
+                )
+                throw NativeHealthTestFailure.failed(
+                    "native Run detail must reject every invalid delivery boundary"
+                )
+            } catch let error as RunDetailPresentationError {
+                try require(
+                    error == expectedError,
+                    "Run detail invalid delivery must retain its typed error"
+                )
+            }
+        }
+        let fullPageRunDetail = try changingRunDetail(runDetailFixture) { object in
+            object["run_version"] = 51
+            object["next_cursor"] = 50
+            object["has_more"] = true
+            object["events"] = (1 ... 50).map { cursor in
+                [
+                    "cursor": cursor,
+                    "event_id": "event-full-\(cursor)",
+                    "session_id": NSNull(),
+                    "event_type": "command.started",
+                    "source_kind": "provider_adapter",
+                    "confidence": 1.0,
+                    "observed_at": "2026-07-28T00:00:00.000Z",
+                ] as [String: Any]
+            }
+        }
+        var fullPagePresentation = RunDetailPresentationState()
+        try fullPagePresentation.apply(
+            fullPageRunDetail,
+            requestedRunId: "run-dashboard-1",
+            expectedRunVersion: 51,
+            requestedAfterCursor: 0,
+            requestedEventLimit: 50
+        )
+        try require(
+            fullPagePresentation.hasMore
+                && fullPagePresentation.events.count == 50
+                && fullPagePresentation.nextCursor == 50,
+            "a full bounded page may truthfully report a later exact Run event"
+        )
+        let completedRunDetailFixture = try changingRunDetail(runDetailFixture) { object in
+            guard var events = object["events"] as? [[String: Any]] else {
+                throw NativeHealthTestFailure.failed("Run detail events must be an array")
+            }
+            events.append([
+                "cursor": 3,
+                "event_id": "event-dashboard-completed",
+                "session_id": "session-dashboard-1",
+                "event_type": "run.completed",
+                "source_kind": "provider_adapter",
+                "confidence": 1.0,
+                "observed_at": "2026-07-28T00:00:02.000Z",
+            ])
+            object["events"] = events
+            object["next_cursor"] = 3
+            object["has_more"] = false
+        }
+        try require(
+            runDetailPresentation.runId == beforeRunId
+                && runDetailPresentation.nextCursor == beforeCursor
+                && runDetailPresentation.events.map(\.eventId) == beforeEventIds,
+            "invalid Run detail must not partially mutate native presentation state"
         )
         let invalidChangeVariants: [(String, String, Any)] = [
             (
@@ -1526,6 +1742,89 @@ struct NativeHealthTests {
                     FoundationCopy.format(.dashboardChangesUnavailable, reason)
                 ),
             "fixture-backed Run card must render exact Unknown, attention, and unavailable facts"
+        )
+        let detailController = FoundationViewController(
+            client: client,
+            dashboardClient: DashboardClient(
+                fixtureLoader: { initialDashboardFixture }
+            ),
+            runDetailClient: RunDetailClient(
+                fixtureLoader: { request in
+                    guard
+                        request.runId == "run-dashboard-1",
+                        request.expectedRunVersion == 3,
+                        request.afterCursor == 0,
+                        request.requestedEventLimit == 50,
+                        request.clientProtocolVersion == flitClientProtocolVersion
+                    else {
+                        throw NativeHealthTestFailure.failed(
+                            "Run detail action must construct the exact bounded current request"
+                        )
+                    }
+                    return completedRunDetailFixture
+                }
+            )
+        )
+        _ = detailController.view
+        let detailDashboardViews = descendants(of: detailController.view)
+        guard
+            let detailButton = detailDashboardViews.first(where: {
+                $0.accessibilityIdentifier()
+                    == "flit.dashboard.runDetail.run-dashboard-1"
+            }) as? NSButton
+        else {
+            throw NativeHealthTestFailure.failed(
+                "fixture-backed Run card must expose its Activity action"
+            )
+        }
+        detailButton.performClick(nil)
+        let detailViews = descendants(of: detailController.view)
+        let detailIdentifiers = Set(
+            detailViews.compactMap { $0.accessibilityIdentifier() }
+        )
+        try require(
+            detailIdentifiers.contains("flit.runDetail.back")
+                && detailIdentifiers.contains("flit.runDetail.title.run-dashboard-1")
+                && detailIdentifiers.contains("flit.runDetail.event.1")
+                && detailIdentifiers.contains("flit.runDetail.event.2")
+                && detailIdentifiers.contains("flit.runDetail.event.3"),
+            "native Run detail must expose stable back, title, and event identities"
+        )
+        let detailCopy = detailViews.compactMap { ($0 as? NSTextField)?.stringValue }
+        try require(
+            detailCopy.contains(
+                FoundationCopy.format(
+                    .runDetailEvent,
+                    "2026-07-28T00:00:00.000Z",
+                    "run.created",
+                    "core",
+                    100
+                )
+            )
+                && detailCopy.contains(
+                    FoundationCopy.format(
+                        .runDetailCapability,
+                        FoundationCopy.text(.runDetailProviderHistory),
+                        "unsupported"
+                    )
+                )
+                && !detailCopy.contains(FoundationCopy.text(.runDetailMoreEvents))
+                && !detailCopy.contains("session-dashboard-1"),
+            "native Run detail must render bounded locator facts without session identity"
+        )
+        guard
+            let backButton = detailViews.first(where: {
+                $0.accessibilityIdentifier() == "flit.runDetail.back"
+            }) as? NSButton
+        else {
+            throw NativeHealthTestFailure.failed("native Run detail must expose Back")
+        }
+        backButton.performClick(nil)
+        try require(
+            descendants(of: detailController.view).contains(where: {
+                $0.accessibilityIdentifier() == "flit.dashboard.run.run-dashboard-1"
+            }),
+            "Back must restore the Core-projected Dashboard"
         )
         let observedController = FoundationViewController(
             client: client,
