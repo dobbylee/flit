@@ -1796,6 +1796,7 @@ fn run_detail_read_with(
                         event_id: event.event_id,
                         session_id: event.session_id,
                         event_type: event.event_type,
+                        category: event.category,
                         source_kind: evidence_source_kind(&event.source_kind)?,
                         confidence: event.confidence,
                         observed_at: event.observed_at,
@@ -4165,6 +4166,9 @@ mod tests {
         assert_eq!(first.events.len(), 2);
         assert!(first.has_more);
         assert!(first.events[0].cursor < first.events[1].cursor);
+        assert!(first.events.iter().all(|event| {
+            event.category == flit_protocol::RunEvidenceCategory::for_event_type(&event.event_type)
+        }));
 
         let second = run_detail_read_with(
             &manager,
@@ -4183,6 +4187,9 @@ mod tests {
         assert!(!second.has_more);
         assert_eq!(second.next_cursor, run_version);
         assert_eq!(second.events.len(), 2);
+        assert!(second.events.iter().all(|event| {
+            event.category == flit_protocol::RunEvidenceCategory::for_event_type(&event.event_type)
+        }));
 
         let open = managed_run_open_in_provider_with(
             &manager,

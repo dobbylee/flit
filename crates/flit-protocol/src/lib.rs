@@ -4,7 +4,7 @@ use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: &str = "1.16";
+pub const PROTOCOL_VERSION: &str = "1.17";
 pub const EVENT_PROTOCOL_VERSION: &str = "1.2";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -526,12 +526,66 @@ pub struct RunDetailReadRequest {
     pub client_protocol_version: String,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunEvidenceCategory {
+    Activity,
+    Command,
+    File,
+    Test,
+    Attention,
+    Lifecycle,
+    Unknown,
+}
+
+impl RunEvidenceCategory {
+    #[must_use]
+    pub fn for_event_type(event_type: &str) -> Self {
+        match event_type {
+            "activity.classified" => Self::Activity,
+            "command.started" | "command.finished" => Self::Command,
+            "file.changed" | "git.snapshot_recorded" => Self::File,
+            "permission.requested"
+            | "permission.mode_change_submitted"
+            | "permission.mode_configured"
+            | "permission.mode_configuration_failed"
+            | "permission.mode_configuration_unknown"
+            | "permission.response_submitted"
+            | "permission.resolved"
+            | "permission.response_failed"
+            | "permission.delivery_unknown"
+            | "permission.provider_outcome_resolved"
+            | "permission.provider_outcome_unknown"
+            | "question.requested"
+            | "question.response_submitted"
+            | "question.resolved"
+            | "question.response_failed"
+            | "question.delivery_unknown"
+            | "risk.detected"
+            | "attention.acknowledged" => Self::Attention,
+            "run.created"
+            | "run.start_requested"
+            | "run.resume_requested"
+            | "run.resume_failed"
+            | "run.completed"
+            | "run.failed"
+            | "run.stop_requested"
+            | "run.stopped"
+            | "run.interrupted"
+            | "session.connected"
+            | "session.resumed" => Self::Lifecycle,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct RunEvidenceRecord {
     pub cursor: u64,
     pub event_id: String,
     pub session_id: Option<String>,
     pub event_type: String,
+    pub category: RunEvidenceCategory,
     pub source_kind: EventSourceKind,
     pub confidence: f64,
     pub observed_at: String,
@@ -1688,11 +1742,22 @@ enum FlitEventSourceKind: String, Codable, Sendable {
     case recovery
 }
 
+enum FlitRunEvidenceCategory: String, Codable, Sendable {
+    case activity
+    case command
+    case file
+    case test
+    case attention
+    case lifecycle
+    case unknown
+}
+
 struct FlitRunEvidenceRecord: Codable, Equatable, Sendable {
     let cursor: UInt64
     let eventId: String
     let sessionId: String?
     let eventType: String
+    let category: FlitRunEvidenceCategory
     let sourceKind: FlitEventSourceKind
     let confidence: Double
     let observedAt: String
@@ -1702,6 +1767,7 @@ struct FlitRunEvidenceRecord: Codable, Equatable, Sendable {
         case eventId = "event_id"
         case sessionId = "session_id"
         case eventType = "event_type"
+        case category
         case sourceKind = "source_kind"
         case confidence
         case observedAt = "observed_at"

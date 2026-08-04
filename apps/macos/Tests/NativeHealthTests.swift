@@ -697,8 +697,33 @@ struct NativeHealthTests {
             runDetailFixture.historyStatus == .unsupported
                 && runDetailFixture.openInProviderStatus == .unsupported
                 && runDetailFixture.events.count == 2
-                && runDetailFixture.events[0].sourceKind == .core,
+                && runDetailFixture.events[0].sourceKind == .core
+                && runDetailFixture.events.allSatisfy({ $0.category == .lifecycle }),
             "generated Run detail must preserve structured evidence and capability facts"
+        )
+        let runDetailFixtureData = try Data(
+            contentsOf: URL(fileURLWithPath: "\(fixtureRoot)/run_detail_read.response.json")
+        )
+        guard
+            var runDetailObject = try JSONSerialization.jsonObject(with: runDetailFixtureData)
+                as? [String: Any],
+            var runDetailEvents = runDetailObject["events"] as? [[String: Any]]
+        else {
+            throw NativeHealthTestFailure.failed("Run detail fixture must contain events")
+        }
+        runDetailEvents[0].removeValue(forKey: "category")
+        runDetailObject["events"] = runDetailEvents
+        try requireDecodingFailure(
+            FlitRunDetailReadResponse.self,
+            from: JSONSerialization.data(withJSONObject: runDetailObject),
+            "generated Run detail must reject a missing required evidence category"
+        )
+        runDetailEvents[0]["category"] = "future_category"
+        runDetailObject["events"] = runDetailEvents
+        try requireDecodingFailure(
+            FlitRunDetailReadResponse.self,
+            from: JSONSerialization.data(withJSONObject: runDetailObject),
+            "generated Run detail must reject an unrecognized evidence category"
         )
         var runDetailPresentation = RunDetailPresentationState()
         try runDetailPresentation.apply(
@@ -715,7 +740,9 @@ struct NativeHealthTests {
                 && runDetailPresentation.hasMore
                 && runDetailPresentation.events.map(\.cursor) == [1, 2]
                 && runDetailPresentation.events.map(\.eventType)
-                    == ["run.created", "run.start_requested"],
+                    == ["run.created", "run.start_requested"]
+                && runDetailPresentation.events.map(\.category)
+                    == [.lifecycle, .lifecycle],
             "native Run detail must preserve exact identity and chronological locator order"
         )
         let beforeRunId = runDetailPresentation.runId

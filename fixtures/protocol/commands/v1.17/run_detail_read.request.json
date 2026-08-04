@@ -1,0 +1,7 @@
+{
+  "run_id": "run-dashboard-1",
+  "expected_run_version": 3,
+  "after_cursor": 0,
+  "requested_event_limit": 2,
+  "client_protocol_version": "1.17"
+}

@@ -11,8 +11,9 @@ use flit_protocol::{
     ProjectTrustResponse, ProjectsListRequest, ProjectsListResponse, ProviderCompatibility,
     ProviderDiagnosticsRequest, ProviderDiagnosticsResponse, ProviderExecutionAfterQuit,
     ProviderUnavailableReason, QuitImpactReason, QuitImpactRequest, QuitImpactResponse,
-    RunDetailReadRequest, RunDetailReadResponse, SystemHealthRequest, SystemHealthResponse,
-    event_schema_id, event_schema_relative_path, generated_swift_command_contract,
+    RunDetailReadRequest, RunDetailReadResponse, RunEvidenceCategory, SystemHealthRequest,
+    SystemHealthResponse, event_schema_id, event_schema_relative_path,
+    generated_swift_command_contract,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -471,6 +472,12 @@ fn current_run_detail_and_provider_open_fixtures_are_exact_and_path_free() {
         CapabilityStatus::Unsupported
     );
     assert_eq!(response.events.len(), 2);
+    assert!(
+        response
+            .events
+            .iter()
+            .all(|event| event.category == RunEvidenceCategory::Lifecycle)
+    );
     let rendered = serde_json::to_string(&response).expect("Run detail should serialize");
     for forbidden in [
         "\"payload\"",
@@ -482,6 +489,63 @@ fn current_run_detail_and_provider_open_fixtures_are_exact_and_path_free() {
         assert!(
             !rendered.contains(forbidden),
             "Run detail must not expose {forbidden}"
+        );
+    }
+    let mut missing_category = serde_json::to_value(&response).expect("Run detail JSON");
+    missing_category["events"][0]
+        .as_object_mut()
+        .expect("Run evidence record")
+        .remove("category");
+    assert!(serde_json::from_value::<RunDetailReadResponse>(missing_category).is_err());
+    let mut unknown_category = serde_json::to_value(&response).expect("Run detail JSON");
+    unknown_category["events"][0]["category"] = serde_json::json!("future_category");
+    assert!(serde_json::from_value::<RunDetailReadResponse>(unknown_category).is_err());
+}
+
+#[test]
+fn run_evidence_category_maps_only_exact_catalog_types() {
+    for (event_type, expected) in [
+        ("activity.classified", RunEvidenceCategory::Activity),
+        ("command.started", RunEvidenceCategory::Command),
+        ("command.finished", RunEvidenceCategory::Command),
+        ("file.changed", RunEvidenceCategory::File),
+        ("git.snapshot_recorded", RunEvidenceCategory::File),
+        ("permission.requested", RunEvidenceCategory::Attention),
+        ("question.resolved", RunEvidenceCategory::Attention),
+        ("risk.detected", RunEvidenceCategory::Attention),
+        ("attention.acknowledged", RunEvidenceCategory::Attention),
+        ("run.created", RunEvidenceCategory::Lifecycle),
+        ("run.interrupted", RunEvidenceCategory::Lifecycle),
+        ("session.resumed", RunEvidenceCategory::Lifecycle),
+    ] {
+        assert_eq!(RunEvidenceCategory::for_event_type(event_type), expected);
+    }
+    for event_type in [
+        "run.event_observed",
+        "command.started.extra",
+        "test.finished",
+        "diagnostic.sequence_gap",
+        "future.event",
+        "",
+    ] {
+        assert_eq!(
+            RunEvidenceCategory::for_event_type(event_type),
+            RunEvidenceCategory::Unknown,
+            "unrecognized event type {event_type:?} must remain unknown"
+        );
+    }
+    for (category, wire_value) in [
+        (RunEvidenceCategory::Activity, "activity"),
+        (RunEvidenceCategory::Command, "command"),
+        (RunEvidenceCategory::File, "file"),
+        (RunEvidenceCategory::Test, "test"),
+        (RunEvidenceCategory::Attention, "attention"),
+        (RunEvidenceCategory::Lifecycle, "lifecycle"),
+        (RunEvidenceCategory::Unknown, "unknown"),
+    ] {
+        assert_eq!(
+            serde_json::to_value(category).expect("category JSON"),
+            serde_json::json!(wire_value)
         );
     }
 }
@@ -973,6 +1037,7 @@ fn generated_swift_project_contract_is_current_and_required_fields_fail_closed()
         "FlitDashboardEventRecord",
         "FlitDashboardReadResponse",
         "FlitRunDetailReadRequest",
+        "FlitRunEvidenceCategory",
         "FlitRunEvidenceRecord",
         "FlitRunDetailReadResponse",
         "FlitManagedRunOpenInProviderRequest",
@@ -1003,6 +1068,18 @@ fn generated_swift_project_contract_is_current_and_required_fields_fail_closed()
         );
     }
     assert!(generated.contains("case providerAuto = \"provider_auto\""));
+    assert!(generated.contains(
+        r#"enum FlitRunEvidenceCategory: String, Codable, Sendable {
+    case activity
+    case command
+    case file
+    case test
+    case attention
+    case lifecycle
+    case unknown
+}"#
+    ));
+    assert!(generated.contains("let category: FlitRunEvidenceCategory"));
     assert!(generated.contains("case providerOutcomeResolved = \"provider_outcome_resolved\""));
     assert!(generated.contains("case permissionModeConfigure = \"permission_mode_configure\""));
     assert!(generated.contains("case providerOutcomeObserve = \"provider_outcome_observe\""));

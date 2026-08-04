@@ -597,7 +597,9 @@ fn run_detail_evidence_is_exact_bounded_and_capability_receipt_owned() {
     );
     let first = append(&mut store, first_event);
     append(&mut store, event(RUN_B, "event-b-1", 1));
-    let third = append(&mut store, event(RUN_A, "event-a-2", 2));
+    let mut second_event = event(RUN_A, "event-a-2", 2);
+    second_event.event_type = "command.started".to_owned();
+    let third = append(&mut store, second_event);
     store
         .write_run_snapshot(snapshot(RUN_A, third, "Running", "Testing", 1.0))
         .expect("Run A snapshot");
@@ -610,12 +612,20 @@ fn run_detail_evidence_is_exact_bounded_and_capability_receipt_owned() {
     assert_eq!(first_page.events[0].cursor, first);
     assert_eq!(first_page.events[0].event_id, "event-a-1");
     assert_eq!(first_page.events[0].source_kind, "core");
+    assert_eq!(
+        first_page.events[0].category,
+        flit_protocol::RunEvidenceCategory::Unknown
+    );
     let second_page = store
         .run_evidence_through(RUN_A, first, third, 1)
         .expect("second evidence page");
     assert!(!second_page.has_more);
     assert_eq!(second_page.events.len(), 1);
     assert_eq!(second_page.events[0].cursor, third);
+    assert_eq!(
+        second_page.events[0].category,
+        flit_protocol::RunEvidenceCategory::Command
+    );
     let empty_page = store
         .run_evidence_through(RUN_A, third, third, 1)
         .expect("empty evidence page");

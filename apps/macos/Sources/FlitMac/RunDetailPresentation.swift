@@ -13,6 +13,7 @@ struct RunActivityRow: Sendable {
     let cursor: UInt64
     let eventId: String
     let eventType: String
+    let category: FlitRunEvidenceCategory
     let sourceKind: FlitEventSourceKind
     let confidence: Double
     let observedAt: String
@@ -147,6 +148,7 @@ private func validatedRows(
                 cursor: event.cursor,
                 eventId: event.eventId,
                 eventType: event.eventType,
+                category: event.category,
                 sourceKind: event.sourceKind,
                 confidence: event.confidence,
                 observedAt: event.observedAt

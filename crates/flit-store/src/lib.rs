@@ -12,7 +12,7 @@ use flit_core::projection::{
 };
 use flit_protocol::{
     EventEnvelope, EventProtocolVersion, EventSource, EventSourceKind, GitBaselinePayload, GitHead,
-    MAX_JSON_SAFE_INTEGER, NullableSessionId, UnsequencedEventEnvelope,
+    MAX_JSON_SAFE_INTEGER, NullableSessionId, RunEvidenceCategory, UnsequencedEventEnvelope,
 };
 use rusqlite::{
     Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params, params_from_iter,
@@ -355,6 +355,7 @@ pub struct RunEvidenceLocator {
     pub event_id: String,
     pub session_id: Option<String>,
     pub event_type: String,
+    pub category: RunEvidenceCategory,
     pub source_kind: String,
     pub confidence: f64,
     pub observed_at: String,
@@ -2409,6 +2410,7 @@ impl Store {
                     cursor,
                     event_id,
                     session_id,
+                    category: RunEvidenceCategory::for_event_type(&event_type),
                     event_type,
                     source_kind,
                     confidence,

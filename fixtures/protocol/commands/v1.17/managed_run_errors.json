@@ -1,0 +1,26 @@
+[
+  {
+    "code": "INVALID_RUN_REQUEST",
+    "message_key": "errors.invalidRunRequest"
+  },
+  {
+    "code": "RUN_CONFLICT",
+    "message_key": "errors.runConflict"
+  },
+  {
+    "code": "PROJECT_NOT_TRUSTED",
+    "message_key": "errors.projectNotTrusted"
+  },
+  {
+    "code": "PROVIDER_UNAVAILABLE",
+    "message_key": "errors.providerUnavailable"
+  },
+  {
+    "code": "PROVIDER_START_FAILED",
+    "message_key": "errors.providerStartFailed"
+  },
+  {
+    "code": "PROVIDER_START_UNKNOWN",
+    "message_key": "errors.providerStartUnknown"
+  }
+]
