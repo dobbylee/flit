@@ -1,0 +1,6 @@
+{
+  "observation": "not_worktree",
+  "protocol_version": "1.15",
+  "project_id": "project-alpha",
+  "reason": "bare_repository"
+}

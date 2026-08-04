@@ -34,8 +34,15 @@ pub struct ProjectionEvent {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ChangeAttribution {
+    Exact,
+    ObservedDuringRun,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ChangeSummary {
     Available {
+        attribution: ChangeAttribution,
         files: u64,
         insertions: u64,
         deletions: u64,

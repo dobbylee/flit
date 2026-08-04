@@ -239,6 +239,26 @@ fn snapshot_version_and_content_validation_fail_before_mutation() {
             field: "attention.level"
         })
     ));
+    for attribution in [None, Some("guessed")] {
+        let mut invalid_attribution = snapshot(RUN_A, 1, "Running", "Editing", 0.9);
+        let changes = invalid_attribution
+            .snapshot
+            .get_mut("changes")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("changes object");
+        match attribution {
+            Some(attribution) => {
+                changes.insert("attribution".to_owned(), json!(attribution));
+            }
+            None => {
+                changes.remove("attribution");
+            }
+        }
+        assert!(matches!(
+            store.write_run_snapshot(invalid_attribution),
+            Err(StoreError::InvalidRunSnapshot { field: "changes" })
+        ));
+    }
     assert_eq!(store.run_snapshot(RUN_A).expect("no snapshot"), None);
 }
 
@@ -339,6 +359,7 @@ fn dashboard_snapshot_and_global_delta_share_one_fixed_cursor_order() {
         "changes".to_owned(),
         json!({
             "availability": "available",
+            "attribution": "observed_during_run",
             "files": 3,
             "insertions": 42,
             "deletions": 7
@@ -375,6 +396,7 @@ fn dashboard_snapshot_and_global_delta_share_one_fixed_cursor_order() {
     assert_eq!(
         current[0].changes,
         flit_store::DashboardChangeSummary::Available {
+            attribution: flit_store::DashboardChangeAttribution::ObservedDuringRun,
             files: 3,
             insertions: 42,
             deletions: 7,
@@ -786,6 +808,7 @@ fn snapshot(
         "last_liveness_at": last_liveness_at,
         "changes": {
             "availability": "available",
+            "attribution": "exact",
             "files": 0,
             "insertions": 0,
             "deletions": 0

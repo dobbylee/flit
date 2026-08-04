@@ -18,20 +18,21 @@ use flit_git::{
 };
 use flit_protocol::{
     CapabilityStatus as ProtocolCapabilityStatus, CommandError, CommandErrorCode,
-    DashboardEventRecord, DashboardReadRequest, DashboardReadResponse, DashboardRunRecord,
-    DashboardSnapshotReason, EVENT_PROTOCOL_VERSION, EventSourceKind,
-    FingerprintAxis as ProtocolFingerprintAxis, GitBaselinePayload, GitBaselineUnavailableReason,
-    GitDirtySummary, GitHead, GitNotWorktreeReason, GitObservationResponse,
-    GitObservationUnavailableReason, HealthStatus, ManagedRunObserveRequest,
-    ManagedRunObserveResponse, ManagedRunOpenInProviderRequest, ManagedRunPermissionRespondRequest,
-    ManagedRunPermissionRespondResponse, ManagedRunStartRequest, PROTOCOL_VERSION,
-    ProjectInspectionResponse, ProjectListCursor as ProjectListCursorResponse, ProjectRecord,
-    ProjectRegistrationResponse, ProjectRegistrationStatus, ProjectTrustResponse,
-    ProjectTrustStatus, ProjectsListResponse, ProviderCapability as ProtocolProviderCapability,
-    ProviderCapabilityEntry, ProviderCompatibility as ProtocolProviderCompatibility,
-    ProviderDiagnosticsResponse, ProviderExecutionAfterQuit, ProviderKind as ProtocolProviderKind,
-    ProviderUnavailableReason, QuitImpactReason, QuitImpactResponse, QuitImpactRun,
-    RunDetailReadRequest, RunDetailReadResponse, RunEvidenceRecord, SystemHealthResponse,
+    DashboardChangeAttribution as ProtocolDashboardChangeAttribution, DashboardEventRecord,
+    DashboardReadRequest, DashboardReadResponse, DashboardRunRecord, DashboardSnapshotReason,
+    EVENT_PROTOCOL_VERSION, EventSourceKind, FingerprintAxis as ProtocolFingerprintAxis,
+    GitBaselinePayload, GitBaselineUnavailableReason, GitDirtySummary, GitHead,
+    GitNotWorktreeReason, GitObservationResponse, GitObservationUnavailableReason, HealthStatus,
+    ManagedRunObserveRequest, ManagedRunObserveResponse, ManagedRunOpenInProviderRequest,
+    ManagedRunPermissionRespondRequest, ManagedRunPermissionRespondResponse,
+    ManagedRunStartRequest, PROTOCOL_VERSION, ProjectInspectionResponse,
+    ProjectListCursor as ProjectListCursorResponse, ProjectRecord, ProjectRegistrationResponse,
+    ProjectRegistrationStatus, ProjectTrustResponse, ProjectTrustStatus, ProjectsListResponse,
+    ProviderCapability as ProtocolProviderCapability, ProviderCapabilityEntry,
+    ProviderCompatibility as ProtocolProviderCompatibility, ProviderDiagnosticsResponse,
+    ProviderExecutionAfterQuit, ProviderKind as ProtocolProviderKind, ProviderUnavailableReason,
+    QuitImpactReason, QuitImpactResponse, QuitImpactRun, RunDetailReadRequest,
+    RunDetailReadResponse, RunEvidenceRecord, SystemHealthResponse,
 };
 use flit_providers::{
     CapabilityStatus, CodexCompatibilityProbe, CodexCompatibilityProbeError,
@@ -40,7 +41,8 @@ use flit_providers::{
     probe_codex_compatibility_on_path,
 };
 use flit_store::{
-    AppendEventOutcome, DashboardChangeSummary as StoreDashboardChangeSummary,
+    AppendEventOutcome, DashboardChangeAttribution as StoreDashboardChangeAttribution,
+    DashboardChangeSummary as StoreDashboardChangeSummary,
     DashboardRunSnapshot as StoreDashboardRunSnapshot, MAX_DASHBOARD_DELTA_EVENTS,
     MAX_LIVE_MANAGED_SESSIONS, MAX_PROJECT_PAGE_SIZE, MAX_RUN_DETAIL_EVENTS,
     ManagedPermissionDecision, ManagedPermissionDeliveryUnknownReason,
@@ -1417,10 +1419,17 @@ fn dashboard_run_record(
     };
     let changes = match snapshot.changes {
         StoreDashboardChangeSummary::Available {
+            attribution,
             files,
             insertions,
             deletions,
         } => flit_protocol::DashboardChangeSummary::Available {
+            attribution: match attribution {
+                StoreDashboardChangeAttribution::Exact => ProtocolDashboardChangeAttribution::Exact,
+                StoreDashboardChangeAttribution::ObservedDuringRun => {
+                    ProtocolDashboardChangeAttribution::ObservedDuringRun
+                }
+            },
             files,
             insertions,
             deletions,
@@ -3770,6 +3779,55 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn dashboard_bridge_preserves_every_available_change_attribution() {
+        for (stored, expected) in [
+            (
+                StoreDashboardChangeAttribution::Exact,
+                ProtocolDashboardChangeAttribution::Exact,
+            ),
+            (
+                StoreDashboardChangeAttribution::ObservedDuringRun,
+                ProtocolDashboardChangeAttribution::ObservedDuringRun,
+            ),
+        ] {
+            let record = dashboard_run_record(StoreDashboardRunSnapshot {
+                project_id: "project-attribution".to_owned(),
+                project_display_name: "Attribution Project".to_owned(),
+                title: "Attribution Run".to_owned(),
+                provider_kind: "codex".to_owned(),
+                started_at: Some("2026-08-04T00:00:00Z".to_owned()),
+                ended_at: Some("2026-08-04T00:01:00Z".to_owned()),
+                attention_open_count: 0,
+                changes: StoreDashboardChangeSummary::Available {
+                    attribution: stored,
+                    files: 3,
+                    insertions: 42,
+                    deletions: 7,
+                },
+                projection: flit_store::RunSnapshot {
+                    run_id: "run-attribution".to_owned(),
+                    version: 1,
+                    lifecycle: "Completed".to_owned(),
+                    activity: "Idle".to_owned(),
+                    activity_confidence: 1.0,
+                    attention_level: "None".to_owned(),
+                    dashboard_bucket: "Finished".to_owned(),
+                    last_progress_at: None,
+                    last_liveness_at: None,
+                    snapshot: serde_json::Map::new(),
+                    updated_at: "2026-08-04T00:01:00Z".to_owned(),
+                },
+            })
+            .expect("Dashboard attribution mapping");
+            assert!(matches!(
+                record.changes,
+                flit_protocol::DashboardChangeSummary::Available { attribution, .. }
+                    if attribution == expected
+            ));
+        }
     }
 
     #[test]

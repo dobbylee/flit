@@ -253,6 +253,46 @@ fn current_dashboard_read_fixtures_round_trip_every_delivery() {
         "dashboard_read_errors.json",
     ));
 
+    let initial: DashboardReadResponse = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "dashboard_read.initial.response.json",
+        )))
+        .expect("Dashboard snapshot fixture should be readable"),
+    )
+    .expect("Dashboard snapshot fixture should match Rust types");
+    assert!(matches!(
+        initial,
+        DashboardReadResponse::Snapshot { runs, .. }
+            if matches!(
+                &runs[0].changes,
+                flit_protocol::DashboardChangeSummary::Available {
+                    attribution: flit_protocol::DashboardChangeAttribution::Exact,
+                    ..
+                }
+            )
+    ));
+    let mut observed: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "dashboard_read.initial.response.json",
+        )))
+        .expect("Dashboard snapshot fixture should be readable"),
+    )
+    .expect("Dashboard snapshot fixture should be JSON");
+    observed["runs"][0]["changes"]["attribution"] = serde_json::json!("observed_during_run");
+    assert!(matches!(
+        serde_json::from_value::<DashboardReadResponse>(observed),
+        Ok(DashboardReadResponse::Snapshot { runs, .. })
+            if matches!(
+                &runs[0].changes,
+                flit_protocol::DashboardChangeSummary::Available {
+                    attribution: flit_protocol::DashboardChangeAttribution::ObservedDuringRun,
+                    ..
+                }
+            )
+    ));
+
     let mut missing_identity: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(repository_path(&command_fixture(
             current,
@@ -357,12 +397,27 @@ fn current_dashboard_read_fixtures_round_trip_every_delivery() {
         }),
         serde_json::json!({
             "availability": "available",
+            "attribution": "exact",
+            "insertions": 1,
+            "deletions": 1
+        }),
+        serde_json::json!({
+            "availability": "available",
+            "files": 1,
+            "insertions": 1,
+            "deletions": 1
+        }),
+        serde_json::json!({
+            "availability": "available",
+            "attribution": "guessed",
+            "files": 1,
             "insertions": 1,
             "deletions": 1
         }),
         serde_json::json!({
             "availability": "unavailable",
             "reason": "git_observation_not_configured",
+            "attribution": "exact",
             "files": 0
         }),
     ] {

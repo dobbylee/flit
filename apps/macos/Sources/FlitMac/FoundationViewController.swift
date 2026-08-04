@@ -272,9 +272,11 @@ final class FoundationViewController: NSViewController {
         )
         let changes: String
         switch run.changes {
-        case let .available(files, insertions, deletions):
+        case let .available(attribution, files, insertions, deletions):
             changes = FoundationCopy.format(
-                .dashboardChanges,
+                attribution == .exact
+                    ? .dashboardChanges
+                    : .dashboardChangesObservedDuringRun,
                 files,
                 insertions,
                 deletions

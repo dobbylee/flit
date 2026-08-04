@@ -7,8 +7,8 @@ use std::{
 };
 
 use flit_core::projection::{
-    ChangeSummary as CoreChangeSummary, ProjectionError, ProjectionEvent,
-    replay_dashboard_projection,
+    ChangeAttribution as CoreChangeAttribution, ChangeSummary as CoreChangeSummary,
+    ProjectionError, ProjectionEvent, replay_dashboard_projection,
 };
 use flit_protocol::{
     EventEnvelope, EventProtocolVersion, EventSource, EventSourceKind, GitBaselinePayload, GitHead,
@@ -153,8 +153,15 @@ type DashboardSnapshotMetadata = (
 );
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DashboardChangeAttribution {
+    Exact,
+    ObservedDuringRun,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DashboardChangeSummary {
     Available {
+        attribution: DashboardChangeAttribution,
         files: u64,
         insertions: u64,
         deletions: u64,
@@ -3659,11 +3666,16 @@ fn refresh_managed_dashboard_projection(
         })?;
     let changes = match projection.changes {
         CoreChangeSummary::Available {
+            attribution,
             files,
             insertions,
             deletions,
         } => json!({
             "availability": "available",
+            "attribution": match attribution {
+                CoreChangeAttribution::Exact => "exact",
+                CoreChangeAttribution::ObservedDuringRun => "observed_during_run",
+            },
             "files": files,
             "insertions": insertions,
             "deletions": deletions,
@@ -3927,6 +3939,12 @@ fn validate_snapshot_json(snapshot: &RunSnapshotDraft) -> Result<(), StoreError>
         .ok_or(StoreError::InvalidRunSnapshot { field: "changes" })?;
     match changes.get("availability").and_then(Value::as_str) {
         Some("available") => {
+            if !matches!(
+                changes.get("attribution").and_then(Value::as_str),
+                Some("exact" | "observed_during_run")
+            ) {
+                return Err(StoreError::InvalidRunSnapshot { field: "changes" });
+            }
             for field in ["files", "insertions", "deletions"] {
                 if changes
                     .get(field)
@@ -3945,7 +3963,7 @@ fn validate_snapshot_json(snapshot: &RunSnapshotDraft) -> Result<(), StoreError>
                 .get("reason")
                 .and_then(Value::as_str)
                 .is_none_or(|reason| reason.trim().is_empty())
-                || ["files", "insertions", "deletions"]
+                || ["attribution", "files", "insertions", "deletions"]
                     .iter()
                     .any(|field| changes.contains_key(*field))
             {
@@ -4118,6 +4136,16 @@ fn load_dashboard_run_snapshot(
         })?;
     let changes = match changes.get("availability").and_then(Value::as_str) {
         Some("available") => {
+            let attribution = match changes.get("attribution").and_then(Value::as_str) {
+                Some("exact") => DashboardChangeAttribution::Exact,
+                Some("observed_during_run") => DashboardChangeAttribution::ObservedDuringRun,
+                _ => {
+                    return Err(StoreError::StoredRunSnapshotInvalid {
+                        run_id: projection.run_id.clone(),
+                        field: "changes.attribution",
+                    });
+                }
+            };
             let count = |key: &str, field: &'static str| {
                 changes.get(key).and_then(Value::as_u64).ok_or_else(|| {
                     StoreError::StoredRunSnapshotInvalid {
@@ -4127,6 +4155,7 @@ fn load_dashboard_run_snapshot(
                 })
             };
             DashboardChangeSummary::Available {
+                attribution,
                 files: count("files", "changes.files")?,
                 insertions: count("insertions", "changes.insertions")?,
                 deletions: count("deletions", "changes.deletions")?,

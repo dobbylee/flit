@@ -5,6 +5,7 @@ enum FoundationCopyKey: String {
     case dashboardActivityUnknown = "dashboard.activity.unknown"
     case dashboardAttention = "dashboard.attention"
     case dashboardChanges = "dashboard.changes"
+    case dashboardChangesObservedDuringRun = "dashboard.changes.observedDuringRun"
     case dashboardChangesUnavailable = "dashboard.changes.unavailable"
     case dashboardDataUnavailable = "dashboard.data.unavailable"
     case dashboardNoRuns = "dashboard.noRuns"
@@ -48,6 +49,8 @@ enum FoundationCopy {
         .dashboardActivityUnknown: "Activity: Unknown",
         .dashboardAttention: "Attention: %@ · %llu open",
         .dashboardChanges: "Changes: %llu files · +%llu −%llu",
+        .dashboardChangesObservedDuringRun:
+            "Observed during run: %llu files · +%llu −%llu",
         .dashboardChangesUnavailable: "Changes unavailable: %@",
         .dashboardDataUnavailable: "Dashboard data unavailable",
         .dashboardNoRuns: "No Runs",

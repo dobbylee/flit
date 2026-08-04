@@ -512,6 +512,18 @@ struct NativeHealthTests {
                 "Dashboard overflow fixture must contain one Run"
             )
         }
+        var observedFixtureObject = overflowFixtureObject
+        var observedRuns = observedFixtureObject["runs"] as? [[String: Any]] ?? []
+        var observedRun = observedRuns[0]
+        var observedChanges = observedRun["changes"] as? [String: Any] ?? [:]
+        observedChanges["attribution"] = "observed_during_run"
+        observedRun["changes"] = observedChanges
+        observedRuns[0] = observedRun
+        observedFixtureObject["runs"] = observedRuns
+        let observedDashboardFixture = try JSONDecoder().decode(
+            FlitDashboardReadResponse.self,
+            from: try JSONSerialization.data(withJSONObject: observedFixtureObject)
+        )
         let overflowFirstRunId = "overflow-needs-attention-0"
         overflowFixtureObject["runs"] = (0..<8).map { index -> [String: Any] in
             var run = overflowBaseRun
@@ -535,7 +547,7 @@ struct NativeHealthTests {
             case let .snapshot(resyncFixture) = resyncDashboardFixture,
             case let .snapshot(unavailableSnapshotFixture) =
                 unavailableChangesDashboardFixture,
-            case let .available(files, insertions, deletions) =
+            case let .available(attribution, files, insertions, deletions) =
                 initialSnapshotFixture.runs[0].changes,
             case let .unavailable(unavailableReason) =
                 unavailableSnapshotFixture.runs[0].changes
@@ -548,6 +560,7 @@ struct NativeHealthTests {
             initialSnapshotFixture.reason == .initial
                 && initialSnapshotFixture.runs.count == 1
                 && initialSnapshotFixture.runs[0].attentionOpenCount == 2
+                && attribution == .exact
                 && files == 3
                 && insertions == 42
                 && deletions == 7
@@ -690,6 +703,38 @@ struct NativeHealthTests {
                 FlitDashboardReadResponse.self,
                 from: try JSONSerialization.data(withJSONObject: object),
                 "Dashboard changes availability must reject \(forbiddenField)"
+            )
+        }
+        let invalidAttributionVariants: [(String, String?)] = [
+            ("dashboard_read.initial.response.json", nil),
+            ("dashboard_read.initial.response.json", "guessed"),
+            ("dashboard_read.unavailable_changes.response.json", "exact"),
+        ]
+        for (name, attribution) in invalidAttributionVariants {
+            let data = try Data(
+                contentsOf: URL(fileURLWithPath: "\(fixtureRoot)/\(name)")
+            )
+            guard
+                var object = try JSONSerialization.jsonObject(with: data)
+                    as? [String: Any],
+                var runs = object["runs"] as? [[String: Any]],
+                var changes = runs[0]["changes"] as? [String: Any]
+            else {
+                throw NativeHealthTestFailure.failed(
+                    "Dashboard attribution fixture must contain one Run"
+                )
+            }
+            if let attribution {
+                changes["attribution"] = attribution
+            } else {
+                changes.removeValue(forKey: "attribution")
+            }
+            runs[0]["changes"] = changes
+            object["runs"] = runs
+            try requireDecodingFailure(
+                FlitDashboardReadResponse.self,
+                from: try JSONSerialization.data(withJSONObject: object),
+                "Dashboard changes must reject missing, unknown, or mixed attribution"
             )
         }
         for (name, requiredField) in [
@@ -1481,6 +1526,21 @@ struct NativeHealthTests {
                     FoundationCopy.format(.dashboardChangesUnavailable, reason)
                 ),
             "fixture-backed Run card must render exact Unknown, attention, and unavailable facts"
+        )
+        let observedController = FoundationViewController(
+            client: client,
+            dashboardClient: DashboardClient(
+                fixtureLoader: { observedDashboardFixture }
+            )
+        )
+        _ = observedController.view
+        let observedCopy = descendants(of: observedController.view)
+            .compactMap { ($0 as? NSTextField)?.stringValue }
+        try require(
+            observedCopy.contains(
+                FoundationCopy.format(.dashboardChangesObservedDuringRun, 3, 42, 7)
+            ),
+            "observed Dashboard counts must preserve their visible attribution"
         )
         let overflowController = FoundationViewController(
             client: client,

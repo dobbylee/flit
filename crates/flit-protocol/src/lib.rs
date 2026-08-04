@@ -4,7 +4,7 @@ use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: &str = "1.14";
+pub const PROTOCOL_VERSION: &str = "1.15";
 pub const EVENT_PROTOCOL_VERSION: &str = "1.1";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -461,9 +461,17 @@ pub struct DashboardRunRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DashboardChangeAttribution {
+    Exact,
+    ObservedDuringRun,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "availability", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DashboardChangeSummary {
     Available {
+        attribution: DashboardChangeAttribution,
         files: u64,
         insertions: u64,
         deletions: u64,
@@ -1467,12 +1475,23 @@ enum FlitDashboardChangeAvailability: String, Codable, Sendable {
     case unavailable
 }
 
+enum FlitDashboardChangeAttribution: String, Codable, Sendable {
+    case exact
+    case observedDuringRun = "observed_during_run"
+}
+
 enum FlitDashboardChangeSummary: Codable, Equatable, Sendable {
-    case available(files: UInt64, insertions: UInt64, deletions: UInt64)
+    case available(
+        attribution: FlitDashboardChangeAttribution,
+        files: UInt64,
+        insertions: UInt64,
+        deletions: UInt64
+    )
     case unavailable(reason: String)
 
     private enum CodingKeys: String, CodingKey {
         case availability
+        case attribution
         case files
         case insertions
         case deletions
@@ -1494,6 +1513,10 @@ enum FlitDashboardChangeSummary: Codable, Equatable, Sendable {
                 )
             }
             self = .available(
+                attribution: try container.decode(
+                    FlitDashboardChangeAttribution.self,
+                    forKey: .attribution
+                ),
                 files: try container.decode(UInt64.self, forKey: .files),
                 insertions: try container.decode(UInt64.self, forKey: .insertions),
                 deletions: try container.decode(UInt64.self, forKey: .deletions)
@@ -1502,7 +1525,8 @@ enum FlitDashboardChangeSummary: Codable, Equatable, Sendable {
             guard
                 !container.contains(.files),
                 !container.contains(.insertions),
-                !container.contains(.deletions)
+                !container.contains(.deletions),
+                !container.contains(.attribution)
             else {
                 throw DecodingError.dataCorruptedError(
                     forKey: .availability,
@@ -1519,11 +1543,12 @@ enum FlitDashboardChangeSummary: Codable, Equatable, Sendable {
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         switch self {
-        case let .available(files, insertions, deletions):
+        case let .available(attribution, files, insertions, deletions):
             try container.encode(
                 FlitDashboardChangeAvailability.available,
                 forKey: .availability
             )
+            try container.encode(attribution, forKey: .attribution)
             try container.encode(files, forKey: .files)
             try container.encode(insertions, forKey: .insertions)
             try container.encode(deletions, forKey: .deletions)
