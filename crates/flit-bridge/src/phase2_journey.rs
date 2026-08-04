@@ -723,6 +723,9 @@ fn start_runs(
                             project_id: PROJECT_ID.to_owned(),
                             reason: GitBaselineUnavailableReason::RunnerUnavailable,
                         },
+                        managed_start::RetainedGitChangeBaseline::Unavailable(
+                            "git_baseline_observation_unavailable".to_owned(),
+                        ),
                         request,
                     )
                 })

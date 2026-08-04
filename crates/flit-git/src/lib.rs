@@ -86,6 +86,15 @@ impl GitChangeBaseline {
     pub fn receipt(&self) -> &RepositoryReceipt {
         &self.receipt
     }
+
+    pub fn observe_changes(&self) -> Result<GitChangeSummary, GitChangeObservationError> {
+        observe_changes_since_clean_baseline(
+            &self.runner,
+            &self.executable,
+            &self.project_directory.canonical_path,
+            self,
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

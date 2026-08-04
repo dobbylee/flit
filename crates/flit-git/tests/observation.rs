@@ -143,8 +143,7 @@ fn observes_exact_tracked_changes_since_a_clean_baseline_without_paths() {
     git(&executable, &root, &["add", "-A"]);
 
     assert_eq!(
-        observe_changes_since_clean_baseline(&noexec_runner(), &executable, &root, &baseline,)
-            .expect("exact terminal changes"),
+        baseline.observe_changes().expect("exact terminal changes"),
         GitChangeSummary {
             files: 3,
             insertions: 3,

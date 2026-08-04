@@ -1,0 +1,16 @@
+{
+  "observation": "repository",
+  "protocol_version": "1.16",
+  "project_id": "project-alpha",
+  "canonical_root": "/private/tmp/flit-project-alpha",
+  "head": {
+    "availability": "available",
+    "oid": "0123456789abcdef0123456789abcdef01234567"
+  },
+  "dirty": {
+    "staged": 1,
+    "unstaged": 2,
+    "untracked": 3,
+    "entries": 4
+  }
+}

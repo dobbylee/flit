@@ -1,5 +1,8 @@
+#[cfg(test)]
+use std::sync::Arc;
 use std::{collections::BTreeMap, ffi::OsStr, path::Path};
 
+use flit_git::GitChangeBaseline;
 #[cfg(test)]
 use flit_protocol::GitBaselineUnavailableReason;
 use flit_protocol::{
@@ -15,8 +18,8 @@ use flit_providers::{
     ProviderCompatibility, ProviderFingerprint, classify_codex,
 };
 use flit_store::{
-    AppendEventOutcome, InitialManagedSessionConnection, ManagedPermissionDecision,
-    ManagedPermissionResolutionKind, ManagedPermissionResponseAttempt,
+    AppendEventOutcome, InitialManagedSessionConnection, ManagedGitChangeSummary,
+    ManagedPermissionDecision, ManagedPermissionResolutionKind, ManagedPermissionResponseAttempt,
     ManagedPermissionResponseResult, ManagedPermissionResponseResultKind, ManagedProviderDecision,
     ManagedProviderObservation, ManagedProviderObservationKind, ManagedProviderOutcome,
     ManagedProviderOutcomeCommit, ManagedProviderTerminalOutcome, ManagedReconciliationState,
@@ -150,6 +153,14 @@ pub(crate) struct RetainedManagedRun {
     contract_version: String,
     provider: Box<dyn ManagedCodexRuntime>,
     active_permission: Option<RetainedPermission>,
+    git_change_baseline: RetainedGitChangeBaseline,
+}
+
+pub(crate) enum RetainedGitChangeBaseline {
+    Exact(Box<GitChangeBaseline>),
+    Unavailable(String),
+    #[cfg(test)]
+    Observer(Arc<dyn Fn() -> ManagedGitChangeSummary + Send + Sync>),
 }
 
 pub(crate) struct RetainedPermission {
@@ -201,6 +212,36 @@ impl RetainedManagedRun {
         &self.contract_version
     }
 
+    pub(crate) fn observe_terminal_changes(&self) -> ManagedGitChangeSummary {
+        match &self.git_change_baseline {
+            RetainedGitChangeBaseline::Exact(baseline) => match baseline.observe_changes() {
+                Ok(summary) => ManagedGitChangeSummary::Exact {
+                    files: summary.files,
+                    insertions: summary.insertions,
+                    deletions: summary.deletions,
+                },
+                Err(_) => ManagedGitChangeSummary::Unavailable {
+                    reason: "git_terminal_observation_unavailable".to_owned(),
+                },
+            },
+            RetainedGitChangeBaseline::Unavailable(reason) => {
+                ManagedGitChangeSummary::Unavailable {
+                    reason: reason.clone(),
+                }
+            }
+            #[cfg(test)]
+            RetainedGitChangeBaseline::Observer(observe) => observe(),
+        }
+    }
+
+    pub(crate) fn validate_observation_identity(
+        &self,
+        thread_id: &CodexManagedThreadId,
+        turn_id: &flit_providers::CodexManagedTurnId,
+    ) -> Result<(), ManagedStartError> {
+        validate_observation_identity(&self.response, thread_id, turn_id)
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(
         response: ManagedRunStartResponse,
@@ -212,6 +253,25 @@ impl RetainedManagedRun {
             contract_version: "codex-app-server/0.145.0".to_owned(),
             provider,
             active_permission: None,
+            git_change_baseline: RetainedGitChangeBaseline::Unavailable(
+                "git_baseline_observation_unavailable".to_owned(),
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_change_observer(
+        response: ManagedRunStartResponse,
+        provider: Box<dyn ManagedCodexRuntime>,
+        observe: Arc<dyn Fn() -> ManagedGitChangeSummary + Send + Sync>,
+    ) -> Self {
+        Self {
+            request_digest: "test-runtime".to_owned(),
+            response,
+            contract_version: "codex-app-server/0.145.0".to_owned(),
+            provider,
+            active_permission: None,
+            git_change_baseline: RetainedGitChangeBaseline::Observer(observe),
         }
     }
 }
@@ -423,6 +483,7 @@ pub(crate) fn start_managed_run(
         connector,
         path_environment,
         baseline,
+        RetainedGitChangeBaseline::Unavailable("git_baseline_observation_unavailable".to_owned()),
         request,
     )
 }
@@ -433,6 +494,7 @@ pub(crate) fn start_managed_run_with_baseline(
     connector: &dyn ManagedCodexConnector,
     path_environment: Option<&OsStr>,
     git_baseline: GitBaselinePayload,
+    git_change_baseline: RetainedGitChangeBaseline,
     request: ManagedRunStartRequest,
 ) -> Result<ManagedRunStartResponse, ManagedStartError> {
     validate_request(&request)?;
@@ -646,6 +708,7 @@ pub(crate) fn start_managed_run_with_baseline(
             contract_version: retained_contract_version,
             provider,
             active_permission: None,
+            git_change_baseline,
         },
     );
     Ok(response)
@@ -696,7 +759,9 @@ fn observe_retained_runtime(
 ) -> Result<ManagedRunObserveResponse, ManagedStartError> {
     for _ in 0..MAX_MANAGED_OBSERVATIONS_PER_CALL {
         let observation = wait_managed_observation(retained)?;
-        match commit_managed_observation(store, retained, request, observation)? {
+        let terminal_changes = matches!(observation, CodexTurnObservation::Terminal { .. })
+            .then(|| retained.observe_terminal_changes());
+        match commit_managed_observation(store, retained, request, observation, terminal_changes)? {
             ManagedObservationCommit::Continue => {}
             ManagedObservationCommit::Complete(response) => return Ok(*response),
         }
@@ -723,6 +788,7 @@ pub(crate) fn commit_managed_observation(
     retained: &mut RetainedManagedRun,
     request: &ManagedRunObserveRequest,
     observation: CodexTurnObservation,
+    terminal_changes: Option<ManagedGitChangeSummary>,
 ) -> Result<ManagedObservationCommit, ManagedStartError> {
     match observation {
         CodexTurnObservation::CommandStarted {
@@ -897,16 +963,17 @@ pub(crate) fn commit_managed_observation(
             turn_id,
             outcome,
         } => {
+            let changes = terminal_changes.ok_or(ManagedStartError::ProviderObservationUnknown)?;
             validate_observation_identity(&retained.response, &thread_id, &turn_id)?;
             let terminal_outcome = outcome;
             let (prefix, kind) = match terminal_outcome {
                 CodexTurnTerminalOutcome::Completed => (
                     "evt_codex_completed_",
-                    ManagedProviderObservationKind::TurnCompleted,
+                    ManagedProviderObservationKind::TurnCompleted { changes },
                 ),
                 CodexTurnTerminalOutcome::Interrupted => (
                     "evt_codex_interrupted_",
-                    ManagedProviderObservationKind::TurnInterrupted,
+                    ManagedProviderObservationKind::TurnInterrupted { changes },
                 ),
             };
             let event_id = observation_id(

@@ -1,0 +1,30 @@
+{
+  "protocol_version": "1.2",
+  "event_id": "event-run-managed-1-completed",
+  "run_id": "run-managed-1",
+  "session_id": "session-managed-1",
+  "stream_seq": 2,
+  "ingest_seq": 5,
+  "occurred_at": "2026-08-04T12:05:00Z",
+  "observed_at": "2026-08-04T12:05:00Z",
+  "type": "run.completed",
+  "source": {
+    "kind": "provider_adapter",
+    "provider": "codex",
+    "contract_version": "codex-app-server/0.146.0"
+  },
+  "confidence": 1.0,
+  "evidence_ids": [],
+  "payload": {
+    "changes": {
+      "availability": "available",
+      "attribution": "exact",
+      "files": 3,
+      "insertions": 5,
+      "deletions": 2
+    },
+    "evidence_unavailable_reason": "raw_provider_content_not_retained",
+    "provider_turn_id": "turn-managed-1",
+    "result": "completed"
+  }
+}

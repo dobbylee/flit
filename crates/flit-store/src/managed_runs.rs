@@ -125,6 +125,18 @@ pub enum InitialManagedSessionOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ManagedGitChangeSummary {
+    Exact {
+        files: u64,
+        insertions: u64,
+        deletions: u64,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ManagedProviderObservationKind {
     CommandStarted {
         provider_item_id: String,
@@ -135,8 +147,12 @@ pub enum ManagedProviderObservationKind {
         provider_item_id: String,
         provider_started_at_ms: u64,
     },
-    TurnCompleted,
-    TurnInterrupted,
+    TurnCompleted {
+        changes: ManagedGitChangeSummary,
+    },
+    TurnInterrupted {
+        changes: ManagedGitChangeSummary,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -551,8 +567,32 @@ pub(crate) fn validate_provider_observation(
             }
             Ok(())
         }
-        ManagedProviderObservationKind::TurnCompleted
-        | ManagedProviderObservationKind::TurnInterrupted => Ok(()),
+        ManagedProviderObservationKind::TurnCompleted { changes }
+        | ManagedProviderObservationKind::TurnInterrupted { changes } => {
+            validate_git_changes(changes)
+        }
+    }
+}
+
+fn validate_git_changes(changes: &ManagedGitChangeSummary) -> Result<(), &'static str> {
+    match changes {
+        ManagedGitChangeSummary::Exact {
+            files,
+            insertions,
+            deletions,
+        } => {
+            if [*files, *insertions, *deletions]
+                .into_iter()
+                .all(|value| value <= flit_protocol::MAX_JSON_SAFE_INTEGER)
+            {
+                Ok(())
+            } else {
+                Err("changes")
+            }
+        }
+        ManagedGitChangeSummary::Unavailable { reason } => {
+            validate_token(reason, MAX_MANAGED_ID_BYTES).map_err(|()| "changes")
+        }
     }
 }
 

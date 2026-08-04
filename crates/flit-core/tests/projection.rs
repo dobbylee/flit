@@ -1,5 +1,5 @@
 use flit_core::projection::{
-    CHANGES_UNAVAILABLE_REASON, ChangeSummary, ProjectionError, ProjectionEvent,
+    CHANGES_UNAVAILABLE_REASON, ChangeAttribution, ChangeSummary, ProjectionError, ProjectionEvent,
     replay_dashboard_projection,
 };
 use serde_json::{Map, Value, json};
@@ -13,6 +13,7 @@ fn event(
     payload: Value,
 ) -> ProjectionEvent {
     ProjectionEvent {
+        protocol_version: "1.1".to_owned(),
         event_id: format!("event-{ingest_seq}"),
         run_id: RUN_ID.to_owned(),
         session_id: session_id.map(ToOwned::to_owned),
@@ -21,6 +22,102 @@ fn event(
         event_type: event_type.to_owned(),
         payload: payload.as_object().cloned().unwrap_or_else(Map::new),
     }
+}
+
+#[test]
+fn current_terminal_changes_require_one_exact_bounded_variant() {
+    let base = vec![
+        event(1, "run.created", None, json!({})),
+        event(2, "session.connected", Some("session-1"), json!({})),
+    ];
+    let mut exact = event(
+        3,
+        "run.completed",
+        Some("session-1"),
+        json!({
+            "changes": {
+                "availability": "available",
+                "attribution": "exact",
+                "files": 3,
+                "insertions": 5,
+                "deletions": 2
+            }
+        }),
+    );
+    exact.protocol_version = "1.2".to_owned();
+    let projection = replay_dashboard_projection(&[base.clone(), vec![exact.clone()]].concat())
+        .expect("exact terminal changes");
+    assert_eq!(
+        projection.changes,
+        ChangeSummary::Available {
+            attribution: ChangeAttribution::Exact,
+            files: 3,
+            insertions: 5,
+            deletions: 2,
+        }
+    );
+
+    let mut unavailable = exact.clone();
+    unavailable.payload["changes"] = json!({
+        "availability": "unavailable",
+        "reason": "git_terminal_observation_unavailable"
+    });
+    assert_eq!(
+        replay_dashboard_projection(&[base.clone(), vec![unavailable]].concat())
+            .expect("unavailable terminal changes")
+            .changes,
+        ChangeSummary::Unavailable {
+            reason: "git_terminal_observation_unavailable".to_owned(),
+        }
+    );
+
+    let mut legacy = exact.clone();
+    legacy.protocol_version = "1.1".to_owned();
+    assert_eq!(
+        replay_dashboard_projection(&[base.clone(), vec![legacy]].concat())
+            .expect("legacy terminal ignores additive changes")
+            .changes,
+        ChangeSummary::Unavailable {
+            reason: CHANGES_UNAVAILABLE_REASON.to_owned(),
+        }
+    );
+
+    let mut malformed = exact.clone();
+    malformed.payload["changes"]["reason"] = json!("mixed");
+    assert_eq!(
+        replay_dashboard_projection(&[base.clone(), vec![malformed]].concat()),
+        Err(ProjectionError::Changes)
+    );
+    let mut missing = exact;
+    missing.payload.remove("changes");
+    assert_eq!(
+        replay_dashboard_projection(&[base, vec![missing]].concat()),
+        Err(ProjectionError::Changes)
+    );
+
+    let mut forged_nonterminal = event(
+        3,
+        "command.started",
+        Some("session-1"),
+        json!({
+            "changes": {
+                "availability": "available",
+                "attribution": "exact",
+                "files": 3,
+                "insertions": 5,
+                "deletions": 2
+            }
+        }),
+    );
+    forged_nonterminal.protocol_version = "1.2".to_owned();
+    assert_eq!(
+        replay_dashboard_projection(&[
+            event(1, "run.created", None, json!({})),
+            event(2, "session.connected", Some("session-1"), json!({})),
+            forged_nonterminal,
+        ]),
+        Err(ProjectionError::Changes)
+    );
 }
 
 fn provider_auto_request(request_id: &str) -> Value {

@@ -1,0 +1,26 @@
+[
+  {
+    "code": "INVALID_RUN_REQUEST",
+    "message_key": "errors.invalidRunRequest"
+  },
+  {
+    "code": "RUN_NOT_FOUND",
+    "message_key": "errors.runNotFound"
+  },
+  {
+    "code": "RUN_VERSION_STALE",
+    "message_key": "errors.runVersionStale"
+  },
+  {
+    "code": "CAPABILITY_UNSUPPORTED",
+    "message_key": "errors.capabilityUnsupported"
+  },
+  {
+    "code": "PROVIDER_UNAVAILABLE",
+    "message_key": "errors.providerUnavailable"
+  },
+  {
+    "code": "STORAGE_UNAVAILABLE",
+    "message_key": "errors.storageUnavailable"
+  }
+]

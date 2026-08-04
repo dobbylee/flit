@@ -4,8 +4,8 @@ use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: &str = "1.15";
-pub const EVENT_PROTOCOL_VERSION: &str = "1.1";
+pub const PROTOCOL_VERSION: &str = "1.16";
+pub const EVENT_PROTOCOL_VERSION: &str = "1.2";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[must_use]
@@ -891,6 +891,8 @@ pub enum EventProtocolVersion {
     V1_0,
     #[serde(rename = "1.1")]
     V1_1,
+    #[serde(rename = "1.2")]
+    V1_2,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

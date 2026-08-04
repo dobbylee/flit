@@ -1,0 +1,36 @@
+{
+  "delivery": "snapshot",
+  "protocol_version": "1.16",
+  "event_schema_version": "1.2",
+  "core_instance_id": "core-instance-1",
+  "reason": "initial",
+  "requested_after_cursor": null,
+  "retained_after_cursor": 0,
+  "next_cursor": 2,
+  "has_more": false,
+  "runs": [
+    {
+      "run_id": "run-dashboard-unavailable",
+      "project_id": "project-dashboard-1",
+      "project_display_name": "Dashboard Project",
+      "title": "Wait for factual change observation",
+      "provider": "codex",
+      "version": 2,
+      "lifecycle": "Starting",
+      "activity": "Unknown",
+      "activity_confidence": 0.0,
+      "attention_level": "None",
+      "attention_open_count": 0,
+      "dashboard_bucket": "Working",
+      "last_progress_at": "2026-07-28T00:00:00.000Z",
+      "last_liveness_at": "2026-07-28T00:00:00.000Z",
+      "started_at": null,
+      "ended_at": null,
+      "changes": {
+        "availability": "unavailable",
+        "reason": "git_observation_not_configured"
+      },
+      "updated_at": "2026-07-28T00:00:00.000Z"
+    }
+  ]
+}

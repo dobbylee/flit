@@ -21,9 +21,11 @@ use crate::{
 };
 
 pub const CHANGES_UNAVAILABLE_REASON: &str = "git_observation_not_configured";
+const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProjectionEvent {
+    pub protocol_version: String,
     pub event_id: String,
     pub run_id: String,
     pub session_id: Option<String>,
@@ -114,6 +116,9 @@ pub fn replay_dashboard_projection(
         AttentionProjection::new(first.ingest_seq).map_err(|_| ProjectionError::Attention)?;
     let mut permission_requests = BTreeMap::new();
     let mut provider_decision_ids = BTreeSet::new();
+    let mut changes = ChangeSummary::Unavailable {
+        reason: CHANGES_UNAVAILABLE_REASON.to_owned(),
+    };
     let mut observed_at_by_evidence =
         BTreeMap::from([(first.event_id.clone(), first.observed_at.clone())]);
 
@@ -135,6 +140,18 @@ pub fn replay_dashboard_projection(
         attention
             .apply_batch(event.ingest_seq, attention_events)
             .map_err(|_| ProjectionError::Attention)?;
+        match change_summary(event)? {
+            Some(summary) => changes = summary,
+            None if event.protocol_version == "1.2"
+                && matches!(
+                    event.event_type.as_str(),
+                    "run.completed" | "run.interrupted"
+                ) =>
+            {
+                return Err(ProjectionError::Changes);
+            }
+            None => {}
+        }
     }
 
     let clear = StuckAssessment::Clear(StuckClearReason::ProcessUnavailable);
@@ -166,11 +183,65 @@ pub fn replay_dashboard_projection(
         dashboard_bucket: bucket_name(dashboard_bucket(&lifecycle, &attention, &clear)).to_owned(),
         last_progress_at,
         last_liveness_at,
-        changes: ChangeSummary::Unavailable {
-            reason: CHANGES_UNAVAILABLE_REASON.to_owned(),
-        },
+        changes,
         updated_at: last.observed_at.clone(),
     })
+}
+
+fn change_summary(event: &ProjectionEvent) -> Result<Option<ChangeSummary>, ProjectionError> {
+    if event.protocol_version != "1.2" {
+        return Ok(None);
+    }
+    let Some(value) = event.payload.get("changes") else {
+        return Ok(None);
+    };
+    if !matches!(
+        event.event_type.as_str(),
+        "run.completed" | "run.failed" | "run.interrupted"
+    ) {
+        return Err(ProjectionError::Changes);
+    }
+    let object = value.as_object().ok_or(ProjectionError::Changes)?;
+    match object.get("availability").and_then(Value::as_str) {
+        Some("available") if object.len() == 5 => {
+            let attribution = match object.get("attribution").and_then(Value::as_str) {
+                Some("exact") => ChangeAttribution::Exact,
+                Some("observed_during_run") => ChangeAttribution::ObservedDuringRun,
+                _ => return Err(ProjectionError::Changes),
+            };
+            let files = bounded_change_count(object, "files")?;
+            let insertions = bounded_change_count(object, "insertions")?;
+            let deletions = bounded_change_count(object, "deletions")?;
+            Ok(Some(ChangeSummary::Available {
+                attribution,
+                files,
+                insertions,
+                deletions,
+            }))
+        }
+        Some("unavailable") if object.len() == 2 => {
+            let reason = object
+                .get("reason")
+                .and_then(Value::as_str)
+                .filter(|reason| !reason.trim().is_empty())
+                .ok_or(ProjectionError::Changes)?;
+            Ok(Some(ChangeSummary::Unavailable {
+                reason: reason.to_owned(),
+            }))
+        }
+        _ => Err(ProjectionError::Changes),
+    }
+}
+
+fn bounded_change_count(
+    object: &Map<String, Value>,
+    field: &'static str,
+) -> Result<u64, ProjectionError> {
+    object
+        .get(field)
+        .and_then(Value::as_u64)
+        .filter(|value| *value <= MAX_JSON_SAFE_INTEGER)
+        .ok_or(ProjectionError::InvalidPayload { field })
 }
 
 fn lifecycle_event(event: &ProjectionEvent) -> Result<LifecycleEvent, ProjectionError> {
@@ -586,6 +657,7 @@ pub enum ProjectionError {
     Activity,
     Attention,
     Permission,
+    Changes,
 }
 
 impl fmt::Display for ProjectionError {
@@ -611,6 +683,7 @@ impl fmt::Display for ProjectionError {
             Self::Activity => formatter.write_str("Run activity projection failed"),
             Self::Attention => formatter.write_str("Run attention projection failed"),
             Self::Permission => formatter.write_str("Run permission projection failed"),
+            Self::Changes => formatter.write_str("Run change projection failed"),
         }
     }
 }

@@ -1067,10 +1067,11 @@ fn current_event_fixture_round_trips_without_losing_unknown_fields() {
 
 #[test]
 fn current_git_baseline_event_payload_is_exact_and_mixed_variants_fail_closed() {
-    let manifest = read_compatibility_manifest();
     let fixture: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(repository_path(&manifest.current.fixture))
-            .expect("current event fixture should be readable"),
+        &fs::read_to_string(repository_path(
+            "fixtures/protocol/events/v1.1/git.snapshot_recorded.json",
+        ))
+        .expect("Git baseline event fixture should be readable"),
     )
     .expect("current event fixture should contain valid JSON");
     let payload = fixture["payload"].clone();
@@ -1215,7 +1216,7 @@ fn current_contract_snapshot() -> CurrentContractSnapshot {
             .expect("current fixture should be readable"),
     )
     .expect("current fixture should contain valid JSON");
-    let serialized_version = serde_json::to_value(EventProtocolVersion::V1_1)
+    let serialized_version = serde_json::to_value(EventProtocolVersion::V1_2)
         .expect("event version should serialize")
         .as_str()
         .expect("event version should serialize as a string")

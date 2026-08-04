@@ -14,7 +14,7 @@ use flit_protocol::{
 use flit_store::{
     AppendEventOutcome, DashboardChangeSummary, InitialManagedSessionConnection,
     InitialManagedSessionOutcome, MAX_DASHBOARD_PROJECTION_SOURCE_BYTES, MAX_LIVE_MANAGED_SESSIONS,
-    ManagedPermissionDecision, ManagedPermissionDeliveryUnknownReason,
+    ManagedGitChangeSummary, ManagedPermissionDecision, ManagedPermissionDeliveryUnknownReason,
     ManagedPermissionResolutionKind, ManagedPermissionResponseAttempt,
     ManagedPermissionResponseAttemptOutcome, ManagedPermissionResponseResult,
     ManagedPermissionResponseResultKind, ManagedProviderDecision, ManagedProviderObservation,
@@ -793,15 +793,44 @@ fn managed_provider_observations_are_exact_ordered_idempotent_and_content_safe()
         contract_version: "codex-app-server/0.145.0".to_owned(),
         event_id: "event-terminal".to_owned(),
         observed_at: ENDED_AT.to_owned(),
-        kind: ManagedProviderObservationKind::TurnCompleted,
+        kind: ManagedProviderObservationKind::TurnCompleted {
+            changes: ManagedGitChangeSummary::Exact {
+                files: 2,
+                insertions: 3,
+                deletions: 1,
+            },
+        },
     };
     let terminal_event = store
         .append_managed_provider_observation(terminal.clone())
         .expect("terminal observation");
     assert!(matches!(
-        terminal_event,
-        AppendEventOutcome::Inserted(ref terminal) if terminal.stream_seq == 4
+        &terminal_event,
+        AppendEventOutcome::Inserted(terminal)
+            if terminal.stream_seq == 4
+                && terminal.protocol_version == EventProtocolVersion::V1_2
+                && terminal.payload["changes"] == json!({
+                    "availability": "available",
+                    "attribution": "exact",
+                    "files": 2,
+                    "insertions": 3,
+                    "deletions": 1
+                })
     ));
+    assert_eq!(
+        store
+            .run_snapshot("run-1")
+            .expect("terminal snapshot")
+            .expect("terminal snapshot")
+            .snapshot["changes"],
+        json!({
+            "availability": "available",
+            "attribution": "exact",
+            "files": 2,
+            "insertions": 3,
+            "deletions": 1
+        })
+    );
     assert_eq!(
         store
             .managed_run("run-1")
@@ -1227,7 +1256,11 @@ fn managed_permission_response_requires_submit_and_a_live_current_request() {
             contract_version: "codex-app-server/0.145.0".to_owned(),
             event_id: "event-terminal".to_owned(),
             observed_at: ENDED_AT.to_owned(),
-            kind: ManagedProviderObservationKind::TurnCompleted,
+            kind: ManagedProviderObservationKind::TurnCompleted {
+                changes: ManagedGitChangeSummary::Unavailable {
+                    reason: "git_terminal_observation_unavailable".to_owned(),
+                },
+            },
         })
         .expect("terminal observation");
     assert!(matches!(
@@ -1729,7 +1762,14 @@ fn interrupted_terminal_uses_only_the_exact_provider_locator() {
     assert_eq!(event.payload["reason"], "provider_turn_interrupted");
     assert_eq!(event.payload["provider_session_key"], "thread-interrupted");
     assert_eq!(event.payload["provider_turn_id"], "turn-interrupted");
-    assert_eq!(event.payload.len(), 3);
+    assert_eq!(
+        event.payload["changes"],
+        json!({
+            "availability": "unavailable",
+            "reason": "git_runtime_baseline_unavailable"
+        })
+    );
+    assert_eq!(event.payload.len(), 4);
 }
 
 #[test]
@@ -2193,8 +2233,27 @@ fn exact_terminal_reconciliation_maps_all_states_atomically_and_reopens() {
         assert_eq!(events[0].stream_seq, 2);
         assert_eq!(events[1].event_type, event_type);
         assert_eq!(events[1].stream_seq, 3);
+        assert_eq!(events[1].protocol_version, EventProtocolVersion::V1_2);
         assert_eq!(events[1].payload["provider_turn_id"], turn_id);
         assert_eq!(events[1].payload["reconciled_after_gap"], true);
+        assert_eq!(
+            events[1].payload["changes"],
+            json!({
+                "availability": "unavailable",
+                "reason": "git_runtime_baseline_unavailable_after_restart"
+            })
+        );
+        assert_eq!(
+            store
+                .run_snapshot(&run_id)
+                .expect("reconciled snapshot")
+                .expect("reconciled snapshot")
+                .snapshot["changes"],
+            json!({
+                "availability": "unavailable",
+                "reason": "git_runtime_baseline_unavailable_after_restart"
+            })
+        );
         assert!(matches!(
             store
                 .reconcile_managed_session(reconciliation)
