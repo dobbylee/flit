@@ -11,6 +11,7 @@ publish = false
 crate-type = ["cdylib", "rlib", "staticlib"]
 
 [dependencies]
+flit-git = { path = "../flit-git" }
 flit-providers = { path = "../flit-providers" }
 flit-protocol = { path = "../flit-protocol" }
 flit-store = { path = "../flit-store" }

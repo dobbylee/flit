@@ -11,6 +11,12 @@ TEST_MODULE_CACHE="$OUTPUT_ROOT/test-module-cache"
 TEST_EXECUTABLE="$OUTPUT_ROOT/native-health-tests"
 HOST_DYLIB="$REPOSITORY_ROOT/target/release/libflit_bridge.dylib"
 BINDGEN="$REPOSITORY_ROOT/target/release/flit-bindgen"
+APP_DIR="$OUTPUT_ROOT/Flit.app"
+APP_GIT_RUNNER="$APP_DIR/Contents/Helpers/flit-git-noexec"
+PACKAGED_GIT_TEST_APP="$OUTPUT_ROOT/git-observation-harness/Flit.app"
+PACKAGED_GIT_TEST_EXECUTABLE="$PACKAGED_GIT_TEST_APP/Contents/MacOS/Flit"
+PACKAGED_GIT_TEST_RUNNER="$PACKAGED_GIT_TEST_APP/Contents/Helpers/flit-git-noexec"
+PACKAGED_GIT_TEST_MODULE_CACHE="$OUTPUT_ROOT/git-observation-harness/module-cache"
 
 if [[ -L "$TARGET_ROOT" ]]; then
     echo "Repository target directory must not be a symbolic link" >&2
@@ -23,8 +29,10 @@ if [[ "$(cd "$TARGET_ROOT" && /bin/pwd -P)" != "$TARGET_ROOT" ]]; then
 fi
 
 PATH_SAFETY_ROOT="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/flit-path-safety.XXXXXX")"
+PACKAGED_GIT_TEST_ROOT="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/flit-packaged-git.XXXXXX")"
 cleanup_path_safety() {
     /bin/rm -rf "$PATH_SAFETY_ROOT"
+    /bin/rm -rf "$PACKAGED_GIT_TEST_ROOT"
 }
 trap cleanup_path_safety EXIT
 /usr/bin/touch "$PATH_SAFETY_ROOT/sentinel"
@@ -37,6 +45,26 @@ if [[ ! -f "$PATH_SAFETY_ROOT/sentinel" || -e "$PATH_SAFETY_ROOT/traversal-escap
 fi
 if [[ -L "$OUTPUT_ROOT" ]]; then
     echo "Native build retained an unsafe output symlink" >&2
+    exit 1
+fi
+
+if [[ -L "$APP_GIT_RUNNER" || ! -f "$APP_GIT_RUNNER" || ! -x "$APP_GIT_RUNNER" ]]; then
+    echo "Native build did not retain one exact executable Git runner" >&2
+    exit 1
+fi
+runner_architectures="$(/usr/bin/lipo -archs "$APP_GIT_RUNNER")"
+if [[ "$runner_architectures" != *"arm64"* || "$runner_architectures" != *"x86_64"* ]]; then
+    echo "Native build Git runner is not universal: $runner_architectures" >&2
+    exit 1
+fi
+/usr/bin/codesign --verify --strict "$APP_GIT_RUNNER"
+/usr/bin/codesign --verify --strict --deep "$APP_DIR"
+set +e
+runner_failure="$($APP_GIT_RUNNER 2>&1)"
+runner_status=$?
+set -e
+if [[ "$runner_status" -ne 120 || "$runner_failure" != "flit-git-noexec:v1:invalid-arguments" ]]; then
+    echo "Packaged Git runner did not expose the exact static protocol failure" >&2
     exit 1
 fi
 
@@ -61,6 +89,32 @@ case "$(/usr/bin/uname -m)" in
         exit 1
         ;;
 esac
+
+/bin/mkdir -p \
+    "$PACKAGED_GIT_TEST_APP/Contents/MacOS" \
+    "$PACKAGED_GIT_TEST_APP/Contents/Helpers" \
+    "$PACKAGED_GIT_TEST_MODULE_CACHE"
+/bin/cp "$APP_GIT_RUNNER" "$PACKAGED_GIT_TEST_RUNNER"
+/bin/cp "$REPOSITORY_ROOT/apps/macos/Resources/Info.plist" \
+    "$PACKAGED_GIT_TEST_APP/Contents/Info.plist"
+/usr/bin/swiftc \
+    -O \
+    -whole-module-optimization \
+    -swift-version 6 \
+    -strict-concurrency=complete \
+    -warnings-as-errors \
+    -module-cache-path "$PACKAGED_GIT_TEST_MODULE_CACHE" \
+    -I "$GENERATION_A" \
+    -Xcc "-fmodule-map-file=$GENERATION_A/FlitBridgeFFI.modulemap" \
+    "$GENERATION_A/FlitBridge.swift" \
+    "$GENERATION_A/FlitProtocol.swift" \
+    "$REPOSITORY_ROOT/apps/macos/Tests/NativeGitObservationTests.swift" \
+    "$REPOSITORY_ROOT/target/$host_target/release/libflit_bridge.a" \
+    -o "$PACKAGED_GIT_TEST_EXECUTABLE"
+/usr/bin/codesign --force --sign - --timestamp=none "$PACKAGED_GIT_TEST_RUNNER"
+/usr/bin/codesign --force --sign - --timestamp=none "$PACKAGED_GIT_TEST_APP"
+/usr/bin/codesign --verify --strict --deep "$PACKAGED_GIT_TEST_APP"
+"$PACKAGED_GIT_TEST_EXECUTABLE" "$PACKAGED_GIT_TEST_ROOT"
 
 /usr/bin/swiftc \
     -O \

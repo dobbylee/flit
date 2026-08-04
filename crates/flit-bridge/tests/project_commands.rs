@@ -1,13 +1,13 @@
 use std::{fs, path::PathBuf, process};
 
 use flit_bridge::{
-    BridgeError, initialize_core, project_inspect_json, project_register_json, project_trust_json,
-    projects_list_page_json,
+    BridgeError, git_observe_project_json, initialize_core, project_inspect_json,
+    project_register_json, project_trust_json, projects_list_page_json,
 };
 use flit_protocol::{
-    CommandError, CommandErrorCode, PROTOCOL_VERSION, ProjectInspectionResponse, ProjectListCursor,
-    ProjectRegistrationResponse, ProjectRegistrationStatus, ProjectTrustResponse,
-    ProjectTrustStatus, ProjectsListResponse,
+    CommandError, CommandErrorCode, GitObservationResponse, GitObservationUnavailableReason,
+    PROTOCOL_VERSION, ProjectInspectionResponse, ProjectListCursor, ProjectRegistrationResponse,
+    ProjectRegistrationStatus, ProjectTrustResponse, ProjectTrustStatus, ProjectsListResponse,
 };
 use flit_store::MAX_PROJECT_PAGE_SIZE;
 
@@ -30,6 +30,10 @@ fn require_command_error(
 fn generated_project_commands_preserve_identity_trust_duplicates_and_bounds() {
     require_command_error(
         projects_list_page_json(None, None, 1, PROTOCOL_VERSION.to_owned()),
+        CommandErrorCode::StorageUnavailable,
+    );
+    require_command_error(
+        git_observe_project_json("project-one".to_owned(), PROTOCOL_VERSION.to_owned()),
         CommandErrorCode::StorageUnavailable,
     );
 
@@ -98,6 +102,10 @@ fn generated_project_commands_preserve_identity_trust_duplicates_and_bounds() {
         registered.project.as_ref().map(|value| value.trusted),
         Some(false)
     );
+    require_command_error(
+        git_observe_project_json("project-one".to_owned(), PROTOCOL_VERSION.to_owned()),
+        CommandErrorCode::ProjectNotTrusted,
+    );
 
     let duplicate: ProjectRegistrationResponse = decode(
         project_register_json(
@@ -161,6 +169,19 @@ fn generated_project_commands_preserve_identity_trust_duplicates_and_bounds() {
         .expect("repeat trust"),
     );
     assert_eq!(repeated.status, ProjectTrustStatus::AlreadyTrusted);
+
+    let observation: GitObservationResponse = decode(
+        git_observe_project_json("project-one".to_owned(), PROTOCOL_VERSION.to_owned())
+            .expect("Git observation command"),
+    );
+    assert_eq!(
+        observation,
+        GitObservationResponse::Unavailable {
+            protocol_version: PROTOCOL_VERSION.to_owned(),
+            project_id: "project-one".to_owned(),
+            reason: GitObservationUnavailableReason::RunnerUnavailable,
+        }
+    );
 
     let listed: ProjectsListResponse = decode(
         projects_list_page_json(None, None, 50, PROTOCOL_VERSION.to_owned())

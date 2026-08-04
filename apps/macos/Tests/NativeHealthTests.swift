@@ -243,7 +243,7 @@ struct NativeHealthTests {
         )
         let commandErrors = projectErrors + [protocolMismatchError]
         try require(
-            Set(commandErrors.map { $0.code.rawValue }).count == 7,
+            Set(commandErrors.map { $0.code.rawValue }).count == 8,
             "generated command errors must decode every Project command error code"
         )
         try requireCommandError(
@@ -725,6 +725,68 @@ struct NativeHealthTests {
         _ = try decodeFixture(
             FlitQuitImpactRequest.self,
             at: "\(fixtureRoot)/quit_impact.request.json"
+        )
+        _ = try decodeFixture(
+            FlitGitObservationRequest.self,
+            at: "\(fixtureRoot)/git_observe.request.json"
+        )
+        for name in [
+            "git_observe.not_repository.response.json",
+            "git_observe.bare_repository.response.json",
+            "git_observe.unborn.response.json",
+            "git_observe.repository.response.json",
+            "git_observe.runner_unavailable.response.json",
+            "git_observe.git_unavailable.response.json",
+            "git_observe.project_changed.response.json",
+            "git_observe.process_unavailable.response.json",
+            "git_observe.malformed_output.response.json",
+        ] {
+            _ = try decodeFixture(
+                FlitGitObservationResponse.self,
+                at: "\(fixtureRoot)/\(name)"
+            )
+        }
+        let repositoryGitData = try Data(
+            contentsOf: URL(
+                fileURLWithPath: "\(fixtureRoot)/git_observe.repository.response.json"
+            )
+        )
+        guard
+            var mixedRepository = try JSONSerialization.jsonObject(with: repositoryGitData)
+                as? [String: Any]
+        else {
+            throw NativeHealthTestFailure.failed("repository Git fixture must be an object")
+        }
+        mixedRepository["reason"] = "runner_unavailable"
+        try requireDecodingFailure(
+            FlitGitObservationResponse.self,
+            from: try JSONSerialization.data(withJSONObject: mixedRepository),
+            "repository Git observation must reject unavailable fields"
+        )
+        let unavailableGitData = try Data(
+            contentsOf: URL(
+                fileURLWithPath:
+                    "\(fixtureRoot)/git_observe.runner_unavailable.response.json"
+            )
+        )
+        guard
+            var mixedUnavailable = try JSONSerialization.jsonObject(with: unavailableGitData)
+                as? [String: Any]
+        else {
+            throw NativeHealthTestFailure.failed("unavailable Git fixture must be an object")
+        }
+        mixedUnavailable["canonical_root"] = "/private/tmp/invented"
+        mixedUnavailable["head"] = ["availability": "unborn"]
+        mixedUnavailable["dirty"] = [
+            "staged": 0,
+            "unstaged": 0,
+            "untracked": 0,
+            "entries": 0,
+        ]
+        try requireDecodingFailure(
+            FlitGitObservationResponse.self,
+            from: try JSONSerialization.data(withJSONObject: mixedUnavailable),
+            "unavailable Git observation must reject repository fields"
         )
         let quitImpactFixture = try decodeFixture(
             FlitQuitImpactResponse.self,
@@ -1251,6 +1313,14 @@ struct NativeHealthTests {
             registeredObject.status == .registered,
             "native Project registration must return its typed status"
         )
+        try requireCommandError(
+            try gitObserveProjectJson(
+                projectId: "native-project",
+                clientProtocolVersion: requestVersion
+            ),
+            code: .projectNotTrusted,
+            fixtures: commandErrors
+        )
         let conflictDirectory = "\(root)/target/flit-macos/native-project-conflict"
         try FileManager.default.createDirectory(
             atPath: conflictDirectory,
@@ -1290,6 +1360,24 @@ struct NativeHealthTests {
         try require(
             trustedObject.status == .trusted && trustedObject.project.trusted,
             "native Project trust must decode its exact typed result"
+        )
+        let gitObservation = try JSONDecoder().decode(
+            FlitGitObservationResponse.self,
+            from: Data(
+                try gitObserveProjectJson(
+                    projectId: "native-project",
+                    clientProtocolVersion: requestVersion
+                ).utf8
+            )
+        )
+        guard case let .unavailable(unavailableGit) = gitObservation else {
+            throw NativeHealthTestFailure.failed(
+                "standalone native tests must not invent a bundled Git runner"
+            )
+        }
+        try require(
+            unavailableGit.reason == .runnerUnavailable,
+            "standalone native Git observation must expose exact runner unavailability"
         )
         let listed = try projectsListPageJson(
             afterDisplayName: nil,

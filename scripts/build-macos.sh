@@ -22,11 +22,18 @@ BUILD_DIR="$OUTPUT_ROOT/build"
 MODULE_CACHE="$OUTPUT_ROOT/module-cache"
 APP_DIR="$OUTPUT_ROOT/Flit.app"
 APP_EXECUTABLE="$APP_DIR/Contents/MacOS/Flit"
+APP_HELPER_DIR="$APP_DIR/Contents/Helpers"
+APP_GIT_RUNNER="$APP_HELPER_DIR/flit-git-noexec"
 HOST_DYLIB="$REPOSITORY_ROOT/target/release/libflit_bridge.dylib"
 BINDGEN="$REPOSITORY_ROOT/target/release/flit-bindgen"
 
 /bin/rm -rf "$OUTPUT_ROOT"
-/bin/mkdir -p "$BINDING_DIR" "$BUILD_DIR" "$MODULE_CACHE" "$APP_DIR/Contents/MacOS"
+/bin/mkdir -p \
+    "$BINDING_DIR" \
+    "$BUILD_DIR" \
+    "$MODULE_CACHE" \
+    "$APP_DIR/Contents/MacOS" \
+    "$APP_HELPER_DIR"
 
 cd "$REPOSITORY_ROOT"
 MACOSX_DEPLOYMENT_TARGET=14.0 cargo build --locked --release \
@@ -45,6 +52,8 @@ for index in 0 1; do
 
     MACOSX_DEPLOYMENT_TARGET=14.0 cargo build --locked --release \
         --target "$rust_target" -p flit-bridge
+    MACOSX_DEPLOYMENT_TARGET=14.0 cargo build --locked --release \
+        --target "$rust_target" -p flit-git --bin flit-git-noexec
 
     /usr/bin/swiftc \
         -O \
@@ -69,18 +78,34 @@ done
     "$BUILD_DIR/Flit-arm64" \
     "$BUILD_DIR/Flit-x86_64" \
     -output "$APP_EXECUTABLE"
+/usr/bin/lipo -create \
+    "$REPOSITORY_ROOT/target/aarch64-apple-darwin/release/flit-git-noexec" \
+    "$REPOSITORY_ROOT/target/x86_64-apple-darwin/release/flit-git-noexec" \
+    -output "$APP_GIT_RUNNER"
 /bin/cp "$REPOSITORY_ROOT/apps/macos/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
 /usr/bin/plutil -lint "$APP_DIR/Contents/Info.plist"
+/usr/bin/codesign --force --sign - --timestamp=none "$APP_GIT_RUNNER"
 /usr/bin/codesign --force --sign - --timestamp=none "$APP_DIR"
 
 architectures="$(/usr/bin/lipo -archs "$APP_EXECUTABLE")"
+runner_architectures="$(/usr/bin/lipo -archs "$APP_GIT_RUNNER")"
 if [[ "$architectures" != *"arm64"* || "$architectures" != *"x86_64"* ]]; then
     echo "Flit executable is not universal: $architectures" >&2
+    exit 1
+fi
+if [[ "$runner_architectures" != *"arm64"* || "$runner_architectures" != *"x86_64"* ]]; then
+    echo "Git runner is not universal: $runner_architectures" >&2
+    exit 1
+fi
+if [[ -L "$APP_GIT_RUNNER" || ! -f "$APP_GIT_RUNNER" || ! -x "$APP_GIT_RUNNER" ]]; then
+    echo "Git runner is not one exact executable file" >&2
     exit 1
 fi
 if /usr/bin/otool -L "$APP_EXECUTABLE" | /usr/bin/grep -q 'libflit_bridge'; then
     echo "Flit must statically link the Rust bridge" >&2
     exit 1
 fi
+/usr/bin/codesign --verify --strict "$APP_GIT_RUNNER"
+/usr/bin/codesign --verify --strict --deep "$APP_DIR"
 
-echo "Built $APP_DIR ($architectures)"
+echo "Built $APP_DIR (app: $architectures; Git runner: $runner_architectures)"

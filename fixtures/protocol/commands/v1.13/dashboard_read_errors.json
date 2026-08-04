@@ -1,0 +1,14 @@
+[
+  {
+    "code": "PROTOCOL_MISMATCH",
+    "message_key": "errors.protocolMismatch"
+  },
+  {
+    "code": "INVALID_DASHBOARD_REQUEST",
+    "message_key": "errors.invalidDashboardRequest"
+  },
+  {
+    "code": "STORAGE_UNAVAILABLE",
+    "message_key": "errors.storageUnavailable"
+  }
+]

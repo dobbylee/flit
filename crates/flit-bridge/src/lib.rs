@@ -11,20 +11,27 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use flit_git::{
+    GitHead as NativeGitHead, GitObservation as NativeGitObservation, GitObservationError,
+    NotWorktreeReason as NativeNotWorktreeReason, inspect_git_on_path, inspect_noexec_runner_at,
+    observe_repository,
+};
 use flit_protocol::{
     CapabilityStatus as ProtocolCapabilityStatus, CommandError, CommandErrorCode,
     DashboardEventRecord, DashboardReadRequest, DashboardReadResponse, DashboardRunRecord,
     DashboardSnapshotReason, EVENT_PROTOCOL_VERSION, EventSourceKind,
-    FingerprintAxis as ProtocolFingerprintAxis, HealthStatus, ManagedRunObserveRequest,
-    ManagedRunObserveResponse, ManagedRunOpenInProviderRequest, ManagedRunPermissionRespondRequest,
-    ManagedRunPermissionRespondResponse, ManagedRunStartRequest, PROTOCOL_VERSION,
-    ProjectInspectionResponse, ProjectListCursor as ProjectListCursorResponse, ProjectRecord,
-    ProjectRegistrationResponse, ProjectRegistrationStatus, ProjectTrustResponse,
-    ProjectTrustStatus, ProjectsListResponse, ProviderCapability as ProtocolProviderCapability,
-    ProviderCapabilityEntry, ProviderCompatibility as ProtocolProviderCompatibility,
-    ProviderDiagnosticsResponse, ProviderExecutionAfterQuit, ProviderKind as ProtocolProviderKind,
-    ProviderUnavailableReason, QuitImpactReason, QuitImpactResponse, QuitImpactRun,
-    RunDetailReadRequest, RunDetailReadResponse, RunEvidenceRecord, SystemHealthResponse,
+    FingerprintAxis as ProtocolFingerprintAxis, GitDirtySummary, GitHead, GitNotWorktreeReason,
+    GitObservationResponse, GitObservationUnavailableReason, HealthStatus,
+    ManagedRunObserveRequest, ManagedRunObserveResponse, ManagedRunOpenInProviderRequest,
+    ManagedRunPermissionRespondRequest, ManagedRunPermissionRespondResponse,
+    ManagedRunStartRequest, PROTOCOL_VERSION, ProjectInspectionResponse,
+    ProjectListCursor as ProjectListCursorResponse, ProjectRecord, ProjectRegistrationResponse,
+    ProjectRegistrationStatus, ProjectTrustResponse, ProjectTrustStatus, ProjectsListResponse,
+    ProviderCapability as ProtocolProviderCapability, ProviderCapabilityEntry,
+    ProviderCompatibility as ProtocolProviderCompatibility, ProviderDiagnosticsResponse,
+    ProviderExecutionAfterQuit, ProviderKind as ProtocolProviderKind, ProviderUnavailableReason,
+    QuitImpactReason, QuitImpactResponse, QuitImpactRun, RunDetailReadRequest,
+    RunDetailReadResponse, RunEvidenceRecord, SystemHealthResponse,
 };
 use flit_providers::{
     CapabilityStatus, CodexCompatibilityProbe, CodexCompatibilityProbeError,
@@ -105,6 +112,8 @@ pub enum BridgeError {
     ProjectConflict,
     #[error("the Project was not found")]
     ProjectNotFound,
+    #[error("the Project is not trusted")]
+    ProjectNotTrusted,
     #[error("the current Project directory identity does not match stored state")]
     ProjectIdentityMismatch,
     #[error("the Project response exceeds the native bridge limit")]
@@ -547,6 +556,7 @@ fn project_command_error(error: &BridgeError) -> Option<CommandError> {
         BridgeError::ProjectInspectionFailure => CommandErrorCode::ProjectInspectionFailure,
         BridgeError::ProjectConflict => CommandErrorCode::ProjectConflict,
         BridgeError::ProjectNotFound => CommandErrorCode::ProjectNotFound,
+        BridgeError::ProjectNotTrusted => CommandErrorCode::ProjectNotTrusted,
         BridgeError::ProjectIdentityMismatch => CommandErrorCode::ProjectIdentityMismatch,
         BridgeError::StorageFailure => CommandErrorCode::StorageUnavailable,
         BridgeError::CoreFailure
@@ -1100,6 +1110,212 @@ pub fn projects_list_page_json(
                     }),
                 })
             })
+        })
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GitProjectTarget {
+    canonical_path: PathBuf,
+    filesystem_id: String,
+}
+
+fn git_project_target(
+    core_manager: &CoreManager,
+    project_id: &str,
+) -> Result<GitProjectTarget, BridgeError> {
+    core_manager.with_ready_core(|core| {
+        let project = core
+            .store
+            .project(project_id)
+            .map_err(|_| BridgeError::StorageFailure)?
+            .ok_or(BridgeError::ProjectNotFound)?;
+        if !project.trusted {
+            return Err(BridgeError::ProjectNotTrusted);
+        }
+        let filesystem_id = project
+            .filesystem_id
+            .ok_or(BridgeError::ProjectIdentityMismatch)?;
+        let inspection = ProjectDirectoryInspection::inspect(&project.canonical_path)
+            .map_err(|_| BridgeError::ProjectIdentityMismatch)?;
+        if inspection.selected_via_symlink
+            || inspection.identity.canonical_path != project.canonical_path
+            || inspection.identity.filesystem_id != filesystem_id
+        {
+            return Err(BridgeError::ProjectIdentityMismatch);
+        }
+        Ok(GitProjectTarget {
+            canonical_path: project.canonical_path,
+            filesystem_id,
+        })
+    })
+}
+
+fn git_observation_with(
+    core_manager: &CoreManager,
+    project_id: &str,
+    observe: impl FnOnce(&Path) -> Result<NativeGitObservation, GitObservationError>,
+) -> Result<GitObservationResponse, BridgeError> {
+    let before = git_project_target(core_manager, project_id)?;
+    let observation = observe(&before.canonical_path);
+    let after = git_project_target(core_manager, project_id)?;
+    if after != before {
+        return Err(BridgeError::ProjectIdentityMismatch);
+    }
+    Ok(protocol_git_observation(project_id, observation))
+}
+
+fn protocol_git_observation(
+    project_id: &str,
+    observation: Result<NativeGitObservation, GitObservationError>,
+) -> GitObservationResponse {
+    match observation {
+        Ok(NativeGitObservation::NotWorktree(reason)) => GitObservationResponse::NotWorktree {
+            protocol_version: PROTOCOL_VERSION.to_owned(),
+            project_id: project_id.to_owned(),
+            reason: match reason {
+                NativeNotWorktreeReason::NotRepository => GitNotWorktreeReason::NotRepository,
+                NativeNotWorktreeReason::BareRepository => GitNotWorktreeReason::BareRepository,
+            },
+        },
+        Ok(NativeGitObservation::Repository(receipt)) => {
+            let Ok(canonical_root) = receipt.canonical_root.into_os_string().into_string() else {
+                return git_unavailable(
+                    project_id,
+                    GitObservationUnavailableReason::MalformedOutput,
+                );
+            };
+            GitObservationResponse::Repository {
+                protocol_version: PROTOCOL_VERSION.to_owned(),
+                project_id: project_id.to_owned(),
+                canonical_root,
+                head: match receipt.head {
+                    NativeGitHead::Available(oid) => GitHead::Available { oid },
+                    NativeGitHead::Unborn => GitHead::Unborn,
+                },
+                dirty: GitDirtySummary {
+                    staged: receipt.dirty.staged,
+                    unstaged: receipt.dirty.unstaged,
+                    untracked: receipt.dirty.untracked,
+                    entries: receipt.dirty.entries,
+                },
+            }
+        }
+        Err(error) => git_unavailable(project_id, git_unavailable_reason(&error)),
+    }
+}
+
+fn git_unavailable(
+    project_id: &str,
+    reason: GitObservationUnavailableReason,
+) -> GitObservationResponse {
+    GitObservationResponse::Unavailable {
+        protocol_version: PROTOCOL_VERSION.to_owned(),
+        project_id: project_id.to_owned(),
+        reason,
+    }
+}
+
+fn git_unavailable_reason(error: &GitObservationError) -> GitObservationUnavailableReason {
+    match error {
+        GitObservationError::RunnerPathNotAbsolute
+        | GitObservationError::RunnerUnavailable
+        | GitObservationError::RunnerChanged
+        | GitObservationError::RunnerBoundaryFailed { .. } => {
+            GitObservationUnavailableReason::RunnerUnavailable
+        }
+        GitObservationError::GitNotFound | GitObservationError::GitExecutableChanged => {
+            GitObservationUnavailableReason::GitUnavailable
+        }
+        GitObservationError::ProjectDirectoryUnavailable
+        | GitObservationError::ProjectDirectoryNotCanonical
+        | GitObservationError::ProjectDirectoryChanged
+        | GitObservationError::RepositoryRootChanged
+        | GitObservationError::RepositoryRootMismatch => {
+            GitObservationUnavailableReason::ProjectChanged
+        }
+        GitObservationError::CommandSpawnFailed { .. }
+        | GitObservationError::CommandIoFailed { .. }
+        | GitObservationError::CommandTimedOut { .. }
+        | GitObservationError::CommandOutputDrainTimedOut { .. }
+        | GitObservationError::CommandOutputTooLarge { .. }
+        | GitObservationError::CommandFailed { .. }
+        | GitObservationError::UnexpectedCommandStderr { .. } => {
+            GitObservationUnavailableReason::ProcessUnavailable
+        }
+        GitObservationError::MalformedRepositoryRoot
+        | GitObservationError::MalformedPorcelain
+        | GitObservationError::DuplicatePorcelainRecord
+        | GitObservationError::TooManyPorcelainEntries
+        | GitObservationError::GitPathTooLong => GitObservationUnavailableReason::MalformedOutput,
+    }
+}
+
+fn bundled_git_runner_path() -> Result<PathBuf, GitObservationError> {
+    let app_executable =
+        std::env::current_exe().map_err(|_| GitObservationError::RunnerUnavailable)?;
+    bundled_git_runner_path_for(&app_executable)
+}
+
+fn bundled_git_runner_path_for(app_executable: &Path) -> Result<PathBuf, GitObservationError> {
+    if !app_executable.is_absolute()
+        || app_executable.file_name().and_then(|name| name.to_str()) != Some("Flit")
+    {
+        return Err(GitObservationError::RunnerUnavailable);
+    }
+    let canonical_app =
+        fs::canonicalize(app_executable).map_err(|_| GitObservationError::RunnerUnavailable)?;
+    if canonical_app != app_executable {
+        return Err(GitObservationError::RunnerUnavailable);
+    }
+    let macos = canonical_app
+        .parent()
+        .filter(|path| path.file_name().and_then(|name| name.to_str()) == Some("MacOS"))
+        .ok_or(GitObservationError::RunnerUnavailable)?;
+    let contents = macos
+        .parent()
+        .filter(|path| path.file_name().and_then(|name| name.to_str()) == Some("Contents"))
+        .ok_or(GitObservationError::RunnerUnavailable)?;
+    if contents
+        .parent()
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        != Some("Flit.app")
+    {
+        return Err(GitObservationError::RunnerUnavailable);
+    }
+    let runner = contents.join("Helpers/flit-git-noexec");
+    let metadata =
+        fs::symlink_metadata(&runner).map_err(|_| GitObservationError::RunnerUnavailable)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(GitObservationError::RunnerUnavailable);
+    }
+    let canonical_runner =
+        fs::canonicalize(&runner).map_err(|_| GitObservationError::RunnerUnavailable)?;
+    if canonical_runner != runner {
+        return Err(GitObservationError::RunnerUnavailable);
+    }
+    Ok(runner)
+}
+
+fn observe_bundled_project(
+    canonical_project_directory: &Path,
+) -> Result<NativeGitObservation, GitObservationError> {
+    let runner = inspect_noexec_runner_at(bundled_git_runner_path()?)?;
+    let git = inspect_git_on_path(std::env::var_os("PATH").as_deref())?;
+    observe_repository(&runner, &git, canonical_project_directory)
+}
+
+#[uniffi::export]
+pub fn git_observe_project_json(
+    project_id: String,
+    client_protocol_version: String,
+) -> Result<String, BridgeError> {
+    protect(|| {
+        project_command_json(|| {
+            validate_project_protocol(&client_protocol_version)?;
+            validate_project_input(&project_id, MAX_PROJECT_ID_BYTES)?;
+            git_observation_with(&CORE, &project_id, observe_bundled_project)
         })
     })
 }
@@ -2796,6 +3012,182 @@ mod tests {
         assert_eq!(response.cursor, 0);
         assert!(response.runs.is_empty());
         assert!(!response.core_instance_id.is_empty());
+    }
+
+    #[test]
+    fn git_observation_releases_core_and_revalidates_the_exact_project() {
+        let (_directory, manager, _) = observation_core("git-observation");
+        let expected_project =
+            git_project_target(&manager, "project-observe").expect("trusted Git Project target");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker_manager = Arc::clone(&manager);
+        let worker = thread::spawn(move || {
+            git_observation_with(&worker_manager, "project-observe", |project| {
+                assert_eq!(project, expected_project.canonical_path);
+                entered_tx.send(()).expect("enter Git observation");
+                release_rx.recv().expect("release Git observation");
+                Ok(NativeGitObservation::NotWorktree(
+                    NativeNotWorktreeReason::NotRepository,
+                ))
+            })
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("Git observation should start");
+
+        let (health_tx, health_rx) = mpsc::channel();
+        let health_manager = Arc::clone(&manager);
+        let health = thread::spawn(move || {
+            health_tx
+                .send(health_manager.require_ready())
+                .expect("send concurrent Core health");
+        });
+        assert_eq!(
+            health_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("Git observation must not hold the Core mutex"),
+            Ok(())
+        );
+        health.join().expect("concurrent health thread");
+        release_tx.send(()).expect("release Git worker");
+        assert_eq!(
+            worker.join().expect("Git observation thread"),
+            Ok(GitObservationResponse::NotWorktree {
+                protocol_version: PROTOCOL_VERSION.to_owned(),
+                project_id: "project-observe".to_owned(),
+                reason: GitNotWorktreeReason::NotRepository,
+            })
+        );
+
+        let original = git_project_target(&manager, "project-observe")
+            .expect("original Project target")
+            .canonical_path;
+        let moved = original.with_extension("moved");
+        assert_eq!(
+            git_observation_with(&manager, "project-observe", |_project| {
+                fs::rename(&original, &moved).expect("move observed Project");
+                fs::create_dir(&original).expect("replace observed Project");
+                Ok(NativeGitObservation::NotWorktree(
+                    NativeNotWorktreeReason::NotRepository,
+                ))
+            }),
+            Err(BridgeError::ProjectIdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn git_observation_mapping_is_content_free_and_exhaustive() {
+        assert_eq!(
+            protocol_git_observation(
+                "project-observe",
+                Ok(NativeGitObservation::Repository(
+                    flit_git::RepositoryReceipt {
+                        canonical_root: PathBuf::from("/private/tmp/project-observe"),
+                        head: NativeGitHead::Available(
+                            "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                        ),
+                        dirty: flit_git::DirtySummary {
+                            staged: 1,
+                            unstaged: 2,
+                            untracked: 3,
+                            entries: 4,
+                        },
+                    },
+                )),
+            ),
+            GitObservationResponse::Repository {
+                protocol_version: PROTOCOL_VERSION.to_owned(),
+                project_id: "project-observe".to_owned(),
+                canonical_root: "/private/tmp/project-observe".to_owned(),
+                head: GitHead::Available {
+                    oid: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                },
+                dirty: GitDirtySummary {
+                    staged: 1,
+                    unstaged: 2,
+                    untracked: 3,
+                    entries: 4,
+                },
+            }
+        );
+        for (error, reason) in [
+            (
+                GitObservationError::RunnerUnavailable,
+                GitObservationUnavailableReason::RunnerUnavailable,
+            ),
+            (
+                GitObservationError::GitNotFound,
+                GitObservationUnavailableReason::GitUnavailable,
+            ),
+            (
+                GitObservationError::ProjectDirectoryChanged,
+                GitObservationUnavailableReason::ProjectChanged,
+            ),
+            (
+                GitObservationError::UnexpectedCommandStderr {
+                    phase: flit_git::GitCommandPhase::Status,
+                },
+                GitObservationUnavailableReason::ProcessUnavailable,
+            ),
+            (
+                GitObservationError::MalformedPorcelain,
+                GitObservationUnavailableReason::MalformedOutput,
+            ),
+        ] {
+            assert_eq!(
+                protocol_git_observation("project-observe", Err(error)),
+                GitObservationResponse::Unavailable {
+                    protocol_version: PROTOCOL_VERSION.to_owned(),
+                    project_id: "project-observe".to_owned(),
+                    reason,
+                }
+            );
+        }
+        let rendered = serde_json::to_string(&protocol_git_observation(
+            "project-observe",
+            Err(GitObservationError::CommandFailed {
+                phase: flit_git::GitCommandPhase::Status,
+                exit_code: Some(77),
+            }),
+        ))
+        .expect("content-free Git unavailable response");
+        assert!(!rendered.contains("77"));
+        assert!(!rendered.contains("stderr"));
+    }
+
+    #[test]
+    fn bundled_git_runner_discovery_rejects_noncanonical_or_escaped_layouts() {
+        let directory = ObservationDirectory::new("git-bundle-layout");
+        let root = fs::canonicalize(&directory.0).expect("canonical bundle root");
+        let contents = root.join("Flit.app/Contents");
+        let macos = contents.join("MacOS");
+        let helpers = contents.join("Helpers");
+        fs::create_dir_all(&macos).expect("app executable directory");
+        fs::create_dir_all(&helpers).expect("app helper directory");
+        let app = macos.join("Flit");
+        let runner = helpers.join("flit-git-noexec");
+        fs::write(&app, b"app").expect("app executable fixture");
+        fs::write(&runner, b"runner").expect("runner fixture");
+        assert_eq!(
+            bundled_git_runner_path_for(&app).expect("exact bundled runner"),
+            runner
+        );
+
+        let alias = root.join("Flit-alias");
+        std::os::unix::fs::symlink(&app, &alias).expect("app alias");
+        assert_eq!(
+            bundled_git_runner_path_for(&alias),
+            Err(GitObservationError::RunnerUnavailable)
+        );
+        fs::remove_file(&runner).expect("remove exact runner");
+        let escaped = root.join("escaped-runner");
+        fs::write(&escaped, b"escaped").expect("escaped runner");
+        std::os::unix::fs::symlink(&escaped, &runner).expect("escaped runner link");
+        assert_eq!(
+            bundled_git_runner_path_for(&app),
+            Err(GitObservationError::RunnerUnavailable)
+        );
     }
 
     #[test]

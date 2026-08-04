@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 
 use schemars::{JsonSchema, generate::SchemaSettings};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: &str = "1.12";
+pub const PROTOCOL_VERSION: &str = "1.13";
 pub const EVENT_PROTOCOL_VERSION: &str = "1.0";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -130,6 +130,209 @@ pub struct ProjectsListResponse {
     pub protocol_version: String,
     pub projects: Vec<ProjectRecord>,
     pub next_cursor: Option<ProjectListCursor>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitObservationRequest {
+    pub project_id: String,
+    pub client_protocol_version: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitNotWorktreeReason {
+    NotRepository,
+    BareRepository,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitObservationUnavailableReason {
+    RunnerUnavailable,
+    GitUnavailable,
+    ProjectChanged,
+    ProcessUnavailable,
+    MalformedOutput,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "availability", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GitHead {
+    Available { oid: String },
+    Unborn,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum GitAvailableHeadTag {
+    Available,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum GitUnbornHeadTag {
+    Unborn,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitAvailableHeadWire {
+    availability: GitAvailableHeadTag,
+    oid: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitUnbornHeadWire {
+    availability: GitUnbornHeadTag,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum GitHeadWire {
+    Available(GitAvailableHeadWire),
+    Unborn(GitUnbornHeadWire),
+}
+
+impl<'de> Deserialize<'de> for GitHead {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match GitHeadWire::deserialize(deserializer)? {
+            GitHeadWire::Available(wire) => {
+                let _ = wire.availability;
+                Self::Available { oid: wire.oid }
+            }
+            GitHeadWire::Unborn(wire) => {
+                let _ = wire.availability;
+                Self::Unborn
+            }
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitDirtySummary {
+    pub staged: u32,
+    pub unstaged: u32,
+    pub untracked: u32,
+    pub entries: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "observation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GitObservationResponse {
+    NotWorktree {
+        protocol_version: String,
+        project_id: String,
+        reason: GitNotWorktreeReason,
+    },
+    Repository {
+        protocol_version: String,
+        project_id: String,
+        canonical_root: String,
+        head: GitHead,
+        dirty: GitDirtySummary,
+    },
+    Unavailable {
+        protocol_version: String,
+        project_id: String,
+        reason: GitObservationUnavailableReason,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum GitNotWorktreeTag {
+    NotWorktree,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum GitRepositoryTag {
+    Repository,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum GitUnavailableTag {
+    Unavailable,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitNotWorktreeResponseWire {
+    observation: GitNotWorktreeTag,
+    protocol_version: String,
+    project_id: String,
+    reason: GitNotWorktreeReason,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitRepositoryResponseWire {
+    observation: GitRepositoryTag,
+    protocol_version: String,
+    project_id: String,
+    canonical_root: String,
+    head: GitHead,
+    dirty: GitDirtySummary,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GitUnavailableResponseWire {
+    observation: GitUnavailableTag,
+    protocol_version: String,
+    project_id: String,
+    reason: GitObservationUnavailableReason,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum GitObservationResponseWire {
+    NotWorktree(GitNotWorktreeResponseWire),
+    Repository(GitRepositoryResponseWire),
+    Unavailable(GitUnavailableResponseWire),
+}
+
+impl<'de> Deserialize<'de> for GitObservationResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(
+            match GitObservationResponseWire::deserialize(deserializer)? {
+                GitObservationResponseWire::NotWorktree(wire) => {
+                    let _ = wire.observation;
+                    Self::NotWorktree {
+                        protocol_version: wire.protocol_version,
+                        project_id: wire.project_id,
+                        reason: wire.reason,
+                    }
+                }
+                GitObservationResponseWire::Repository(wire) => {
+                    let _ = wire.observation;
+                    Self::Repository {
+                        protocol_version: wire.protocol_version,
+                        project_id: wire.project_id,
+                        canonical_root: wire.canonical_root,
+                        head: wire.head,
+                        dirty: wire.dirty,
+                    }
+                }
+                GitObservationResponseWire::Unavailable(wire) => {
+                    let _ = wire.observation;
+                    Self::Unavailable {
+                        protocol_version: wire.protocol_version,
+                        project_id: wire.project_id,
+                        reason: wire.reason,
+                    }
+                }
+            },
+        )
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -907,6 +1110,197 @@ struct FlitProjectsListResponse: Codable, Equatable, Sendable {
         case protocolVersion = "protocol_version"
         case projects
         case nextCursor = "next_cursor"
+    }
+}
+
+struct FlitGitObservationRequest: Codable, Equatable, Sendable {
+    let projectId: String
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+enum FlitGitObservationKind: String, Codable, Sendable {
+    case notWorktree = "not_worktree"
+    case repository
+    case unavailable
+}
+
+enum FlitGitNotWorktreeReason: String, Codable, Sendable {
+    case notRepository = "not_repository"
+    case bareRepository = "bare_repository"
+}
+
+enum FlitGitObservationUnavailableReason: String, Codable, Sendable {
+    case runnerUnavailable = "runner_unavailable"
+    case gitUnavailable = "git_unavailable"
+    case projectChanged = "project_changed"
+    case processUnavailable = "process_unavailable"
+    case malformedOutput = "malformed_output"
+}
+
+enum FlitGitHeadAvailability: String, Codable, Sendable {
+    case available
+    case unborn
+}
+
+enum FlitGitHead: Codable, Equatable, Sendable {
+    case available(oid: String)
+    case unborn
+
+    private enum CodingKeys: String, CodingKey {
+        case availability
+        case oid
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(FlitGitHeadAvailability.self, forKey: .availability) {
+        case .available:
+            self = .available(oid: try container.decode(String.self, forKey: .oid))
+        case .unborn:
+            guard !container.contains(.oid) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .oid,
+                    in: container,
+                    debugDescription: "An unborn Git HEAD cannot include an object ID"
+                )
+            }
+            self = .unborn
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case let .available(oid):
+            try container.encode(FlitGitHeadAvailability.available, forKey: .availability)
+            try container.encode(oid, forKey: .oid)
+        case .unborn:
+            try container.encode(FlitGitHeadAvailability.unborn, forKey: .availability)
+        }
+    }
+}
+
+struct FlitGitDirtySummary: Codable, Equatable, Sendable {
+    let staged: UInt32
+    let unstaged: UInt32
+    let untracked: UInt32
+    let entries: UInt32
+}
+
+struct FlitGitNotWorktreeResponse: Codable, Equatable, Sendable {
+    let observation: FlitGitObservationKind
+    let protocolVersion: String
+    let projectId: String
+    let reason: FlitGitNotWorktreeReason
+
+    private enum CodingKeys: String, CodingKey {
+        case observation
+        case protocolVersion = "protocol_version"
+        case projectId = "project_id"
+        case reason
+    }
+}
+
+struct FlitGitRepositoryResponse: Codable, Equatable, Sendable {
+    let observation: FlitGitObservationKind
+    let protocolVersion: String
+    let projectId: String
+    let canonicalRoot: String
+    let head: FlitGitHead
+    let dirty: FlitGitDirtySummary
+
+    private enum CodingKeys: String, CodingKey {
+        case observation
+        case protocolVersion = "protocol_version"
+        case projectId = "project_id"
+        case canonicalRoot = "canonical_root"
+        case head
+        case dirty
+    }
+}
+
+struct FlitGitUnavailableResponse: Codable, Equatable, Sendable {
+    let observation: FlitGitObservationKind
+    let protocolVersion: String
+    let projectId: String
+    let reason: FlitGitObservationUnavailableReason
+
+    private enum CodingKeys: String, CodingKey {
+        case observation
+        case protocolVersion = "protocol_version"
+        case projectId = "project_id"
+        case reason
+    }
+}
+
+enum FlitGitObservationResponse: Codable, Equatable, Sendable {
+    case notWorktree(FlitGitNotWorktreeResponse)
+    case repository(FlitGitRepositoryResponse)
+    case unavailable(FlitGitUnavailableResponse)
+
+    private enum CodingKeys: String, CodingKey {
+        case observation
+        case canonicalRoot = "canonical_root"
+        case head
+        case dirty
+        case reason
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(FlitGitObservationKind.self, forKey: .observation) {
+        case .notWorktree:
+            guard
+                !container.contains(.canonicalRoot),
+                !container.contains(.head),
+                !container.contains(.dirty)
+            else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .observation,
+                    in: container,
+                    debugDescription: "A non-worktree Git observation cannot include repository fields"
+                )
+            }
+            self = .notWorktree(try FlitGitNotWorktreeResponse(from: decoder))
+        case .repository:
+            guard !container.contains(.reason) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .reason,
+                    in: container,
+                    debugDescription: "A repository Git observation cannot include an unavailable reason"
+                )
+            }
+            self = .repository(try FlitGitRepositoryResponse(from: decoder))
+        case .unavailable:
+            guard
+                !container.contains(.canonicalRoot),
+                !container.contains(.head),
+                !container.contains(.dirty)
+            else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .observation,
+                    in: container,
+                    debugDescription: "An unavailable Git observation cannot include repository fields"
+                )
+            }
+            self = .unavailable(try FlitGitUnavailableResponse(from: decoder))
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        switch self {
+        case let .notWorktree(response):
+            try response.encode(to: encoder)
+        case let .repository(response):
+            try response.encode(to: encoder)
+        case let .unavailable(response):
+            try response.encode(to: encoder)
+        }
     }
 }
 

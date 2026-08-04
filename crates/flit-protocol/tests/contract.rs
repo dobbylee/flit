@@ -2,17 +2,17 @@ use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use flit_protocol::{
     CapabilityStatus, CommandError, DashboardReadRequest, DashboardReadResponse,
-    EVENT_PROTOCOL_VERSION, EventEnvelope, EventProtocolVersion, MAX_JSON_SAFE_INTEGER,
-    ManagedRunObserveRequest, ManagedRunObserveResponse, ManagedRunOpenInProviderRequest,
-    ManagedRunPermissionRespondRequest, ManagedRunPermissionRespondResponse,
-    ManagedRunStartRequest, ManagedRunStartResponse, PROTOCOL_VERSION, ProjectInspectionRequest,
-    ProjectInspectionResponse, ProjectRegistrationRequest, ProjectRegistrationResponse,
-    ProjectTrustRequest, ProjectTrustResponse, ProjectsListRequest, ProjectsListResponse,
-    ProviderCompatibility, ProviderDiagnosticsRequest, ProviderDiagnosticsResponse,
-    ProviderExecutionAfterQuit, ProviderUnavailableReason, QuitImpactReason, QuitImpactRequest,
-    QuitImpactResponse, RunDetailReadRequest, RunDetailReadResponse, SystemHealthRequest,
-    SystemHealthResponse, event_schema_id, event_schema_relative_path,
-    generated_swift_command_contract,
+    EVENT_PROTOCOL_VERSION, EventEnvelope, EventProtocolVersion, GitObservationRequest,
+    GitObservationResponse, MAX_JSON_SAFE_INTEGER, ManagedRunObserveRequest,
+    ManagedRunObserveResponse, ManagedRunOpenInProviderRequest, ManagedRunPermissionRespondRequest,
+    ManagedRunPermissionRespondResponse, ManagedRunStartRequest, ManagedRunStartResponse,
+    PROTOCOL_VERSION, ProjectInspectionRequest, ProjectInspectionResponse,
+    ProjectRegistrationRequest, ProjectRegistrationResponse, ProjectTrustRequest,
+    ProjectTrustResponse, ProjectsListRequest, ProjectsListResponse, ProviderCompatibility,
+    ProviderDiagnosticsRequest, ProviderDiagnosticsResponse, ProviderExecutionAfterQuit,
+    ProviderUnavailableReason, QuitImpactReason, QuitImpactRequest, QuitImpactResponse,
+    RunDetailReadRequest, RunDetailReadResponse, SystemHealthRequest, SystemHealthResponse,
+    event_schema_id, event_schema_relative_path, generated_swift_command_contract,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -178,6 +178,56 @@ fn current_project_command_fixtures_round_trip_every_shape() {
     for error in errors {
         assert_eq!(error, CommandError::for_code(error.code));
     }
+}
+
+#[test]
+fn current_git_observation_fixtures_are_exhaustive_and_fail_closed() {
+    let manifest = read_command_compatibility_manifest();
+    let current = &manifest.current;
+    assert_fixture_round_trip::<GitObservationRequest>(&command_fixture(
+        current,
+        "git_observe.request.json",
+    ));
+    for name in [
+        "git_observe.not_repository.response.json",
+        "git_observe.bare_repository.response.json",
+        "git_observe.unborn.response.json",
+        "git_observe.repository.response.json",
+        "git_observe.runner_unavailable.response.json",
+        "git_observe.git_unavailable.response.json",
+        "git_observe.project_changed.response.json",
+        "git_observe.process_unavailable.response.json",
+        "git_observe.malformed_output.response.json",
+    ] {
+        assert_fixture_round_trip::<GitObservationResponse>(&command_fixture(current, name));
+    }
+
+    let mut mixed: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "git_observe.unborn.response.json",
+        )))
+        .expect("unborn Git fixture should be readable"),
+    )
+    .expect("unborn Git fixture should be JSON");
+    mixed["head"]["oid"] = serde_json::json!("invented");
+    assert!(serde_json::from_value::<GitObservationResponse>(mixed).is_err());
+
+    let mut wrong_variant: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "git_observe.runner_unavailable.response.json",
+        )))
+        .expect("unavailable Git fixture should be readable"),
+    )
+    .expect("unavailable Git fixture should be JSON");
+    wrong_variant["dirty"] = serde_json::json!({
+        "staged": 0,
+        "unstaged": 0,
+        "untracked": 0,
+        "entries": 0
+    });
+    assert!(serde_json::from_value::<GitObservationResponse>(wrong_variant).is_err());
 }
 
 #[test]
@@ -746,6 +796,11 @@ fn generated_swift_project_contract_is_current_and_required_fields_fail_closed()
         "FlitProjectTrustResponse",
         "FlitProjectsListRequest",
         "FlitProjectsListResponse",
+        "FlitGitObservationRequest",
+        "FlitGitObservationResponse",
+        "FlitGitObservationUnavailableReason",
+        "FlitGitHead",
+        "FlitGitDirtySummary",
         "FlitDashboardReadRequest",
         "FlitDashboardDelivery",
         "FlitDashboardSnapshotReason",

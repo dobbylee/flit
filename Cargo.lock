@@ -334,6 +334,7 @@ dependencies = [
 name = "flit-bridge"
 version = "0.1.0"
 dependencies = [
+ "flit-git",
  "flit-protocol",
  "flit-providers",
  "flit-store",

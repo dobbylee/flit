@@ -1,0 +1,22 @@
+[
+  {
+    "code": "INVALID_RUN_REQUEST",
+    "message_key": "errors.invalidRunRequest"
+  },
+  {
+    "code": "STORAGE_UNAVAILABLE",
+    "message_key": "errors.storageUnavailable"
+  },
+  {
+    "code": "MANAGED_RUN_NOT_ACTIVE",
+    "message_key": "errors.managedRunNotActive"
+  },
+  {
+    "code": "PERMISSION_REQUEST_STALE",
+    "message_key": "errors.permissionRequestStale"
+  },
+  {
+    "code": "PERMISSION_RESPONSE_CONFLICT",
+    "message_key": "errors.permissionResponseConflict"
+  }
+]
