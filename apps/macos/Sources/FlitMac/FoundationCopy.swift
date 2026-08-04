@@ -38,9 +38,10 @@ enum FoundationCopyKey: String {
     case runDetailBack = "runDetail.back"
     case runDetailCapability = "runDetail.capability"
     case runDetailEvent = "runDetail.event"
-    case runDetailMoreEvents = "runDetail.moreEvents"
+    case runDetailLoadMore = "runDetail.loadMore"
     case runDetailNoEvents = "runDetail.noEvents"
     case runDetailOpenInProvider = "runDetail.openInProvider"
+    case runDetailPageUnavailable = "runDetail.pageUnavailable"
     case runDetailProviderHistory = "runDetail.providerHistory"
     case runDetailTitle = "runDetail.title"
     case runDetailUnavailable = "runDetail.unavailable"
@@ -99,9 +100,10 @@ enum FoundationCopy {
         .runDetailBack: "Back to Dashboard",
         .runDetailCapability: "%@: %@",
         .runDetailEvent: "%@ · %@ · %@ · %d%% confidence",
-        .runDetailMoreEvents: "More events are available",
+        .runDetailLoadMore: "Load more",
         .runDetailNoEvents: "No structured activity is available",
         .runDetailOpenInProvider: "Open in provider",
+        .runDetailPageUnavailable: "More activity could not be loaded",
         .runDetailProviderHistory: "Provider history",
         .runDetailTitle: "Activity · %@",
         .runDetailUnavailable: "Run activity unavailable",

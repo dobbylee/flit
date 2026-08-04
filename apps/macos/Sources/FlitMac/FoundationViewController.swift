@@ -35,6 +35,8 @@ final class FoundationViewController: NSViewController {
     private var foundationPanel: NSStackView?
     private var dashboardStack: NSStackView?
     private var dashboardScroll: NSScrollView?
+    private var activeRunDetail: RunDetailPresentationState?
+    private var activeRunTitle: String?
 
     init(
         client: SystemHealthClient,
@@ -341,19 +343,55 @@ final class FoundationViewController: NSViewController {
                 requestedAfterCursor: 0,
                 requestedEventLimit: 50
             )
-            renderRunDetail(detail, runTitle: sender.runTitle)
+            activeRunDetail = detail
+            activeRunTitle = sender.runTitle
+            renderRunDetail(detail, runTitle: sender.runTitle, pageFailure: false)
         } catch {
             renderRunDetailFailure()
         }
     }
 
     @objc private func showDashboard(_: NSButton) {
+        activeRunDetail = nil
+        activeRunTitle = nil
         renderDashboard()
+    }
+
+    @objc private func loadMoreRunDetail(_: NSButton) {
+        guard
+            var detail = activeRunDetail,
+            let runId = detail.runId,
+            let runVersion = detail.runVersion,
+            let runTitle = activeRunTitle
+        else {
+            renderRunDetailFailure()
+            return
+        }
+        let afterCursor = detail.nextCursor
+        do {
+            let response = try runDetailClient.loadPage(
+                runId: runId,
+                expectedRunVersion: runVersion,
+                afterCursor: afterCursor
+            )
+            try detail.append(
+                response,
+                requestedRunId: runId,
+                expectedRunVersion: runVersion,
+                requestedAfterCursor: afterCursor,
+                requestedEventLimit: 50
+            )
+            activeRunDetail = detail
+            renderRunDetail(detail, runTitle: runTitle, pageFailure: false)
+        } catch {
+            renderRunDetail(detail, runTitle: runTitle, pageFailure: true)
+        }
     }
 
     private func renderRunDetail(
         _ detail: RunDetailPresentationState,
-        runTitle: String
+        runTitle: String,
+        pageFailure: Bool
     ) {
         guard
             let dashboardStack,
@@ -424,14 +462,24 @@ final class FoundationViewController: NSViewController {
             }
         }
         if detail.hasMore {
-            dashboardStack.addArrangedSubview(
-                label(
-                    FoundationCopy.text(.runDetailMoreEvents),
-                    size: 12,
-                    weight: .semibold,
-                    color: .secondaryLabelColor
-                )
+            let loadMore = NSButton(
+                title: FoundationCopy.text(.runDetailLoadMore),
+                target: self,
+                action: #selector(loadMoreRunDetail(_:))
             )
+            loadMore.bezelStyle = .inline
+            identify(loadMore, as: "flit.runDetail.loadMore")
+            dashboardStack.addArrangedSubview(loadMore)
+        }
+        if pageFailure {
+            let failure = label(
+                FoundationCopy.text(.runDetailPageUnavailable),
+                size: 12,
+                weight: .semibold,
+                color: .systemRed
+            )
+            identify(failure, as: "flit.runDetail.pageUnavailable")
+            dashboardStack.addArrangedSubview(failure)
         }
         scrollDashboardToTop()
     }

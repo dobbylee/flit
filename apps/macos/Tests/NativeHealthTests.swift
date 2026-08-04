@@ -134,6 +134,21 @@ private func changingRunDetail(
     )
 }
 
+private func changingDashboard(
+    _ response: FlitDashboardReadResponse,
+    mutate: (inout [String: Any]) throws -> Void
+) throws -> FlitDashboardReadResponse {
+    let data = try JSONEncoder().encode(response)
+    guard var object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        throw NativeHealthTestFailure.failed("Dashboard response must be an object")
+    }
+    try mutate(&object)
+    return try JSONDecoder().decode(
+        FlitDashboardReadResponse.self,
+        from: try JSONSerialization.data(withJSONObject: object)
+    )
+}
+
 @MainActor
 private func requireCommandError(
     _ text: String,
@@ -863,6 +878,72 @@ struct NativeHealthTests {
                 && fullPagePresentation.nextCursor == 50,
             "a full bounded page may truthfully report a later exact Run event"
         )
+        let finalPageRunDetail = try changingRunDetail(runDetailFixture) { object in
+            object["run_version"] = 51
+            object["next_cursor"] = 51
+            object["has_more"] = false
+            object["events"] = [[
+                "cursor": 51,
+                "event_id": "event-full-51",
+                "session_id": "session-dashboard-1",
+                "event_type": "run.completed",
+                "source_kind": "provider_adapter",
+                "confidence": 1.0,
+                "observed_at": "2026-07-28T00:00:51.000Z",
+            ]]
+        }
+        let duplicateFinalPage = try changingRunDetail(finalPageRunDetail) { object in
+            guard var events = object["events"] as? [[String: Any]] else {
+                throw NativeHealthTestFailure.failed("Run detail events must be an array")
+            }
+            events[0]["event_id"] = "event-full-1"
+            object["events"] = events
+        }
+        let changedCapabilityFinalPage = try changingRunDetail(finalPageRunDetail) { object in
+            object["history_status"] = "supported"
+        }
+        for (invalidPage, expectedError) in [
+            (duplicateFinalPage, RunDetailPresentationError.duplicateEvent),
+            (changedCapabilityFinalPage, RunDetailPresentationError.contractMismatch),
+        ] {
+            do {
+                try fullPagePresentation.append(
+                    invalidPage,
+                    requestedRunId: "run-dashboard-1",
+                    expectedRunVersion: 51,
+                    requestedAfterCursor: 50,
+                    requestedEventLimit: 50
+                )
+                throw NativeHealthTestFailure.failed(
+                    "native Run detail must reject inconsistent next-page facts"
+                )
+            } catch let error as RunDetailPresentationError {
+                try require(
+                    error == expectedError,
+                    "invalid next page must retain its typed error"
+                )
+            }
+        }
+        try require(
+            fullPagePresentation.events.count == 50
+                && fullPagePresentation.nextCursor == 50
+                && fullPagePresentation.hasMore,
+            "invalid next page must preserve all accepted Run detail rows"
+        )
+        try fullPagePresentation.append(
+            finalPageRunDetail,
+            requestedRunId: "run-dashboard-1",
+            expectedRunVersion: 51,
+            requestedAfterCursor: 50,
+            requestedEventLimit: 50
+        )
+        try require(
+            fullPagePresentation.events.count == 51
+                && fullPagePresentation.events.last?.cursor == 51
+                && fullPagePresentation.nextCursor == 51
+                && !fullPagePresentation.hasMore,
+            "valid next page must append once and close at the exact Run tail"
+        )
         let completedRunDetailFixture = try changingRunDetail(runDetailFixture) { object in
             guard var events = object["events"] as? [[String: Any]] else {
                 throw NativeHealthTestFailure.failed("Run detail events must be an array")
@@ -879,6 +960,14 @@ struct NativeHealthTests {
             object["events"] = events
             object["next_cursor"] = 3
             object["has_more"] = false
+        }
+        let pagedDashboardFixture = try changingDashboard(initialDashboardFixture) { object in
+            guard var runs = object["runs"] as? [[String: Any]] else {
+                throw NativeHealthTestFailure.failed("Dashboard runs must be an array")
+            }
+            runs[0]["version"] = 51
+            object["runs"] = runs
+            object["next_cursor"] = 51
         }
         try require(
             runDetailPresentation.runId == beforeRunId
@@ -1808,7 +1897,6 @@ struct NativeHealthTests {
                         "unsupported"
                     )
                 )
-                && !detailCopy.contains(FoundationCopy.text(.runDetailMoreEvents))
                 && !detailCopy.contains("session-dashboard-1"),
             "native Run detail must render bounded locator facts without session identity"
         )
@@ -1825,6 +1913,109 @@ struct NativeHealthTests {
                 $0.accessibilityIdentifier() == "flit.dashboard.run.run-dashboard-1"
             }),
             "Back must restore the Core-projected Dashboard"
+        )
+        let pagedController = FoundationViewController(
+            client: client,
+            dashboardClient: DashboardClient(
+                fixtureLoader: { pagedDashboardFixture }
+            ),
+            runDetailClient: RunDetailClient(
+                fixtureLoader: { request in
+                    guard
+                        request.runId == "run-dashboard-1",
+                        request.expectedRunVersion == 51,
+                        request.requestedEventLimit == 50,
+                        request.clientProtocolVersion == flitClientProtocolVersion
+                    else {
+                        throw NativeHealthTestFailure.failed(
+                            "paged Run detail request must preserve exact scope"
+                        )
+                    }
+                    switch request.afterCursor {
+                    case 0: return fullPageRunDetail
+                    case 50: return finalPageRunDetail
+                    default:
+                        throw NativeHealthTestFailure.failed(
+                            "paged Run detail must request only the accepted cursor"
+                        )
+                    }
+                }
+            )
+        )
+        _ = pagedController.view
+        guard
+            let pagedDetailButton = descendants(of: pagedController.view).first(where: {
+                $0.accessibilityIdentifier()
+                    == "flit.dashboard.runDetail.run-dashboard-1"
+            }) as? NSButton
+        else {
+            throw NativeHealthTestFailure.failed("paged Dashboard must expose Activity")
+        }
+        pagedDetailButton.performClick(nil)
+        guard
+            let loadMore = descendants(of: pagedController.view).first(where: {
+                $0.accessibilityIdentifier() == "flit.runDetail.loadMore"
+            }) as? NSButton
+        else {
+            throw NativeHealthTestFailure.failed(
+                "a full non-tail page must expose Load more"
+            )
+        }
+        loadMore.performClick(nil)
+        let completedPageViews = descendants(of: pagedController.view)
+        try require(
+            completedPageViews.contains(where: {
+                $0.accessibilityIdentifier() == "flit.runDetail.event.51"
+            })
+                && !completedPageViews.contains(where: {
+                    $0.accessibilityIdentifier() == "flit.runDetail.loadMore"
+                }),
+            "explicit next-page load must append the tail and remove its control"
+        )
+        let failingPageController = FoundationViewController(
+            client: client,
+            dashboardClient: DashboardClient(
+                fixtureLoader: { pagedDashboardFixture }
+            ),
+            runDetailClient: RunDetailClient(
+                fixtureLoader: { request in
+                    guard request.afterCursor == 0 else {
+                        throw NativeHealthTestFailure.failed("next page unavailable")
+                    }
+                    return fullPageRunDetail
+                }
+            )
+        )
+        _ = failingPageController.view
+        guard
+            let failingDetailButton = descendants(of: failingPageController.view).first(where: {
+                $0.accessibilityIdentifier()
+                    == "flit.dashboard.runDetail.run-dashboard-1"
+            }) as? NSButton
+        else {
+            throw NativeHealthTestFailure.failed("failure Dashboard must expose Activity")
+        }
+        failingDetailButton.performClick(nil)
+        guard
+            let failingLoadMore = descendants(of: failingPageController.view).first(where: {
+                $0.accessibilityIdentifier() == "flit.runDetail.loadMore"
+            }) as? NSButton
+        else {
+            throw NativeHealthTestFailure.failed("failure page must expose Load more")
+        }
+        failingLoadMore.performClick(nil)
+        let failedPageViews = descendants(of: failingPageController.view)
+        try require(
+            failedPageViews.contains(where: {
+                $0.accessibilityIdentifier() == "flit.runDetail.event.50"
+            })
+                && failedPageViews.contains(where: {
+                    $0.accessibilityIdentifier() == "flit.runDetail.loadMore"
+                })
+                && failedPageViews.contains(where: {
+                    $0.accessibilityIdentifier() == "flit.runDetail.pageUnavailable"
+                }),
+            "failed next page must preserve rows and require another explicit click"
         )
         let observedController = FoundationViewController(
             client: client,
