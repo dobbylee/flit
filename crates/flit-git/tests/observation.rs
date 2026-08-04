@@ -8,8 +8,10 @@ use std::{
 };
 
 use flit_git::{
-    DirtySummary, GitCommandPhase, GitHead, GitObservation, GitObservationError, GitRunnerFailure,
-    NotWorktreeReason, inspect_git_on_path, inspect_noexec_runner_at, observe_repository,
+    DirtySummary, GitChangeObservationError, GitChangeSummary, GitCommandPhase, GitHead,
+    GitObservation, GitObservationError, GitRunnerFailure, NotWorktreeReason, inspect_git_on_path,
+    inspect_noexec_runner_at, observe_changes_since_clean_baseline, observe_clean_change_baseline,
+    observe_repository,
 };
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -115,6 +117,702 @@ fn observes_non_repository_unborn_clean_and_exact_dirty_categories() {
             untracked: 1,
             entries: 3,
         }
+    );
+}
+
+#[test]
+fn observes_exact_tracked_changes_since_a_clean_baseline_without_paths() {
+    let executable = installed_git();
+    let workspace = TestWorkspace::new("changes");
+    let root = workspace.canonical_directory();
+    git(&executable, &root, &["init", "-b", "main"]);
+    fs::write(root.join("modified.txt"), b"one\ntwo\n").expect("modified baseline file");
+    fs::write(root.join("removed.txt"), b"removed\n").expect("removed baseline file");
+    git(&executable, &root, &["add", "--", "."]);
+    git_with_identity(&executable, &root, &["commit", "-m", "baseline"]);
+    let baseline = clean_baseline(&executable, &root);
+    assert_eq!(
+        observe_changes_since_clean_baseline(&noexec_runner(), &executable, &root, &baseline,)
+            .expect("exact unchanged terminal state"),
+        GitChangeSummary::default()
+    );
+
+    fs::write(root.join("modified.txt"), b"one\nthree\n").expect("modified terminal file");
+    fs::remove_file(root.join("removed.txt")).expect("removed terminal file");
+    fs::write(root.join("added.txt"), b"added\nlines\n").expect("added terminal file");
+    git(&executable, &root, &["add", "-A"]);
+
+    assert_eq!(
+        observe_changes_since_clean_baseline(&noexec_runner(), &executable, &root, &baseline,)
+            .expect("exact terminal changes"),
+        GitChangeSummary {
+            files: 3,
+            insertions: 3,
+            deletions: 2,
+        }
+    );
+}
+
+#[test]
+fn rejects_unborn_and_dirty_baselines() {
+    let executable = installed_git();
+    let workspace = TestWorkspace::new("baseline-contract");
+    let root = workspace.canonical_directory();
+    assert_eq!(
+        observe_clean_change_baseline(&noexec_runner(), &executable, &root)
+            .expect_err("non-worktree baseline"),
+        GitChangeObservationError::BaselineNotWorktree(NotWorktreeReason::NotRepository)
+    );
+    git(&executable, &root, &["init", "-b", "main"]);
+    assert_eq!(
+        observe_clean_change_baseline(&noexec_runner(), &executable, &root)
+            .expect_err("unborn baseline"),
+        GitChangeObservationError::BaselineHeadUnavailable
+    );
+
+    fs::write(root.join("tracked.txt"), b"baseline\n").expect("tracked file");
+    git(&executable, &root, &["add", "--", "."]);
+    git_with_identity(&executable, &root, &["commit", "-m", "baseline"]);
+    fs::write(root.join("tracked.txt"), b"dirty\n").expect("dirty tracked file");
+    assert_eq!(
+        observe_clean_change_baseline(&noexec_runner(), &executable, &root)
+            .expect_err("dirty baseline"),
+        GitChangeObservationError::BaselineNotClean
+    );
+}
+
+#[test]
+fn rejects_untracked_and_binary_terminal_states_without_zero_fallback() {
+    let executable = installed_git();
+    let workspace = TestWorkspace::new("terminal-unavailable");
+    let root = workspace.canonical_directory();
+    git(&executable, &root, &["init", "-b", "main"]);
+    fs::write(root.join(".gitattributes"), b"binary.bin binary\n").expect("attributes");
+    fs::write(root.join("binary.bin"), b"baseline\0bytes").expect("binary baseline");
+    git(&executable, &root, &["add", "--", "."]);
+    git_with_identity(&executable, &root, &["commit", "-m", "baseline"]);
+    let baseline = clean_baseline(&executable, &root);
+
+    fs::write(root.join("untracked.txt"), b"untracked\n").expect("untracked file");
+    assert_eq!(
+        observe_changes_since_clean_baseline(&noexec_runner(), &executable, &root, &baseline,)
+            .expect_err("untracked terminal state"),
+        GitChangeObservationError::TerminalUntracked
+    );
+    fs::remove_file(root.join("untracked.txt")).expect("remove untracked file");
+
+    fs::write(root.join("binary.bin"), b"changed\0bytes").expect("binary terminal file");
+    assert_eq!(
+        observe_changes_since_clean_baseline(&noexec_runner(), &executable, &root, &baseline,)
+            .expect_err("binary terminal diff"),
+        GitChangeObservationError::BinaryNumstat
+    );
+}
+
+#[test]
+fn rejects_staged_content_cancelled_by_the_terminal_worktree() {
+    let executable = installed_git();
+    let workspace = TestWorkspace::new("mixed-index-worktree");
+    let root = workspace.canonical_directory();
+    git(&executable, &root, &["init", "-b", "main"]);
+    fs::write(root.join("tracked.txt"), b"baseline\n").expect("baseline file");
+    git(&executable, &root, &["add", "--", "."]);
+    git_with_identity(&executable, &root, &["commit", "-m", "baseline"]);
+    let baseline = clean_baseline(&executable, &root);
+
+    fs::write(root.join("tracked.txt"), b"staged\n").expect("staged content");
+    git(&executable, &root, &["add", "--", "tracked.txt"]);
+    fs::write(root.join("tracked.txt"), b"baseline\n").expect("cancelled worktree content");
+
+    assert_eq!(
+        observe_changes_since_clean_baseline(&noexec_runner(), &executable, &root, &baseline,)
+            .expect_err("mixed index and worktree changes"),
+        GitChangeObservationError::MixedIndexWorktreeChangesUnsupported
+    );
+}
+
+#[test]
+fn rejects_index_flags_that_hide_tracked_worktree_changes() {
+    let executable = installed_git();
+    let workspace = TestWorkspace::new("hidden-index-flags");
+    let root = workspace.canonical_directory();
+    git(&executable, &root, &["init", "-b", "main"]);
+    fs::write(root.join("tracked.txt"), b"baseline\n").expect("baseline file");
+    git(&executable, &root, &["add", "--", "."]);
+    git_with_identity(&executable, &root, &["commit", "-m", "baseline"]);
+    let baseline = clean_baseline(&executable, &root);
+
+    git(
+        &executable,
+        &root,
+        &["update-index", "--assume-unchanged", "tracked.txt"],
+    );
+    fs::write(root.join("tracked.txt"), b"hidden assume-unchanged\n")
+        .expect("assume-unchanged content");
+    assert_eq!(
+        observe_changes_since_clean_baseline(&noexec_runner(), &executable, &root, &baseline,)
+            .expect_err("assume-unchanged flag"),
+        GitChangeObservationError::IndexFlagsUnsupportedForChanges
+    );
+
+    fs::write(root.join("tracked.txt"), b"baseline\n").expect("restore baseline content");
+    git(
+        &executable,
+        &root,
+        &["update-index", "--no-assume-unchanged", "tracked.txt"],
+    );
+    git(
+        &executable,
+        &root,
+        &["update-index", "--skip-worktree", "tracked.txt"],
+    );
+    fs::write(root.join("tracked.txt"), b"hidden skip-worktree\n").expect("skip-worktree content");
+    assert_eq!(
+        observe_changes_since_clean_baseline(&noexec_runner(), &executable, &root, &baseline,)
+            .expect_err("skip-worktree flag"),
+        GitChangeObservationError::IndexFlagsUnsupportedForChanges
+    );
+}
+
+#[test]
+fn ignores_replacement_refs_when_resolving_the_captured_baseline() {
+    let executable = installed_git();
+    let workspace = TestWorkspace::new("replacement-refs");
+    let root = workspace.canonical_directory();
+    git(&executable, &root, &["init", "-b", "main"]);
+    fs::write(root.join("tracked.txt"), b"baseline\n").expect("baseline file");
+    git(&executable, &root, &["add", "--", "."]);
+    git_with_identity(&executable, &root, &["commit", "-m", "baseline"]);
+    let baseline_oid = git_stdout(&executable, &root, &["rev-parse", "HEAD"]);
+    let baseline = clean_baseline(&executable, &root);
+
+    fs::write(root.join("tracked.txt"), b"terminal\n").expect("terminal file");
+    git(&executable, &root, &["add", "--", "."]);
+    git_with_identity(&executable, &root, &["commit", "-m", "terminal"]);
+    let terminal_oid = git_stdout(&executable, &root, &["rev-parse", "HEAD"]);
+    git(
+        &executable,
+        &root,
+        &["replace", &baseline_oid, &terminal_oid],
+    );
+
+    assert_eq!(
+        observe_changes_since_clean_baseline(&noexec_runner(), &executable, &root, &baseline,)
+            .expect("replacement-independent aggregate"),
+        GitChangeSummary {
+            files: 1,
+            insertions: 1,
+            deletions: 1,
+        }
+    );
+}
+
+#[test]
+fn overrides_weakened_stat_config_for_same_length_tracked_rewrites() {
+    let executable = installed_git();
+    let repository = TestWorkspace::new("stat-config-repository");
+    let timestamp_workspace = TestWorkspace::new("stat-config-timestamp");
+    let root = repository.canonical_directory();
+    let timestamp_root = timestamp_workspace.canonical_directory();
+    let tracked = root.join("tracked.txt");
+    let reference = timestamp_root.join("reference");
+    git(&executable, &root, &["init", "-b", "main"]);
+    fs::write(&tracked, b"aaaa\n").expect("baseline file");
+    git(&executable, &root, &["add", "--", "."]);
+    git_with_identity(&executable, &root, &["commit", "-m", "baseline"]);
+    let baseline = clean_baseline(&executable, &root);
+    fs::write(&reference, b"timestamp reference\n").expect("timestamp reference");
+    let status = Command::new("/usr/bin/touch")
+        .args(["-r"])
+        .arg(&tracked)
+        .arg(&reference)
+        .status()
+        .expect("copy baseline timestamp");
+    assert!(status.success(), "copy baseline timestamp failed");
+    git(&executable, &root, &["config", "core.trustctime", "false"]);
+    git(&executable, &root, &["config", "core.checkStat", "minimal"]);
+
+    fs::write(&tracked, b"bbbb\n").expect("same-length terminal rewrite");
+    let status = Command::new("/usr/bin/touch")
+        .args(["-r"])
+        .arg(&reference)
+        .arg(&tracked)
+        .status()
+        .expect("restore baseline mtime");
+    assert!(status.success(), "restore baseline mtime failed");
+
+    assert_eq!(
+        observe_changes_since_clean_baseline(&noexec_runner(), &executable, &root, &baseline,)
+            .expect("stat-independent aggregate"),
+        GitChangeSummary {
+            files: 1,
+            insertions: 1,
+            deletions: 1,
+        }
+    );
+}
+
+#[test]
+fn overrides_disabled_filemode_for_executable_bit_changes() {
+    let executable = installed_git();
+    let workspace = TestWorkspace::new("filemode-config");
+    let root = workspace.canonical_directory();
+    let tracked = root.join("tracked.sh");
+    git(&executable, &root, &["init", "-b", "main"]);
+    fs::write(&tracked, b"#!/bin/sh\n").expect("baseline file");
+    git(&executable, &root, &["add", "--", "."]);
+    git_with_identity(&executable, &root, &["commit", "-m", "baseline"]);
+    let baseline = clean_baseline(&executable, &root);
+    git(&executable, &root, &["config", "core.filemode", "false"]);
+
+    let mut permissions = fs::metadata(&tracked)
+        .expect("tracked metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&tracked, permissions).expect("make tracked file executable");
+
+    assert_eq!(
+        observe_changes_since_clean_baseline(&noexec_runner(), &executable, &root, &baseline,)
+            .expect("filemode-independent aggregate"),
+        GitChangeSummary {
+            files: 1,
+            insertions: 0,
+            deletions: 0,
+        }
+    );
+}
+
+#[test]
+fn rejects_missing_baseline_object_without_zero_fallback() {
+    let executable = installed_git();
+    let workspace = TestWorkspace::new("missing-baseline-object");
+    let root = workspace.canonical_directory();
+    git(&executable, &root, &["init", "-b", "main"]);
+    fs::write(root.join("tracked.txt"), b"baseline\n").expect("baseline file");
+    git(&executable, &root, &["add", "--", "."]);
+    git_with_identity(&executable, &root, &["commit", "-m", "baseline"]);
+    let baseline = clean_baseline(&executable, &root);
+    let receipt = baseline.receipt();
+    let GitHead::Available(baseline_oid) = &receipt.head else {
+        panic!("expected an available baseline HEAD");
+    };
+    let baseline_object = root
+        .join(".git/objects")
+        .join(&baseline_oid[..2])
+        .join(&baseline_oid[2..]);
+    fs::write(root.join("tracked.txt"), b"terminal\n").expect("terminal file");
+    git(&executable, &root, &["add", "--", "."]);
+    git_with_identity(&executable, &root, &["commit", "-m", "terminal"]);
+    fs::remove_file(&baseline_object).expect("remove baseline commit object");
+
+    assert!(matches!(
+        observe_changes_since_clean_baseline(&noexec_runner(), &executable, &root, &baseline,)
+            .expect_err("missing baseline object"),
+        GitChangeObservationError::Observation(GitObservationError::CommandFailed {
+            phase: GitCommandPhase::ChangeSummary,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn rejects_replaced_git_directory_even_when_the_baseline_object_is_shared() {
+    let executable = installed_git();
+    let repository = TestWorkspace::new("repository-identity");
+    let alternate_workspace = TestWorkspace::new("alternate-repository");
+    let root = repository.canonical_directory();
+    let alternate_root = alternate_workspace.canonical_directory();
+    git(&executable, &root, &["init", "-b", "main"]);
+    fs::write(root.join("tracked.txt"), b"baseline\n").expect("baseline file");
+    git(&executable, &root, &["add", "--", "."]);
+    git_with_identity(&executable, &root, &["commit", "-m", "baseline"]);
+    let baseline = clean_baseline(&executable, &root);
+
+    git(
+        &executable,
+        &alternate_root,
+        &[
+            "clone",
+            "--no-hardlinks",
+            root.to_str().expect("UTF-8 source repository"),
+            "replacement",
+        ],
+    );
+    let replacement_git = alternate_root.join("replacement/.git");
+    fs::rename(root.join(".git"), alternate_root.join("original-git"))
+        .expect("preserve original Git directory");
+    fs::write(
+        root.join(".git"),
+        format!("gitdir: {}\n", replacement_git.display()),
+    )
+    .expect("redirect Git directory");
+
+    assert_eq!(
+        observe_changes_since_clean_baseline(&noexec_runner(), &executable, &root, &baseline,)
+            .expect_err("replaced repository identity"),
+        GitChangeObservationError::RepositoryIdentityChanged
+    );
+}
+
+#[test]
+fn rejects_replaced_worktree_with_the_same_external_git_directory() {
+    let executable = installed_git();
+    let workspace = TestWorkspace::new("worktree-identity");
+    let parent = workspace.canonical_directory();
+    let project = parent.join("project");
+    let external_git = parent.join("external.git");
+    git(
+        &executable,
+        &parent,
+        &[
+            "init",
+            "-b",
+            "main",
+            "--separate-git-dir",
+            external_git.to_str().expect("UTF-8 external Git directory"),
+            "project",
+        ],
+    );
+    let root = fs::canonicalize(&project).expect("canonical Project");
+    fs::write(root.join("tracked.txt"), b"baseline\n").expect("baseline file");
+    git(&executable, &root, &["add", "--", "."]);
+    git_with_identity(&executable, &root, &["commit", "-m", "baseline"]);
+    let baseline = clean_baseline(&executable, &root);
+
+    fs::rename(&root, parent.join("original-project")).expect("preserve original worktree");
+    fs::create_dir(&root).expect("replacement worktree root");
+    fs::write(
+        root.join(".git"),
+        format!("gitdir: {}\n", external_git.display()),
+    )
+    .expect("reuse external Git directory");
+    fs::write(root.join("tracked.txt"), b"baseline\n").expect("replacement tracked file");
+
+    assert_eq!(
+        observe_changes_since_clean_baseline(&noexec_runner(), &executable, &root, &baseline,)
+            .expect_err("replaced worktree identity"),
+        GitChangeObservationError::BaselineProjectIdentityChanged
+    );
+}
+
+#[test]
+fn rejects_replaced_repository_root_even_when_the_nested_project_is_preserved() {
+    let executable = installed_git();
+    let workspace = TestWorkspace::new("repository-root-identity");
+    let parent = workspace.canonical_directory();
+    let repository = parent.join("repository");
+    let external_git = parent.join("external.git");
+    git(
+        &executable,
+        &parent,
+        &[
+            "init",
+            "-b",
+            "main",
+            "--separate-git-dir",
+            external_git.to_str().expect("UTF-8 external Git directory"),
+            "repository",
+        ],
+    );
+    let root = fs::canonicalize(&repository).expect("canonical repository root");
+    fs::create_dir(root.join("nested")).expect("nested Project");
+    fs::write(root.join("nested/tracked.txt"), b"baseline\n").expect("baseline file");
+    git(&executable, &root, &["add", "--", "."]);
+    git_with_identity(&executable, &root, &["commit", "-m", "baseline"]);
+    let project = fs::canonicalize(root.join("nested")).expect("canonical nested Project");
+    let baseline = clean_baseline(&executable, &project);
+
+    let original_root = parent.join("original-repository");
+    fs::rename(&root, &original_root).expect("preserve original repository root");
+    fs::create_dir(&root).expect("replacement repository root");
+    fs::rename(original_root.join("nested"), root.join("nested"))
+        .expect("preserve nested Project identity");
+    fs::write(
+        root.join(".git"),
+        format!("gitdir: {}\n", external_git.display()),
+    )
+    .expect("reuse external Git directory");
+
+    assert_eq!(
+        observe_changes_since_clean_baseline(&noexec_runner(), &executable, &project, &baseline,)
+            .expect_err("replaced repository root identity"),
+        GitChangeObservationError::BaselineRepositoryRootIdentityChanged
+    );
+}
+
+#[test]
+fn rejects_exact_counts_when_a_superproject_gitlink_advances() {
+    let executable = installed_git();
+    let source_workspace = TestWorkspace::new("submodule-source");
+    let super_workspace = TestWorkspace::new("submodule-superproject");
+    let source = source_workspace.canonical_directory();
+    let root = super_workspace.canonical_directory();
+    git(&executable, &source, &["init", "-b", "main"]);
+    fs::write(source.join("source.txt"), b"a\n").expect("source A");
+    git(&executable, &source, &["add", "--", "."]);
+    git_with_identity(&executable, &source, &["commit", "-m", "source A"]);
+    let source_a = git_stdout(&executable, &source, &["rev-parse", "HEAD"]);
+    fs::write(source.join("source.txt"), b"b\n").expect("source B");
+    git(&executable, &source, &["add", "--", "."]);
+    git_with_identity(&executable, &source, &["commit", "-m", "source B"]);
+    let source_b = git_stdout(&executable, &source, &["rev-parse", "HEAD"]);
+
+    git(&executable, &root, &["init", "-b", "main"]);
+    fs::write(
+        root.join(".gitmodules"),
+        format!(
+            "[submodule \"module\"]\n\tpath = module\n\turl = {}\n",
+            source.display()
+        ),
+    )
+    .expect("submodule metadata");
+    git(&executable, &root, &["add", "--", ".gitmodules"]);
+    git(
+        &executable,
+        &root,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000",
+            &source_a,
+            "module",
+        ],
+    );
+    git_with_identity(&executable, &root, &["commit", "-m", "baseline gitlink"]);
+    let baseline = clean_baseline(&executable, &root);
+
+    git(
+        &executable,
+        &root,
+        &["update-index", "--cacheinfo", "160000", &source_b, "module"],
+    );
+    git_with_identity(&executable, &root, &["commit", "-m", "terminal gitlink"]);
+
+    assert_eq!(
+        observe_changes_since_clean_baseline(&noexec_runner(), &executable, &root, &baseline,)
+            .expect_err("submodule gitlink change"),
+        GitChangeObservationError::SubmodulesUnsupportedForChanges
+    );
+}
+
+#[test]
+fn rejects_runner_and_git_executable_mismatches_from_the_bound_baseline() {
+    let executable = installed_git();
+    let repository = TestWorkspace::new("baseline-tools-repository");
+    let tool_workspace = TestWorkspace::new("baseline-tools-alternate");
+    let root = repository.canonical_directory();
+    let tool_root = tool_workspace.canonical_directory();
+    git(&executable, &root, &["init", "-b", "main"]);
+    fs::write(root.join("tracked.txt"), b"baseline\n").expect("baseline file");
+    git(&executable, &root, &["add", "--", "."]);
+    git_with_identity(&executable, &root, &["commit", "-m", "baseline"]);
+    let baseline = clean_baseline(&executable, &root);
+
+    let copied_runner = tool_root.join("copied-runner");
+    fs::copy(noexec_runner_path(), &copied_runner).expect("copy runner");
+    let mut runner_permissions = fs::metadata(&copied_runner)
+        .expect("runner metadata")
+        .permissions();
+    runner_permissions.set_mode(0o700);
+    fs::set_permissions(&copied_runner, runner_permissions).expect("runner permissions");
+    let alternate_runner = inspect_noexec_runner_at(&copied_runner).expect("alternate runner");
+    assert_eq!(
+        observe_changes_since_clean_baseline(&alternate_runner, &executable, &root, &baseline,)
+            .expect_err("runner mismatch"),
+        GitChangeObservationError::BaselineRunnerMismatch
+    );
+
+    let fake_git = tool_root.join("git");
+    write_executable(&fake_git, b"#!/bin/sh\nexit 99\n");
+    let path = std::env::join_paths([&tool_root]).expect("alternate Git PATH");
+    let alternate_git = inspect_git_on_path(Some(&path)).expect("alternate Git");
+    assert_eq!(
+        observe_changes_since_clean_baseline(&noexec_runner(), &alternate_git, &root, &baseline,)
+            .expect_err("Git executable mismatch"),
+        GitChangeObservationError::BaselineGitExecutableMismatch
+    );
+}
+
+#[test]
+fn rejects_a_terminal_project_that_is_no_longer_a_worktree() {
+    let executable = installed_git();
+    let workspace = TestWorkspace::new("terminal-non-worktree");
+    let root = workspace.canonical_directory();
+    git(&executable, &root, &["init", "-b", "main"]);
+    fs::write(root.join("tracked.txt"), b"baseline\n").expect("tracked file");
+    git(&executable, &root, &["add", "--", "."]);
+    git_with_identity(&executable, &root, &["commit", "-m", "baseline"]);
+    let baseline = clean_baseline(&executable, &root);
+    fs::remove_dir_all(root.join(".git")).expect("remove temporary repository metadata");
+
+    assert_eq!(
+        observe_changes_since_clean_baseline(&noexec_runner(), &executable, &root, &baseline,)
+            .expect_err("terminal non-worktree"),
+        GitChangeObservationError::TerminalNotWorktree(NotWorktreeReason::NotRepository)
+    );
+}
+
+#[test]
+fn disables_configured_diff_helpers_for_terminal_aggregation() {
+    let executable = installed_git();
+    let repository = TestWorkspace::new("diff-helper-repository");
+    let helper_workspace = TestWorkspace::new("diff-helper-tool");
+    let root = repository.canonical_directory();
+    let helper_root = helper_workspace.canonical_directory();
+    let marker = helper_root.join("helper-must-not-run");
+    let helper = helper_root.join("diff-helper");
+    write_executable(
+        &helper,
+        format!(
+            "#!/bin/sh\n/usr/bin/touch '{}'\n/bin/cat \"$1\"\n",
+            marker.display()
+        )
+        .as_bytes(),
+    );
+    git(&executable, &root, &["init", "-b", "main"]);
+    fs::write(
+        root.join(".gitattributes"),
+        b"tracked.txt diff=sideeffect\n",
+    )
+    .expect("attributes");
+    fs::write(root.join("tracked.txt"), b"baseline\n").expect("tracked file");
+    git(&executable, &root, &["add", "--", "."]);
+    git_with_identity(&executable, &root, &["commit", "-m", "baseline"]);
+    let baseline = clean_baseline(&executable, &root);
+    let helper_path = helper.to_str().expect("UTF-8 helper path");
+    git(
+        &executable,
+        &root,
+        &["config", "diff.sideeffect.command", helper_path],
+    );
+    git(
+        &executable,
+        &root,
+        &["config", "diff.sideeffect.textconv", helper_path],
+    );
+    fs::write(root.join("tracked.txt"), b"changed\n").expect("terminal file");
+
+    assert_eq!(
+        observe_changes_since_clean_baseline(&noexec_runner(), &executable, &root, &baseline,)
+            .expect("helper-free aggregate"),
+        GitChangeSummary {
+            files: 1,
+            insertions: 1,
+            deletions: 1,
+        }
+    );
+    assert!(!marker.exists(), "configured diff helper must not execute");
+}
+
+#[test]
+fn missing_terminal_blob_fails_without_lazy_fetch_or_remote_helper_execution() {
+    let executable = installed_git();
+    let repository = TestWorkspace::new("terminal-promisor-repository");
+    let helper_workspace = TestWorkspace::new("terminal-promisor-helper");
+    let root = repository.canonical_directory();
+    let helper_root = helper_workspace.canonical_directory();
+    let marker = helper_root.join("upload-pack-must-not-run");
+    let upload_pack = helper_root.join("marker-upload-pack");
+    git(&executable, &root, &["init", "-b", "main"]);
+    fs::write(root.join("tracked.txt"), b"baseline content\n").expect("baseline file");
+    git(&executable, &root, &["add", "--", "."]);
+    git_with_identity(&executable, &root, &["commit", "-m", "baseline"]);
+    let baseline = clean_baseline(&executable, &root);
+    let source_blob = git_stdout(&executable, &root, &["rev-parse", "HEAD:tracked.txt"]);
+    write_executable(
+        &upload_pack,
+        format!("#!/bin/sh\n/usr/bin/touch '{}'\nexit 1\n", marker.display()).as_bytes(),
+    );
+    git(
+        &executable,
+        &root,
+        &["config", "core.repositoryformatversion", "1"],
+    );
+    git(
+        &executable,
+        &root,
+        &["config", "extensions.partialClone", "origin"],
+    );
+    git(
+        &executable,
+        &root,
+        &["config", "remote.origin.promisor", "true"],
+    );
+    git(
+        &executable,
+        &root,
+        &["config", "remote.origin.partialclonefilter", "blob:none"],
+    );
+    git(
+        &executable,
+        &root,
+        &[
+            "config",
+            "remote.origin.url",
+            root.to_str().expect("UTF-8 root"),
+        ],
+    );
+    git(
+        &executable,
+        &root,
+        &[
+            "config",
+            "remote.origin.uploadpack",
+            upload_pack.to_str().expect("UTF-8 upload-pack path"),
+        ],
+    );
+    let object_path = root
+        .join(".git/objects")
+        .join(&source_blob[..2])
+        .join(&source_blob[2..]);
+    fs::remove_file(root.join("tracked.txt")).expect("remove worktree file");
+    fs::remove_file(&object_path).expect("remove promised source blob");
+
+    assert!(matches!(
+        observe_changes_since_clean_baseline(&noexec_runner(), &executable, &root, &baseline,)
+            .expect_err("missing terminal blob"),
+        GitChangeObservationError::Observation(GitObservationError::CommandFailed {
+            phase: GitCommandPhase::ChangeSummary,
+            ..
+        })
+    ));
+    assert!(
+        !marker.exists(),
+        "remote upload-pack helper must not execute"
+    );
+    assert!(!object_path.exists(), "missing object must not be fetched");
+}
+
+#[test]
+fn rejects_a_terminal_receipt_that_changes_between_bounded_diff_reads() {
+    const OID: &str = "0123456789abcdef0123456789abcdef01234567";
+    let repository = TestWorkspace::new("unstable-repository");
+    let tool_workspace = TestWorkspace::new("unstable-tool");
+    let root = repository.canonical_directory();
+    let tool_root = tool_workspace.canonical_directory();
+    let fake_git = tool_root.join("git");
+    let changed = tool_root.join("changed");
+    write_executable(
+        &fake_git,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in\n  *\" --git-dir \"*) printf '%s\\n%s\\n' '{}' '{}' ;;\n  *\" rev-parse \"*) printf '%s\\n' '{}' ;;\n  *\" status \"*) printf '# branch.oid {OID}\\0# branch.head main\\0' ;;\n  *\" ls-files \"*) exit 0 ;;\n  *\" diff \"*) if [ -e '{}' ]; then printf '2\\t0\\tpath\\0'; else : > '{}'; printf '1\\t0\\tpath\\0'; fi ;;\n  *) exit 2 ;;\nesac\n",
+            root.display(),
+            root.display(),
+            root.display(),
+            changed.display(),
+            changed.display(),
+        )
+        .as_bytes(),
+    );
+    let path = std::env::join_paths([&tool_root]).expect("fake Git PATH");
+    let executable = inspect_git_on_path(Some(&path)).expect("inspect fake Git");
+    let baseline = clean_baseline(&executable, &root);
+
+    assert_eq!(
+        observe_changes_since_clean_baseline(&noexec_runner(), &executable, &root, &baseline,)
+            .expect_err("unstable diff"),
+        GitChangeObservationError::RepositoryChangedDuringObservation
     );
 }
 
@@ -386,6 +1084,14 @@ fn observe(
     root: &Path,
 ) -> Result<GitObservation, GitObservationError> {
     observe_repository(&noexec_runner(), executable, root)
+}
+
+fn clean_baseline(
+    executable: &flit_git::GitExecutable,
+    root: &Path,
+) -> flit_git::GitChangeBaseline {
+    observe_clean_change_baseline(&noexec_runner(), executable, root)
+        .expect("observe clean Git change baseline")
 }
 
 fn git(executable: &flit_git::GitExecutable, root: &Path, arguments: &[&str]) {

@@ -245,7 +245,7 @@ fn count_xy(value: &[u8], staged: &mut u32, unstaged: &mut u32) {
     }
 }
 
-fn valid_object_id(value: &[u8]) -> bool {
+pub(crate) fn valid_object_id(value: &[u8]) -> bool {
     matches!(value.len(), 40 | 64)
         && value
             .iter()
