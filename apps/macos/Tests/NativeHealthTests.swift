@@ -775,6 +775,55 @@ struct NativeHealthTests {
                     == [.lifecycle, .lifecycle],
             "native Run detail must preserve exact identity and chronological locator order"
         )
+        let categorizedRows = [
+            FlitRunEvidenceCategory.activity,
+            .command,
+            .file,
+            .test,
+            .attention,
+            .lifecycle,
+            .unknown,
+        ].enumerated().map { index, category in
+            RunActivityRow(
+                cursor: UInt64(index + 1),
+                eventId: "event-category-\(index)",
+                eventType: "fixture.category.\(index)",
+                category: category,
+                sourceKind: .core,
+                confidence: 1.0,
+                observedAt: "2026-08-05T00:00:0\(index).000Z"
+            )
+        }
+        try require(
+            RunActivityFilter.allCases == [
+                .all,
+                .activity,
+                .command,
+                .file,
+                .test,
+                .attention,
+                .lifecycle,
+            ],
+            "native Run detail filter order must match the documented category choices"
+        )
+        for (filter, expectedCategories) in [
+            (RunActivityFilter.all, categorizedRows.map(\.category)),
+            (.activity, [.activity]),
+            (.command, [.command]),
+            (.file, [.file]),
+            (.test, [.test]),
+            (.attention, [.attention]),
+            (.lifecycle, [.lifecycle]),
+        ] {
+            try require(
+                filter.visibleRows(in: categorizedRows).map(\.category) == expectedCategories,
+                "native Run detail filter must select only its exact generated category"
+            )
+        }
+        try require(
+            RunActivityFilter.all.visibleRows(in: categorizedRows).last?.category == .unknown,
+            "unknown evidence must remain visible in All without being reclassified"
+        )
         let beforeRunId = runDetailPresentation.runId
         let beforeCursor = runDetailPresentation.nextCursor
         let beforeEventIds = runDetailPresentation.events.map(\.eventId)
@@ -1943,6 +1992,66 @@ struct NativeHealthTests {
                 && detailIdentifiers.contains("flit.runDetail.event.3"),
             "native Run detail must expose stable back, title, and event identities"
         )
+        guard
+            let categoryFilter = detailViews.first(where: {
+                $0.accessibilityIdentifier() == "flit.runDetail.filter"
+            }) as? NSPopUpButton
+        else {
+            throw NativeHealthTestFailure.failed(
+                "native Run detail must expose its category filter"
+            )
+        }
+        try require(
+            categoryFilter.itemTitles == [
+                FoundationCopy.text(.runDetailFilterAll),
+                FoundationCopy.text(.runDetailFilterActivity),
+                FoundationCopy.text(.runDetailFilterCommand),
+                FoundationCopy.text(.runDetailFilterFile),
+                FoundationCopy.text(.runDetailFilterTest),
+                FoundationCopy.text(.runDetailFilterAttention),
+                FoundationCopy.text(.runDetailFilterLifecycle),
+            ]
+                && categoryFilter.titleOfSelectedItem
+                    == FoundationCopy.text(.runDetailFilterAll),
+            "native Run detail must default to All with stable documented filter choices"
+        )
+        categoryFilter.selectItem(
+            withTitle: FoundationCopy.text(.runDetailFilterCommand)
+        )
+        categoryFilter.sendAction(categoryFilter.action, to: categoryFilter.target)
+        let commandFilteredViews = descendants(of: detailController.view)
+        try require(
+            !commandFilteredViews.contains(where: {
+                $0.accessibilityIdentifier().hasPrefix("flit.runDetail.event.")
+            })
+                && commandFilteredViews.contains(where: {
+                    $0.accessibilityIdentifier()
+                        == "flit.runDetail.noMatchingEvents.command"
+                }),
+            "a category with no accepted rows must show a truthful filtered empty state"
+        )
+        guard
+            let updatedCategoryFilter = commandFilteredViews.first(where: {
+                $0.accessibilityIdentifier() == "flit.runDetail.filter"
+            }) as? NSPopUpButton
+        else {
+            throw NativeHealthTestFailure.failed(
+                "filtered Run detail must preserve its category control"
+            )
+        }
+        updatedCategoryFilter.selectItem(
+            withTitle: FoundationCopy.text(.runDetailFilterLifecycle)
+        )
+        updatedCategoryFilter.sendAction(
+            updatedCategoryFilter.action,
+            to: updatedCategoryFilter.target
+        )
+        try require(
+            descendants(of: detailController.view).filter({
+                $0.accessibilityIdentifier().hasPrefix("flit.runDetail.event.")
+            }).count == 3,
+            "selecting Lifecycle must restore only the accepted lifecycle rows"
+        )
         let detailCopy = detailViews.compactMap { ($0 as? NSTextField)?.stringValue }
         try require(
             detailCopy.contains(
@@ -2017,7 +2126,46 @@ struct NativeHealthTests {
         }
         pagedDetailButton.performClick(nil)
         guard
-            let loadMore = descendants(of: pagedController.view).first(where: {
+            let pagedCategoryFilter = descendants(of: pagedController.view).first(where: {
+                $0.accessibilityIdentifier() == "flit.runDetail.filter"
+            }) as? NSPopUpButton
+        else {
+            throw NativeHealthTestFailure.failed(
+                "paged Run detail must expose its category filter"
+            )
+        }
+        pagedCategoryFilter.selectItem(
+            withTitle: FoundationCopy.text(.runDetailFilterLifecycle)
+        )
+        pagedCategoryFilter.sendAction(
+            pagedCategoryFilter.action,
+            to: pagedCategoryFilter.target
+        )
+        let filteredFirstPageViews = descendants(of: pagedController.view)
+        let filteredFirstPageCopy = filteredFirstPageViews.compactMap {
+            ($0 as? NSTextField)?.stringValue
+        }
+        try require(
+            filteredFirstPageViews.contains(where: {
+                $0.accessibilityIdentifier()
+                    == "flit.runDetail.noMatchingLoadedEvents.lifecycle"
+            })
+                && filteredFirstPageCopy.contains(
+                    FoundationCopy.format(
+                        .runDetailNoMatchingLoadedEvents,
+                        FoundationCopy.text(.runDetailFilterLifecycle)
+                    )
+                )
+                && !filteredFirstPageCopy.contains(
+                    FoundationCopy.format(
+                        .runDetailNoMatchingEvents,
+                        FoundationCopy.text(.runDetailFilterLifecycle)
+                    )
+                ),
+            "a filtered non-tail page must scope its empty result to loaded activity"
+        )
+        guard
+            let loadMore = filteredFirstPageViews.first(where: {
                 $0.accessibilityIdentifier() == "flit.runDetail.loadMore"
             }) as? NSButton
         else {
@@ -2027,14 +2175,23 @@ struct NativeHealthTests {
         }
         loadMore.performClick(nil)
         let completedPageViews = descendants(of: pagedController.view)
+        let completedPageFilter = completedPageViews.first(where: {
+            $0.accessibilityIdentifier() == "flit.runDetail.filter"
+        }) as? NSPopUpButton
         try require(
             completedPageViews.contains(where: {
                 $0.accessibilityIdentifier() == "flit.runDetail.event.51"
             })
                 && !completedPageViews.contains(where: {
+                    $0.accessibilityIdentifier()
+                        == "flit.runDetail.noMatchingLoadedEvents.lifecycle"
+                })
+                && !completedPageViews.contains(where: {
                     $0.accessibilityIdentifier() == "flit.runDetail.loadMore"
-                }),
-            "explicit next-page load must append the tail and remove its control"
+                })
+                && completedPageFilter?.titleOfSelectedItem
+                    == FoundationCopy.text(.runDetailFilterLifecycle),
+            "explicit next-page load must append before filtering and preserve the selection"
         )
         let failingPageController = FoundationViewController(
             client: client,
@@ -2068,10 +2225,26 @@ struct NativeHealthTests {
             throw NativeHealthTestFailure.failed("failure page must expose Load more")
         }
         failingLoadMore.performClick(nil)
+        guard
+            let failedCategoryFilter = descendants(of: failingPageController.view).first(where: {
+                $0.accessibilityIdentifier() == "flit.runDetail.filter"
+            }) as? NSPopUpButton
+        else {
+            throw NativeHealthTestFailure.failed(
+                "failed Run detail page must preserve its category filter"
+            )
+        }
+        failedCategoryFilter.selectItem(
+            withTitle: FoundationCopy.text(.runDetailFilterLifecycle)
+        )
+        failedCategoryFilter.sendAction(
+            failedCategoryFilter.action,
+            to: failedCategoryFilter.target
+        )
         let failedPageViews = descendants(of: failingPageController.view)
         try require(
-            failedPageViews.contains(where: {
-                $0.accessibilityIdentifier() == "flit.runDetail.event.50"
+            !failedPageViews.contains(where: {
+                $0.accessibilityIdentifier().hasPrefix("flit.runDetail.event.")
             })
                 && failedPageViews.contains(where: {
                     $0.accessibilityIdentifier() == "flit.runDetail.loadMore"
@@ -2079,7 +2252,7 @@ struct NativeHealthTests {
                 && failedPageViews.contains(where: {
                     $0.accessibilityIdentifier() == "flit.runDetail.pageUnavailable"
                 }),
-            "failed next page must preserve rows and require another explicit click"
+            "failed next page must preserve accepted rows, retry, and failure across filtering"
         )
         let observedController = FoundationViewController(
             client: client,

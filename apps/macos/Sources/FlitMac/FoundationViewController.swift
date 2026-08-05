@@ -37,6 +37,8 @@ final class FoundationViewController: NSViewController {
     private var dashboardScroll: NSScrollView?
     private var activeRunDetail: RunDetailPresentationState?
     private var activeRunTitle: String?
+    private var activeRunDetailFilter = RunActivityFilter.all
+    private var activeRunDetailPageFailure = false
 
     init(
         client: SystemHealthClient,
@@ -330,6 +332,8 @@ final class FoundationViewController: NSViewController {
     }
 
     @objc private func showRunDetail(_ sender: RunDetailButton) {
+        activeRunDetailFilter = .all
+        activeRunDetailPageFailure = false
         do {
             let response = try runDetailClient.loadFirstPage(
                 runId: sender.runId,
@@ -354,6 +358,8 @@ final class FoundationViewController: NSViewController {
     @objc private func showDashboard(_: NSButton) {
         activeRunDetail = nil
         activeRunTitle = nil
+        activeRunDetailFilter = .all
+        activeRunDetailPageFailure = false
         renderDashboard()
     }
 
@@ -382,10 +388,29 @@ final class FoundationViewController: NSViewController {
                 requestedEventLimit: 50
             )
             activeRunDetail = detail
+            activeRunDetailPageFailure = false
             renderRunDetail(detail, runTitle: runTitle, pageFailure: false)
         } catch {
+            activeRunDetailPageFailure = true
             renderRunDetail(detail, runTitle: runTitle, pageFailure: true)
         }
+    }
+
+    @objc private func changeRunDetailFilter(_ sender: NSPopUpButton) {
+        guard
+            RunActivityFilter.allCases.indices.contains(sender.indexOfSelectedItem),
+            let detail = activeRunDetail,
+            let runTitle = activeRunTitle
+        else {
+            renderRunDetailFailure()
+            return
+        }
+        activeRunDetailFilter = RunActivityFilter.allCases[sender.indexOfSelectedItem]
+        renderRunDetail(
+            detail,
+            runTitle: runTitle,
+            pageFailure: activeRunDetailPageFailure
+        )
     }
 
     private func renderRunDetail(
@@ -435,17 +460,36 @@ final class FoundationViewController: NSViewController {
                 color: .secondaryLabelColor
             )
         )
-        if detail.events.isEmpty {
-            dashboardStack.addArrangedSubview(
-                label(
-                    FoundationCopy.text(.runDetailNoEvents),
-                    size: 12,
-                    weight: .regular,
-                    color: .secondaryLabelColor
+        dashboardStack.addArrangedSubview(runDetailFilterControl())
+        let visibleEvents = activeRunDetailFilter.visibleRows(in: detail.events)
+        if visibleEvents.isEmpty {
+            let emptyCopy: String
+            let emptyIdentifier: String
+            if activeRunDetailFilter == .all {
+                emptyCopy = FoundationCopy.text(.runDetailNoEvents)
+                emptyIdentifier = "flit.runDetail.noEvents"
+            } else {
+                emptyCopy = FoundationCopy.format(
+                    detail.hasMore
+                        ? .runDetailNoMatchingLoadedEvents
+                        : .runDetailNoMatchingEvents,
+                    runDetailFilterTitle(activeRunDetailFilter)
                 )
+                emptyIdentifier =
+                    "flit.runDetail.\(detail.hasMore ? "noMatchingLoadedEvents" : "noMatchingEvents").\(runDetailFilterIdentifier(activeRunDetailFilter))"
+            }
+            let empty = label(
+                emptyCopy,
+                size: 12,
+                weight: .regular,
+                color: .secondaryLabelColor
+            )
+            identify(empty, as: emptyIdentifier)
+            dashboardStack.addArrangedSubview(
+                empty
             )
         } else {
-            for event in detail.events {
+            for event in visibleEvents {
                 let row = label(
                     FoundationCopy.format(
                         .runDetailEvent,
@@ -482,6 +526,60 @@ final class FoundationViewController: NSViewController {
             dashboardStack.addArrangedSubview(failure)
         }
         scrollDashboardToTop()
+    }
+
+    private func runDetailFilterControl() -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 8
+
+        let filterLabel = label(
+            FoundationCopy.text(.runDetailFilter),
+            size: 12,
+            weight: .regular,
+            color: .secondaryLabelColor
+        )
+        identify(filterLabel, as: "flit.runDetail.filterLabel")
+        stack.addArrangedSubview(filterLabel)
+
+        let filter = NSPopUpButton()
+        filter.addItems(withTitles: RunActivityFilter.allCases.map(runDetailFilterTitle))
+        filter.selectItem(
+            at: RunActivityFilter.allCases.firstIndex(of: activeRunDetailFilter) ?? 0
+        )
+        filter.target = self
+        filter.action = #selector(changeRunDetailFilter(_:))
+        filter.setAccessibilityLabel(FoundationCopy.text(.runDetailFilter))
+        identify(filter, as: "flit.runDetail.filter")
+        stack.addArrangedSubview(filter)
+        return stack
+    }
+
+    private func runDetailFilterTitle(_ filter: RunActivityFilter) -> String {
+        let key: FoundationCopyKey
+        switch filter {
+        case .all: key = .runDetailFilterAll
+        case .activity: key = .runDetailFilterActivity
+        case .command: key = .runDetailFilterCommand
+        case .file: key = .runDetailFilterFile
+        case .test: key = .runDetailFilterTest
+        case .attention: key = .runDetailFilterAttention
+        case .lifecycle: key = .runDetailFilterLifecycle
+        }
+        return FoundationCopy.text(key)
+    }
+
+    private func runDetailFilterIdentifier(_ filter: RunActivityFilter) -> String {
+        switch filter {
+        case .all: "all"
+        case .activity: "activity"
+        case .command: "command"
+        case .file: "file"
+        case .test: "test"
+        case .attention: "attention"
+        case .lifecycle: "lifecycle"
+        }
     }
 
     private func renderRunDetailFailure() {

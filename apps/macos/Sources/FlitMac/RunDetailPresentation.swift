@@ -19,6 +19,33 @@ struct RunActivityRow: Sendable {
     let observedAt: String
 }
 
+enum RunActivityFilter: CaseIterable, Equatable, Sendable {
+    case all
+    case activity
+    case command
+    case file
+    case test
+    case attention
+    case lifecycle
+
+    func visibleRows(in rows: [RunActivityRow]) -> [RunActivityRow] {
+        guard let category else { return rows }
+        return rows.filter { $0.category == category }
+    }
+
+    private var category: FlitRunEvidenceCategory? {
+        switch self {
+        case .all: nil
+        case .activity: .activity
+        case .command: .command
+        case .file: .file
+        case .test: .test
+        case .attention: .attention
+        case .lifecycle: .lifecycle
+        }
+    }
+}
+
 struct RunDetailPresentationState: Sendable {
     private(set) var runId: String?
     private(set) var runVersion: UInt64?

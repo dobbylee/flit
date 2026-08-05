@@ -38,7 +38,17 @@ enum FoundationCopyKey: String {
     case runDetailBack = "runDetail.back"
     case runDetailCapability = "runDetail.capability"
     case runDetailEvent = "runDetail.event"
+    case runDetailFilter = "runDetail.filter"
+    case runDetailFilterActivity = "runDetail.filter.activity"
+    case runDetailFilterAll = "runDetail.filter.all"
+    case runDetailFilterAttention = "runDetail.filter.attention"
+    case runDetailFilterCommand = "runDetail.filter.command"
+    case runDetailFilterFile = "runDetail.filter.file"
+    case runDetailFilterLifecycle = "runDetail.filter.lifecycle"
+    case runDetailFilterTest = "runDetail.filter.test"
     case runDetailLoadMore = "runDetail.loadMore"
+    case runDetailNoMatchingLoadedEvents = "runDetail.noMatchingLoadedEvents"
+    case runDetailNoMatchingEvents = "runDetail.noMatchingEvents"
     case runDetailNoEvents = "runDetail.noEvents"
     case runDetailOpenInProvider = "runDetail.openInProvider"
     case runDetailPageUnavailable = "runDetail.pageUnavailable"
@@ -100,7 +110,17 @@ enum FoundationCopy {
         .runDetailBack: "Back to Dashboard",
         .runDetailCapability: "%@: %@",
         .runDetailEvent: "%@ · %@ · %@ · %d%% confidence",
+        .runDetailFilter: "Filter",
+        .runDetailFilterActivity: "Activity",
+        .runDetailFilterAll: "All",
+        .runDetailFilterAttention: "Attention",
+        .runDetailFilterCommand: "Command",
+        .runDetailFilterFile: "File",
+        .runDetailFilterLifecycle: "Lifecycle",
+        .runDetailFilterTest: "Test",
         .runDetailLoadMore: "Load more",
+        .runDetailNoMatchingLoadedEvents: "No %@ events are loaded yet",
+        .runDetailNoMatchingEvents: "No %@ events are available",
         .runDetailNoEvents: "No structured activity is available",
         .runDetailOpenInProvider: "Open in provider",
         .runDetailPageUnavailable: "More activity could not be loaded",
