@@ -516,6 +516,23 @@ final class FoundationViewController: NSViewController {
                 color: .secondaryLabelColor
             )
         )
+        let openInProvider = NSButton(
+            title: FoundationCopy.text(.runDetailOpenInProvider),
+            target: nil,
+            action: nil
+        )
+        openInProvider.bezelStyle = .inline
+        openInProvider.isEnabled = false
+        identify(openInProvider, as: "flit.runDetail.openInProvider")
+        dashboardStack.addArrangedSubview(openInProvider)
+        let openInProviderReason = label(
+            FoundationCopy.providerOpenUnavailableReason(openInProviderStatus),
+            size: 11,
+            weight: .regular,
+            color: .secondaryLabelColor
+        )
+        identify(openInProviderReason, as: "flit.runDetail.openInProvider.reason")
+        dashboardStack.addArrangedSubview(openInProviderReason)
         dashboardStack.addArrangedSubview(runDetailFilterControl())
         let visibleGroups = activeRunDetailFilter.visibleGroups(in: detail.events)
         if visibleGroups.isEmpty {

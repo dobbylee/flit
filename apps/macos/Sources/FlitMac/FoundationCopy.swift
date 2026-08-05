@@ -56,6 +56,11 @@ enum FoundationCopyKey: String {
     case runDetailNoMatchingEvents = "runDetail.noMatchingEvents"
     case runDetailNoEvents = "runDetail.noEvents"
     case runDetailOpenInProvider = "runDetail.openInProvider"
+    case runDetailOpenInProviderDegraded = "runDetail.openInProvider.degraded"
+    case runDetailOpenInProviderSupported = "runDetail.openInProvider.supported"
+    case runDetailOpenInProviderUnknown = "runDetail.openInProvider.unknown"
+    case runDetailOpenInProviderUnavailable = "runDetail.openInProvider.unavailable"
+    case runDetailOpenInProviderUnsupported = "runDetail.openInProvider.unsupported"
     case runDetailPageUnavailable = "runDetail.pageUnavailable"
     case runDetailProviderHistory = "runDetail.providerHistory"
     case runDetailRawPayloadUnavailable = "runDetail.rawPayloadUnavailable"
@@ -144,6 +149,16 @@ enum FoundationCopy {
         .runDetailNoMatchingEvents: "No %@ events are available",
         .runDetailNoEvents: "No structured activity is available",
         .runDetailOpenInProvider: "Open in provider",
+        .runDetailOpenInProviderDegraded:
+            "Open in provider is disabled because the capability is degraded",
+        .runDetailOpenInProviderSupported:
+            "Open in provider is disabled because this Flit build has no guarded open implementation",
+        .runDetailOpenInProviderUnknown:
+            "Open in provider is disabled because the capability is unknown",
+        .runDetailOpenInProviderUnavailable:
+            "Open in provider is disabled because the capability is unavailable",
+        .runDetailOpenInProviderUnsupported:
+            "Open in provider is disabled because this provider documents no open action",
         .runDetailPageUnavailable: "More activity could not be loaded",
         .runDetailProviderHistory: "Provider history",
         .runDetailRawPayloadUnavailable:
@@ -182,5 +197,17 @@ enum FoundationCopy {
 
     static func format(_ key: FoundationCopyKey, _ arguments: CVarArg...) -> String {
         String(format: text(key), arguments: arguments)
+    }
+
+    static func providerOpenUnavailableReason(_ status: FlitCapabilityStatus) -> String {
+        let key: FoundationCopyKey
+        switch status {
+        case .supported: key = .runDetailOpenInProviderSupported
+        case .degraded: key = .runDetailOpenInProviderDegraded
+        case .unsupported: key = .runDetailOpenInProviderUnsupported
+        case .unknown: key = .runDetailOpenInProviderUnknown
+        case .unavailable: key = .runDetailOpenInProviderUnavailable
+        }
+        return text(key)
     }
 }

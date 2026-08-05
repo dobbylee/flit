@@ -707,6 +707,18 @@ struct NativeHealthTests {
             reason == "git_observation_not_configured",
             "native presentation must not invent zero changes"
         )
+        let providerOpenReasons = [
+            FlitCapabilityStatus.supported,
+            .degraded,
+            .unsupported,
+            .unknown,
+            .unavailable,
+        ].map(FoundationCopy.providerOpenUnavailableReason)
+        try require(
+            Set(providerOpenReasons).count == 5
+                && providerOpenReasons.allSatisfy { $0.contains("disabled") },
+            "every provider-open capability status must remain distinctly non-actionable"
+        )
         _ = try decodeFixture(
             FlitRunDetailReadRequest.self,
             at: "\(fixtureRoot)/run_detail_read.request.json"
@@ -2134,6 +2146,27 @@ struct NativeHealthTests {
                 "native Run detail must expose its category filter"
             )
         }
+        guard
+            let providerOpenButton = detailViews.first(where: {
+                $0.accessibilityIdentifier() == "flit.runDetail.openInProvider"
+            }) as? NSButton
+        else {
+            throw NativeHealthTestFailure.failed(
+                "native Run detail must expose its provider-open capability control"
+            )
+        }
+        let detailInitialCopy = detailViews.compactMap {
+            ($0 as? NSTextField)?.stringValue
+        }
+        try require(
+            !providerOpenButton.isEnabled
+                && providerOpenButton.target == nil
+                && providerOpenButton.action == nil
+                && detailInitialCopy.contains(
+                    FoundationCopy.providerOpenUnavailableReason(.unsupported)
+                ),
+            "current unsupported provider open must be disabled with its exact reason"
+        )
         try require(
             initialCategoryFilter.itemTitles == [
                 FoundationCopy.text(.runDetailFilterAll),
@@ -2213,6 +2246,10 @@ struct NativeHealthTests {
             })
                 && commandFilteredViews.contains(where: {
                     $0.accessibilityIdentifier() == "flit.runDetail.completionSummary"
+                })
+                && commandFilteredViews.contains(where: {
+                    $0.accessibilityIdentifier() == "flit.runDetail.openInProvider"
+                        && ($0 as? NSButton)?.isEnabled == false
                 })
                 && commandFilteredViews.contains(where: {
                     $0.accessibilityIdentifier()
@@ -2498,6 +2535,9 @@ struct NativeHealthTests {
             completedPageViews.contains(where: {
                 $0.accessibilityIdentifier() == "flit.runDetail.event.51"
             })
+                && completedPageViews.contains(where: {
+                    $0.accessibilityIdentifier() == "flit.runDetail.openInProvider.reason"
+                })
                 && !completedPageViews.contains(where: {
                     $0.accessibilityIdentifier()
                         == "flit.runDetail.noMatchingLoadedEvents.lifecycle"
@@ -2576,7 +2616,10 @@ struct NativeHealthTests {
         try require(
             descendants(of: failingPageController.view).contains(where: {
                 $0.accessibilityIdentifier() == "flit.runDetail.evidence.50"
-            }),
+            })
+                && descendants(of: failingPageController.view).contains(where: {
+                    $0.accessibilityIdentifier() == "flit.runDetail.openInProvider.reason"
+                }),
             "failed next page must preserve expanded accepted evidence"
         )
         guard
