@@ -10,9 +10,12 @@ use std::{
 use rustix::fs::{Access, AtFlags, CWD, accessat};
 
 mod index;
+mod name_status;
 mod numstat;
+mod path_set;
 mod porcelain;
 mod process;
+mod relative_path;
 mod runner;
 
 use process::{ProcessError, ProcessPolicy, run_bounded};
@@ -95,6 +98,15 @@ impl GitChangeBaseline {
             self,
         )
     }
+
+    pub fn observe_change_set(&self) -> Result<GitChangeSet, GitChangeObservationError> {
+        observe_change_set_since_clean_baseline(
+            &self.runner,
+            &self.executable,
+            &self.project_directory.canonical_path,
+            self,
+        )
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -116,6 +128,115 @@ pub struct GitChangeSummary {
     pub files: u64,
     pub insertions: u64,
     pub deletions: u64,
+}
+
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+pub struct GitRelativePath(Vec<u8>);
+
+impl GitRelativePath {
+    pub fn new(value: Vec<u8>) -> Result<Self, GitChangeObservationError> {
+        relative_path::validate(&value)?;
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for GitRelativePath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("GitRelativePath(<redacted>)")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GitFileStatus {
+    Added,
+    Modified,
+    Deleted,
+    TypeChanged,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GitLineCounts {
+    pub insertions: u64,
+    pub deletions: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitFileChange {
+    path: GitRelativePath,
+    status: GitFileStatus,
+    committed: bool,
+    staged: bool,
+    unstaged: bool,
+    line_counts: Option<GitLineCounts>,
+}
+
+impl GitFileChange {
+    #[must_use]
+    pub fn path(&self) -> &GitRelativePath {
+        &self.path
+    }
+
+    #[must_use]
+    pub const fn status(&self) -> GitFileStatus {
+        self.status
+    }
+
+    #[must_use]
+    pub const fn committed(&self) -> bool {
+        self.committed
+    }
+
+    #[must_use]
+    pub const fn staged(&self) -> bool {
+        self.staged
+    }
+
+    #[must_use]
+    pub const fn unstaged(&self) -> bool {
+        self.unstaged
+    }
+
+    #[must_use]
+    pub const fn line_counts(&self) -> Option<GitLineCounts> {
+        self.line_counts
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct GitChangeSet {
+    changes: Vec<GitFileChange>,
+}
+
+impl GitChangeSet {
+    #[must_use]
+    pub fn changes(&self) -> &[GitFileChange] {
+        &self.changes
+    }
+
+    pub fn summary(&self) -> Result<GitChangeSummary, GitChangeObservationError> {
+        let mut summary = GitChangeSummary::default();
+        for change in &self.changes {
+            let counts = change
+                .line_counts
+                .ok_or(GitChangeObservationError::BinaryNumstat)?;
+            summary.files = add_change_count(summary.files, 1)?;
+            summary.insertions = add_change_count(summary.insertions, counts.insertions)?;
+            summary.deletions = add_change_count(summary.deletions, counts.deletions)?;
+        }
+        Ok(summary)
+    }
+}
+
+fn add_change_count(current: u64, increment: u64) -> Result<u64, GitChangeObservationError> {
+    current
+        .checked_add(increment)
+        .filter(|value| *value <= MAX_GIT_CHANGE_COUNT)
+        .ok_or(GitChangeObservationError::GitChangeCountTooLarge)
 }
 
 impl DirtySummary {
@@ -337,6 +458,38 @@ pub fn observe_changes_since_clean_baseline(
     canonical_project_directory: &Path,
     baseline: &GitChangeBaseline,
 ) -> Result<GitChangeSummary, GitChangeObservationError> {
+    observe_change_set_since_clean_baseline_with_policy(
+        runner,
+        executable,
+        canonical_project_directory,
+        baseline,
+        true,
+    )?
+    .summary()
+}
+
+pub fn observe_change_set_since_clean_baseline(
+    runner: &GitNoExecRunner,
+    executable: &GitExecutable,
+    canonical_project_directory: &Path,
+    baseline: &GitChangeBaseline,
+) -> Result<GitChangeSet, GitChangeObservationError> {
+    observe_change_set_since_clean_baseline_with_policy(
+        runner,
+        executable,
+        canonical_project_directory,
+        baseline,
+        false,
+    )
+}
+
+fn observe_change_set_since_clean_baseline_with_policy(
+    runner: &GitNoExecRunner,
+    executable: &GitExecutable,
+    canonical_project_directory: &Path,
+    baseline: &GitChangeBaseline,
+    reject_mixed_index_worktree_changes: bool,
+) -> Result<GitChangeSet, GitChangeObservationError> {
     if runner != &baseline.runner {
         return Err(GitChangeObservationError::BaselineRunnerMismatch);
     }
@@ -390,11 +543,14 @@ pub fn observe_changes_since_clean_baseline(
     if terminal_before.dirty.untracked != 0 {
         return Err(GitChangeObservationError::TerminalUntracked);
     }
-    if terminal_before.dirty.staged != 0 && terminal_before.dirty.unstaged != 0 {
+    if reject_mixed_index_worktree_changes
+        && terminal_before.dirty.staged != 0
+        && terminal_before.dirty.unstaged != 0
+    {
         return Err(GitChangeObservationError::MixedIndexWorktreeChangesUnsupported);
     }
 
-    let first = observe_numstat(runner, executable, &receipt.canonical_root, baseline_oid)?;
+    let first = observe_change_outputs(runner, executable, &receipt.canonical_root, baseline_oid)?;
     let terminal_middle = observe_status_at_root(
         runner,
         executable,
@@ -419,7 +575,7 @@ pub fn observe_changes_since_clean_baseline(
     if observe_index(runner, executable, &receipt.canonical_root)?.contains_submodules {
         return Err(GitChangeObservationError::SubmodulesUnsupportedForChanges);
     }
-    let second = observe_numstat(runner, executable, &receipt.canonical_root, baseline_oid)?;
+    let second = observe_change_outputs(runner, executable, &receipt.canonical_root, baseline_oid)?;
     if second != first {
         return Err(GitChangeObservationError::RepositoryChangedDuringObservation);
     }
@@ -447,7 +603,48 @@ pub fn observe_changes_since_clean_baseline(
     if observe_index(runner, executable, &receipt.canonical_root)?.contains_submodules {
         return Err(GitChangeObservationError::SubmodulesUnsupportedForChanges);
     }
-    numstat::parse(&first)
+    build_change_set(&first)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RawChangeOutputs {
+    numstat: Vec<u8>,
+    name_status: Vec<u8>,
+    committed_paths: Vec<u8>,
+    staged_paths: Vec<u8>,
+    unstaged_paths: Vec<u8>,
+}
+
+fn build_change_set(outputs: &RawChangeOutputs) -> Result<GitChangeSet, GitChangeObservationError> {
+    let counts = numstat::parse_records(&outputs.numstat)?;
+    let statuses = name_status::parse(&outputs.name_status)?;
+    if counts.keys().ne(statuses.keys()) {
+        return Err(GitChangeObservationError::ChangePathSetMismatch);
+    }
+    let committed = path_set::parse(&outputs.committed_paths)?;
+    let staged = path_set::parse(&outputs.staged_paths)?;
+    let unstaged = path_set::parse(&outputs.unstaged_paths)?;
+    let mut changes = Vec::with_capacity(statuses.len());
+    for (path, status) in statuses {
+        let is_committed = committed.contains(&path);
+        let is_staged = staged.contains(&path);
+        let is_unstaged = unstaged.contains(&path);
+        if !is_committed && !is_staged && !is_unstaged {
+            return Err(GitChangeObservationError::ChangePathSetMismatch);
+        }
+        changes.push(GitFileChange {
+            line_counts: counts
+                .get(&path)
+                .copied()
+                .ok_or(GitChangeObservationError::ChangePathSetMismatch)?,
+            path,
+            status,
+            committed: is_committed,
+            staged: is_staged,
+            unstaged: is_unstaged,
+        });
+    }
+    Ok(GitChangeSet { changes })
 }
 
 fn observe_index(
@@ -604,16 +801,50 @@ fn observe_status_at_root(
     Ok(receipt)
 }
 
-fn observe_numstat(
+fn observe_change_outputs(
     runner: &GitNoExecRunner,
     executable: &GitExecutable,
     canonical_root: &Path,
     baseline_oid: &str,
+) -> Result<RawChangeOutputs, GitChangeObservationError> {
+    Ok(RawChangeOutputs {
+        numstat: observe_change_output(
+            runner,
+            executable,
+            numstat_arguments(canonical_root, baseline_oid),
+        )?,
+        name_status: observe_change_output(
+            runner,
+            executable,
+            name_status_arguments(canonical_root, baseline_oid),
+        )?,
+        committed_paths: observe_change_output(
+            runner,
+            executable,
+            committed_path_arguments(canonical_root, baseline_oid),
+        )?,
+        staged_paths: observe_change_output(
+            runner,
+            executable,
+            staged_path_arguments(canonical_root),
+        )?,
+        unstaged_paths: observe_change_output(
+            runner,
+            executable,
+            unstaged_path_arguments(canonical_root),
+        )?,
+    })
+}
+
+fn observe_change_output(
+    runner: &GitNoExecRunner,
+    executable: &GitExecutable,
+    arguments: Vec<OsString>,
 ) -> Result<Vec<u8>, GitChangeObservationError> {
     let output = run_git(
         runner,
         executable,
-        numstat_arguments(canonical_root, baseline_oid),
+        arguments,
         GitCommandPhase::ChangeSummary,
     )?;
     Ok(require_successful_output(
@@ -687,18 +918,68 @@ fn status_arguments(root: &Path) -> Vec<OsString> {
 }
 
 fn numstat_arguments(root: &Path, baseline_oid: &str) -> Vec<OsString> {
+    diff_arguments(root)
+        .into_iter()
+        .chain([
+            OsString::from("--numstat"),
+            OsString::from(baseline_oid),
+            OsString::from("--"),
+        ])
+        .collect()
+}
+
+fn name_status_arguments(root: &Path, baseline_oid: &str) -> Vec<OsString> {
+    diff_arguments(root)
+        .into_iter()
+        .chain([
+            OsString::from("--name-status"),
+            OsString::from(baseline_oid),
+            OsString::from("--"),
+        ])
+        .collect()
+}
+
+fn committed_path_arguments(root: &Path, baseline_oid: &str) -> Vec<OsString> {
+    diff_arguments(root)
+        .into_iter()
+        .chain([
+            OsString::from("--name-only"),
+            OsString::from(baseline_oid),
+            OsString::from("HEAD"),
+            OsString::from("--"),
+        ])
+        .collect()
+}
+
+fn staged_path_arguments(root: &Path) -> Vec<OsString> {
+    diff_arguments(root)
+        .into_iter()
+        .chain([
+            OsString::from("--cached"),
+            OsString::from("--name-only"),
+            OsString::from("HEAD"),
+            OsString::from("--"),
+        ])
+        .collect()
+}
+
+fn unstaged_path_arguments(root: &Path) -> Vec<OsString> {
+    diff_arguments(root)
+        .into_iter()
+        .chain([OsString::from("--name-only"), OsString::from("--")])
+        .collect()
+}
+
+fn diff_arguments(root: &Path) -> Vec<OsString> {
     base_arguments(root)
         .into_iter()
         .chain([
             OsString::from("diff"),
-            OsString::from("--numstat"),
             OsString::from("-z"),
             OsString::from("--no-renames"),
             OsString::from("--no-ext-diff"),
             OsString::from("--no-textconv"),
             OsString::from("--ignore-submodules=all"),
-            OsString::from(baseline_oid),
-            OsString::from("--"),
         ])
         .collect()
 }
@@ -1023,10 +1304,18 @@ pub enum GitChangeObservationError {
     TerminalRepositoryMismatch,
     TerminalUntracked,
     RepositoryChangedDuringObservation,
+    InvalidRelativePath,
     MalformedNumstat,
     DuplicateNumstatRecord,
     BinaryNumstat,
     TooManyNumstatEntries,
+    MalformedNameStatus,
+    DuplicateNameStatusRecord,
+    TooManyNameStatusEntries,
+    MalformedPathSet,
+    DuplicatePathSetRecord,
+    TooManyPathSetEntries,
+    ChangePathSetMismatch,
     GitChangeCountTooLarge,
     MalformedRepositoryIdentity,
     RepositoryIdentityChanged,
@@ -1109,10 +1398,18 @@ impl fmt::Display for GitChangeObservationError {
             Self::RepositoryChangedDuringObservation => {
                 "the repository changed during terminal Git observation"
             }
+            Self::InvalidRelativePath => "Git returned an invalid relative path",
             Self::MalformedNumstat => "Git returned malformed numstat output",
             Self::DuplicateNumstatRecord => "Git returned a duplicate numstat record",
             Self::BinaryNumstat => "Git returned a binary numstat record",
             Self::TooManyNumstatEntries => "Git returned too many numstat entries",
+            Self::MalformedNameStatus => "Git returned malformed name-status output",
+            Self::DuplicateNameStatusRecord => "Git returned a duplicate name-status record",
+            Self::TooManyNameStatusEntries => "Git returned too many name-status entries",
+            Self::MalformedPathSet => "Git returned a malformed path-set output",
+            Self::DuplicatePathSetRecord => "Git returned a duplicate path-set record",
+            Self::TooManyPathSetEntries => "Git returned too many path-set entries",
+            Self::ChangePathSetMismatch => "Git returned inconsistent per-file change facts",
             Self::GitChangeCountTooLarge => "Git returned a change count that exceeded its bound",
             Self::MalformedRepositoryIdentity => "Git returned a malformed repository identity",
             Self::RepositoryIdentityChanged => {

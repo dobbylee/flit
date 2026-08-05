@@ -1,44 +1,58 @@
-use std::collections::HashSet;
+use std::collections::BTreeMap;
 
+#[cfg(test)]
+use crate::GitChangeSummary;
 use crate::{
-    GitChangeObservationError, GitChangeSummary, GitObservationError, MAX_GIT_CHANGE_COUNT,
-    MAX_GIT_PATH_BYTES, MAX_GIT_STATUS_ENTRIES,
+    GitChangeObservationError, GitLineCounts, GitRelativePath, MAX_GIT_CHANGE_COUNT,
+    MAX_GIT_STATUS_ENTRIES,
 };
 
+#[cfg(test)]
 pub(crate) fn parse(output: &[u8]) -> Result<GitChangeSummary, GitChangeObservationError> {
+    let records = parse_records(output)?;
+    let mut summary = GitChangeSummary::default();
+    for counts in records.values() {
+        let counts = counts.ok_or(GitChangeObservationError::BinaryNumstat)?;
+        summary.files = add_count(summary.files, 1)?;
+        summary.insertions = add_count(summary.insertions, counts.insertions)?;
+        summary.deletions = add_count(summary.deletions, counts.deletions)?;
+    }
+    Ok(summary)
+}
+
+pub(crate) fn parse_records(
+    output: &[u8],
+) -> Result<BTreeMap<GitRelativePath, Option<GitLineCounts>>, GitChangeObservationError> {
     if output.is_empty() {
-        return Ok(GitChangeSummary::default());
+        return Ok(BTreeMap::new());
     }
     if !output.ends_with(&[0]) {
         return Err(GitChangeObservationError::MalformedNumstat);
     }
 
-    let mut summary = GitChangeSummary::default();
-    let mut paths = HashSet::<Vec<u8>>::new();
+    let mut records = BTreeMap::new();
     for record in output[..output.len() - 1].split(|byte| *byte == 0) {
         let fields = record.splitn(3, |byte| *byte == b'\t').collect::<Vec<_>>();
         if fields.len() != 3 || fields[2].is_empty() {
             return Err(GitChangeObservationError::MalformedNumstat);
         }
-        if fields[2].len() > MAX_GIT_PATH_BYTES {
-            return Err(GitObservationError::GitPathTooLong.into());
-        }
-        if !paths.insert(fields[2].to_vec()) {
+        let path = GitRelativePath::new(fields[2].to_vec())?;
+        let counts = if fields[0] == b"-" && fields[1] == b"-" {
+            None
+        } else {
+            Some(GitLineCounts {
+                insertions: parse_count(fields[0])?,
+                deletions: parse_count(fields[1])?,
+            })
+        };
+        if records.insert(path, counts).is_some() {
             return Err(GitChangeObservationError::DuplicateNumstatRecord);
         }
-        if fields[0] == b"-" && fields[1] == b"-" {
-            return Err(GitChangeObservationError::BinaryNumstat);
-        }
-        let insertions = parse_count(fields[0])?;
-        let deletions = parse_count(fields[1])?;
-        summary.files = add_count(summary.files, 1)?;
-        if summary.files as usize > MAX_GIT_STATUS_ENTRIES {
+        if records.len() > MAX_GIT_STATUS_ENTRIES {
             return Err(GitChangeObservationError::TooManyNumstatEntries);
         }
-        summary.insertions = add_count(summary.insertions, insertions)?;
-        summary.deletions = add_count(summary.deletions, deletions)?;
     }
-    Ok(summary)
+    Ok(records)
 }
 
 fn parse_count(value: &[u8]) -> Result<u64, GitChangeObservationError> {
@@ -58,6 +72,7 @@ fn parse_count(value: &[u8]) -> Result<u64, GitChangeObservationError> {
     Ok(value)
 }
 
+#[cfg(test)]
 fn add_count(current: u64, increment: u64) -> Result<u64, GitChangeObservationError> {
     current
         .checked_add(increment)
@@ -67,7 +82,7 @@ fn add_count(current: u64, increment: u64) -> Result<u64, GitChangeObservationEr
 
 #[cfg(test)]
 mod tests {
-    use super::parse;
+    use super::{parse, parse_records};
     use crate::{
         GitChangeObservationError, GitChangeSummary, GitObservationError, MAX_GIT_CHANGE_COUNT,
         MAX_GIT_PATH_BYTES, MAX_GIT_STATUS_ENTRIES,
@@ -88,6 +103,8 @@ mod tests {
 
     #[test]
     fn rejects_binary_malformed_duplicate_and_unbounded_records() {
+        let binary = parse_records(b"-\t-\tbinary\0").expect("binary record metadata");
+        assert_eq!(binary.values().next(), Some(&None));
         assert_eq!(
             parse(b"-\t-\tbinary\0").expect_err("binary record"),
             GitChangeObservationError::BinaryNumstat

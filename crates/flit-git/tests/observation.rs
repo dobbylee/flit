@@ -8,10 +8,10 @@ use std::{
 };
 
 use flit_git::{
-    DirtySummary, GitChangeObservationError, GitChangeSummary, GitCommandPhase, GitHead,
-    GitObservation, GitObservationError, GitRunnerFailure, NotWorktreeReason, inspect_git_on_path,
-    inspect_noexec_runner_at, observe_changes_since_clean_baseline, observe_clean_change_baseline,
-    observe_repository,
+    DirtySummary, GitChangeObservationError, GitChangeSummary, GitCommandPhase, GitFileStatus,
+    GitHead, GitLineCounts, GitObservation, GitObservationError, GitRunnerFailure,
+    NotWorktreeReason, inspect_git_on_path, inspect_noexec_runner_at,
+    observe_changes_since_clean_baseline, observe_clean_change_baseline, observe_repository,
 };
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -149,6 +149,207 @@ fn observes_exact_tracked_changes_since_a_clean_baseline_without_paths() {
             insertions: 3,
             deletions: 2,
         }
+    );
+}
+
+#[test]
+fn observes_exact_per_file_change_facts_across_terminal_git_layers() {
+    let executable = installed_git();
+    let workspace = TestWorkspace::new("change-facts");
+    let root = workspace.canonical_directory();
+    git(&executable, &root, &["init", "-b", "main"]);
+    fs::write(root.join("modified.txt"), b"one\ntwo\n").expect("modified baseline file");
+    fs::write(root.join("removed.txt"), b"removed\n").expect("removed baseline file");
+    git(&executable, &root, &["add", "--", "."]);
+    git_with_identity(&executable, &root, &["commit", "-m", "baseline"]);
+    let baseline = clean_baseline(&executable, &root);
+    assert!(
+        baseline
+            .observe_change_set()
+            .expect("unchanged set")
+            .changes()
+            .is_empty()
+    );
+
+    fs::write(root.join("modified.txt"), b"one\nthree\n").expect("modified terminal file");
+    fs::remove_file(root.join("removed.txt")).expect("removed terminal file");
+    fs::write(root.join("added.txt"), b"added\nlines\n").expect("added terminal file");
+    git(&executable, &root, &["add", "-A"]);
+
+    let staged = baseline.observe_change_set().expect("staged change facts");
+    assert_eq!(staged.changes().len(), 3);
+    assert_change(
+        &staged,
+        b"added.txt",
+        GitFileStatus::Added,
+        [false, true, false],
+        Some(GitLineCounts {
+            insertions: 2,
+            deletions: 0,
+        }),
+    );
+    assert_change(
+        &staged,
+        b"modified.txt",
+        GitFileStatus::Modified,
+        [false, true, false],
+        Some(GitLineCounts {
+            insertions: 1,
+            deletions: 1,
+        }),
+    );
+    assert_change(
+        &staged,
+        b"removed.txt",
+        GitFileStatus::Deleted,
+        [false, true, false],
+        Some(GitLineCounts {
+            insertions: 0,
+            deletions: 1,
+        }),
+    );
+
+    git_with_identity(&executable, &root, &["commit", "-m", "terminal"]);
+    fs::write(root.join("modified.txt"), b"one\nfour\n").expect("unstaged terminal file");
+    let layered = baseline.observe_change_set().expect("layered change facts");
+    assert_change(
+        &layered,
+        b"modified.txt",
+        GitFileStatus::Modified,
+        [true, false, true],
+        Some(GitLineCounts {
+            insertions: 1,
+            deletions: 1,
+        }),
+    );
+    assert_change(
+        &layered,
+        b"added.txt",
+        GitFileStatus::Added,
+        [true, false, false],
+        Some(GitLineCounts {
+            insertions: 2,
+            deletions: 0,
+        }),
+    );
+}
+
+#[test]
+fn observes_overlapping_and_distinct_staged_and_unstaged_layers() {
+    let executable = installed_git();
+    let workspace = TestWorkspace::new("mixed-change-facts");
+    let root = workspace.canonical_directory();
+    git(&executable, &root, &["init", "-b", "main"]);
+    for path in ["both.txt", "staged.txt", "unstaged.txt"] {
+        fs::write(root.join(path), b"baseline\n").expect("baseline file");
+    }
+    git(&executable, &root, &["add", "--", "."]);
+    git_with_identity(&executable, &root, &["commit", "-m", "baseline"]);
+    let baseline = clean_baseline(&executable, &root);
+
+    fs::write(root.join("both.txt"), b"staged\n").expect("staged overlap");
+    fs::write(root.join("staged.txt"), b"staged\n").expect("staged only");
+    git(&executable, &root, &["add", "--", "both.txt", "staged.txt"]);
+    fs::write(root.join("both.txt"), b"terminal\n").expect("unstaged overlap");
+    fs::write(root.join("unstaged.txt"), b"unstaged\n").expect("unstaged only");
+
+    let changes = baseline.observe_change_set().expect("mixed layer facts");
+    assert_change(
+        &changes,
+        b"both.txt",
+        GitFileStatus::Modified,
+        [false, true, true],
+        Some(GitLineCounts {
+            insertions: 1,
+            deletions: 1,
+        }),
+    );
+    assert_change(
+        &changes,
+        b"staged.txt",
+        GitFileStatus::Modified,
+        [false, true, false],
+        Some(GitLineCounts {
+            insertions: 1,
+            deletions: 1,
+        }),
+    );
+    assert_change(
+        &changes,
+        b"unstaged.txt",
+        GitFileStatus::Modified,
+        [false, false, true],
+        Some(GitLineCounts {
+            insertions: 1,
+            deletions: 1,
+        }),
+    );
+    assert_eq!(
+        baseline
+            .observe_changes()
+            .expect_err("legacy mixed-state contract"),
+        GitChangeObservationError::MixedIndexWorktreeChangesUnsupported
+    );
+}
+
+#[test]
+fn ignores_intermediate_layer_changes_that_cancel_at_the_terminal_worktree() {
+    let executable = installed_git();
+    let workspace = TestWorkspace::new("cancelled-change-facts");
+    let root = workspace.canonical_directory();
+    git(&executable, &root, &["init", "-b", "main"]);
+    fs::write(root.join("tracked.txt"), b"baseline\n").expect("baseline file");
+    git(&executable, &root, &["add", "--", "."]);
+    git_with_identity(&executable, &root, &["commit", "-m", "baseline"]);
+    let baseline = clean_baseline(&executable, &root);
+
+    fs::write(root.join("tracked.txt"), b"committed\n").expect("committed content");
+    git(&executable, &root, &["add", "--", "tracked.txt"]);
+    git_with_identity(&executable, &root, &["commit", "-m", "intermediate"]);
+    fs::write(root.join("tracked.txt"), b"baseline\n").expect("cancel at terminal");
+
+    assert!(
+        baseline
+            .observe_change_set()
+            .expect("cancelled detailed change set")
+            .changes()
+            .is_empty()
+    );
+    assert_eq!(
+        baseline
+            .observe_changes()
+            .expect("cancelled legacy summary"),
+        GitChangeSummary::default()
+    );
+}
+
+#[test]
+fn preserves_binary_path_metadata_in_the_detailed_view() {
+    let executable = installed_git();
+    let workspace = TestWorkspace::new("raw-change-facts");
+    let root = workspace.canonical_directory();
+    git(&executable, &root, &["init", "-b", "main"]);
+    fs::write(root.join(".gitattributes"), b"binary.bin binary\n").expect("attributes");
+    fs::write(root.join("binary.bin"), b"baseline\0bytes").expect("binary baseline");
+    git(&executable, &root, &["add", "--", "."]);
+    git_with_identity(&executable, &root, &["commit", "-m", "baseline"]);
+    let baseline = clean_baseline(&executable, &root);
+
+    fs::write(root.join("binary.bin"), b"changed\0bytes").expect("binary terminal file");
+    git(&executable, &root, &["add", "--", "binary.bin"]);
+    let binary = baseline.observe_change_set().expect("binary metadata");
+    assert_change(
+        &binary,
+        b"binary.bin",
+        GitFileStatus::Modified,
+        [false, true, false],
+        None,
+    );
+    assert_eq!(
+        binary
+            .summary()
+            .expect_err("binary aggregate remains unavailable"),
+        GitChangeObservationError::BinaryNumstat
     );
 }
 
@@ -1104,6 +1305,26 @@ fn git(executable: &flit_git::GitExecutable, root: &Path, arguments: &[&str]) {
         .status()
         .expect("run Git");
     assert!(status.success(), "Git command failed: {arguments:?}");
+}
+
+fn assert_change(
+    set: &flit_git::GitChangeSet,
+    path: &[u8],
+    status: GitFileStatus,
+    layers: [bool; 3],
+    line_counts: Option<GitLineCounts>,
+) {
+    let change = set
+        .changes()
+        .iter()
+        .find(|change| change.path().as_bytes() == path)
+        .expect("change path");
+    assert_eq!(change.status(), status);
+    assert_eq!(
+        [change.committed(), change.staged(), change.unstaged()],
+        layers
+    );
+    assert_eq!(change.line_counts(), line_counts);
 }
 
 fn git_with_identity(executable: &flit_git::GitExecutable, root: &Path, arguments: &[&str]) {
