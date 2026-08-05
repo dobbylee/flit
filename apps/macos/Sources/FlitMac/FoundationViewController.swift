@@ -23,6 +23,24 @@ private final class RunDetailButton: NSButton {
     }
 }
 
+private final class RunEvidenceButton: NSButton {
+    let runId: String
+    let eventId: String
+    let cursor: UInt64
+
+    init(runId: String, eventId: String, cursor: UInt64) {
+        self.runId = runId
+        self.eventId = eventId
+        self.cursor = cursor
+        super.init(frame: .zero)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
+}
+
 @MainActor
 final class FoundationViewController: NSViewController {
     private let client: SystemHealthClient
@@ -39,6 +57,8 @@ final class FoundationViewController: NSViewController {
     private var activeRunTitle: String?
     private var activeRunDetailFilter = RunActivityFilter.all
     private var activeRunDetailPageFailure = false
+    private var expandedRunEvidenceIds: Set<String> = []
+    private var runEvidenceButtonsByCursor: [UInt64: NSButton] = [:]
 
     init(
         client: SystemHealthClient,
@@ -334,6 +354,7 @@ final class FoundationViewController: NSViewController {
     @objc private func showRunDetail(_ sender: RunDetailButton) {
         activeRunDetailFilter = .all
         activeRunDetailPageFailure = false
+        expandedRunEvidenceIds = []
         do {
             let response = try runDetailClient.loadFirstPage(
                 runId: sender.runId,
@@ -360,6 +381,7 @@ final class FoundationViewController: NSViewController {
         activeRunTitle = nil
         activeRunDetailFilter = .all
         activeRunDetailPageFailure = false
+        expandedRunEvidenceIds = []
         renderDashboard()
     }
 
@@ -413,10 +435,33 @@ final class FoundationViewController: NSViewController {
         )
     }
 
+    @objc private func toggleRunEvidence(_ sender: RunEvidenceButton) {
+        guard
+            let detail = activeRunDetail,
+            let runTitle = activeRunTitle,
+            detail.runId == sender.runId,
+            detail.events.contains(where: {
+                $0.eventId == sender.eventId && $0.cursor == sender.cursor
+            })
+        else {
+            return
+        }
+        if !expandedRunEvidenceIds.insert(sender.eventId).inserted {
+            expandedRunEvidenceIds.remove(sender.eventId)
+        }
+        renderRunDetail(
+            detail,
+            runTitle: runTitle,
+            pageFailure: activeRunDetailPageFailure,
+            focusedEvidenceCursor: sender.cursor
+        )
+    }
+
     private func renderRunDetail(
         _ detail: RunDetailPresentationState,
         runTitle: String,
-        pageFailure: Bool
+        pageFailure: Bool,
+        focusedEvidenceCursor: UInt64? = nil
     ) {
         guard
             let dashboardStack,
@@ -491,12 +536,18 @@ final class FoundationViewController: NSViewController {
         } else {
             for group in visibleGroups {
                 if group.events.count == 1 {
-                    dashboardStack.addArrangedSubview(runDetailEventRow(group.events[0]))
+                    dashboardStack.addArrangedSubview(
+                        runDetailEventView(group.events[0], runId: runId)
+                    )
                 } else {
                     let hasUnloadedTail = detail.hasMore
                         && group.events.last?.cursor == detail.events.last?.cursor
                     dashboardStack.addArrangedSubview(
-                        runDetailGroup(group, hasUnloadedTail: hasUnloadedTail)
+                        runDetailGroup(
+                            group,
+                            runId: runId,
+                            hasUnloadedTail: hasUnloadedTail
+                        )
                     )
                 }
             }
@@ -521,11 +572,16 @@ final class FoundationViewController: NSViewController {
             identify(failure, as: "flit.runDetail.pageUnavailable")
             dashboardStack.addArrangedSubview(failure)
         }
-        scrollDashboardToTop()
+        if let focusedEvidenceCursor {
+            restoreRunEvidenceFocus(focusedEvidenceCursor)
+        } else {
+            scrollDashboardToTop()
+        }
     }
 
     private func runDetailGroup(
         _ group: RunActivityGroup,
+        runId: String,
         hasUnloadedTail: Bool
     ) -> NSView {
         let stack = NSStackView()
@@ -550,11 +606,17 @@ final class FoundationViewController: NSViewController {
         )
         identify(header, as: "flit.runDetail.groupHeader.\(first.cursor).\(last.cursor)")
         stack.addArrangedSubview(header)
-        group.events.forEach { stack.addArrangedSubview(runDetailEventRow($0)) }
+        group.events.forEach {
+            stack.addArrangedSubview(runDetailEventView($0, runId: runId))
+        }
         return stack
     }
 
-    private func runDetailEventRow(_ event: RunActivityRow) -> NSView {
+    private func runDetailEventView(_ event: RunActivityRow, runId: String) -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 2
         let row = label(
             FoundationCopy.format(
                 .runDetailEvent,
@@ -567,7 +629,56 @@ final class FoundationViewController: NSViewController {
             weight: .regular
         )
         identify(row, as: "flit.runDetail.event.\(event.cursor)")
-        return row
+        stack.addArrangedSubview(row)
+
+        let toggle = RunEvidenceButton(
+            runId: runId,
+            eventId: event.eventId,
+            cursor: event.cursor
+        )
+        toggle.title = FoundationCopy.text(
+            expandedRunEvidenceIds.contains(event.eventId)
+                ? .runDetailHideEvidence
+                : .runDetailShowEvidence
+        )
+        toggle.bezelStyle = .inline
+        toggle.target = self
+        toggle.action = #selector(toggleRunEvidence(_:))
+        identify(toggle, as: "flit.runDetail.evidenceToggle.\(event.cursor)")
+        runEvidenceButtonsByCursor[event.cursor] = toggle
+        stack.addArrangedSubview(toggle)
+
+        if expandedRunEvidenceIds.contains(event.eventId) {
+            let evidence = label(
+                FoundationCopy.format(
+                    .runDetailEvidence,
+                    event.eventId,
+                    event.eventType,
+                    runDetailCategoryTitle(event.category),
+                    event.sourceKind.rawValue,
+                    Int(event.confidence * 100),
+                    event.observedAt
+                ),
+                size: 11,
+                weight: .regular,
+                color: .secondaryLabelColor
+            )
+            evidence.maximumNumberOfLines = 2
+            identify(evidence, as: "flit.runDetail.evidence.\(event.cursor)")
+            stack.addArrangedSubview(evidence)
+            let rawUnavailable = label(
+                FoundationCopy.text(.runDetailRawPayloadUnavailable),
+                size: 11,
+                weight: .regular,
+                color: .secondaryLabelColor
+            )
+            identify(
+                rawUnavailable,
+                as: "flit.runDetail.rawPayloadUnavailable.\(event.cursor)"
+            )
+            stack.addArrangedSubview(rawUnavailable)
+        }
+        return stack
     }
 
     private func runDetailFilterControl() -> NSView {
@@ -621,7 +732,7 @@ final class FoundationViewController: NSViewController {
         case .test: filter = .test
         case .attention: filter = .attention
         case .lifecycle: filter = .lifecycle
-        case .unknown: preconditionFailure("Unknown evidence cannot form a group")
+        case .unknown: return FoundationCopy.text(.runDetailEvidenceUnknown)
         }
         return runDetailFilterTitle(filter)
     }
@@ -666,6 +777,7 @@ final class FoundationViewController: NSViewController {
 
     private func clearDashboardStack() {
         guard let dashboardStack else { return }
+        runEvidenceButtonsByCursor.removeAll(keepingCapacity: true)
         dashboardStack.arrangedSubviews.forEach { view in
             dashboardStack.removeArrangedSubview(view)
             view.removeFromSuperview()
@@ -677,6 +789,16 @@ final class FoundationViewController: NSViewController {
         dashboardScroll.documentView?.layoutSubtreeIfNeeded()
         dashboardScroll.contentView.scroll(to: .zero)
         dashboardScroll.reflectScrolledClipView(dashboardScroll.contentView)
+    }
+
+    private func restoreRunEvidenceFocus(_ cursor: UInt64) {
+        guard let button = runEvidenceButtonsByCursor[cursor] else {
+            scrollDashboardToTop()
+            return
+        }
+        dashboardScroll?.documentView?.layoutSubtreeIfNeeded()
+        button.scrollToVisible(button.bounds)
+        button.window?.makeFirstResponder(button)
     }
 
     private func label(

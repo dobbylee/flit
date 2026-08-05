@@ -37,6 +37,8 @@ enum FoundationCopyKey: String {
     case quitTitle = "lifecycle.quit.title"
     case runDetailBack = "runDetail.back"
     case runDetailCapability = "runDetail.capability"
+    case runDetailEvidence = "runDetail.evidence"
+    case runDetailEvidenceUnknown = "runDetail.evidence.unknown"
     case runDetailEvent = "runDetail.event"
     case runDetailFilter = "runDetail.filter"
     case runDetailFilterActivity = "runDetail.filter.activity"
@@ -48,6 +50,7 @@ enum FoundationCopyKey: String {
     case runDetailFilterTest = "runDetail.filter.test"
     case runDetailGroup = "runDetail.group"
     case runDetailGroupLoadedThrough = "runDetail.group.loadedThrough"
+    case runDetailHideEvidence = "runDetail.hideEvidence"
     case runDetailLoadMore = "runDetail.loadMore"
     case runDetailNoMatchingLoadedEvents = "runDetail.noMatchingLoadedEvents"
     case runDetailNoMatchingEvents = "runDetail.noMatchingEvents"
@@ -55,6 +58,8 @@ enum FoundationCopyKey: String {
     case runDetailOpenInProvider = "runDetail.openInProvider"
     case runDetailPageUnavailable = "runDetail.pageUnavailable"
     case runDetailProviderHistory = "runDetail.providerHistory"
+    case runDetailRawPayloadUnavailable = "runDetail.rawPayloadUnavailable"
+    case runDetailShowEvidence = "runDetail.showEvidence"
     case runDetailTitle = "runDetail.title"
     case runDetailUnavailable = "runDetail.unavailable"
     case noControls = "foundation.noControls"
@@ -111,6 +116,8 @@ enum FoundationCopy {
         .quitTitle: "Quit Flit?",
         .runDetailBack: "Back to Dashboard",
         .runDetailCapability: "%@: %@",
+        .runDetailEvidence: "Evidence %@ · %@ · %@ · %@ · %d%% · captured %@",
+        .runDetailEvidenceUnknown: "Unknown",
         .runDetailEvent: "%@ · %@ · %@ · %d%% confidence",
         .runDetailFilter: "Filter",
         .runDetailFilterActivity: "Activity",
@@ -122,6 +129,7 @@ enum FoundationCopy {
         .runDetailFilterTest: "Test",
         .runDetailGroup: "%@ – %@ · %@ · %d events",
         .runDetailGroupLoadedThrough: "Started %@ · loaded through %@ · %@ · %d events",
+        .runDetailHideEvidence: "Hide evidence",
         .runDetailLoadMore: "Load more",
         .runDetailNoMatchingLoadedEvents: "No %@ events are loaded yet",
         .runDetailNoMatchingEvents: "No %@ events are available",
@@ -129,6 +137,9 @@ enum FoundationCopy {
         .runDetailOpenInProvider: "Open in provider",
         .runDetailPageUnavailable: "More activity could not be loaded",
         .runDetailProviderHistory: "Provider history",
+        .runDetailRawPayloadUnavailable:
+            "Raw payload unavailable in this bounded activity view",
+        .runDetailShowEvidence: "Show evidence",
         .runDetailTitle: "Activity · %@",
         .runDetailUnavailable: "Run activity unavailable",
         .noControls: "No agent controls yet",

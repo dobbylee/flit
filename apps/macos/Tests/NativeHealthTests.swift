@@ -2022,6 +2022,9 @@ struct NativeHealthTests {
             )
         )
         _ = detailController.view
+        let detailWindow = NSWindow(contentViewController: detailController)
+        detailWindow.setContentSize(NSSize(width: 1_280, height: 720))
+        detailWindow.contentView?.layoutSubtreeIfNeeded()
         let detailDashboardViews = descendants(of: detailController.view)
         guard
             let detailButton = detailDashboardViews.first(where: {
@@ -2048,7 +2051,7 @@ struct NativeHealthTests {
             "native Run detail must expose stable back, title, and event identities"
         )
         guard
-            let categoryFilter = detailViews.first(where: {
+            let initialCategoryFilter = detailViews.first(where: {
                 $0.accessibilityIdentifier() == "flit.runDetail.filter"
             }) as? NSPopUpButton
         else {
@@ -2057,7 +2060,7 @@ struct NativeHealthTests {
             )
         }
         try require(
-            categoryFilter.itemTitles == [
+            initialCategoryFilter.itemTitles == [
                 FoundationCopy.text(.runDetailFilterAll),
                 FoundationCopy.text(.runDetailFilterActivity),
                 FoundationCopy.text(.runDetailFilterCommand),
@@ -2066,10 +2069,64 @@ struct NativeHealthTests {
                 FoundationCopy.text(.runDetailFilterAttention),
                 FoundationCopy.text(.runDetailFilterLifecycle),
             ]
-                && categoryFilter.titleOfSelectedItem
+                && initialCategoryFilter.titleOfSelectedItem
                     == FoundationCopy.text(.runDetailFilterAll),
             "native Run detail must default to All with stable documented filter choices"
         )
+        guard
+            let evidenceToggle = detailViews.first(where: {
+                $0.accessibilityIdentifier() == "flit.runDetail.evidenceToggle.1"
+            }) as? NSButton
+        else {
+            throw NativeHealthTestFailure.failed(
+                "every Run Activity event must expose its evidence control"
+            )
+        }
+        try require(
+            evidenceToggle.title == FoundationCopy.text(.runDetailShowEvidence),
+            "collapsed Run evidence must use stable Show Evidence copy"
+        )
+        evidenceToggle.performClick(nil)
+        let detailWithEvidenceViews = descendants(of: detailController.view)
+        let detailWithEvidenceCopy = detailWithEvidenceViews.compactMap {
+            ($0 as? NSTextField)?.stringValue
+        }
+        let hideEvidenceToggle = detailWithEvidenceViews.first(where: {
+            $0.accessibilityIdentifier() == "flit.runDetail.evidenceToggle.1"
+        }) as? NSButton
+        try require(
+            detailWithEvidenceViews.contains(where: {
+                $0.accessibilityIdentifier() == "flit.runDetail.evidence.1"
+            })
+                && detailWithEvidenceCopy.contains(
+                    FoundationCopy.format(
+                        .runDetailEvidence,
+                        "event-dashboard-created",
+                        "run.created",
+                        FoundationCopy.text(.runDetailFilterLifecycle),
+                        "core",
+                        100,
+                        "2026-07-28T00:00:00.000Z"
+                    )
+                )
+                && detailWithEvidenceCopy.contains(
+                    FoundationCopy.text(.runDetailRawPayloadUnavailable)
+                )
+                && hideEvidenceToggle?.title
+                    == FoundationCopy.text(.runDetailHideEvidence)
+                && detailWindow.firstResponder === hideEvidenceToggle
+                && !detailWithEvidenceCopy.contains("session-dashboard-1"),
+            "evidence disclosure must show bounded locator facts and explicit raw unavailability"
+        )
+        guard
+            let categoryFilter = detailWithEvidenceViews.first(where: {
+                $0.accessibilityIdentifier() == "flit.runDetail.filter"
+            }) as? NSPopUpButton
+        else {
+            throw NativeHealthTestFailure.failed(
+                "evidence rerender must preserve the category filter"
+            )
+        }
         categoryFilter.selectItem(
             withTitle: FoundationCopy.text(.runDetailFilterCommand)
         )
@@ -2104,8 +2161,11 @@ struct NativeHealthTests {
         try require(
             descendants(of: detailController.view).filter({
                 $0.accessibilityIdentifier().hasPrefix("flit.runDetail.event.")
-            }).count == 3,
-            "selecting Lifecycle must restore only the accepted lifecycle rows"
+            }).count == 3
+                && descendants(of: detailController.view).contains(where: {
+                    $0.accessibilityIdentifier() == "flit.runDetail.evidence.1"
+                }),
+            "selecting Lifecycle must restore its rows and expanded evidence"
         )
         let detailCopy = detailViews.compactMap { ($0 as? NSTextField)?.stringValue }
         try require(
@@ -2145,11 +2205,12 @@ struct NativeHealthTests {
             throw NativeHealthTestFailure.failed("native Run detail must expose Back")
         }
         backButton.performClick(nil)
+        evidenceToggle.sendAction(evidenceToggle.action, to: evidenceToggle.target)
         try require(
             descendants(of: detailController.view).contains(where: {
                 $0.accessibilityIdentifier() == "flit.dashboard.run.run-dashboard-1"
             }),
-            "Back must restore the Core-projected Dashboard"
+            "Back must restore the Dashboard and stale evidence controls must be inert"
         )
         let pagedController = FoundationViewController(
             client: client,
@@ -2180,6 +2241,9 @@ struct NativeHealthTests {
             )
         )
         _ = pagedController.view
+        let pagedWindow = NSWindow(contentViewController: pagedController)
+        pagedWindow.setContentSize(NSSize(width: 1_280, height: 720))
+        pagedWindow.contentView?.layoutSubtreeIfNeeded()
         guard
             let pagedDetailButton = descendants(of: pagedController.view).first(where: {
                 $0.accessibilityIdentifier()
@@ -2209,7 +2273,29 @@ struct NativeHealthTests {
             "a grouped loaded tail must not claim an exact segment end"
         )
         guard
-            let pagedCategoryFilter = unfilteredFirstPageViews.first(where: {
+            let firstPageEvidenceToggle = unfilteredFirstPageViews.first(where: {
+                $0.accessibilityIdentifier() == "flit.runDetail.evidenceToggle.50"
+            }) as? NSButton
+        else {
+            throw NativeHealthTestFailure.failed(
+                "loaded first page must expose evidence disclosure"
+            )
+        }
+        firstPageEvidenceToggle.scrollToVisible(firstPageEvidenceToggle.bounds)
+        pagedWindow.makeFirstResponder(firstPageEvidenceToggle)
+        firstPageEvidenceToggle.performClick(nil)
+        let focusedFirstPageViews = descendants(of: pagedController.view)
+        let focusedFirstPageToggle = focusedFirstPageViews.first(where: {
+            $0.accessibilityIdentifier() == "flit.runDetail.evidenceToggle.50"
+        }) as? NSButton
+        try require(
+            focusedFirstPageToggle?.title == FoundationCopy.text(.runDetailHideEvidence)
+                && pagedWindow.firstResponder === focusedFirstPageToggle
+                && focusedFirstPageToggle?.visibleRect.isEmpty == false,
+            "late evidence disclosure must retain its viewport anchor and keyboard focus"
+        )
+        guard
+            let pagedCategoryFilter = focusedFirstPageViews.first(where: {
                 $0.accessibilityIdentifier() == "flit.runDetail.filter"
             }) as? NSPopUpButton
         else {
@@ -2276,6 +2362,28 @@ struct NativeHealthTests {
                     == FoundationCopy.text(.runDetailFilterLifecycle),
             "explicit next-page load must append before filtering and preserve the selection"
         )
+        guard
+            let completedPageCategoryFilter = completedPageViews.first(where: {
+                $0.accessibilityIdentifier() == "flit.runDetail.filter"
+            }) as? NSPopUpButton
+        else {
+            throw NativeHealthTestFailure.failed(
+                "completed page must preserve its category filter"
+            )
+        }
+        completedPageCategoryFilter.selectItem(
+            withTitle: FoundationCopy.text(.runDetailFilterCommand)
+        )
+        completedPageCategoryFilter.sendAction(
+            completedPageCategoryFilter.action,
+            to: completedPageCategoryFilter.target
+        )
+        try require(
+            descendants(of: pagedController.view).contains(where: {
+                $0.accessibilityIdentifier() == "flit.runDetail.evidence.50"
+            }),
+            "expanded evidence must survive filtering, pagination, and a later rerender"
+        )
         let failingPageController = FoundationViewController(
             client: client,
             dashboardClient: DashboardClient(
@@ -2301,6 +2409,16 @@ struct NativeHealthTests {
         }
         failingDetailButton.performClick(nil)
         guard
+            let failingEvidenceToggle = descendants(of: failingPageController.view).first(where: {
+                $0.accessibilityIdentifier() == "flit.runDetail.evidenceToggle.50"
+            }) as? NSButton
+        else {
+            throw NativeHealthTestFailure.failed(
+                "failure fixture must expose loaded evidence disclosure"
+            )
+        }
+        failingEvidenceToggle.performClick(nil)
+        guard
             let failingLoadMore = descendants(of: failingPageController.view).first(where: {
                 $0.accessibilityIdentifier() == "flit.runDetail.loadMore"
             }) as? NSButton
@@ -2308,6 +2426,12 @@ struct NativeHealthTests {
             throw NativeHealthTestFailure.failed("failure page must expose Load more")
         }
         failingLoadMore.performClick(nil)
+        try require(
+            descendants(of: failingPageController.view).contains(where: {
+                $0.accessibilityIdentifier() == "flit.runDetail.evidence.50"
+            }),
+            "failed next page must preserve expanded accepted evidence"
+        )
         guard
             let failedCategoryFilter = descendants(of: failingPageController.view).first(where: {
                 $0.accessibilityIdentifier() == "flit.runDetail.filter"
