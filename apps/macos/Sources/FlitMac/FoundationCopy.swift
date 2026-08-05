@@ -46,6 +46,8 @@ enum FoundationCopyKey: String {
     case runDetailFilterFile = "runDetail.filter.file"
     case runDetailFilterLifecycle = "runDetail.filter.lifecycle"
     case runDetailFilterTest = "runDetail.filter.test"
+    case runDetailGroup = "runDetail.group"
+    case runDetailGroupLoadedThrough = "runDetail.group.loadedThrough"
     case runDetailLoadMore = "runDetail.loadMore"
     case runDetailNoMatchingLoadedEvents = "runDetail.noMatchingLoadedEvents"
     case runDetailNoMatchingEvents = "runDetail.noMatchingEvents"
@@ -118,6 +120,8 @@ enum FoundationCopy {
         .runDetailFilterFile: "File",
         .runDetailFilterLifecycle: "Lifecycle",
         .runDetailFilterTest: "Test",
+        .runDetailGroup: "%@ – %@ · %@ · %d events",
+        .runDetailGroupLoadedThrough: "Started %@ · loaded through %@ · %@ · %d events",
         .runDetailLoadMore: "Load more",
         .runDetailNoMatchingLoadedEvents: "No %@ events are loaded yet",
         .runDetailNoMatchingEvents: "No %@ events are available",

@@ -824,6 +824,38 @@ struct NativeHealthTests {
             RunActivityFilter.all.visibleRows(in: categorizedRows).last?.category == .unknown,
             "unknown evidence must remain visible in All without being reclassified"
         )
+        let groupingRows = [
+            FlitRunEvidenceCategory.activity,
+            .activity,
+            .command,
+            .activity,
+            .unknown,
+            .unknown,
+        ].enumerated().map { index, category in
+            RunActivityRow(
+                cursor: UInt64(index + 1),
+                eventId: "event-group-\(index)",
+                eventType: "fixture.group.\(index)",
+                category: category,
+                sourceKind: .core,
+                confidence: 1.0,
+                observedAt: "2026-08-05T01:00:0\(index).000Z"
+            )
+        }
+        let allGroups = RunActivityFilter.all.visibleGroups(in: groupingRows)
+        try require(
+            allGroups.map(\.category)
+                == [.activity, .command, .activity, .unknown, .unknown]
+                && allGroups.map(\.events.count) == [2, 1, 1, 1, 1]
+                && allGroups[0].startedAt == "2026-08-05T01:00:00.000Z"
+                && allGroups[0].endedAt == "2026-08-05T01:00:01.000Z",
+            "native grouping must merge only adjacent exact known categories"
+        )
+        try require(
+            RunActivityFilter.activity.visibleGroups(in: groupingRows).map(\.events.count)
+                == [2, 1],
+            "filtering must not merge same categories across an intervening hidden group"
+        )
         let beforeRunId = runDetailPresentation.runId
         let beforeCursor = runDetailPresentation.nextCursor
         let beforeEventIds = runDetailPresentation.events.map(\.eventId)
@@ -1002,6 +1034,28 @@ struct NativeHealthTests {
                 ),
             ]
         }
+        let matchingFinalPageRunDetail = try changingRunDetail(finalPageRunDetail) { object in
+            guard var events = object["events"] as? [[String: Any]] else {
+                throw NativeHealthTestFailure.failed("Run detail events must be an array")
+            }
+            events[0]["event_type"] = "command.finished"
+            events[0]["category"] = "command"
+            object["events"] = events
+        }
+        var crossPageGroupingPresentation = fullPagePresentation
+        try crossPageGroupingPresentation.append(
+            matchingFinalPageRunDetail,
+            requestedRunId: "run-dashboard-1",
+            expectedRunVersion: 51,
+            requestedAfterCursor: 50,
+            requestedEventLimit: 50
+        )
+        try require(
+            RunActivityFilter.all.visibleGroups(
+                in: crossPageGroupingPresentation.events
+            ).map(\.events.count) == [51],
+            "matching categories at an accepted page boundary must form one segment"
+        )
         let duplicateFinalPage = try changingRunDetail(finalPageRunDetail) { object in
             guard var events = object["events"] as? [[String: Any]] else {
                 throw NativeHealthTestFailure.failed("Run detail events must be an array")
@@ -1987,6 +2041,7 @@ struct NativeHealthTests {
         try require(
             detailIdentifiers.contains("flit.runDetail.back")
                 && detailIdentifiers.contains("flit.runDetail.title.run-dashboard-1")
+                && detailIdentifiers.contains("flit.runDetail.group.1.3")
                 && detailIdentifiers.contains("flit.runDetail.event.1")
                 && detailIdentifiers.contains("flit.runDetail.event.2")
                 && detailIdentifiers.contains("flit.runDetail.event.3"),
@@ -2055,6 +2110,15 @@ struct NativeHealthTests {
         let detailCopy = detailViews.compactMap { ($0 as? NSTextField)?.stringValue }
         try require(
             detailCopy.contains(
+                FoundationCopy.format(
+                    .runDetailGroup,
+                    "2026-07-28T00:00:00.000Z",
+                    "2026-07-28T00:00:02.000Z",
+                    FoundationCopy.text(.runDetailFilterLifecycle),
+                    3
+                )
+            )
+                && detailCopy.contains(
                 FoundationCopy.format(
                     .runDetailEvent,
                     "2026-07-28T00:00:00.000Z",
@@ -2125,8 +2189,27 @@ struct NativeHealthTests {
             throw NativeHealthTestFailure.failed("paged Dashboard must expose Activity")
         }
         pagedDetailButton.performClick(nil)
+        let unfilteredFirstPageViews = descendants(of: pagedController.view)
+        let unfilteredFirstPageCopy = unfilteredFirstPageViews.compactMap {
+            ($0 as? NSTextField)?.stringValue
+        }
+        try require(
+            unfilteredFirstPageViews.contains(where: {
+                $0.accessibilityIdentifier() == "flit.runDetail.group.1.50"
+            })
+                && unfilteredFirstPageCopy.contains(
+                    FoundationCopy.format(
+                        .runDetailGroupLoadedThrough,
+                        "2026-07-28T00:00:00.000Z",
+                        "2026-07-28T00:00:00.000Z",
+                        FoundationCopy.text(.runDetailFilterCommand),
+                        50
+                    )
+                ),
+            "a grouped loaded tail must not claim an exact segment end"
+        )
         guard
-            let pagedCategoryFilter = descendants(of: pagedController.view).first(where: {
+            let pagedCategoryFilter = unfilteredFirstPageViews.first(where: {
                 $0.accessibilityIdentifier() == "flit.runDetail.filter"
             }) as? NSPopUpButton
         else {

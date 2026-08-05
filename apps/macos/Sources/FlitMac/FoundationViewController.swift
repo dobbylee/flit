@@ -461,8 +461,8 @@ final class FoundationViewController: NSViewController {
             )
         )
         dashboardStack.addArrangedSubview(runDetailFilterControl())
-        let visibleEvents = activeRunDetailFilter.visibleRows(in: detail.events)
-        if visibleEvents.isEmpty {
+        let visibleGroups = activeRunDetailFilter.visibleGroups(in: detail.events)
+        if visibleGroups.isEmpty {
             let emptyCopy: String
             let emptyIdentifier: String
             if activeRunDetailFilter == .all {
@@ -489,20 +489,16 @@ final class FoundationViewController: NSViewController {
                 empty
             )
         } else {
-            for event in visibleEvents {
-                let row = label(
-                    FoundationCopy.format(
-                        .runDetailEvent,
-                        event.observedAt,
-                        event.eventType,
-                        event.sourceKind.rawValue,
-                        Int(event.confidence * 100)
-                    ),
-                    size: 12,
-                    weight: .regular
-                )
-                identify(row, as: "flit.runDetail.event.\(event.cursor)")
-                dashboardStack.addArrangedSubview(row)
+            for group in visibleGroups {
+                if group.events.count == 1 {
+                    dashboardStack.addArrangedSubview(runDetailEventRow(group.events[0]))
+                } else {
+                    let hasUnloadedTail = detail.hasMore
+                        && group.events.last?.cursor == detail.events.last?.cursor
+                    dashboardStack.addArrangedSubview(
+                        runDetailGroup(group, hasUnloadedTail: hasUnloadedTail)
+                    )
+                }
             }
         }
         if detail.hasMore {
@@ -526,6 +522,52 @@ final class FoundationViewController: NSViewController {
             dashboardStack.addArrangedSubview(failure)
         }
         scrollDashboardToTop()
+    }
+
+    private func runDetailGroup(
+        _ group: RunActivityGroup,
+        hasUnloadedTail: Bool
+    ) -> NSView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 2
+        guard let first = group.events.first, let last = group.events.last else {
+            preconditionFailure("Run Activity group must contain evidence")
+        }
+        identify(stack, as: "flit.runDetail.group.\(first.cursor).\(last.cursor)")
+        let header = label(
+            FoundationCopy.format(
+                hasUnloadedTail ? .runDetailGroupLoadedThrough : .runDetailGroup,
+                group.startedAt,
+                group.endedAt,
+                runDetailCategoryTitle(group.category),
+                group.events.count
+            ),
+            size: 11,
+            weight: .semibold,
+            color: .secondaryLabelColor
+        )
+        identify(header, as: "flit.runDetail.groupHeader.\(first.cursor).\(last.cursor)")
+        stack.addArrangedSubview(header)
+        group.events.forEach { stack.addArrangedSubview(runDetailEventRow($0)) }
+        return stack
+    }
+
+    private func runDetailEventRow(_ event: RunActivityRow) -> NSView {
+        let row = label(
+            FoundationCopy.format(
+                .runDetailEvent,
+                event.observedAt,
+                event.eventType,
+                event.sourceKind.rawValue,
+                Int(event.confidence * 100)
+            ),
+            size: 12,
+            weight: .regular
+        )
+        identify(row, as: "flit.runDetail.event.\(event.cursor)")
+        return row
     }
 
     private func runDetailFilterControl() -> NSView {
@@ -568,6 +610,20 @@ final class FoundationViewController: NSViewController {
         case .lifecycle: key = .runDetailFilterLifecycle
         }
         return FoundationCopy.text(key)
+    }
+
+    private func runDetailCategoryTitle(_ category: FlitRunEvidenceCategory) -> String {
+        let filter: RunActivityFilter
+        switch category {
+        case .activity: filter = .activity
+        case .command: filter = .command
+        case .file: filter = .file
+        case .test: filter = .test
+        case .attention: filter = .attention
+        case .lifecycle: filter = .lifecycle
+        case .unknown: preconditionFailure("Unknown evidence cannot form a group")
+        }
+        return runDetailFilterTitle(filter)
     }
 
     private func runDetailFilterIdentifier(_ filter: RunActivityFilter) -> String {

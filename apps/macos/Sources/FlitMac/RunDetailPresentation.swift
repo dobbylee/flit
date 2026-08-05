@@ -19,6 +19,29 @@ struct RunActivityRow: Sendable {
     let observedAt: String
 }
 
+struct RunActivityGroup: Sendable {
+    let category: FlitRunEvidenceCategory
+    private(set) var events: [RunActivityRow]
+
+    init(event: RunActivityRow) {
+        category = event.category
+        events = [event]
+    }
+
+    var startedAt: String {
+        events[0].observedAt
+    }
+
+    var endedAt: String {
+        events[events.count - 1].observedAt
+    }
+
+    mutating func append(_ event: RunActivityRow) {
+        precondition(category != .unknown && event.category == category)
+        events.append(event)
+    }
+}
+
 enum RunActivityFilter: CaseIterable, Equatable, Sendable {
     case all
     case activity
@@ -31,6 +54,19 @@ enum RunActivityFilter: CaseIterable, Equatable, Sendable {
     func visibleRows(in rows: [RunActivityRow]) -> [RunActivityRow] {
         guard let category else { return rows }
         return rows.filter { $0.category == category }
+    }
+
+    func visibleGroups(in rows: [RunActivityRow]) -> [RunActivityGroup] {
+        var groups: [RunActivityGroup] = []
+        for row in rows {
+            if row.category != .unknown, groups.last?.category == row.category {
+                groups[groups.count - 1].append(row)
+            } else {
+                groups.append(RunActivityGroup(event: row))
+            }
+        }
+        guard let category else { return groups }
+        return groups.filter { $0.category == category }
     }
 
     private var category: FlitRunEvidenceCategory? {
