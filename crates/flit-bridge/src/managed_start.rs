@@ -969,11 +969,17 @@ pub(crate) fn commit_managed_observation(
             let (prefix, kind) = match terminal_outcome {
                 CodexTurnTerminalOutcome::Completed => (
                     "evt_codex_completed_",
-                    ManagedProviderObservationKind::TurnCompleted { changes },
+                    ManagedProviderObservationKind::TurnCompleted {
+                        changes,
+                        change_set: None,
+                    },
                 ),
                 CodexTurnTerminalOutcome::Interrupted => (
                     "evt_codex_interrupted_",
-                    ManagedProviderObservationKind::TurnInterrupted { changes },
+                    ManagedProviderObservationKind::TurnInterrupted {
+                        changes,
+                        change_set: None,
+                    },
                 ),
             };
             let event_id = observation_id(

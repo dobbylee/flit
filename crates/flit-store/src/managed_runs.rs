@@ -1,4 +1,8 @@
-use std::path::{Component, Path, PathBuf};
+use std::{
+    collections::BTreeSet,
+    fmt,
+    path::{Component, Path, PathBuf},
+};
 
 use flit_protocol::{EventEnvelope, GitBaselinePayload, GitHead};
 use serde_json::{Map, Value};
@@ -16,6 +20,9 @@ const MAX_MANAGED_FINGERPRINT_BYTES: usize = 4 * 1024;
 const MAX_MANAGED_TIMESTAMP_BYTES: usize = 128;
 const MAX_MANAGED_FAILURE_REASON_BYTES: usize = 4 * 1024;
 const MAX_MANAGED_CONTRACT_VERSION_BYTES: usize = 256;
+pub const MAX_MANAGED_GIT_CHANGE_ENTRIES: usize = 10_000;
+pub const MAX_MANAGED_GIT_PATH_BYTES: usize = 16 * 1024;
+pub const MAX_MANAGED_GIT_DISPLAY_PATH_BYTES: usize = 3 * MAX_MANAGED_GIT_PATH_BYTES;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ManagedRunIntent {
@@ -136,6 +143,178 @@ pub enum ManagedGitChangeSummary {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedGitFileStatus {
+    Added,
+    Modified,
+    Deleted,
+    TypeChanged,
+    Untracked,
+}
+
+impl ManagedGitFileStatus {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Modified => "modified",
+            Self::Deleted => "deleted",
+            Self::TypeChanged => "type_changed",
+            Self::Untracked => "untracked",
+        }
+    }
+
+    pub(crate) fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "added" => Some(Self::Added),
+            "modified" => Some(Self::Modified),
+            "deleted" => Some(Self::Deleted),
+            "type_changed" => Some(Self::TypeChanged),
+            "untracked" => Some(Self::Untracked),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedGitProjectScope {
+    InsideProject,
+    OutsideProject,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedGitChangeAttribution {
+    Exact,
+    ObservedDuringRun,
+}
+
+impl ManagedGitChangeAttribution {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::ObservedDuringRun => "observed_during_run",
+        }
+    }
+
+    pub(crate) fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "exact" => Some(Self::Exact),
+            "observed_during_run" => Some(Self::ObservedDuringRun),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct ManagedGitRepositoryIdentity {
+    pub project_filesystem_id: String,
+    pub repository_root: Vec<u8>,
+    pub repository_root_filesystem_id: String,
+    pub git_directory: Vec<u8>,
+    pub git_directory_filesystem_id: String,
+    pub common_directory: Vec<u8>,
+    pub common_directory_filesystem_id: String,
+}
+
+impl fmt::Debug for ManagedGitRepositoryIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedGitRepositoryIdentity")
+            .field("project_filesystem_id", &self.project_filesystem_id)
+            .field("repository_root", &"<redacted>")
+            .field(
+                "repository_root_filesystem_id",
+                &self.repository_root_filesystem_id,
+            )
+            .field("git_directory", &"<redacted>")
+            .field(
+                "git_directory_filesystem_id",
+                &self.git_directory_filesystem_id,
+            )
+            .field("common_directory", &"<redacted>")
+            .field(
+                "common_directory_filesystem_id",
+                &self.common_directory_filesystem_id,
+            )
+            .finish()
+    }
+}
+
+impl ManagedGitProjectScope {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::InsideProject => "inside_project",
+            Self::OutsideProject => "outside_project",
+        }
+    }
+
+    pub(crate) fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "inside_project" => Some(Self::InsideProject),
+            "outside_project" => Some(Self::OutsideProject),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct ManagedGitFileChange {
+    pub change_id: String,
+    pub raw_path: Vec<u8>,
+    pub display_path: String,
+    pub status: ManagedGitFileStatus,
+    pub committed: bool,
+    pub staged: bool,
+    pub unstaged: bool,
+    pub binary: bool,
+    pub insertions: Option<u64>,
+    pub deletions: Option<u64>,
+    pub project_scope: ManagedGitProjectScope,
+}
+
+impl fmt::Debug for ManagedGitFileChange {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ManagedGitFileChange")
+            .field("change_id", &self.change_id)
+            .field("raw_path", &"<redacted>")
+            .field("display_path", &"<redacted>")
+            .field("status", &self.status)
+            .field("committed", &self.committed)
+            .field("staged", &self.staged)
+            .field("unstaged", &self.unstaged)
+            .field("binary", &self.binary)
+            .field("insertions", &self.insertions)
+            .field("deletions", &self.deletions)
+            .field("project_scope", &self.project_scope)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedGitChangeSet {
+    pub attribution: ManagedGitChangeAttribution,
+    pub baseline_head: Option<String>,
+    pub terminal_head: Option<String>,
+    pub repository_identity: ManagedGitRepositoryIdentity,
+    pub files: u64,
+    pub insertions: Option<u64>,
+    pub deletions: Option<u64>,
+    pub changes: Vec<ManagedGitFileChange>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedGitChangeSetMetadata {
+    pub run_id: String,
+    pub terminal_event_id: String,
+    pub attribution: ManagedGitChangeAttribution,
+    pub baseline_head: Option<String>,
+    pub terminal_head: Option<String>,
+    pub repository_identity: ManagedGitRepositoryIdentity,
+    pub files: u64,
+    pub insertions: Option<u64>,
+    pub deletions: Option<u64>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ManagedProviderObservationKind {
     CommandStarted {
@@ -149,9 +328,11 @@ pub enum ManagedProviderObservationKind {
     },
     TurnCompleted {
         changes: ManagedGitChangeSummary,
+        change_set: Option<Box<ManagedGitChangeSet>>,
     },
     TurnInterrupted {
         changes: ManagedGitChangeSummary,
+        change_set: Option<Box<ManagedGitChangeSet>>,
     },
 }
 
@@ -567,10 +748,216 @@ pub(crate) fn validate_provider_observation(
             }
             Ok(())
         }
-        ManagedProviderObservationKind::TurnCompleted { changes }
-        | ManagedProviderObservationKind::TurnInterrupted { changes } => {
-            validate_git_changes(changes)
+        ManagedProviderObservationKind::TurnCompleted {
+            changes,
+            change_set,
         }
+        | ManagedProviderObservationKind::TurnInterrupted {
+            changes,
+            change_set,
+        } => {
+            validate_git_changes(changes)?;
+            if let Some(change_set) = change_set {
+                validate_git_change_set(changes, change_set)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_git_change_set(
+    summary: &ManagedGitChangeSummary,
+    change_set: &ManagedGitChangeSet,
+) -> Result<(), &'static str> {
+    if change_set
+        .baseline_head
+        .as_deref()
+        .is_some_and(|head| !valid_object_id(head))
+        || change_set
+            .terminal_head
+            .as_deref()
+            .is_some_and(|head| !valid_object_id(head))
+        || (change_set.attribution == ManagedGitChangeAttribution::Exact
+            && (change_set.baseline_head.is_none() || change_set.terminal_head.is_none()))
+        || !valid_repository_identity(&change_set.repository_identity)
+    {
+        return Err("change_set");
+    }
+    if change_set.changes.len() > MAX_MANAGED_GIT_CHANGE_ENTRIES
+        || change_set.files != change_set.changes.len() as u64
+        || change_set.files > flit_protocol::MAX_JSON_SAFE_INTEGER
+        || change_set.insertions.is_some() != change_set.deletions.is_some()
+    {
+        return Err("change_set");
+    }
+    let mut ids = BTreeSet::new();
+    let mut paths = BTreeSet::new();
+    let mut previous = None::<(&[u8], &str)>;
+    let mut aggregate_insertions = Some(0_u64);
+    let mut aggregate_deletions = Some(0_u64);
+    for change in &change_set.changes {
+        if !valid_git_change_id(&change.change_id) {
+            return Err("change_set");
+        }
+        validate_git_relative_path(&change.raw_path)?;
+        if change.display_path.is_empty()
+            || change.display_path.len() > MAX_MANAGED_GIT_DISPLAY_PATH_BYTES
+            || change.display_path.contains('\0')
+            || String::from_utf8_lossy(&change.raw_path) != change.display_path
+            || (!change.committed && !change.staged && !change.unstaged)
+            || change.insertions.is_some() != change.deletions.is_some()
+            || (change.binary && change.insertions.is_some())
+        {
+            return Err("change_set");
+        }
+        if !ids.insert(change.change_id.as_str()) || !paths.insert(change.raw_path.as_slice()) {
+            return Err("change_set");
+        }
+        let order = (change.raw_path.as_slice(), change.change_id.as_str());
+        if previous.is_some_and(|previous| previous >= order) {
+            return Err("change_set");
+        }
+        previous = Some(order);
+        aggregate_insertions = aggregate_insertions
+            .zip(change.insertions)
+            .and_then(|(total, value)| total.checked_add(value))
+            .filter(|value| *value <= flit_protocol::MAX_JSON_SAFE_INTEGER);
+        aggregate_deletions = aggregate_deletions
+            .zip(change.deletions)
+            .and_then(|(total, value)| total.checked_add(value))
+            .filter(|value| *value <= flit_protocol::MAX_JSON_SAFE_INTEGER);
+    }
+    if change_set.insertions != aggregate_insertions || change_set.deletions != aggregate_deletions
+    {
+        return Err("change_set");
+    }
+    if change_set.attribution == ManagedGitChangeAttribution::Exact
+        && change_set.changes.iter().any(|change| {
+            change.status == ManagedGitFileStatus::Untracked || change.insertions.is_none()
+        })
+    {
+        return Err("change_set");
+    }
+    match summary {
+        ManagedGitChangeSummary::Exact {
+            files,
+            insertions,
+            deletions,
+        } if change_set.insertions == Some(*insertions)
+            && change_set.deletions == Some(*deletions)
+            && change_set.files == *files
+            && change_set.attribution == ManagedGitChangeAttribution::Exact => {}
+        ManagedGitChangeSummary::Unavailable { .. }
+            if change_set.attribution == ManagedGitChangeAttribution::ObservedDuringRun => {}
+        _ => return Err("change_set"),
+    }
+    Ok(())
+}
+
+fn valid_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+pub(crate) fn valid_stored_git_object_id(value: &str) -> bool {
+    valid_object_id(value)
+}
+
+pub(crate) fn valid_stored_git_repository_identity(
+    identity: &ManagedGitRepositoryIdentity,
+) -> bool {
+    valid_repository_identity(identity)
+}
+
+pub(crate) fn validate_stored_git_file_change(
+    change: &ManagedGitFileChange,
+) -> Result<(), &'static str> {
+    if !valid_git_change_id(&change.change_id) {
+        return Err("change_id");
+    }
+    validate_git_relative_path(&change.raw_path).map_err(|_| "raw_path")?;
+    if change.display_path.is_empty()
+        || change.display_path.len() > MAX_MANAGED_GIT_DISPLAY_PATH_BYTES
+        || change.display_path.contains('\0')
+        || String::from_utf8_lossy(&change.raw_path) != change.display_path
+    {
+        return Err("display_path");
+    }
+    if !change.committed && !change.staged && !change.unstaged {
+        return Err("layers");
+    }
+    if change.insertions.is_some() != change.deletions.is_some()
+        || (change.binary && change.insertions.is_some())
+    {
+        return Err("line_counts");
+    }
+    Ok(())
+}
+
+fn valid_git_change_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_repository_identity(identity: &ManagedGitRepositoryIdentity) -> bool {
+    [
+        identity.project_filesystem_id.as_str(),
+        identity.repository_root_filesystem_id.as_str(),
+        identity.git_directory_filesystem_id.as_str(),
+        identity.common_directory_filesystem_id.as_str(),
+    ]
+    .into_iter()
+    .all(valid_filesystem_id)
+        && [
+            identity.repository_root.as_slice(),
+            identity.git_directory.as_slice(),
+            identity.common_directory.as_slice(),
+        ]
+        .into_iter()
+        .all(valid_absolute_path)
+}
+
+fn valid_filesystem_id(value: &str) -> bool {
+    let Some((device, inode)) = value
+        .strip_prefix("unix:")
+        .and_then(|value| value.split_once(':'))
+    else {
+        return false;
+    };
+    let (Ok(device), Ok(inode)) = (device.parse::<u64>(), inode.parse::<u64>()) else {
+        return false;
+    };
+    value == format!("unix:{device}:{inode}")
+}
+
+fn valid_absolute_path(path: &[u8]) -> bool {
+    path.len() <= MAX_MANAGED_GIT_PATH_BYTES
+        && path.first() == Some(&b'/')
+        && !path.contains(&0)
+        && (path == b"/"
+            || (!path.ends_with(b"/")
+                && path[1..].split(|byte| *byte == b'/').all(|component| {
+                    !component.is_empty() && component != b"." && component != b".."
+                })))
+}
+
+pub(crate) fn validate_git_change_read_id(value: &str) -> Result<(), ()> {
+    valid_git_change_id(value).then_some(()).ok_or(())
+}
+
+fn validate_git_relative_path(path: &[u8]) -> Result<(), &'static str> {
+    if path.is_empty()
+        || path.len() > MAX_MANAGED_GIT_PATH_BYTES
+        || path[0] == b'/'
+        || path.contains(&0)
+        || path
+            .split(|byte| *byte == b'/')
+            .any(|component| component.is_empty() || component == b"." || component == b"..")
+    {
+        Err("change_set")
+    } else {
+        Ok(())
     }
 }
 
@@ -829,6 +1216,10 @@ pub(crate) fn validate_stored_session(session: &ManagedSession) -> Result<(), &'
 
 fn validate_id(value: &str) -> Result<(), ()> {
     validate_token(value, MAX_MANAGED_ID_BYTES)
+}
+
+pub(crate) fn validate_read_id(value: &str) -> Result<(), ()> {
+    validate_id(value)
 }
 
 fn validate_timestamp(value: &str) -> Result<(), ()> {

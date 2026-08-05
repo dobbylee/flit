@@ -14,16 +14,19 @@ use flit_protocol::{
 use flit_store::{
     AppendEventOutcome, DashboardChangeSummary, InitialManagedSessionConnection,
     InitialManagedSessionOutcome, MAX_DASHBOARD_PROJECTION_SOURCE_BYTES, MAX_LIVE_MANAGED_SESSIONS,
-    ManagedGitChangeSummary, ManagedPermissionDecision, ManagedPermissionDeliveryUnknownReason,
-    ManagedPermissionResolutionKind, ManagedPermissionResponseAttempt,
-    ManagedPermissionResponseAttemptOutcome, ManagedPermissionResponseResult,
-    ManagedPermissionResponseResultKind, ManagedProviderDecision, ManagedProviderObservation,
-    ManagedProviderObservationKind, ManagedProviderOutcome, ManagedProviderOutcomeCommit,
-    ManagedProviderTerminalOutcome, ManagedReconciliationState, ManagedRunIntent,
-    ManagedRunIntentOutcome, ManagedRunStartFailure, ManagedRunStartFailureOutcome,
-    ManagedSessionReconciliation, ManagedSessionReconciliationOutcome, ManagedSessionTermination,
-    ManagedSessionTerminationOutcome, ManagedTurnTerminalOutcome, ProjectRegistration,
-    ProjectTrustConfirmation, Store, StoreError,
+    ManagedGitChangeAttribution, ManagedGitChangeSet, ManagedGitChangeSummary,
+    ManagedGitFileChange, ManagedGitFileStatus, ManagedGitProjectScope,
+    ManagedGitRepositoryIdentity, ManagedPermissionDecision,
+    ManagedPermissionDeliveryUnknownReason, ManagedPermissionResolutionKind,
+    ManagedPermissionResponseAttempt, ManagedPermissionResponseAttemptOutcome,
+    ManagedPermissionResponseResult, ManagedPermissionResponseResultKind, ManagedProviderDecision,
+    ManagedProviderObservation, ManagedProviderObservationKind, ManagedProviderOutcome,
+    ManagedProviderOutcomeCommit, ManagedProviderTerminalOutcome, ManagedReconciliationState,
+    ManagedRunIntent, ManagedRunIntentOutcome, ManagedRunStartFailure,
+    ManagedRunStartFailureOutcome, ManagedSessionReconciliation,
+    ManagedSessionReconciliationOutcome, ManagedSessionTermination,
+    ManagedSessionTerminationOutcome, ManagedTurnTerminalOutcome, ProjectDirectoryInspection,
+    ProjectRegistration, ProjectTrustConfirmation, Store, StoreError,
 };
 use rusqlite::Connection;
 use serde_json::{Map, Value, json};
@@ -32,6 +35,8 @@ static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 const CREATED_AT: &str = "2026-07-24T10:00:00Z";
 const STARTED_AT: &str = "2026-07-24T10:00:01Z";
 const ENDED_AT: &str = "2026-07-24T10:05:00Z";
+const CHANGE_INSIDE_ID: &str = "11111111111111111111111111111111";
+const CHANGE_OUTSIDE_ID: &str = "22222222222222222222222222222222";
 
 struct TestDirectory(PathBuf);
 
@@ -799,6 +804,7 @@ fn managed_provider_observations_are_exact_ordered_idempotent_and_content_safe()
                 insertions: 3,
                 deletions: 1,
             },
+            change_set: None,
         },
     };
     let terminal_event = store
@@ -846,6 +852,658 @@ fn managed_provider_observations_are_exact_ordered_idempotent_and_content_safe()
             .expect("terminal duplicate"),
         AppendEventOutcome::Duplicate(_)
     ));
+}
+
+#[test]
+fn terminal_file_changes_are_atomic_sensitive_idempotent_and_restart_durable() {
+    let directory = TestDirectory::new("terminal-file-changes");
+    let (mut store, database, project_path) = trusted_store(&directory);
+    store
+        .create_managed_run_intent(run_intent_with_clean_baseline(
+            "run-changes",
+            "event-changes-created",
+            "event-changes-requested",
+        ))
+        .expect("managed Run");
+    store
+        .connect_initial_managed_session(session_connection(
+            "session-changes",
+            "run-changes",
+            "thread-changes",
+            &project_path,
+        ))
+        .expect("managed session");
+    let command = ManagedProviderObservation {
+        run_id: "run-changes".to_owned(),
+        session_id: "session-changes".to_owned(),
+        external_session_key: "thread-changes".to_owned(),
+        provider_turn_id: "turn-changes".to_owned(),
+        contract_version: "codex-app-server/0.145.0".to_owned(),
+        event_id: "event-changes-command".to_owned(),
+        observed_at: STARTED_AT.to_owned(),
+        kind: ManagedProviderObservationKind::CommandStarted {
+            provider_item_id: "command-changes".to_owned(),
+        },
+    };
+    store
+        .append_managed_provider_observation(command.clone())
+        .expect("command before terminal");
+    let change_set = exact_file_change_set(&project_path);
+    let terminal = ManagedProviderObservation {
+        run_id: "run-changes".to_owned(),
+        session_id: "session-changes".to_owned(),
+        external_session_key: "thread-changes".to_owned(),
+        provider_turn_id: "turn-changes".to_owned(),
+        contract_version: "codex-app-server/0.145.0".to_owned(),
+        event_id: "event-changes-terminal".to_owned(),
+        observed_at: ENDED_AT.to_owned(),
+        kind: ManagedProviderObservationKind::TurnCompleted {
+            changes: ManagedGitChangeSummary::Exact {
+                files: 2,
+                insertions: 3,
+                deletions: 1,
+            },
+            change_set: Some(Box::new(change_set.clone())),
+        },
+    };
+    let event = store
+        .append_managed_provider_observation(terminal.clone())
+        .expect("terminal changes");
+    let AppendEventOutcome::Inserted(event) = event else {
+        panic!("expected inserted terminal event");
+    };
+    let event_json = serde_json::to_string(&event).expect("event JSON");
+    assert!(!event_json.contains("inside-"));
+    assert!(!event_json.contains("outside.txt"));
+    assert_eq!(
+        event.payload["changes"],
+        json!({
+            "availability": "available",
+            "attribution": "exact",
+            "files": 2,
+            "insertions": 3,
+            "deletions": 1
+        })
+    );
+    let metadata = store
+        .managed_git_change_set_metadata("run-changes")
+        .expect("change metadata")
+        .expect("stored change metadata");
+    assert_eq!(metadata.attribution, ManagedGitChangeAttribution::Exact);
+    assert_eq!(metadata.baseline_head, change_set.baseline_head);
+    assert_eq!(metadata.terminal_head, change_set.terminal_head);
+    assert_eq!(metadata.repository_identity, change_set.repository_identity);
+    assert_eq!(metadata.files, 2);
+    assert_eq!(
+        store
+            .managed_git_file_change("run-changes", CHANGE_INSIDE_ID)
+            .expect("file change")
+            .expect("stored file change"),
+        change_set.changes[0]
+    );
+    assert!(matches!(
+        store
+            .append_managed_provider_observation(terminal.clone())
+            .expect("exact duplicate"),
+        AppendEventOutcome::Duplicate(_)
+    ));
+    assert!(matches!(
+        store
+            .append_managed_provider_observation(command)
+            .expect("nonterminal duplicate after terminal"),
+        AppendEventOutcome::Duplicate(_)
+    ));
+
+    let mut downgraded = terminal.clone();
+    let ManagedProviderObservationKind::TurnCompleted {
+        change_set: downgraded_set,
+        ..
+    } = &mut downgraded.kind
+    else {
+        unreachable!()
+    };
+    *downgraded_set = None;
+    assert!(matches!(
+        store.append_managed_provider_observation(downgraded),
+        Err(StoreError::ManagedGitChangeSetConflict { ref run_id }) if run_id == "run-changes"
+    ));
+
+    drop(store);
+    let reopened = Store::open(&database, CREATED_AT).expect("reopen Store");
+    let stored = reopened
+        .managed_git_file_change("run-changes", CHANGE_OUTSIDE_ID)
+        .expect("reopened file change")
+        .expect("reopened stored file change");
+    assert_eq!(stored, change_set.changes[1]);
+    assert!(!format!("{stored:?}").contains("outside.txt"));
+
+    let corruption = Connection::open(&database).expect("corruption fixture");
+    corruption
+        .execute_batch(
+            "PRAGMA ignore_check_constraints = ON;
+             UPDATE run_git_file_changes SET status = 'corrupt' WHERE run_id = 'run-changes' AND change_id = '22222222222222222222222222222222';",
+        )
+        .expect("corrupt stored status");
+    let error = reopened
+        .managed_git_file_change("run-changes", CHANGE_OUTSIDE_ID)
+        .expect_err("corrupt file change");
+    assert!(matches!(
+        error,
+        StoreError::StoredManagedGitFileChangeInvalid {
+            ref run_id,
+            ref change_id,
+            field: "status",
+        } if run_id == "run-changes" && change_id == CHANGE_OUTSIDE_ID
+    ));
+    assert!(!error.to_string().contains("outside.txt"));
+    corruption
+        .execute(
+            "UPDATE run_git_file_changes SET status = 'added' WHERE run_id = 'run-changes' AND change_id = '22222222222222222222222222222222'",
+            [],
+        )
+        .expect("restore stored status");
+    corruption
+        .execute(
+            "UPDATE run_git_file_changes SET insertions = 7 WHERE run_id = 'run-changes' AND change_id = '22222222222222222222222222222222'",
+            [],
+        )
+        .expect("corrupt stored aggregate");
+    assert!(matches!(
+        reopened.managed_git_change_set_metadata("run-changes"),
+        Err(StoreError::StoredManagedGitChangeSetInvalid {
+            ref run_id,
+            field: "aggregate",
+        }) if run_id == "run-changes"
+    ));
+    assert!(matches!(
+        reopened.managed_git_file_change("run-changes", CHANGE_INSIDE_ID),
+        Err(StoreError::StoredManagedGitChangeSetInvalid {
+            ref run_id,
+            field: "aggregate",
+        }) if run_id == "run-changes"
+    ));
+    corruption
+        .execute(
+            "UPDATE run_git_file_changes SET insertions = 1 WHERE run_id = 'run-changes' AND change_id = '22222222222222222222222222222222'",
+            [],
+        )
+        .expect("restore stored aggregate");
+    corruption
+        .execute(
+            "UPDATE run_git_change_sets SET file_count = 10001 WHERE run_id = 'run-changes'",
+            [],
+        )
+        .expect("corrupt stored bound");
+    assert!(matches!(
+        reopened.managed_git_change_set_metadata("run-changes"),
+        Err(StoreError::StoredManagedGitChangeSetInvalid {
+            ref run_id,
+            field: "metadata",
+        }) if run_id == "run-changes"
+    ));
+    corruption
+        .execute(
+            "UPDATE run_git_change_sets SET file_count = 2 WHERE run_id = 'run-changes'",
+            [],
+        )
+        .expect("restore stored bound");
+    corruption
+        .execute(
+            "UPDATE run_git_change_sets SET attribution = 'observed_during_run' WHERE run_id = 'run-changes'",
+            [],
+        )
+        .expect("corrupt stored attribution");
+    assert!(matches!(
+        reopened.managed_git_change_set_metadata("run-changes"),
+        Err(StoreError::StoredManagedGitChangeSetInvalid {
+            ref run_id,
+            field: "terminal_event_changes",
+        }) if run_id == "run-changes"
+    ));
+    corruption
+        .execute(
+            "UPDATE run_git_change_sets SET attribution = 'exact' WHERE run_id = 'run-changes'",
+            [],
+        )
+        .expect("restore stored attribution");
+    corruption
+        .execute_batch(
+            "UPDATE run_git_file_changes SET insertions = 7 WHERE run_id = 'run-changes' AND change_id = '22222222222222222222222222222222';
+             UPDATE run_git_change_sets SET insertions = 9 WHERE run_id = 'run-changes';",
+        )
+        .expect("corrupt internally consistent totals");
+    assert!(matches!(
+        reopened.managed_git_change_set_metadata("run-changes"),
+        Err(StoreError::StoredManagedGitChangeSetInvalid {
+            ref run_id,
+            field: "terminal_event_changes",
+        }) if run_id == "run-changes"
+    ));
+    corruption
+        .execute_batch(
+            "UPDATE run_git_file_changes SET insertions = 1 WHERE run_id = 'run-changes' AND change_id = '22222222222222222222222222222222';
+             UPDATE run_git_change_sets SET insertions = 3 WHERE run_id = 'run-changes';",
+        )
+        .expect("restore stored totals");
+    drop(corruption);
+    drop(reopened);
+
+    let connection = Connection::open(&database).expect("cascade fixture");
+    connection
+        .execute_batch("PRAGMA foreign_keys = ON; DELETE FROM runs WHERE id = 'run-changes';")
+        .expect("delete Run");
+    let remaining: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM run_git_file_changes WHERE run_id = 'run-changes'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("remaining locator rows");
+    assert_eq!(remaining, 0);
+}
+
+#[test]
+fn terminal_change_storage_failure_rolls_back_lifecycle_event_and_locators() {
+    let directory = TestDirectory::new("terminal-change-rollback");
+    let (mut store, database, project_path) = trusted_store(&directory);
+    store
+        .create_managed_run_intent(run_intent_with_clean_baseline(
+            "run-rollback",
+            "event-rollback-created",
+            "event-rollback-requested",
+        ))
+        .expect("managed Run");
+    store
+        .connect_initial_managed_session(session_connection(
+            "session-rollback",
+            "run-rollback",
+            "thread-rollback",
+            &project_path,
+        ))
+        .expect("managed session");
+    let connection = Connection::open(&database).expect("failure fixture");
+    connection
+        .execute_batch(
+            "CREATE TRIGGER fail_change_insert BEFORE INSERT ON run_git_file_changes
+             BEGIN SELECT RAISE(ABORT, 'forced change failure'); END;",
+        )
+        .expect("failure trigger");
+    drop(connection);
+    let terminal = ManagedProviderObservation {
+        run_id: "run-rollback".to_owned(),
+        session_id: "session-rollback".to_owned(),
+        external_session_key: "thread-rollback".to_owned(),
+        provider_turn_id: "turn-rollback".to_owned(),
+        contract_version: "codex-app-server/0.145.0".to_owned(),
+        event_id: "event-rollback-terminal".to_owned(),
+        observed_at: ENDED_AT.to_owned(),
+        kind: ManagedProviderObservationKind::TurnCompleted {
+            changes: ManagedGitChangeSummary::Exact {
+                files: 2,
+                insertions: 3,
+                deletions: 1,
+            },
+            change_set: Some(Box::new(exact_file_change_set(&project_path))),
+        },
+    };
+    assert!(matches!(
+        store.append_managed_provider_observation(terminal),
+        Err(StoreError::Sqlite(_))
+    ));
+    assert_eq!(
+        store
+            .managed_run("run-rollback")
+            .expect("Run")
+            .expect("stored Run")
+            .ended_at,
+        None
+    );
+    assert_eq!(
+        store
+            .managed_session("session-rollback")
+            .expect("session")
+            .expect("stored session")
+            .ended_at,
+        None
+    );
+    assert_eq!(
+        store
+            .managed_git_change_set_metadata("run-rollback")
+            .expect("missing metadata"),
+        None
+    );
+    assert!(
+        store
+            .run_events_through(
+                "run-rollback",
+                0,
+                store.latest_ingest_seq().expect("latest cursor"),
+                10,
+            )
+            .expect("events")
+            .events
+            .iter()
+            .all(|event| event.event_id != "event-rollback-terminal")
+    );
+}
+
+#[test]
+fn exact_file_changes_require_the_run_clean_baseline_and_matching_oid() {
+    let directory = TestDirectory::new("terminal-change-baseline-binding");
+    let (mut store, _database, project_path) = trusted_store(&directory);
+    for case in ["unavailable", "dirty", "mismatched"] {
+        let run_id = format!("run-baseline-{case}");
+        let session_id = format!("session-baseline-{case}");
+        let thread_id = format!("thread-baseline-{case}");
+        let created_event_id = format!("event-baseline-{case}-created");
+        let requested_event_id = format!("event-baseline-{case}-requested");
+        let mut intent = if case == "unavailable" {
+            run_intent(&run_id, &created_event_id, &requested_event_id)
+        } else {
+            run_intent_with_clean_baseline(&run_id, &created_event_id, &requested_event_id)
+        };
+        if case == "dirty" {
+            let GitBaselinePayload::Available { dirty, .. } = &mut intent.git_baseline else {
+                unreachable!()
+            };
+            dirty.unstaged = 1;
+            dirty.entries = 1;
+        }
+        store
+            .create_managed_run_intent(intent)
+            .expect("managed Run");
+        store
+            .connect_initial_managed_session(session_connection(
+                &session_id,
+                &run_id,
+                &thread_id,
+                &project_path,
+            ))
+            .expect("managed session");
+        let before = store.latest_ingest_seq().expect("cursor before rejection");
+        let mut change_set = exact_file_change_set(&project_path);
+        if case == "mismatched" {
+            change_set.baseline_head = Some("9".repeat(40));
+        }
+        let observation = ManagedProviderObservation {
+            run_id: run_id.clone(),
+            session_id: session_id.clone(),
+            external_session_key: thread_id,
+            provider_turn_id: format!("turn-baseline-{case}"),
+            contract_version: "codex-app-server/0.145.0".to_owned(),
+            event_id: format!("event-baseline-{case}-terminal"),
+            observed_at: ENDED_AT.to_owned(),
+            kind: ManagedProviderObservationKind::TurnCompleted {
+                changes: ManagedGitChangeSummary::Exact {
+                    files: 2,
+                    insertions: 3,
+                    deletions: 1,
+                },
+                change_set: Some(Box::new(change_set)),
+            },
+        };
+        assert!(matches!(
+            store.append_managed_provider_observation(observation),
+            Err(StoreError::ManagedGitChangeBaselineMismatch { run_id: rejected })
+                if rejected == run_id
+        ));
+        assert_eq!(store.latest_ingest_seq().expect("unchanged cursor"), before);
+        assert_eq!(
+            store
+                .managed_run(&run_id)
+                .expect("Run")
+                .expect("stored Run")
+                .ended_at,
+            None
+        );
+        assert_eq!(
+            store
+                .managed_git_change_set_metadata(&run_id)
+                .expect("missing change set"),
+            None
+        );
+    }
+}
+
+#[test]
+fn invalid_terminal_file_change_sets_fail_before_mutation_and_binary_remains_exactly_stored() {
+    let directory = TestDirectory::new("terminal-change-validation");
+    let (mut store, _database, project_path) = trusted_store(&directory);
+    store
+        .create_managed_run_intent(run_intent_with_clean_baseline(
+            "run-validation",
+            "event-validation-created",
+            "event-validation-requested",
+        ))
+        .expect("managed Run");
+    store
+        .connect_initial_managed_session(session_connection(
+            "session-validation",
+            "run-validation",
+            "thread-validation",
+            &project_path,
+        ))
+        .expect("managed session");
+    let initial_cursor = store.latest_ingest_seq().expect("initial cursor");
+
+    let mut invalid_sets = Vec::new();
+    let mut invalid_id = exact_file_change_set(&project_path);
+    invalid_id.changes[0].change_id = "path-shaped-id".to_owned();
+    invalid_sets.push(invalid_id);
+    let mut misleading_display = exact_file_change_set(&project_path);
+    misleading_display.changes[0].display_path = "different.txt".to_owned();
+    invalid_sets.push(misleading_display);
+    let mut duplicate_path = exact_file_change_set(&project_path);
+    duplicate_path.changes[1].raw_path = duplicate_path.changes[0].raw_path.clone();
+    duplicate_path.changes[1].display_path = duplicate_path.changes[0].display_path.clone();
+    invalid_sets.push(duplicate_path);
+    let mut no_layer = exact_file_change_set(&project_path);
+    no_layer.changes[0].committed = false;
+    no_layer.changes[0].staged = false;
+    no_layer.changes[0].unstaged = false;
+    invalid_sets.push(no_layer);
+    let mut invalid_binary = exact_file_change_set(&project_path);
+    invalid_binary.changes[0].binary = true;
+    invalid_sets.push(invalid_binary);
+    let mut exact_untracked = exact_file_change_set(&project_path);
+    exact_untracked.changes[0].status = ManagedGitFileStatus::Untracked;
+    invalid_sets.push(exact_untracked);
+    let mut exact_countless = exact_file_change_set(&project_path);
+    exact_countless.changes[0].insertions = None;
+    exact_countless.changes[0].deletions = None;
+    exact_countless.insertions = None;
+    exact_countless.deletions = None;
+    invalid_sets.push(exact_countless);
+    let mut invalid_aggregate = exact_file_change_set(&project_path);
+    invalid_aggregate.insertions = Some(4);
+    invalid_sets.push(invalid_aggregate);
+    let mut unsorted = exact_file_change_set(&project_path);
+    unsorted.changes.swap(0, 1);
+    invalid_sets.push(unsorted);
+
+    for (index, change_set) in invalid_sets.into_iter().enumerate() {
+        let observation = ManagedProviderObservation {
+            run_id: "run-validation".to_owned(),
+            session_id: "session-validation".to_owned(),
+            external_session_key: "thread-validation".to_owned(),
+            provider_turn_id: "turn-validation".to_owned(),
+            contract_version: "codex-app-server/0.145.0".to_owned(),
+            event_id: format!("event-invalid-change-set-{index}"),
+            observed_at: ENDED_AT.to_owned(),
+            kind: ManagedProviderObservationKind::TurnCompleted {
+                changes: ManagedGitChangeSummary::Exact {
+                    files: 2,
+                    insertions: 3,
+                    deletions: 1,
+                },
+                change_set: Some(Box::new(change_set)),
+            },
+        };
+        assert!(matches!(
+            store.append_managed_provider_observation(observation),
+            Err(StoreError::InvalidManagedProviderObservation {
+                field: "change_set"
+            })
+        ));
+    }
+    assert_eq!(
+        store.latest_ingest_seq().expect("unchanged cursor"),
+        initial_cursor
+    );
+    assert_eq!(
+        store
+            .managed_run("run-validation")
+            .expect("Run")
+            .expect("stored Run")
+            .ended_at,
+        None
+    );
+
+    let binary_id = "33333333333333333333333333333333";
+    let observed_id = "44444444444444444444444444444444";
+    let binary_set = ManagedGitChangeSet {
+        attribution: ManagedGitChangeAttribution::ObservedDuringRun,
+        baseline_head: None,
+        terminal_head: None,
+        repository_identity: test_repository_identity(&project_path),
+        files: 2,
+        insertions: None,
+        deletions: None,
+        changes: vec![
+            ManagedGitFileChange {
+                change_id: binary_id.to_owned(),
+                raw_path: b"binary.bin".to_vec(),
+                display_path: "binary.bin".to_owned(),
+                status: ManagedGitFileStatus::Modified,
+                committed: false,
+                staged: true,
+                unstaged: false,
+                binary: true,
+                insertions: None,
+                deletions: None,
+                project_scope: ManagedGitProjectScope::InsideProject,
+            },
+            ManagedGitFileChange {
+                change_id: observed_id.to_owned(),
+                raw_path: b"observed.txt".to_vec(),
+                display_path: "observed.txt".to_owned(),
+                status: ManagedGitFileStatus::Untracked,
+                committed: false,
+                staged: false,
+                unstaged: true,
+                binary: false,
+                insertions: None,
+                deletions: None,
+                project_scope: ManagedGitProjectScope::InsideProject,
+            },
+        ],
+    };
+    let binary = ManagedProviderObservation {
+        run_id: "run-validation".to_owned(),
+        session_id: "session-validation".to_owned(),
+        external_session_key: "thread-validation".to_owned(),
+        provider_turn_id: "turn-validation".to_owned(),
+        contract_version: "codex-app-server/0.145.0".to_owned(),
+        event_id: "event-binary-change-set".to_owned(),
+        observed_at: ENDED_AT.to_owned(),
+        kind: ManagedProviderObservationKind::TurnCompleted {
+            changes: ManagedGitChangeSummary::Unavailable {
+                reason: "binary_line_counts_unavailable".to_owned(),
+            },
+            change_set: Some(Box::new(binary_set.clone())),
+        },
+    };
+    store
+        .append_managed_provider_observation(binary)
+        .expect("binary detailed change set");
+    let metadata = store
+        .managed_git_change_set_metadata("run-validation")
+        .expect("observed metadata")
+        .expect("stored observed metadata");
+    assert_eq!(
+        metadata.attribution,
+        ManagedGitChangeAttribution::ObservedDuringRun
+    );
+    assert_eq!(metadata.baseline_head, None);
+    assert_eq!(metadata.terminal_head, None);
+    assert_eq!(metadata.insertions, None);
+    assert_eq!(
+        store
+            .managed_git_file_change("run-validation", binary_id)
+            .expect("binary change")
+            .expect("stored binary change"),
+        binary_set.changes[0]
+    );
+    assert_eq!(
+        store
+            .managed_git_file_change("run-validation", observed_id)
+            .expect("countless nonbinary change")
+            .expect("stored countless nonbinary change"),
+        binary_set.changes[1]
+    );
+}
+
+fn exact_file_change_set(project_path: &Path) -> ManagedGitChangeSet {
+    ManagedGitChangeSet {
+        attribution: ManagedGitChangeAttribution::Exact,
+        baseline_head: Some("1".repeat(40)),
+        terminal_head: Some("2".repeat(40)),
+        repository_identity: test_repository_identity(project_path),
+        files: 2,
+        insertions: Some(3),
+        deletions: Some(1),
+        changes: vec![
+            ManagedGitFileChange {
+                change_id: CHANGE_INSIDE_ID.to_owned(),
+                raw_path: b"inside-\xff.txt".to_vec(),
+                display_path: "inside-�.txt".to_owned(),
+                status: ManagedGitFileStatus::Modified,
+                committed: false,
+                staged: true,
+                unstaged: true,
+                binary: false,
+                insertions: Some(2),
+                deletions: Some(1),
+                project_scope: ManagedGitProjectScope::InsideProject,
+            },
+            ManagedGitFileChange {
+                change_id: CHANGE_OUTSIDE_ID.to_owned(),
+                raw_path: b"outside.txt".to_vec(),
+                display_path: "outside.txt".to_owned(),
+                status: ManagedGitFileStatus::Added,
+                committed: true,
+                staged: false,
+                unstaged: false,
+                binary: false,
+                insertions: Some(1),
+                deletions: Some(0),
+                project_scope: ManagedGitProjectScope::OutsideProject,
+            },
+        ],
+    }
+}
+
+fn test_repository_identity(project_path: &Path) -> ManagedGitRepositoryIdentity {
+    let project = ProjectDirectoryInspection::inspect(project_path)
+        .expect("Project identity")
+        .identity;
+    let root = project
+        .canonical_path
+        .to_str()
+        .expect("UTF-8 test Project path")
+        .as_bytes()
+        .to_vec();
+    let mut git_directory = root.clone();
+    git_directory.extend_from_slice(b"/.git");
+    ManagedGitRepositoryIdentity {
+        project_filesystem_id: project.filesystem_id.clone(),
+        repository_root: root,
+        repository_root_filesystem_id: project.filesystem_id.clone(),
+        git_directory: git_directory.clone(),
+        git_directory_filesystem_id: "unix:11:12".to_owned(),
+        common_directory: git_directory,
+        common_directory_filesystem_id: "unix:11:12".to_owned(),
+    }
 }
 
 #[test]
@@ -1260,6 +1918,7 @@ fn managed_permission_response_requires_submit_and_a_live_current_request() {
                 changes: ManagedGitChangeSummary::Unavailable {
                     reason: "git_terminal_observation_unavailable".to_owned(),
                 },
+                change_set: None,
             },
         })
         .expect("terminal observation");
@@ -2599,6 +3258,27 @@ fn run_intent(run_id: &str, created_event_id: &str, requested_event_id: &str) ->
         git_baseline_event_id: format!("{created_event_id}-git-baseline"),
         start_requested_event_id: requested_event_id.to_owned(),
     }
+}
+
+fn run_intent_with_clean_baseline(
+    run_id: &str,
+    created_event_id: &str,
+    requested_event_id: &str,
+) -> ManagedRunIntent {
+    let mut intent = run_intent(run_id, created_event_id, requested_event_id);
+    intent.git_baseline = GitBaselinePayload::Available {
+        project_id: "project-1".to_owned(),
+        head: flit_protocol::GitHead::Available {
+            oid: "1".repeat(40),
+        },
+        dirty: flit_protocol::GitDirtySummary {
+            staged: 0,
+            unstaged: 0,
+            untracked: 0,
+            entries: 0,
+        },
+    };
+    intent
 }
 
 fn start_failure(run_id: &str, event_id: &str) -> ManagedRunStartFailure {

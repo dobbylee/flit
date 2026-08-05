@@ -27,16 +27,19 @@ mod writer;
 
 pub use managed_runs::{
     InitialManagedSessionConnection, InitialManagedSessionOutcome, MANAGED_PROVIDER_KIND_CODEX,
-    MAX_LIVE_MANAGED_SESSIONS, MAX_MANAGED_METADATA_JSON_BYTES, MAX_MANAGED_METADATA_JSON_DEPTH,
-    MAX_MANAGED_METADATA_JSON_VALUES, ManagedGitChangeSummary, ManagedPermissionDecision,
-    ManagedPermissionDeliveryUnknownReason, ManagedPermissionResolutionKind,
-    ManagedPermissionResponseAttempt, ManagedPermissionResponseAttemptOutcome,
-    ManagedPermissionResponseResult, ManagedPermissionResponseResultKind, ManagedProviderDecision,
-    ManagedProviderObservation, ManagedProviderObservationKind, ManagedProviderOutcome,
-    ManagedProviderOutcomeCommit, ManagedProviderTerminalOutcome, ManagedReconciliationState,
-    ManagedRun, ManagedRunIntent, ManagedRunIntentOutcome, ManagedRunStartFailure,
-    ManagedRunStartFailureOutcome, ManagedSession, ManagedSessionReconciliation,
-    ManagedSessionReconciliationOutcome, ManagedSessionTermination,
+    MAX_LIVE_MANAGED_SESSIONS, MAX_MANAGED_GIT_CHANGE_ENTRIES, MAX_MANAGED_GIT_DISPLAY_PATH_BYTES,
+    MAX_MANAGED_GIT_PATH_BYTES, MAX_MANAGED_METADATA_JSON_BYTES, MAX_MANAGED_METADATA_JSON_DEPTH,
+    MAX_MANAGED_METADATA_JSON_VALUES, ManagedGitChangeAttribution, ManagedGitChangeSet,
+    ManagedGitChangeSetMetadata, ManagedGitChangeSummary, ManagedGitFileChange,
+    ManagedGitFileStatus, ManagedGitProjectScope, ManagedGitRepositoryIdentity,
+    ManagedPermissionDecision, ManagedPermissionDeliveryUnknownReason,
+    ManagedPermissionResolutionKind, ManagedPermissionResponseAttempt,
+    ManagedPermissionResponseAttemptOutcome, ManagedPermissionResponseResult,
+    ManagedPermissionResponseResultKind, ManagedProviderDecision, ManagedProviderObservation,
+    ManagedProviderObservationKind, ManagedProviderOutcome, ManagedProviderOutcomeCommit,
+    ManagedProviderTerminalOutcome, ManagedReconciliationState, ManagedRun, ManagedRunIntent,
+    ManagedRunIntentOutcome, ManagedRunStartFailure, ManagedRunStartFailureOutcome, ManagedSession,
+    ManagedSessionReconciliation, ManagedSessionReconciliationOutcome, ManagedSessionTermination,
     ManagedSessionTerminationOutcome, ManagedTurnTerminalOutcome,
 };
 pub use projects::{
@@ -59,6 +62,9 @@ const PROJECT_FILESYSTEM_IDENTITY_MIGRATION_VERSION: i64 = 2;
 const PROJECT_FILESYSTEM_IDENTITY_MIGRATION_NAME: &str = "project_filesystem_identity";
 const PROJECT_FILESYSTEM_IDENTITY_MIGRATION_SQL: &str =
     include_str!("../migrations/0002_project_filesystem_identity.sql");
+const RUN_GIT_CHANGES_MIGRATION_VERSION: i64 = 3;
+const RUN_GIT_CHANGES_MIGRATION_NAME: &str = "run_git_changes";
+const RUN_GIT_CHANGES_MIGRATION_SQL: &str = include_str!("../migrations/0003_run_git_changes.sql");
 const MAX_EVENT_READ_LIMIT: usize = 1_000;
 const MAX_MANAGED_PERMISSION_RESPONSE_EVENTS: usize = 2;
 pub const MAX_EVENT_APPEND_BATCH: usize = 50;
@@ -917,11 +923,31 @@ impl Store {
                 session_id: observation.session_id,
             });
         }
+        if let Some(change_set) = terminal_git_change_set(&observation.kind) {
+            validate_managed_git_change_set_run_binding(&transaction, &run, change_set)?;
+        }
         if let Some(stored) = load_event_by_id(&transaction, &observation.event_id)? {
             let expected = managed_provider_observation_event(&observation, stored.stream_seq);
             if UnsequencedEventEnvelope::from(stored.clone()) != expected {
                 return Err(StoreError::EventIdentityConflict {
                     event_id: observation.event_id,
+                });
+            }
+            let terminal_retry = matches!(
+                &observation.kind,
+                ManagedProviderObservationKind::TurnCompleted { .. }
+                    | ManagedProviderObservationKind::TurnInterrupted { .. }
+            );
+            if terminal_retry
+                && !stored_git_change_set_matches(
+                    &transaction,
+                    &observation.run_id,
+                    terminal_git_change_set(&observation.kind),
+                    &observation.event_id,
+                )?
+            {
+                return Err(StoreError::ManagedGitChangeSetConflict {
+                    run_id: observation.run_id,
                 });
             }
             return Ok(AppendEventOutcome::Duplicate(stored));
@@ -974,6 +1000,14 @@ impl Store {
         let outcome = outcomes
             .pop()
             .expect("one managed provider observation must produce one outcome");
+        if let Some(change_set) = terminal_git_change_set(&observation.kind) {
+            persist_managed_git_change_set(
+                &transaction,
+                &observation.run_id,
+                &observation.event_id,
+                change_set,
+            )?;
+        }
         transaction.commit().map_err(StoreError::Sqlite)?;
         Ok(outcome)
     }
@@ -1732,6 +1766,30 @@ impl Store {
             return Err(StoreError::InvalidManagedRunIntent { field: "id" });
         }
         load_managed_run(&self.connection, run_id)
+    }
+
+    pub fn managed_git_change_set_metadata(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<ManagedGitChangeSetMetadata>, StoreError> {
+        managed_runs::validate_read_id(run_id)
+            .map_err(|()| StoreError::InvalidManagedGitChangeRead { field: "run_id" })?;
+        load_managed_git_change_set_metadata(&self.connection, run_id)
+    }
+
+    pub fn managed_git_file_change(
+        &self,
+        run_id: &str,
+        change_id: &str,
+    ) -> Result<Option<ManagedGitFileChange>, StoreError> {
+        managed_runs::validate_read_id(run_id)
+            .map_err(|()| StoreError::InvalidManagedGitChangeRead { field: "run_id" })?;
+        managed_runs::validate_git_change_read_id(change_id)
+            .map_err(|()| StoreError::InvalidManagedGitChangeRead { field: "change_id" })?;
+        if load_managed_git_change_set_metadata(&self.connection, run_id)?.is_none() {
+            return Ok(None);
+        }
+        load_managed_git_file_change(&self.connection, run_id, change_id)
     }
 
     pub fn managed_run_detail_context(
@@ -2662,7 +2720,7 @@ fn managed_provider_observation_event(
                 "request_id": request_id,
             }),
         ),
-        ManagedProviderObservationKind::TurnCompleted { changes } => (
+        ManagedProviderObservationKind::TurnCompleted { changes, .. } => (
             "run.completed",
             json!({
                 "changes": managed_git_changes_payload(changes),
@@ -2671,7 +2729,7 @@ fn managed_provider_observation_event(
                 "result": "completed",
             }),
         ),
-        ManagedProviderObservationKind::TurnInterrupted { changes } => (
+        ManagedProviderObservationKind::TurnInterrupted { changes, .. } => (
             "run.interrupted",
             json!({
                 "changes": managed_git_changes_payload(changes),
@@ -3214,6 +3272,513 @@ fn load_managed_run(
         }
     })?;
     Ok(Some(run))
+}
+
+fn terminal_git_change_set(kind: &ManagedProviderObservationKind) -> Option<&ManagedGitChangeSet> {
+    match kind {
+        ManagedProviderObservationKind::TurnCompleted { change_set, .. }
+        | ManagedProviderObservationKind::TurnInterrupted { change_set, .. } => {
+            change_set.as_deref()
+        }
+        ManagedProviderObservationKind::CommandStarted { .. }
+        | ManagedProviderObservationKind::PermissionRequested { .. } => None,
+    }
+}
+
+fn validate_managed_git_change_set_run_binding(
+    connection: &Connection,
+    run: &ManagedRun,
+    change_set: &ManagedGitChangeSet,
+) -> Result<(), StoreError> {
+    let project_filesystem_id = connection
+        .query_row(
+            "SELECT filesystem_id FROM projects WHERE id = ?1",
+            [&run.project_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(StoreError::Sqlite)?
+        .flatten();
+    if project_filesystem_id.as_deref()
+        != Some(
+            change_set
+                .repository_identity
+                .project_filesystem_id
+                .as_str(),
+        )
+    {
+        return Err(StoreError::ManagedGitChangeBaselineMismatch {
+            run_id: run.id.clone(),
+        });
+    }
+    if change_set.attribution != ManagedGitChangeAttribution::Exact {
+        return Ok(());
+    }
+    let baseline_payload = connection
+        .query_row(
+            "SELECT payload_json FROM events
+             WHERE run_id = ?1 AND event_type = 'git.snapshot_recorded'
+             ORDER BY ingest_seq LIMIT 1",
+            [&run.id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(StoreError::Sqlite)?
+        .and_then(|payload| serde_json::from_str::<GitBaselinePayload>(&payload).ok());
+    let exact_clean = matches!(
+        baseline_payload,
+        Some(GitBaselinePayload::Available {
+            project_id,
+            head: GitHead::Available { oid },
+            dirty,
+        }) if project_id == run.project_id
+            && Some(oid.as_str()) == change_set.baseline_head.as_deref()
+            && run.baseline_head.as_deref() == Some(oid.as_str())
+            && dirty.staged == 0
+            && dirty.unstaged == 0
+            && dirty.untracked == 0
+            && dirty.entries == 0
+    );
+    if !exact_clean {
+        return Err(StoreError::ManagedGitChangeBaselineMismatch {
+            run_id: run.id.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn persist_managed_git_change_set(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    terminal_event_id: &str,
+    change_set: &ManagedGitChangeSet,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "INSERT INTO run_git_change_sets(
+                run_id, terminal_event_id, attribution, baseline_head, terminal_head,
+                project_filesystem_id, repository_root, repository_root_filesystem_id,
+                git_directory, git_directory_filesystem_id, common_directory,
+                common_directory_filesystem_id, file_count, insertions, deletions
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                run_id,
+                terminal_event_id,
+                change_set.attribution.as_str(),
+                change_set.baseline_head,
+                change_set.terminal_head,
+                change_set.repository_identity.project_filesystem_id,
+                change_set.repository_identity.repository_root,
+                change_set.repository_identity.repository_root_filesystem_id,
+                change_set.repository_identity.git_directory,
+                change_set.repository_identity.git_directory_filesystem_id,
+                change_set.repository_identity.common_directory,
+                change_set
+                    .repository_identity
+                    .common_directory_filesystem_id,
+                change_set.files as i64,
+                change_set.insertions.map(|value| value as i64),
+                change_set.deletions.map(|value| value as i64),
+            ],
+        )
+        .map_err(StoreError::Sqlite)?;
+    for change in &change_set.changes {
+        transaction
+            .execute(
+                "INSERT INTO run_git_file_changes(run_id, change_id, raw_path, display_path, status, committed, staged, unstaged, binary, insertions, deletions, project_scope)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    run_id,
+                    change.change_id,
+                    change.raw_path,
+                    change.display_path,
+                    change.status.as_str(),
+                    i64::from(change.committed),
+                    i64::from(change.staged),
+                    i64::from(change.unstaged),
+                    i64::from(change.binary),
+                    change.insertions.map(|value| value as i64),
+                    change.deletions.map(|value| value as i64),
+                    change.project_scope.as_str(),
+                ],
+            )
+            .map_err(StoreError::Sqlite)?;
+    }
+    Ok(())
+}
+
+fn load_managed_git_change_set_metadata(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<Option<ManagedGitChangeSetMetadata>, StoreError> {
+    let stored = connection
+        .query_row(
+            "SELECT terminal_event_id, attribution, baseline_head, terminal_head,
+                    project_filesystem_id, repository_root, repository_root_filesystem_id,
+                    git_directory, git_directory_filesystem_id, common_directory,
+                    common_directory_filesystem_id, file_count, insertions, deletions
+             FROM run_git_change_sets WHERE run_id = ?1",
+            [run_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Vec<u8>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Vec<u8>>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, Option<i64>>(12)?,
+                    row.get::<_, Option<i64>>(13)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(StoreError::Sqlite)?;
+    let Some((
+        terminal_event_id,
+        attribution,
+        baseline_head,
+        terminal_head,
+        project_filesystem_id,
+        repository_root,
+        repository_root_filesystem_id,
+        git_directory,
+        git_directory_filesystem_id,
+        common_directory,
+        common_directory_filesystem_id,
+        files,
+        insertions,
+        deletions,
+    )) = stored
+    else {
+        return Ok(None);
+    };
+    let attribution = ManagedGitChangeAttribution::from_str(&attribution);
+    let repository_identity = ManagedGitRepositoryIdentity {
+        project_filesystem_id,
+        repository_root,
+        repository_root_filesystem_id,
+        git_directory,
+        git_directory_filesystem_id,
+        common_directory,
+        common_directory_filesystem_id,
+    };
+    let invalid = files < 0
+        || files as usize > MAX_MANAGED_GIT_CHANGE_ENTRIES
+        || files as u64 > MAX_JSON_SAFE_INTEGER
+        || insertions.is_some() != deletions.is_some()
+        || insertions.is_some_and(|value| value < 0 || value as u64 > MAX_JSON_SAFE_INTEGER)
+        || deletions.is_some_and(|value| value < 0 || value as u64 > MAX_JSON_SAFE_INTEGER)
+        || baseline_head
+            .as_deref()
+            .is_some_and(|head| !managed_runs::valid_stored_git_object_id(head))
+        || terminal_head
+            .as_deref()
+            .is_some_and(|head| !managed_runs::valid_stored_git_object_id(head))
+        || matches!(attribution, Some(ManagedGitChangeAttribution::Exact))
+            && (baseline_head.is_none() || terminal_head.is_none())
+        || attribution.is_none()
+        || !managed_runs::valid_stored_git_repository_identity(&repository_identity);
+    if invalid {
+        return Err(StoreError::StoredManagedGitChangeSetInvalid {
+            run_id: run_id.to_owned(),
+            field: "metadata",
+        });
+    }
+    let attribution = attribution.expect("validated attribution");
+    let terminal_event = connection
+        .query_row(
+            "SELECT run_id, event_type, payload_json FROM events WHERE event_id = ?1",
+            [&terminal_event_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(StoreError::Sqlite)?;
+    if !matches!(
+        &terminal_event,
+        Some((event_run_id, event_type, _))
+            if event_run_id == run_id
+                && matches!(event_type.as_str(), "run.completed" | "run.interrupted")
+    ) {
+        return Err(StoreError::StoredManagedGitChangeSetInvalid {
+            run_id: run_id.to_owned(),
+            field: "terminal_event",
+        });
+    }
+    let record_count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM run_git_file_changes WHERE run_id = ?1",
+            [run_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(StoreError::Sqlite)?;
+    if record_count < 0 || record_count as u64 != files as u64 {
+        return Err(StoreError::StoredManagedGitChangeSetInvalid {
+            run_id: run_id.to_owned(),
+            field: "record_count",
+        });
+    }
+    let metadata = ManagedGitChangeSetMetadata {
+        run_id: run_id.to_owned(),
+        terminal_event_id,
+        attribution,
+        baseline_head,
+        terminal_head,
+        repository_identity,
+        files: files as u64,
+        insertions: insertions.map(|value| value as u64),
+        deletions: deletions.map(|value| value as u64),
+    };
+    let Some((_, _, event_payload)) = terminal_event else {
+        unreachable!("validated terminal event")
+    };
+    let event_payload = serde_json::from_str::<Value>(&event_payload).map_err(|_| {
+        StoreError::StoredManagedGitChangeSetInvalid {
+            run_id: run_id.to_owned(),
+            field: "terminal_event_changes",
+        }
+    })?;
+    if !terminal_event_changes_match(&event_payload["changes"], &metadata) {
+        return Err(StoreError::StoredManagedGitChangeSetInvalid {
+            run_id: run_id.to_owned(),
+            field: "terminal_event_changes",
+        });
+    }
+    validate_stored_git_change_set_integrity(connection, &metadata)?;
+    Ok(Some(metadata))
+}
+
+fn terminal_event_changes_match(changes: &Value, metadata: &ManagedGitChangeSetMetadata) -> bool {
+    match metadata.attribution {
+        ManagedGitChangeAttribution::Exact => {
+            changes["availability"].as_str() == Some("available")
+                && changes["attribution"].as_str() == Some("exact")
+                && changes["files"].as_u64() == Some(metadata.files)
+                && changes["insertions"].as_u64() == metadata.insertions
+                && changes["deletions"].as_u64() == metadata.deletions
+        }
+        ManagedGitChangeAttribution::ObservedDuringRun => {
+            changes["availability"].as_str() == Some("unavailable")
+                || (changes["availability"].as_str() == Some("available")
+                    && changes["attribution"].as_str() == Some("observed_during_run")
+                    && changes["files"].as_u64() == Some(metadata.files)
+                    && changes["insertions"].as_u64() == metadata.insertions
+                    && changes["deletions"].as_u64() == metadata.deletions)
+        }
+    }
+}
+
+fn load_managed_git_file_change(
+    connection: &Connection,
+    run_id: &str,
+    change_id: &str,
+) -> Result<Option<ManagedGitFileChange>, StoreError> {
+    let stored = connection
+        .query_row(
+            "SELECT raw_path, display_path, status, committed, staged, unstaged, binary, insertions, deletions, project_scope
+             FROM run_git_file_changes WHERE run_id = ?1 AND change_id = ?2",
+            params![run_id, change_id],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, String>(9)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(StoreError::Sqlite)?;
+    let Some((
+        raw_path,
+        display_path,
+        status,
+        committed,
+        staged,
+        unstaged,
+        binary,
+        insertions,
+        deletions,
+        project_scope,
+    )) = stored
+    else {
+        return Ok(None);
+    };
+    let change = ManagedGitFileChange {
+        change_id: change_id.to_owned(),
+        raw_path,
+        display_path,
+        status: ManagedGitFileStatus::from_str(&status)
+            .ok_or_else(|| stored_git_change_error(run_id, change_id, "status"))?,
+        committed: stored_bool(committed)
+            .ok_or_else(|| stored_git_change_error(run_id, change_id, "committed"))?,
+        staged: stored_bool(staged)
+            .ok_or_else(|| stored_git_change_error(run_id, change_id, "staged"))?,
+        unstaged: stored_bool(unstaged)
+            .ok_or_else(|| stored_git_change_error(run_id, change_id, "unstaged"))?,
+        binary: stored_bool(binary)
+            .ok_or_else(|| stored_git_change_error(run_id, change_id, "binary"))?,
+        insertions: stored_optional_change_count(insertions)
+            .ok_or_else(|| stored_git_change_error(run_id, change_id, "insertions"))?,
+        deletions: stored_optional_change_count(deletions)
+            .ok_or_else(|| stored_git_change_error(run_id, change_id, "deletions"))?,
+        project_scope: ManagedGitProjectScope::from_str(&project_scope)
+            .ok_or_else(|| stored_git_change_error(run_id, change_id, "project_scope"))?,
+    };
+    managed_runs::validate_stored_git_file_change(&change)
+        .map_err(|field| stored_git_change_error(run_id, change_id, field))?;
+    Ok(Some(change))
+}
+
+fn validate_stored_git_change_set_integrity(
+    connection: &Connection,
+    metadata: &ManagedGitChangeSetMetadata,
+) -> Result<(), StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT change_id FROM run_git_file_changes
+             WHERE run_id = ?1 ORDER BY raw_path, change_id",
+        )
+        .map_err(StoreError::Sqlite)?;
+    let change_ids = statement
+        .query_map([&metadata.run_id], |row| row.get::<_, String>(0))
+        .map_err(StoreError::Sqlite)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::Sqlite)?;
+    if change_ids.len() > MAX_MANAGED_GIT_CHANGE_ENTRIES
+        || change_ids.len() as u64 != metadata.files
+    {
+        return Err(StoreError::StoredManagedGitChangeSetInvalid {
+            run_id: metadata.run_id.clone(),
+            field: "record_count",
+        });
+    }
+    let mut previous = None::<(Vec<u8>, String)>;
+    let mut insertions = Some(0_u64);
+    let mut deletions = Some(0_u64);
+    for change_id in change_ids {
+        let change = load_managed_git_file_change(connection, &metadata.run_id, &change_id)?
+            .ok_or_else(|| StoreError::StoredManagedGitChangeSetInvalid {
+                run_id: metadata.run_id.clone(),
+                field: "record",
+            })?;
+        if metadata.attribution == ManagedGitChangeAttribution::Exact
+            && (change.status == ManagedGitFileStatus::Untracked || change.insertions.is_none())
+        {
+            return Err(StoreError::StoredManagedGitChangeSetInvalid {
+                run_id: metadata.run_id.clone(),
+                field: "attribution",
+            });
+        }
+        let order = (change.raw_path.clone(), change.change_id.clone());
+        if previous.as_ref().is_some_and(|previous| previous >= &order) {
+            return Err(StoreError::StoredManagedGitChangeSetInvalid {
+                run_id: metadata.run_id.clone(),
+                field: "record_order",
+            });
+        }
+        previous = Some(order);
+        insertions = insertions
+            .zip(change.insertions)
+            .and_then(|(total, value)| total.checked_add(value))
+            .filter(|value| *value <= MAX_JSON_SAFE_INTEGER);
+        deletions = deletions
+            .zip(change.deletions)
+            .and_then(|(total, value)| total.checked_add(value))
+            .filter(|value| *value <= MAX_JSON_SAFE_INTEGER);
+    }
+    if insertions != metadata.insertions || deletions != metadata.deletions {
+        return Err(StoreError::StoredManagedGitChangeSetInvalid {
+            run_id: metadata.run_id.clone(),
+            field: "aggregate",
+        });
+    }
+    Ok(())
+}
+
+fn stored_bool(value: i64) -> Option<bool> {
+    match value {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+fn stored_optional_change_count(value: Option<i64>) -> Option<Option<u64>> {
+    match value {
+        None => Some(None),
+        Some(value) if value >= 0 && value as u64 <= MAX_JSON_SAFE_INTEGER => {
+            Some(Some(value as u64))
+        }
+        Some(_) => None,
+    }
+}
+
+fn stored_git_change_error(run_id: &str, change_id: &str, field: &'static str) -> StoreError {
+    StoreError::StoredManagedGitFileChangeInvalid {
+        run_id: run_id.to_owned(),
+        change_id: change_id.to_owned(),
+        field,
+    }
+}
+
+fn stored_git_change_set_matches(
+    connection: &Connection,
+    run_id: &str,
+    expected: Option<&ManagedGitChangeSet>,
+    terminal_event_id: &str,
+) -> Result<bool, StoreError> {
+    let stored = load_managed_git_change_set_metadata(connection, run_id)?;
+    let (Some(stored), Some(expected)) = (&stored, expected) else {
+        return Ok(stored.is_none() && expected.is_none());
+    };
+    if stored.terminal_event_id != terminal_event_id
+        || stored.attribution != expected.attribution
+        || stored.baseline_head != expected.baseline_head
+        || stored.terminal_head != expected.terminal_head
+        || stored.repository_identity != expected.repository_identity
+        || stored.files != expected.files
+        || stored.insertions != expected.insertions
+        || stored.deletions != expected.deletions
+    {
+        return Ok(false);
+    }
+    let count = connection
+        .query_row(
+            "SELECT COUNT(*) FROM run_git_file_changes WHERE run_id = ?1",
+            [run_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(StoreError::Sqlite)?;
+    if count < 0 || count as usize != expected.changes.len() {
+        return Ok(false);
+    }
+    for change in &expected.changes {
+        if load_managed_git_file_change(connection, run_id, &change.change_id)?.as_ref()
+            != Some(change)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn load_managed_run_intent_events(
@@ -4612,6 +5177,11 @@ pub fn project_filesystem_identity_migration_checksum() -> String {
     migration_checksum(PROJECT_FILESYSTEM_IDENTITY_MIGRATION_SQL)
 }
 
+#[must_use]
+pub fn run_git_changes_migration_checksum() -> String {
+    migration_checksum(RUN_GIT_CHANGES_MIGRATION_SQL)
+}
+
 fn migration_checksum(sql: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(sql.as_bytes());
@@ -4772,7 +5342,7 @@ struct Migration {
     sql: &'static str,
 }
 
-fn migrations() -> [Migration; 2] {
+fn migrations() -> [Migration; 3] {
     [
         Migration {
             version: INITIAL_MIGRATION_VERSION,
@@ -4783,6 +5353,11 @@ fn migrations() -> [Migration; 2] {
             version: PROJECT_FILESYSTEM_IDENTITY_MIGRATION_VERSION,
             name: PROJECT_FILESYSTEM_IDENTITY_MIGRATION_NAME,
             sql: PROJECT_FILESYSTEM_IDENTITY_MIGRATION_SQL,
+        },
+        Migration {
+            version: RUN_GIT_CHANGES_MIGRATION_VERSION,
+            name: RUN_GIT_CHANGES_MIGRATION_NAME,
+            sql: RUN_GIT_CHANGES_MIGRATION_SQL,
         },
     ]
 }
@@ -4991,6 +5566,24 @@ pub enum StoreError {
         field: &'static str,
     },
     InvalidManagedProviderObservation {
+        field: &'static str,
+    },
+    InvalidManagedGitChangeRead {
+        field: &'static str,
+    },
+    ManagedGitChangeSetConflict {
+        run_id: String,
+    },
+    ManagedGitChangeBaselineMismatch {
+        run_id: String,
+    },
+    StoredManagedGitChangeSetInvalid {
+        run_id: String,
+        field: &'static str,
+    },
+    StoredManagedGitFileChangeInvalid {
+        run_id: String,
+        change_id: String,
         field: &'static str,
     },
     InvalidManagedProviderOutcome {
@@ -5318,6 +5911,35 @@ impl fmt::Display for StoreError {
                     "invalid managed provider observation field: {field}"
                 )
             }
+            Self::InvalidManagedGitChangeRead { field } => {
+                write!(formatter, "invalid managed Git change read field: {field}")
+            }
+            Self::ManagedGitChangeSetConflict { run_id } => {
+                write!(
+                    formatter,
+                    "managed Git change set conflicts for Run: {run_id}"
+                )
+            }
+            Self::ManagedGitChangeBaselineMismatch { run_id } => {
+                write!(
+                    formatter,
+                    "managed Git change set baseline conflicts for Run: {run_id}"
+                )
+            }
+            Self::StoredManagedGitChangeSetInvalid { run_id, field } => {
+                write!(
+                    formatter,
+                    "stored managed Git change set {run_id} has invalid {field}"
+                )
+            }
+            Self::StoredManagedGitFileChangeInvalid {
+                run_id,
+                change_id,
+                field,
+            } => write!(
+                formatter,
+                "stored managed Git file change {run_id}/{change_id} has invalid {field}"
+            ),
             Self::InvalidManagedProviderOutcome { field } => {
                 write!(formatter, "invalid managed provider outcome field: {field}")
             }
