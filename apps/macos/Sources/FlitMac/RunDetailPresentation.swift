@@ -1,5 +1,62 @@
 import Foundation
 
+enum RunCompletionSummaryError: Error, Equatable {
+    case invalidProjection
+}
+
+struct RunCompletionSummary: Sendable {
+    let result: String
+    let projectDisplayName: String
+    let provider: FlitProviderKind
+    let startedAt: String?
+    let endedAt: String
+    let changes: FlitDashboardChangeSummary
+}
+
+func runCompletionSummary(
+    for run: FlitDashboardRunRecord
+) throws -> RunCompletionSummary? {
+    guard
+        !run.runId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+        !run.projectDisplayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+        run.startedAt.map({
+            !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }) ?? true
+    else {
+        throw RunCompletionSummaryError.invalidProjection
+    }
+    if case let .unavailable(reason) = run.changes,
+        reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    {
+        throw RunCompletionSummaryError.invalidProjection
+    }
+
+    switch run.lifecycle {
+    case "Starting", "Running":
+        guard run.endedAt == nil else {
+            throw RunCompletionSummaryError.invalidProjection
+        }
+        return nil
+    case "Finished", "Failed", "Stopped", "Interrupted":
+        guard
+            let endedAt = run.endedAt,
+            !endedAt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            throw RunCompletionSummaryError.invalidProjection
+        }
+        return RunCompletionSummary(
+            result: run.lifecycle,
+            projectDisplayName: run.projectDisplayName,
+            provider: run.provider,
+            startedAt: run.startedAt,
+            endedAt: endedAt,
+            changes: run.changes
+        )
+    default:
+        throw RunCompletionSummaryError.invalidProjection
+    }
+}
+
 enum RunDetailPresentationError: Error, Equatable {
     case contractMismatch
     case runIdentityMismatch

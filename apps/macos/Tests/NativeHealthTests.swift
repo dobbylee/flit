@@ -1128,6 +1128,80 @@ struct NativeHealthTests {
             object["next_cursor"] = 3
             object["has_more"] = false
         }
+        let completedDashboardFixture = try changingDashboard(initialDashboardFixture) {
+            object in
+            guard var runs = object["runs"] as? [[String: Any]] else {
+                throw NativeHealthTestFailure.failed("Dashboard runs must be an array")
+            }
+            runs[0]["lifecycle"] = "Finished"
+            runs[0]["dashboard_bucket"] = "Finished"
+            runs[0]["ended_at"] = "2026-07-28T00:00:03.000Z"
+            object["runs"] = runs
+        }
+        guard case let .snapshot(completedDashboardSnapshot) = completedDashboardFixture else {
+            throw NativeHealthTestFailure.failed(
+                "completed Dashboard fixture must remain a snapshot"
+            )
+        }
+        let activeCompletionSummary = try runCompletionSummary(
+            for: initialSnapshotFixture.runs[0]
+        )
+        try require(
+            activeCompletionSummary == nil,
+            "an active Dashboard Run must not produce a completion summary"
+        )
+        guard
+            let completionSummary = try runCompletionSummary(
+                for: completedDashboardSnapshot.runs[0]
+            )
+        else {
+            throw NativeHealthTestFailure.failed(
+                "a valid terminal Dashboard Run must produce a completion summary"
+            )
+        }
+        try require(
+            completionSummary.result == "Finished"
+                && completionSummary.projectDisplayName == "Dashboard Project"
+                && completionSummary.provider == .codex
+                && completionSummary.startedAt == "2026-07-28T00:00:01.000Z"
+                && completionSummary.endedAt == "2026-07-28T00:00:03.000Z"
+                && completionSummary.changes == initialSnapshotFixture.runs[0].changes,
+            "completion summary must preserve exact projected terminal facts"
+        )
+        let malformedCompletionFixtures = try [
+            changingDashboard(completedDashboardFixture) { object in
+                guard var runs = object["runs"] as? [[String: Any]] else {
+                    throw NativeHealthTestFailure.failed("Dashboard runs must be an array")
+                }
+                runs[0]["ended_at"] = NSNull()
+                object["runs"] = runs
+            },
+            changingDashboard(completedDashboardFixture) { object in
+                guard var runs = object["runs"] as? [[String: Any]] else {
+                    throw NativeHealthTestFailure.failed("Dashboard runs must be an array")
+                }
+                runs[0]["lifecycle"] = "UnknownTerminal"
+                object["runs"] = runs
+            },
+        ]
+        for malformed in malformedCompletionFixtures {
+            guard case let .snapshot(snapshot) = malformed else {
+                throw NativeHealthTestFailure.failed(
+                    "malformed completion fixture must remain a snapshot"
+                )
+            }
+            do {
+                _ = try runCompletionSummary(for: snapshot.runs[0])
+                throw NativeHealthTestFailure.failed(
+                    "malformed terminal facts must not produce a completion summary"
+                )
+            } catch let error as RunCompletionSummaryError {
+                try require(
+                    error == .invalidProjection,
+                    "malformed terminal facts must retain their typed failure"
+                )
+            }
+        }
         let pagedDashboardFixture = try changingDashboard(initialDashboardFixture) { object in
             guard var runs = object["runs"] as? [[String: Any]] else {
                 throw NativeHealthTestFailure.failed("Dashboard runs must be an array")
@@ -2002,7 +2076,7 @@ struct NativeHealthTests {
         let detailController = FoundationViewController(
             client: client,
             dashboardClient: DashboardClient(
-                fixtureLoader: { initialDashboardFixture }
+                fixtureLoader: { completedDashboardFixture }
             ),
             runDetailClient: RunDetailClient(
                 fixtureLoader: { request in
@@ -2044,6 +2118,7 @@ struct NativeHealthTests {
         try require(
             detailIdentifiers.contains("flit.runDetail.back")
                 && detailIdentifiers.contains("flit.runDetail.title.run-dashboard-1")
+                && detailIdentifiers.contains("flit.runDetail.completionSummary")
                 && detailIdentifiers.contains("flit.runDetail.group.1.3")
                 && detailIdentifiers.contains("flit.runDetail.event.1")
                 && detailIdentifiers.contains("flit.runDetail.event.2")
@@ -2137,6 +2212,9 @@ struct NativeHealthTests {
                 $0.accessibilityIdentifier().hasPrefix("flit.runDetail.event.")
             })
                 && commandFilteredViews.contains(where: {
+                    $0.accessibilityIdentifier() == "flit.runDetail.completionSummary"
+                })
+                && commandFilteredViews.contains(where: {
                     $0.accessibilityIdentifier()
                         == "flit.runDetail.noMatchingEvents.command"
                 }),
@@ -2169,7 +2247,40 @@ struct NativeHealthTests {
         )
         let detailCopy = detailViews.compactMap { ($0 as? NSTextField)?.stringValue }
         try require(
-            detailCopy.contains(
+            detailCopy.contains(FoundationCopy.text(.runDetailCompletionSummary))
+                && detailCopy.contains(
+                    FoundationCopy.format(.runDetailSummaryResult, "Finished")
+                )
+                && detailCopy.contains(
+                    FoundationCopy.format(
+                        .runDetailSummaryProjectProvider,
+                        "Dashboard Project",
+                        "codex"
+                    )
+                )
+                && detailCopy.contains(
+                    FoundationCopy.format(
+                        .runDetailSummaryTime,
+                        "2026-07-28T00:00:01.000Z",
+                        "2026-07-28T00:00:03.000Z"
+                    )
+                )
+                && detailCopy.contains(
+                    FoundationCopy.format(.dashboardChanges, 3, 42, 7)
+                )
+                && detailCopy.contains(
+                    FoundationCopy.text(.runDetailSummaryBranchUnavailable)
+                )
+                && detailCopy.contains(
+                    FoundationCopy.text(.runDetailSummaryValidationUnavailable)
+                )
+                && detailCopy.contains(
+                    FoundationCopy.text(.runDetailSummaryOpenIssuesUnavailable)
+                )
+                && detailCopy.contains(
+                    FoundationCopy.text(.runDetailSummaryEvidenceUnavailable)
+                )
+                && detailCopy.contains(
                 FoundationCopy.format(
                     .runDetailGroup,
                     "2026-07-28T00:00:00.000Z",
@@ -2211,6 +2322,39 @@ struct NativeHealthTests {
                 $0.accessibilityIdentifier() == "flit.dashboard.run.run-dashboard-1"
             }),
             "Back must restore the Dashboard and stale evidence controls must be inert"
+        )
+        let malformedDetailController = FoundationViewController(
+            client: client,
+            dashboardClient: DashboardClient(
+                fixtureLoader: { malformedCompletionFixtures[0] }
+            ),
+            runDetailClient: RunDetailClient(
+                fixtureLoader: { _ in completedRunDetailFixture }
+            )
+        )
+        _ = malformedDetailController.view
+        guard
+            let malformedDetailButton = descendants(
+                of: malformedDetailController.view
+            ).first(where: {
+                $0.accessibilityIdentifier()
+                    == "flit.dashboard.runDetail.run-dashboard-1"
+            }) as? NSButton
+        else {
+            throw NativeHealthTestFailure.failed(
+                "malformed terminal Dashboard must still expose its bounded detail action"
+            )
+        }
+        malformedDetailButton.performClick(nil)
+        let malformedDetailViews = descendants(of: malformedDetailController.view)
+        try require(
+            malformedDetailViews.contains(where: {
+                $0.accessibilityIdentifier() == "flit.runDetail.unavailable"
+            })
+                && !malformedDetailViews.contains(where: {
+                    $0.accessibilityIdentifier() == "flit.runDetail.completionSummary"
+                }),
+            "malformed terminal projection must fail Run detail closed"
         )
         let pagedController = FoundationViewController(
             client: client,
@@ -2261,6 +2405,9 @@ struct NativeHealthTests {
             unfilteredFirstPageViews.contains(where: {
                 $0.accessibilityIdentifier() == "flit.runDetail.group.1.50"
             })
+                && !unfilteredFirstPageViews.contains(where: {
+                    $0.accessibilityIdentifier() == "flit.runDetail.completionSummary"
+                })
                 && unfilteredFirstPageCopy.contains(
                     FoundationCopy.format(
                         .runDetailGroupLoadedThrough,

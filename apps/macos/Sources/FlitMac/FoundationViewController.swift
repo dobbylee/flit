@@ -6,14 +6,10 @@ private final class FlippedDashboardDocumentView: NSView {
 }
 
 private final class RunDetailButton: NSButton {
-    let runId: String
-    let runVersion: UInt64
-    let runTitle: String
+    let run: FlitDashboardRunRecord
 
-    init(runId: String, runVersion: UInt64, runTitle: String) {
-        self.runId = runId
-        self.runVersion = runVersion
-        self.runTitle = runTitle
+    init(run: FlitDashboardRunRecord) {
+        self.run = run
         super.init(frame: .zero)
     }
 
@@ -41,6 +37,22 @@ private final class RunEvidenceButton: NSButton {
     }
 }
 
+private func dashboardChangesCopy(_ changes: FlitDashboardChangeSummary) -> String {
+    switch changes {
+    case let .available(attribution, files, insertions, deletions):
+        FoundationCopy.format(
+            attribution == .exact
+                ? .dashboardChanges
+                : .dashboardChangesObservedDuringRun,
+            files,
+            insertions,
+            deletions
+        )
+    case let .unavailable(reason):
+        FoundationCopy.format(.dashboardChangesUnavailable, reason)
+    }
+}
+
 @MainActor
 final class FoundationViewController: NSViewController {
     private let client: SystemHealthClient
@@ -55,6 +67,7 @@ final class FoundationViewController: NSViewController {
     private var dashboardScroll: NSScrollView?
     private var activeRunDetail: RunDetailPresentationState?
     private var activeRunTitle: String?
+    private var activeRunCompletionSummary: RunCompletionSummary?
     private var activeRunDetailFilter = RunActivityFilter.all
     private var activeRunDetailPageFailure = false
     private var expandedRunEvidenceIds: Set<String> = []
@@ -320,28 +333,15 @@ final class FoundationViewController: NSViewController {
                 weight: .regular
             )
         )
-        let changes: String
-        switch run.changes {
-        case let .available(attribution, files, insertions, deletions):
-            changes = FoundationCopy.format(
-                attribution == .exact
-                    ? .dashboardChanges
-                    : .dashboardChangesObservedDuringRun,
-                files,
-                insertions,
-                deletions
-            )
-        case let .unavailable(reason):
-            changes = FoundationCopy.format(.dashboardChangesUnavailable, reason)
-        }
         card.addArrangedSubview(
-            label(changes, size: 12, weight: .regular, color: .secondaryLabelColor)
+            label(
+                dashboardChangesCopy(run.changes),
+                size: 12,
+                weight: .regular,
+                color: .secondaryLabelColor
+            )
         )
-        let detail = RunDetailButton(
-            runId: run.runId,
-            runVersion: run.version,
-            runTitle: run.title
-        )
+        let detail = RunDetailButton(run: run)
         detail.title = FoundationCopy.text(.dashboardViewActivity)
         detail.bezelStyle = .inline
         detail.target = self
@@ -356,22 +356,27 @@ final class FoundationViewController: NSViewController {
         activeRunDetailPageFailure = false
         expandedRunEvidenceIds = []
         do {
+            let completionSummary = try runCompletionSummary(for: sender.run)
             let response = try runDetailClient.loadFirstPage(
-                runId: sender.runId,
-                expectedRunVersion: sender.runVersion
+                runId: sender.run.runId,
+                expectedRunVersion: sender.run.version
             )
             var detail = RunDetailPresentationState()
             try detail.apply(
                 response,
-                requestedRunId: sender.runId,
-                expectedRunVersion: sender.runVersion,
+                requestedRunId: sender.run.runId,
+                expectedRunVersion: sender.run.version,
                 requestedAfterCursor: 0,
                 requestedEventLimit: 50
             )
             activeRunDetail = detail
-            activeRunTitle = sender.runTitle
-            renderRunDetail(detail, runTitle: sender.runTitle, pageFailure: false)
+            activeRunTitle = sender.run.title
+            activeRunCompletionSummary = completionSummary
+            renderRunDetail(detail, runTitle: sender.run.title, pageFailure: false)
         } catch {
+            activeRunDetail = nil
+            activeRunTitle = nil
+            activeRunCompletionSummary = nil
             renderRunDetailFailure()
         }
     }
@@ -379,6 +384,7 @@ final class FoundationViewController: NSViewController {
     @objc private func showDashboard(_: NSButton) {
         activeRunDetail = nil
         activeRunTitle = nil
+        activeRunCompletionSummary = nil
         activeRunDetailFilter = .all
         activeRunDetailPageFailure = false
         expandedRunEvidenceIds = []
@@ -481,6 +487,11 @@ final class FoundationViewController: NSViewController {
         )
         identify(heading, as: "flit.runDetail.title.\(runId)")
         dashboardStack.addArrangedSubview(heading)
+        if let completionSummary = activeRunCompletionSummary {
+            dashboardStack.addArrangedSubview(
+                runCompletionSummaryView(completionSummary)
+            )
+        }
         dashboardStack.addArrangedSubview(
             label(
                 FoundationCopy.format(
@@ -577,6 +588,46 @@ final class FoundationViewController: NSViewController {
         } else {
             scrollDashboardToTop()
         }
+    }
+
+    private func runCompletionSummaryView(_ summary: RunCompletionSummary) -> NSView {
+        let stack = NSStackView()
+        identify(stack, as: "flit.runDetail.completionSummary")
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 3
+        stack.addArrangedSubview(
+            label(
+                FoundationCopy.text(.runDetailCompletionSummary),
+                size: 13,
+                weight: .semibold
+            )
+        )
+        let facts = [
+            FoundationCopy.format(.runDetailSummaryResult, summary.result),
+            FoundationCopy.format(
+                .runDetailSummaryProjectProvider,
+                summary.projectDisplayName,
+                summary.provider.rawValue
+            ),
+            summary.startedAt.map {
+                FoundationCopy.format(.runDetailSummaryTime, $0, summary.endedAt)
+            } ?? FoundationCopy.format(
+                .runDetailSummaryStartUnavailable,
+                summary.endedAt
+            ),
+            dashboardChangesCopy(summary.changes),
+            FoundationCopy.text(.runDetailSummaryBranchUnavailable),
+            FoundationCopy.text(.runDetailSummaryValidationUnavailable),
+            FoundationCopy.text(.runDetailSummaryOpenIssuesUnavailable),
+            FoundationCopy.text(.runDetailSummaryEvidenceUnavailable),
+        ]
+        facts.forEach {
+            stack.addArrangedSubview(
+                label($0, size: 11, weight: .regular, color: .secondaryLabelColor)
+            )
+        }
+        return stack
     }
 
     private func runDetailGroup(

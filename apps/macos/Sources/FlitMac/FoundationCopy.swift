@@ -59,6 +59,15 @@ enum FoundationCopyKey: String {
     case runDetailPageUnavailable = "runDetail.pageUnavailable"
     case runDetailProviderHistory = "runDetail.providerHistory"
     case runDetailRawPayloadUnavailable = "runDetail.rawPayloadUnavailable"
+    case runDetailSummaryBranchUnavailable = "runDetail.summary.branchUnavailable"
+    case runDetailSummaryEvidenceUnavailable = "runDetail.summary.evidenceUnavailable"
+    case runDetailSummaryOpenIssuesUnavailable = "runDetail.summary.openIssuesUnavailable"
+    case runDetailSummaryProjectProvider = "runDetail.summary.projectProvider"
+    case runDetailSummaryResult = "runDetail.summary.result"
+    case runDetailSummaryStartUnavailable = "runDetail.summary.startUnavailable"
+    case runDetailSummaryTime = "runDetail.summary.time"
+    case runDetailSummaryValidationUnavailable = "runDetail.summary.validationUnavailable"
+    case runDetailCompletionSummary = "runDetail.completionSummary"
     case runDetailShowEvidence = "runDetail.showEvidence"
     case runDetailTitle = "runDetail.title"
     case runDetailUnavailable = "runDetail.unavailable"
@@ -139,6 +148,19 @@ enum FoundationCopy {
         .runDetailProviderHistory: "Provider history",
         .runDetailRawPayloadUnavailable:
             "Raw payload unavailable in this bounded activity view",
+        .runDetailSummaryBranchUnavailable:
+            "Branch unavailable in the current Dashboard projection",
+        .runDetailSummaryEvidenceUnavailable:
+            "Completion evidence unavailable in the current Dashboard projection",
+        .runDetailSummaryOpenIssuesUnavailable:
+            "Open issues unavailable in the current Dashboard projection",
+        .runDetailSummaryProjectProvider: "Project: %@ · Provider: %@",
+        .runDetailSummaryResult: "Result: %@",
+        .runDetailSummaryStartUnavailable: "Started: unavailable · Ended: %@",
+        .runDetailSummaryTime: "Started: %@ · Ended: %@",
+        .runDetailSummaryValidationUnavailable:
+            "Validation unavailable in the current Dashboard projection",
+        .runDetailCompletionSummary: "Completion summary",
         .runDetailShowEvidence: "Show evidence",
         .runDetailTitle: "Activity · %@",
         .runDetailUnavailable: "Run activity unavailable",
