@@ -235,6 +235,68 @@ fn observes_exact_per_file_change_facts_across_terminal_git_layers() {
 }
 
 #[test]
+fn detailed_receipt_binds_heads_directory_identities_and_subproject_scope_without_debug_paths() {
+    let executable = installed_git();
+    let workspace = TestWorkspace::new("change-receipt");
+    let root = workspace.canonical_directory();
+    let project = root.join("project");
+    fs::create_dir(&project).expect("project directory");
+    git(&executable, &root, &["init", "-b", "main"]);
+    fs::write(project.join("inside.txt"), b"baseline\n").expect("inside baseline");
+    fs::write(root.join("outside.txt"), b"baseline\n").expect("outside baseline");
+    git(&executable, &root, &["add", "--", "."]);
+    git_with_identity(&executable, &root, &["commit", "-m", "baseline"]);
+    let baseline = clean_baseline(&executable, &project);
+    let baseline_head = match &baseline.receipt().head {
+        GitHead::Available(head) => head.clone(),
+        GitHead::Unborn => panic!("committed baseline head"),
+    };
+
+    fs::write(project.join("inside.txt"), b"inside\n").expect("inside terminal");
+    fs::write(root.join("outside.txt"), b"outside\n").expect("outside terminal");
+    git(&executable, &root, &["add", "--", "."]);
+    git_with_identity(&executable, &root, &["commit", "-m", "terminal"]);
+
+    let receipt = baseline.observe_change_set().expect("detailed receipt");
+    assert_eq!(receipt.baseline_head(), baseline_head);
+    assert!(receipt.terminal_head().is_some());
+    assert_ne!(receipt.terminal_head(), Some(baseline_head.as_str()));
+    assert_eq!(receipt.project_directory().canonical_path(), project);
+    assert_eq!(receipt.repository_root().canonical_path(), root);
+    assert_eq!(receipt.git_directory().canonical_path(), root.join(".git"));
+    assert_eq!(
+        receipt.common_directory().canonical_path(),
+        root.join(".git")
+    );
+    for identity in [
+        receipt.project_directory(),
+        receipt.repository_root(),
+        receipt.git_directory(),
+        receipt.common_directory(),
+    ] {
+        let filesystem_id = identity.filesystem_id();
+        assert!(filesystem_id.starts_with("unix:"));
+        assert_eq!(filesystem_id.split(':').count(), 3);
+    }
+    let inside = receipt
+        .changes()
+        .iter()
+        .find(|change| change.path().as_bytes() == b"project/inside.txt")
+        .expect("inside change");
+    let outside = receipt
+        .changes()
+        .iter()
+        .find(|change| change.path().as_bytes() == b"outside.txt")
+        .expect("outside change");
+    assert!(inside.inside_project());
+    assert!(!outside.inside_project());
+    let rendered = format!("{receipt:?}");
+    assert!(!rendered.contains(root.to_string_lossy().as_ref()));
+    assert!(!rendered.contains("inside.txt"));
+    assert!(!rendered.contains("outside.txt"));
+}
+
+#[test]
 fn observes_overlapping_and_distinct_staged_and_unstaged_layers() {
     let executable = installed_git();
     let workspace = TestWorkspace::new("mixed-change-facts");

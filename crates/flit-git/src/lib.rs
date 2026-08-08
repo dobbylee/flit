@@ -2,7 +2,10 @@ use std::{
     error::Error,
     ffi::{OsStr, OsString},
     fmt, fs,
-    os::unix::{ffi::OsStringExt, fs::MetadataExt},
+    os::unix::{
+        ffi::{OsStrExt, OsStringExt},
+        fs::MetadataExt,
+    },
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -172,6 +175,7 @@ pub struct GitFileChange {
     committed: bool,
     staged: bool,
     unstaged: bool,
+    inside_project: bool,
     line_counts: Option<GitLineCounts>,
 }
 
@@ -202,17 +206,87 @@ impl GitFileChange {
     }
 
     #[must_use]
+    pub const fn inside_project(&self) -> bool {
+        self.inside_project
+    }
+
+    #[must_use]
     pub const fn line_counts(&self) -> Option<GitLineCounts> {
         self.line_counts
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
+pub struct GitDirectoryIdentity {
+    canonical_path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
+impl GitDirectoryIdentity {
+    #[must_use]
+    pub fn canonical_path(&self) -> &Path {
+        &self.canonical_path
+    }
+
+    #[must_use]
+    pub fn filesystem_id(&self) -> String {
+        format!("unix:{}:{}", self.device, self.inode)
+    }
+}
+
+impl fmt::Debug for GitDirectoryIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GitDirectoryIdentity")
+            .field("canonical_path", &"<redacted>")
+            .field("filesystem_id", &self.filesystem_id())
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitChangeSet {
+    baseline_head: String,
+    terminal_head: Option<String>,
+    project_directory: GitDirectoryIdentity,
+    repository_root: GitDirectoryIdentity,
+    git_directory: GitDirectoryIdentity,
+    common_directory: GitDirectoryIdentity,
     changes: Vec<GitFileChange>,
 }
 
 impl GitChangeSet {
+    #[must_use]
+    pub fn baseline_head(&self) -> &str {
+        &self.baseline_head
+    }
+
+    #[must_use]
+    pub fn terminal_head(&self) -> Option<&str> {
+        self.terminal_head.as_deref()
+    }
+
+    #[must_use]
+    pub const fn project_directory(&self) -> &GitDirectoryIdentity {
+        &self.project_directory
+    }
+
+    #[must_use]
+    pub const fn repository_root(&self) -> &GitDirectoryIdentity {
+        &self.repository_root
+    }
+
+    #[must_use]
+    pub const fn git_directory(&self) -> &GitDirectoryIdentity {
+        &self.git_directory
+    }
+
+    #[must_use]
+    pub const fn common_directory(&self) -> &GitDirectoryIdentity {
+        &self.common_directory
+    }
+
     #[must_use]
     pub fn changes(&self) -> &[GitFileChange] {
         &self.changes
@@ -517,6 +591,10 @@ fn observe_change_set_since_clean_baseline_with_policy(
         }
         GitObservation::Repository(receipt) => receipt,
     };
+    let terminal_head = match &terminal_before.head {
+        GitHead::Available(oid) => Some(oid.clone()),
+        GitHead::Unborn => None,
+    };
     verify_observation_identities(
         runner,
         executable,
@@ -587,7 +665,7 @@ fn observe_change_set_since_clean_baseline_with_policy(
         &receipt.canonical_root,
         &root_identity,
     )?;
-    if terminal_after != (terminal_before.head, terminal_before.dirty)
+    if terminal_after != (terminal_before.head.clone(), terminal_before.dirty)
         || terminal_after.1.untracked != 0
     {
         return Err(GitChangeObservationError::RepositoryChangedDuringObservation);
@@ -603,7 +681,26 @@ fn observe_change_set_since_clean_baseline_with_policy(
     if observe_index(runner, executable, &receipt.canonical_root)?.contains_submodules {
         return Err(GitChangeObservationError::SubmodulesUnsupportedForChanges);
     }
-    build_change_set(&first)
+    let project_relative = canonical_project_directory
+        .strip_prefix(&receipt.canonical_root)
+        .map_err(|_| GitChangeObservationError::TerminalRepositoryMismatch)?
+        .as_os_str()
+        .as_bytes();
+    let changes = build_change_set(&first, project_relative)?;
+    let GitHead::Available(baseline_head) = &receipt.head else {
+        unreachable!("GitChangeBaseline always contains an available HEAD")
+    };
+    Ok(GitChangeSet {
+        baseline_head: baseline_head.clone(),
+        terminal_head,
+        project_directory: GitDirectoryIdentity::from(&baseline.project_directory),
+        repository_root: GitDirectoryIdentity::from(&baseline.repository_root),
+        git_directory: GitDirectoryIdentity::from(&baseline.repository_identity.git_directory),
+        common_directory: GitDirectoryIdentity::from(
+            &baseline.repository_identity.common_directory,
+        ),
+        changes,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -615,7 +712,10 @@ struct RawChangeOutputs {
     unstaged_paths: Vec<u8>,
 }
 
-fn build_change_set(outputs: &RawChangeOutputs) -> Result<GitChangeSet, GitChangeObservationError> {
+fn build_change_set(
+    outputs: &RawChangeOutputs,
+    project_relative: &[u8],
+) -> Result<Vec<GitFileChange>, GitChangeObservationError> {
     let counts = numstat::parse_records(&outputs.numstat)?;
     let statuses = name_status::parse(&outputs.name_status)?;
     if counts.keys().ne(statuses.keys()) {
@@ -632,6 +732,7 @@ fn build_change_set(outputs: &RawChangeOutputs) -> Result<GitChangeSet, GitChang
         if !is_committed && !is_staged && !is_unstaged {
             return Err(GitChangeObservationError::ChangePathSetMismatch);
         }
+        let inside_project = path_is_inside_project(path.as_bytes(), project_relative);
         changes.push(GitFileChange {
             line_counts: counts
                 .get(&path)
@@ -642,9 +743,17 @@ fn build_change_set(outputs: &RawChangeOutputs) -> Result<GitChangeSet, GitChang
             committed: is_committed,
             staged: is_staged,
             unstaged: is_unstaged,
+            inside_project,
         });
     }
-    Ok(GitChangeSet { changes })
+    Ok(changes)
+}
+
+fn path_is_inside_project(path: &[u8], project_relative: &[u8]) -> bool {
+    project_relative.is_empty()
+        || path
+            .strip_prefix(project_relative)
+            .is_some_and(|suffix| suffix.len() > 1 && suffix[0] == b'/')
 }
 
 fn observe_index(
@@ -1193,6 +1302,16 @@ struct StableDirectoryIdentity {
     device: u64,
     inode: u64,
     mode: u32,
+}
+
+impl From<&CanonicalDirectoryIdentity> for GitDirectoryIdentity {
+    fn from(identity: &CanonicalDirectoryIdentity) -> Self {
+        Self {
+            canonical_path: identity.canonical_path.clone(),
+            device: identity.identity.device,
+            inode: identity.identity.inode,
+        }
+    }
 }
 
 impl StableDirectoryIdentity {

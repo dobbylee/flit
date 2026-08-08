@@ -1,8 +1,8 @@
 #[cfg(test)]
 use std::sync::Arc;
-use std::{collections::BTreeMap, ffi::OsStr, path::Path};
+use std::{collections::BTreeMap, ffi::OsStr, os::unix::ffi::OsStrExt, path::Path};
 
-use flit_git::GitChangeBaseline;
+use flit_git::{GitChangeBaseline, GitChangeSet, GitFileStatus};
 #[cfg(test)]
 use flit_protocol::GitBaselineUnavailableReason;
 use flit_protocol::{
@@ -18,8 +18,10 @@ use flit_providers::{
     ProviderCompatibility, ProviderFingerprint, classify_codex,
 };
 use flit_store::{
-    AppendEventOutcome, InitialManagedSessionConnection, ManagedGitChangeSummary,
-    ManagedPermissionDecision, ManagedPermissionResolutionKind, ManagedPermissionResponseAttempt,
+    AppendEventOutcome, InitialManagedSessionConnection, ManagedGitChangeAttribution,
+    ManagedGitChangeSet, ManagedGitChangeSummary, ManagedGitFileChange, ManagedGitFileStatus,
+    ManagedGitProjectScope, ManagedGitRepositoryIdentity, ManagedPermissionDecision,
+    ManagedPermissionResolutionKind, ManagedPermissionResponseAttempt,
     ManagedPermissionResponseResult, ManagedPermissionResponseResultKind, ManagedProviderDecision,
     ManagedProviderObservation, ManagedProviderObservationKind, ManagedProviderOutcome,
     ManagedProviderOutcomeCommit, ManagedProviderTerminalOutcome, ManagedReconciliationState,
@@ -160,7 +162,13 @@ pub(crate) enum RetainedGitChangeBaseline {
     Exact(Box<GitChangeBaseline>),
     Unavailable(String),
     #[cfg(test)]
-    Observer(Arc<dyn Fn() -> ManagedGitChangeSummary + Send + Sync>),
+    Observer(Arc<dyn Fn() -> ManagedTerminalGitChanges + Send + Sync>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ManagedTerminalGitChanges {
+    summary: ManagedGitChangeSummary,
+    change_set: Option<Box<ManagedGitChangeSet>>,
 }
 
 pub(crate) struct RetainedPermission {
@@ -212,22 +220,16 @@ impl RetainedManagedRun {
         &self.contract_version
     }
 
-    pub(crate) fn observe_terminal_changes(&self) -> ManagedGitChangeSummary {
+    pub(crate) fn observe_terminal_changes(&self, run_id: &str) -> ManagedTerminalGitChanges {
         match &self.git_change_baseline {
-            RetainedGitChangeBaseline::Exact(baseline) => match baseline.observe_changes() {
-                Ok(summary) => ManagedGitChangeSummary::Exact {
-                    files: summary.files,
-                    insertions: summary.insertions,
-                    deletions: summary.deletions,
-                },
-                Err(_) => ManagedGitChangeSummary::Unavailable {
-                    reason: "git_terminal_observation_unavailable".to_owned(),
-                },
+            RetainedGitChangeBaseline::Exact(baseline) => match baseline.observe_change_set() {
+                Ok(change_set) => managed_terminal_git_changes(run_id, &change_set),
+                Err(_) => {
+                    ManagedTerminalGitChanges::unavailable("git_terminal_observation_unavailable")
+                }
             },
             RetainedGitChangeBaseline::Unavailable(reason) => {
-                ManagedGitChangeSummary::Unavailable {
-                    reason: reason.clone(),
-                }
+                ManagedTerminalGitChanges::unavailable(reason)
             }
             #[cfg(test)]
             RetainedGitChangeBaseline::Observer(observe) => observe(),
@@ -265,6 +267,10 @@ impl RetainedManagedRun {
         provider: Box<dyn ManagedCodexRuntime>,
         observe: Arc<dyn Fn() -> ManagedGitChangeSummary + Send + Sync>,
     ) -> Self {
+        let observe = Arc::new(move || ManagedTerminalGitChanges {
+            summary: observe(),
+            change_set: None,
+        });
         Self {
             request_digest: "test-runtime".to_owned(),
             response,
@@ -274,6 +280,153 @@ impl RetainedManagedRun {
             git_change_baseline: RetainedGitChangeBaseline::Observer(observe),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_terminal_change_observer(
+        response: ManagedRunStartResponse,
+        provider: Box<dyn ManagedCodexRuntime>,
+        observe: Arc<
+            dyn Fn() -> (ManagedGitChangeSummary, Option<Box<ManagedGitChangeSet>>) + Send + Sync,
+        >,
+    ) -> Self {
+        let observe = Arc::new(move || {
+            let (summary, change_set) = observe();
+            ManagedTerminalGitChanges {
+                summary,
+                change_set,
+            }
+        });
+        Self {
+            request_digest: "test-runtime".to_owned(),
+            response,
+            contract_version: "codex-app-server/0.145.0".to_owned(),
+            provider,
+            active_permission: None,
+            git_change_baseline: RetainedGitChangeBaseline::Observer(observe),
+        }
+    }
+}
+
+impl ManagedTerminalGitChanges {
+    fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            summary: ManagedGitChangeSummary::Unavailable {
+                reason: reason.into(),
+            },
+            change_set: None,
+        }
+    }
+}
+
+fn managed_terminal_git_changes(
+    run_id: &str,
+    observed: &GitChangeSet,
+) -> ManagedTerminalGitChanges {
+    let aggregate = observed.summary().ok();
+    let exact = observed.terminal_head().is_some() && aggregate.is_some();
+    let summary = if exact {
+        let aggregate = aggregate.expect("exact aggregate checked above");
+        ManagedGitChangeSummary::Exact {
+            files: aggregate.files,
+            insertions: aggregate.insertions,
+            deletions: aggregate.deletions,
+        }
+    } else {
+        ManagedGitChangeSummary::Unavailable {
+            reason: if observed.terminal_head().is_none() {
+                "git_terminal_head_unavailable"
+            } else {
+                "git_terminal_line_counts_unavailable"
+            }
+            .to_owned(),
+        }
+    };
+    let changes = observed
+        .changes()
+        .iter()
+        .map(|change| {
+            let raw_path = change.path().as_bytes().to_vec();
+            let counts = change.line_counts();
+            ManagedGitFileChange {
+                change_id: managed_git_change_id(run_id, &raw_path),
+                display_path: String::from_utf8_lossy(&raw_path).into_owned(),
+                raw_path,
+                status: match change.status() {
+                    GitFileStatus::Added => ManagedGitFileStatus::Added,
+                    GitFileStatus::Modified => ManagedGitFileStatus::Modified,
+                    GitFileStatus::Deleted => ManagedGitFileStatus::Deleted,
+                    GitFileStatus::TypeChanged => ManagedGitFileStatus::TypeChanged,
+                },
+                committed: change.committed(),
+                staged: change.staged(),
+                unstaged: change.unstaged(),
+                binary: counts.is_none(),
+                insertions: counts.map(|counts| counts.insertions),
+                deletions: counts.map(|counts| counts.deletions),
+                project_scope: if change.inside_project() {
+                    ManagedGitProjectScope::InsideProject
+                } else {
+                    ManagedGitProjectScope::OutsideProject
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    let (insertions, deletions) = aggregate
+        .map(|summary| (Some(summary.insertions), Some(summary.deletions)))
+        .unwrap_or((None, None));
+    ManagedTerminalGitChanges {
+        summary,
+        change_set: Some(Box::new(ManagedGitChangeSet {
+            attribution: if exact {
+                ManagedGitChangeAttribution::Exact
+            } else {
+                ManagedGitChangeAttribution::ObservedDuringRun
+            },
+            baseline_head: Some(observed.baseline_head().to_owned()),
+            terminal_head: observed.terminal_head().map(ToOwned::to_owned),
+            repository_identity: ManagedGitRepositoryIdentity {
+                project_filesystem_id: observed.project_directory().filesystem_id(),
+                repository_root: observed
+                    .repository_root()
+                    .canonical_path()
+                    .as_os_str()
+                    .as_bytes()
+                    .to_vec(),
+                repository_root_filesystem_id: observed.repository_root().filesystem_id(),
+                git_directory: observed
+                    .git_directory()
+                    .canonical_path()
+                    .as_os_str()
+                    .as_bytes()
+                    .to_vec(),
+                git_directory_filesystem_id: observed.git_directory().filesystem_id(),
+                common_directory: observed
+                    .common_directory()
+                    .canonical_path()
+                    .as_os_str()
+                    .as_bytes()
+                    .to_vec(),
+                common_directory_filesystem_id: observed.common_directory().filesystem_id(),
+            },
+            files: changes.len() as u64,
+            insertions,
+            deletions,
+            changes,
+        })),
+    }
+}
+
+fn managed_git_change_id(run_id: &str, raw_path: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    for axis in [
+        b"flit-managed-git-change-v1".as_slice(),
+        run_id.as_bytes(),
+        raw_path,
+    ] {
+        hasher.update(axis.len().to_be_bytes());
+        hasher.update(axis);
+    }
+    format!("{:x}", hasher.finalize())[..32].to_owned()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -760,7 +913,7 @@ fn observe_retained_runtime(
     for _ in 0..MAX_MANAGED_OBSERVATIONS_PER_CALL {
         let observation = wait_managed_observation(retained)?;
         let terminal_changes = matches!(observation, CodexTurnObservation::Terminal { .. })
-            .then(|| retained.observe_terminal_changes());
+            .then(|| retained.observe_terminal_changes(&request.run_id));
         match commit_managed_observation(store, retained, request, observation, terminal_changes)? {
             ManagedObservationCommit::Continue => {}
             ManagedObservationCommit::Complete(response) => return Ok(*response),
@@ -788,7 +941,7 @@ pub(crate) fn commit_managed_observation(
     retained: &mut RetainedManagedRun,
     request: &ManagedRunObserveRequest,
     observation: CodexTurnObservation,
-    terminal_changes: Option<ManagedGitChangeSummary>,
+    terminal_changes: Option<ManagedTerminalGitChanges>,
 ) -> Result<ManagedObservationCommit, ManagedStartError> {
     match observation {
         CodexTurnObservation::CommandStarted {
@@ -963,7 +1116,12 @@ pub(crate) fn commit_managed_observation(
             turn_id,
             outcome,
         } => {
-            let changes = terminal_changes.ok_or(ManagedStartError::ProviderObservationUnknown)?;
+            let terminal_changes =
+                terminal_changes.ok_or(ManagedStartError::ProviderObservationUnknown)?;
+            let ManagedTerminalGitChanges {
+                summary: changes,
+                change_set,
+            } = terminal_changes;
             validate_observation_identity(&retained.response, &thread_id, &turn_id)?;
             let terminal_outcome = outcome;
             let (prefix, kind) = match terminal_outcome {
@@ -971,14 +1129,14 @@ pub(crate) fn commit_managed_observation(
                     "evt_codex_completed_",
                     ManagedProviderObservationKind::TurnCompleted {
                         changes,
-                        change_set: None,
+                        change_set,
                     },
                 ),
                 CodexTurnTerminalOutcome::Interrupted => (
                     "evt_codex_interrupted_",
                     ManagedProviderObservationKind::TurnInterrupted {
                         changes,
-                        change_set: None,
+                        change_set,
                     },
                 ),
             };
@@ -1363,6 +1521,22 @@ mod tests {
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
     const CREATED_AT: &str = "2026-07-27T12:00:00Z";
     const STARTED_AT: &str = "2026-07-27T12:00:01Z";
+
+    #[test]
+    fn managed_git_change_ids_are_run_scoped_deterministic_and_opaque() {
+        let path = b"private/path.txt";
+        let first = managed_git_change_id("run-a", path);
+        assert_eq!(first, managed_git_change_id("run-a", path));
+        assert_ne!(first, managed_git_change_id("run-b", path));
+        assert_ne!(first, managed_git_change_id("run-a", b"private/other.txt"));
+        assert_eq!(first.len(), 32);
+        assert!(
+            first
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert!(!first.contains("private"));
+    }
 
     struct TestDirectory(PathBuf);
 

@@ -45,11 +45,17 @@ use flit_store::{
     DashboardChangeSummary as StoreDashboardChangeSummary,
     DashboardRunSnapshot as StoreDashboardRunSnapshot, MAX_DASHBOARD_DELTA_EVENTS,
     MAX_LIVE_MANAGED_SESSIONS, MAX_PROJECT_PAGE_SIZE, MAX_RUN_DETAIL_EVENTS,
-    ManagedGitChangeSummary, ManagedPermissionDecision, ManagedPermissionDeliveryUnknownReason,
+    ManagedPermissionDecision, ManagedPermissionDeliveryUnknownReason,
     ManagedPermissionResponseAttemptOutcome, ManagedPermissionResponseResult,
     ManagedPermissionResponseResultKind, ManagedSession, Project, ProjectDirectoryInspection,
     ProjectListCursor as StoreProjectListCursor, ProjectRegistration, ProjectRegistrationOutcome,
     ProjectTrustConfirmation, ProjectTrustOutcome, Store, StoreError,
+};
+#[cfg(test)]
+use flit_store::{
+    ManagedGitChangeAttribution, ManagedGitChangeSet, ManagedGitChangeSummary,
+    ManagedGitFileChange, ManagedGitFileStatus, ManagedGitProjectScope,
+    ManagedGitRepositoryIdentity,
 };
 use sha2::{Digest, Sha256};
 
@@ -2106,7 +2112,7 @@ where
             &mut managed_start::RetainedManagedRun,
             &ManagedRunObserveRequest,
             flit_providers::CodexTurnObservation,
-            Option<ManagedGitChangeSummary>,
+            Option<managed_start::ManagedTerminalGitChanges>,
         )
             -> Result<managed_start::ManagedObservationCommit, managed_start::ManagedStartError>,
 {
@@ -2195,7 +2201,7 @@ where
                         error,
                     );
                 }
-                Some(runtime.observe_terminal_changes())
+                Some(runtime.observe_terminal_changes(&request.run_id))
             }
             _ => None,
         };
@@ -3044,6 +3050,19 @@ mod tests {
         Arc<CoreManager>,
         ManagedRunStartResponse,
     ) {
+        let (directory, manager, response, _) = observation_core_with_baseline(label, false);
+        (directory, manager, response)
+    }
+
+    fn observation_core_with_baseline(
+        label: &str,
+        exact_clean_baseline: bool,
+    ) -> (
+        ObservationDirectory,
+        Arc<CoreManager>,
+        ManagedRunStartResponse,
+        PathBuf,
+    ) {
         let directory = ObservationDirectory::new(label);
         let project = directory.0.join("project");
         fs::create_dir(&project).expect("Project directory");
@@ -3086,9 +3105,24 @@ mod tests {
                         title: "Observe one exact permission".to_owned(),
                         goal: Some("Request one exact file change.".to_owned()),
                         start_request: serde_json::Map::new(),
-                        git_baseline: GitBaselinePayload::Unavailable {
-                            project_id: "project-observe".to_owned(),
-                            reason: GitBaselineUnavailableReason::RunnerUnavailable,
+                        git_baseline: if exact_clean_baseline {
+                            GitBaselinePayload::Available {
+                                project_id: "project-observe".to_owned(),
+                                head: GitHead::Available {
+                                    oid: "1".repeat(40),
+                                },
+                                dirty: GitDirtySummary {
+                                    staged: 0,
+                                    unstaged: 0,
+                                    untracked: 0,
+                                    entries: 0,
+                                },
+                            }
+                        } else {
+                            GitBaselinePayload::Unavailable {
+                                project_id: "project-observe".to_owned(),
+                                reason: GitBaselineUnavailableReason::RunnerUnavailable,
+                            }
                         },
                         git_baseline_observed_at: "2026-07-27T12:00:00Z".to_owned(),
                         created_at: "2026-07-27T12:00:00Z".to_owned(),
@@ -3105,7 +3139,7 @@ mod tests {
                         session_fingerprint: "test-profile".to_owned(),
                         executable_path: Some(PathBuf::from("/private/tmp/codex")),
                         executable_version: Some("0.145.0".to_owned()),
-                        cwd: project,
+                        cwd: project.clone(),
                         capabilities: serde_json::Map::from_iter([
                             ("history".to_owned(), serde_json::json!("unsupported")),
                             (
@@ -3128,7 +3162,7 @@ mod tests {
                 Ok(())
             })
             .expect("seed observation Core");
-        (directory, manager, response)
+        (directory, manager, response, project)
     }
 
     fn command_error(response: &str) -> CommandError {
@@ -5025,6 +5059,115 @@ mod tests {
                 Ok(())
             })
             .expect("terminal projection");
+    }
+
+    #[test]
+    fn terminal_file_receipt_is_committed_atomically_without_exposing_raw_paths() {
+        let (_directory, manager, response, project) =
+            observation_core_with_baseline("terminal-file-receipt", true);
+        let project_identity = ProjectDirectoryInspection::inspect(&project)
+            .expect("Project identity")
+            .identity;
+        let root = project
+            .to_str()
+            .expect("UTF-8 test Project")
+            .as_bytes()
+            .to_vec();
+        let mut git_directory = root.clone();
+        git_directory.extend_from_slice(b"/.git");
+        let raw_path = b"non-utf8-\xff.txt".to_vec();
+        let display_path = String::from_utf8_lossy(&raw_path).into_owned();
+        let change_id = "0123456789abcdef0123456789abcdef".to_owned();
+        let change_set = ManagedGitChangeSet {
+            attribution: ManagedGitChangeAttribution::Exact,
+            baseline_head: Some("1".repeat(40)),
+            terminal_head: Some("2".repeat(40)),
+            repository_identity: ManagedGitRepositoryIdentity {
+                project_filesystem_id: project_identity.filesystem_id.clone(),
+                repository_root: root,
+                repository_root_filesystem_id: project_identity.filesystem_id,
+                git_directory: git_directory.clone(),
+                git_directory_filesystem_id: "unix:11:12".to_owned(),
+                common_directory: git_directory,
+                common_directory_filesystem_id: "unix:11:12".to_owned(),
+            },
+            files: 1,
+            insertions: Some(2),
+            deletions: Some(1),
+            changes: vec![ManagedGitFileChange {
+                change_id: change_id.clone(),
+                raw_path: raw_path.clone(),
+                display_path: display_path.clone(),
+                status: ManagedGitFileStatus::Modified,
+                committed: true,
+                staged: false,
+                unstaged: false,
+                binary: false,
+                insertions: Some(2),
+                deletions: Some(1),
+                project_scope: ManagedGitProjectScope::InsideProject,
+            }],
+        };
+        manager
+            .with_ready_core(|core| {
+                core.managed_runtimes.insert(
+                    "run-observe".to_owned(),
+                    managed_start::RetainedManagedRun::for_test_with_terminal_change_observer(
+                        response,
+                        Box::new(DetachedTestRuntime),
+                        Arc::new(move || {
+                            (
+                                ManagedGitChangeSummary::Exact {
+                                    files: 1,
+                                    insertions: 2,
+                                    deletions: 1,
+                                },
+                                Some(Box::new(change_set.clone())),
+                            )
+                        }),
+                    ),
+                );
+                Ok(())
+            })
+            .expect("replace retained detailed Git baseline");
+
+        managed_run_observe_with(
+            &manager,
+            observation_request_json(),
+            |_runtime| Ok(terminal_observation()),
+            managed_start::commit_managed_observation,
+        )
+        .expect("terminal response");
+        assert_runtime_state(&manager, false);
+        manager
+            .with_ready_core(|core| {
+                let snapshot = core
+                    .store
+                    .run_snapshot("run-observe")
+                    .expect("terminal snapshot")
+                    .expect("terminal snapshot");
+                let event = core
+                    .store
+                    .run_events_through("run-observe", 0, snapshot.version, 10)
+                    .expect("terminal events")
+                    .events
+                    .pop()
+                    .expect("terminal event");
+                let rendered =
+                    serde_json::to_string(&(snapshot.snapshot, event)).expect("public JSON");
+                assert!(!rendered.contains(&display_path));
+                assert!(!rendered.contains("non-utf8"));
+                assert_eq!(
+                    core.store
+                        .managed_git_file_change("run-observe", &change_id)
+                        .expect("stored change")
+                        .expect("stored change")
+                        .raw_path,
+                    raw_path
+                );
+                Ok(())
+            })
+            .expect("atomic terminal receipt");
     }
 
     #[test]
