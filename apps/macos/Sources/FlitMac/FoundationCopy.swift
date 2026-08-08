@@ -76,6 +76,33 @@ enum FoundationCopyKey: String {
     case runDetailShowEvidence = "runDetail.showEvidence"
     case runDetailTitle = "runDetail.title"
     case runDetailUnavailable = "runDetail.unavailable"
+    case runChangesAttributionExact = "runChanges.attribution.exact"
+    case runChangesAttributionObserved = "runChanges.attribution.observed"
+    case runChangesBaselineHead = "runChanges.baselineHead"
+    case runChangesBinary = "runChanges.binary"
+    case runChangesCommitted = "runChanges.committed"
+    case runChangesChangeSetNotAvailable = "runChanges.changeSetNotAvailable"
+    case runChangesFirstPageUnavailable = "runChanges.firstPageUnavailable"
+    case runChangesHeadUnavailable = "runChanges.headUnavailable"
+    case runChangesLayers = "runChanges.layers"
+    case runChangesLineCounts = "runChanges.lineCounts"
+    case runChangesLineCountsUnavailable = "runChanges.lineCountsUnavailable"
+    case runChangesLoadMore = "runChanges.loadMore"
+    case runChangesNoChanges = "runChanges.noChanges"
+    case runChangesPageUnavailable = "runChanges.pageUnavailable"
+    case runChangesScopeInside = "runChanges.scope.inside"
+    case runChangesScopeOutside = "runChanges.scope.outside"
+    case runChangesStaged = "runChanges.staged"
+    case runChangesStatusAdded = "runChanges.status.added"
+    case runChangesStatusDeleted = "runChanges.status.deleted"
+    case runChangesStatusModified = "runChanges.status.modified"
+    case runChangesStatusTypeChanged = "runChanges.status.typeChanged"
+    case runChangesStatusUntracked = "runChanges.status.untracked"
+    case runChangesTerminalHead = "runChanges.terminalHead"
+    case runChangesText = "runChanges.text"
+    case runChangesTitle = "runChanges.title"
+    case runChangesUnavailable = "runChanges.unavailable"
+    case runChangesUnstaged = "runChanges.unstaged"
     case noControls = "foundation.noControls"
     case phase = "foundation.phase"
     case statusChecking = "foundation.status.checking"
@@ -179,6 +206,33 @@ enum FoundationCopy {
         .runDetailShowEvidence: "Show evidence",
         .runDetailTitle: "Activity · %@",
         .runDetailUnavailable: "Run activity unavailable",
+        .runChangesAttributionExact: "Attribution: Exact",
+        .runChangesAttributionObserved: "Attribution: Observed during run",
+        .runChangesBaselineHead: "Baseline HEAD: %@",
+        .runChangesBinary: "Binary",
+        .runChangesCommitted: "Committed",
+        .runChangesChangeSetNotAvailable: "Terminal change set not available",
+        .runChangesFirstPageUnavailable: "Changes could not be loaded",
+        .runChangesHeadUnavailable: "Unavailable",
+        .runChangesLayers: "Layers: %@",
+        .runChangesLineCounts: "+%llu −%llu",
+        .runChangesLineCountsUnavailable: "Line counts unavailable",
+        .runChangesLoadMore: "Load more changes",
+        .runChangesNoChanges: "No file changes are available",
+        .runChangesPageUnavailable: "More changes could not be loaded",
+        .runChangesScopeInside: "Inside Project",
+        .runChangesScopeOutside: "Outside Project",
+        .runChangesStaged: "Staged",
+        .runChangesStatusAdded: "Added",
+        .runChangesStatusDeleted: "Deleted",
+        .runChangesStatusModified: "Modified",
+        .runChangesStatusTypeChanged: "Type changed",
+        .runChangesStatusUntracked: "Untracked",
+        .runChangesTerminalHead: "Terminal HEAD: %@",
+        .runChangesText: "Text",
+        .runChangesTitle: "Changes",
+        .runChangesUnavailable: "Changes unavailable: %@",
+        .runChangesUnstaged: "Unstaged",
         .noControls: "No agent controls yet",
         .phase: "Flit · Phase 2",
         .statusChecking: "Checking foundation",

@@ -135,6 +135,7 @@ esac
     "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/SystemHealthClient.swift" \
     "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/DashboardPresentation.swift" \
     "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/RunDetailPresentation.swift" \
+    "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/RunChangesPresentation.swift" \
     "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/FoundationStatusBadge.swift" \
     "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/FoundationViewController.swift" \
     "$REPOSITORY_ROOT/apps/macos/Tests/NativeHealthTests.swift" \

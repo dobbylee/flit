@@ -134,6 +134,21 @@ private func changingRunDetail(
     )
 }
 
+private func changingRunChanges(
+    _ response: FlitRunChangesReadResponse,
+    mutate: (inout [String: Any]) throws -> Void
+) throws -> FlitRunChangesReadResponse {
+    let data = try JSONEncoder().encode(response)
+    guard var object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        throw NativeHealthTestFailure.failed("Run Changes response must be an object")
+    }
+    try mutate(&object)
+    return try JSONDecoder().decode(
+        FlitRunChangesReadResponse.self,
+        from: try JSONSerialization.data(withJSONObject: object)
+    )
+}
+
 private func runEvidenceObject(
     cursor: UInt64,
     eventId: String,
@@ -719,6 +734,277 @@ struct NativeHealthTests {
                 && providerOpenReasons.allSatisfy { $0.contains("disabled") },
             "every provider-open capability status must remain distinctly non-actionable"
         )
+        let runChangesRequest = try decodeFixture(
+            FlitRunChangesReadRequest.self,
+            at: "\(fixtureRoot)/run_changes_read.request.json"
+        )
+        let runChangesFixture = try decodeFixture(
+            FlitRunChangesReadResponse.self,
+            at: "\(fixtureRoot)/run_changes_read.available.response.json"
+        )
+        let unavailableRunChangesFixture = try decodeFixture(
+            FlitRunChangesReadResponse.self,
+            at: "\(fixtureRoot)/run_changes_read.unavailable.response.json"
+        )
+        try require(
+            runChangesRequest.runId == "run-changes-1"
+                && runChangesRequest.expectedRunVersion == 5
+                && runChangesRequest.afterCursor == nil
+                && runChangesRequest.requestedChangeLimit == 2,
+            "generated Run Changes request must preserve exact version and cursor scope"
+        )
+        guard case .available = runChangesFixture else {
+            throw NativeHealthTestFailure.failed(
+                "generated Run Changes fixture must remain available"
+            )
+        }
+        var runChangesPresentation = RunChangesPresentationState()
+        try runChangesPresentation.apply(
+            runChangesFixture,
+            requestedRunId: "run-changes-1",
+            expectedRunVersion: 5,
+            requestedAfterCursor: nil,
+            requestedChangeLimit: 2
+        )
+        guard
+            case let .available(attribution, baselineHead, terminalHead) =
+                runChangesPresentation.availability
+        else {
+            throw NativeHealthTestFailure.failed(
+                "native Run Changes state must preserve available metadata"
+            )
+        }
+        try require(
+            attribution == .exact
+                && baselineHead == .available(String(repeating: "1", count: 40))
+                && terminalHead == .available(String(repeating: "2", count: 40))
+                && runChangesPresentation.nextCursor
+                    == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                && runChangesPresentation.hasMore
+                && runChangesPresentation.changes.map(\.displayPath)
+                    == ["project/inside-�.txt", "outside.txt"]
+                && runChangesPresentation.changes[0].status == .modified
+                && runChangesPresentation.changes[0].staged
+                && runChangesPresentation.changes[0].unstaged
+                && runChangesPresentation.changes[1].committed
+                && runChangesPresentation.changes[1].projectScope == .outsideProject,
+            "native Run Changes must preserve display-only file facts and exact attribution"
+        )
+        let finalRunChangesPage = try changingRunChanges(runChangesFixture) { object in
+            guard
+                let changes = object["changes"] as? [[String: Any]],
+                var final = changes.first
+            else {
+                throw NativeHealthTestFailure.failed("Run Changes fixture must contain rows")
+            }
+            final["change_id"] = "cccccccccccccccccccccccccccccccc"
+            final["display_path"] = "final.txt"
+            object["changes"] = [final]
+            object["next_cursor"] = "cccccccccccccccccccccccccccccccc"
+            object["has_more"] = false
+        }
+        let duplicateRunChangesPage = try changingRunChanges(finalRunChangesPage) { object in
+            guard var changes = object["changes"] as? [[String: Any]] else {
+                throw NativeHealthTestFailure.failed("Run Changes page must contain rows")
+            }
+            changes[0]["change_id"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            object["changes"] = changes
+            object["next_cursor"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+        let changedRunChangesMetadata = try changingRunChanges(finalRunChangesPage) { object in
+            object["attribution"] = "observed_during_run"
+        }
+        let emptyRunChangesTail = try changingRunChanges(finalRunChangesPage) { object in
+            object["changes"] = []
+            object["next_cursor"] = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            object["has_more"] = false
+        }
+        for (invalidPage, expectedError) in [
+            (duplicateRunChangesPage, RunChangesPresentationError.duplicateChange),
+            (changedRunChangesMetadata, RunChangesPresentationError.metadataMismatch),
+            (emptyRunChangesTail, RunChangesPresentationError.cursorMismatch),
+        ] {
+            do {
+                try runChangesPresentation.append(
+                    invalidPage,
+                    requestedRunId: "run-changes-1",
+                    expectedRunVersion: 5,
+                    requestedAfterCursor: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    requestedChangeLimit: 2
+                )
+                throw NativeHealthTestFailure.failed(
+                    "native Run Changes must reject inconsistent next-page facts"
+                )
+            } catch let error as RunChangesPresentationError {
+                try require(
+                    error == expectedError,
+                    "invalid Run Changes page must retain its typed error"
+                )
+            }
+        }
+        try require(
+            runChangesPresentation.changes.count == 2
+                && runChangesPresentation.nextCursor
+                    == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                && runChangesPresentation.hasMore,
+            "invalid Run Changes pages must preserve accepted rows"
+        )
+        try runChangesPresentation.append(
+            finalRunChangesPage,
+            requestedRunId: "run-changes-1",
+            expectedRunVersion: 5,
+            requestedAfterCursor: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            requestedChangeLimit: 2
+        )
+        try require(
+            runChangesPresentation.changes.count == 3
+                && runChangesPresentation.changes.last?.displayPath == "final.txt"
+                && !runChangesPresentation.hasMore,
+            "valid Run Changes next page must append once and close pagination"
+        )
+        let invalidRunChangesDeliveries: [(FlitRunChangesReadResponse, RunChangesPresentationError)] =
+            try [
+                (
+                    changingRunChanges(runChangesFixture) { $0["protocol_version"] = "999.0" },
+                    .contractMismatch
+                ),
+                (
+                    changingRunChanges(runChangesFixture) { $0["run_id"] = "run-mismatch" },
+                    .runIdentityMismatch
+                ),
+                (
+                    changingRunChanges(runChangesFixture) { $0["run_version"] = 6 },
+                    .runVersionMismatch
+                ),
+                (
+                    changingRunChanges(runChangesFixture) {
+                        $0["next_cursor"] = "cccccccccccccccccccccccccccccccc"
+                    },
+                    .cursorMismatch
+                ),
+                (
+                    changingRunChanges(runChangesFixture) { object in
+                        guard var changes = object["changes"] as? [[String: Any]] else {
+                            throw NativeHealthTestFailure.failed(
+                                "Run Changes fixture must contain rows"
+                            )
+                        }
+                        changes[1]["change_id"] = changes[0]["change_id"]
+                        object["changes"] = changes
+                    },
+                    .duplicateChange
+                ),
+                (
+                    changingRunChanges(runChangesFixture) { object in
+                        guard var changes = object["changes"] as? [[String: Any]] else {
+                            throw NativeHealthTestFailure.failed(
+                                "Run Changes fixture must contain rows"
+                            )
+                        }
+                        changes[0]["display_path"] = ""
+                        object["changes"] = changes
+                    },
+                    .invalidChange
+                ),
+                (
+                    changingRunChanges(runChangesFixture) {
+                        $0["baseline_head"] = ["availability": "unavailable"]
+                    },
+                    .metadataMismatch
+                ),
+            ]
+        for (invalid, expectedError) in invalidRunChangesDeliveries {
+            var invalidState = RunChangesPresentationState()
+            do {
+                try invalidState.apply(
+                    invalid,
+                    requestedRunId: "run-changes-1",
+                    expectedRunVersion: 5,
+                    requestedAfterCursor: nil,
+                    requestedChangeLimit: 2
+                )
+                throw NativeHealthTestFailure.failed(
+                    "native Run Changes must reject every invalid delivery boundary"
+                )
+            } catch let error as RunChangesPresentationError {
+                try require(
+                    error == expectedError,
+                    "invalid Run Changes delivery must retain its typed error"
+                )
+            }
+            try require(
+                invalidState.runId == nil && invalidState.changes.isEmpty,
+                "invalid Run Changes delivery must not partially mutate state"
+            )
+        }
+        var unavailableRunChanges = RunChangesPresentationState()
+        try unavailableRunChanges.apply(
+            unavailableRunChangesFixture,
+            requestedRunId: "run-changes-1",
+            expectedRunVersion: 4,
+            requestedAfterCursor: nil,
+            requestedChangeLimit: 50
+        )
+        guard case .unavailable(.changeSetNotAvailable) = unavailableRunChanges.availability else {
+            throw NativeHealthTestFailure.failed(
+                "native Run Changes must preserve the explicit missing-set reason"
+            )
+        }
+        try require(
+            unavailableRunChanges.changes.isEmpty && !unavailableRunChanges.hasMore,
+            "unavailable Run Changes must never invent file rows"
+        )
+        let detailRunChangesFixture = try changingRunChanges(runChangesFixture) { object in
+            object["run_id"] = "run-dashboard-1"
+            object["run_version"] = 3
+            object["has_more"] = false
+        }
+        let detailUnavailableRunChangesFixture = try changingRunChanges(
+            unavailableRunChangesFixture
+        ) { object in
+            object["run_id"] = "run-dashboard-1"
+            object["run_version"] = 3
+        }
+        let detailEmptyRunChangesFixture = try changingRunChanges(
+            detailRunChangesFixture
+        ) { object in
+            object["changes"] = []
+            object["next_cursor"] = NSNull()
+            object["has_more"] = false
+        }
+        let detailObservedRunChangesFixture = try changingRunChanges(
+            detailRunChangesFixture
+        ) { object in
+            object["attribution"] = "observed_during_run"
+            object["baseline_head"] = ["availability": "unavailable"]
+            object["terminal_head"] = ["availability": "unavailable"]
+        }
+        let pagedRunChangesFixture = try changingRunChanges(runChangesFixture) { object in
+            guard let base = (object["changes"] as? [[String: Any]])?.first else {
+                throw NativeHealthTestFailure.failed("Run Changes fixture must contain a row")
+            }
+            let rows = (1 ... 50).map { index -> [String: Any] in
+                var row = base
+                row["change_id"] = String(format: "%032llx", UInt64(index))
+                row["display_path"] = "page/changed-\(index).txt"
+                return row
+            }
+            object["run_id"] = "run-dashboard-1"
+            object["run_version"] = 51
+            object["changes"] = rows
+            object["next_cursor"] = String(format: "%032llx", UInt64(50))
+            object["has_more"] = true
+        }
+        let finalRunChangesFixture = try changingRunChanges(pagedRunChangesFixture) { object in
+            guard var row = (object["changes"] as? [[String: Any]])?.first else {
+                throw NativeHealthTestFailure.failed("paged Run Changes must contain a row")
+            }
+            row["change_id"] = String(format: "%032llx", UInt64(51))
+            row["display_path"] = "page/changed-51.txt"
+            object["changes"] = [row]
+            object["next_cursor"] = String(format: "%032llx", UInt64(51))
+            object["has_more"] = false
+        }
         _ = try decodeFixture(
             FlitRunDetailReadRequest.self,
             at: "\(fixtureRoot)/run_detail_read.request.json"
@@ -2105,6 +2391,22 @@ struct NativeHealthTests {
                     }
                     return completedRunDetailFixture
                 }
+            ),
+            runChangesClient: RunChangesClient(
+                fixtureLoader: { request in
+                    guard
+                        request.runId == "run-dashboard-1",
+                        request.expectedRunVersion == 3,
+                        request.afterCursor == nil,
+                        request.requestedChangeLimit == 50,
+                        request.clientProtocolVersion == flitClientProtocolVersion
+                    else {
+                        throw NativeHealthTestFailure.failed(
+                            "Run Changes action must construct the exact bounded current request"
+                        )
+                    }
+                    return detailRunChangesFixture
+                }
             )
         )
         _ = detailController.view
@@ -2134,8 +2436,15 @@ struct NativeHealthTests {
                 && detailIdentifiers.contains("flit.runDetail.group.1.3")
                 && detailIdentifiers.contains("flit.runDetail.event.1")
                 && detailIdentifiers.contains("flit.runDetail.event.2")
-                && detailIdentifiers.contains("flit.runDetail.event.3"),
-            "native Run detail must expose stable back, title, and event identities"
+                && detailIdentifiers.contains("flit.runDetail.event.3")
+                && detailIdentifiers.contains("flit.runChanges.section")
+                && detailIdentifiers.contains(
+                    "flit.runChanges.row.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                )
+                && detailIdentifiers.contains(
+                    "flit.runChanges.row.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                ),
+            "native Run detail must expose stable Activity and Changes identities"
         )
         guard
             let initialCategoryFilter = detailViews.first(where: {
@@ -2166,6 +2475,23 @@ struct NativeHealthTests {
                     FoundationCopy.providerOpenUnavailableReason(.unsupported)
                 ),
             "current unsupported provider open must be disabled with its exact reason"
+        )
+        try require(
+            detailInitialCopy.contains(FoundationCopy.text(.runChangesAttributionExact))
+                && detailInitialCopy.contains(
+                    FoundationCopy.format(
+                        .runChangesBaselineHead,
+                        String(repeating: "1", count: 40)
+                    )
+                )
+                && detailInitialCopy.contains("project/inside-�.txt")
+                && detailInitialCopy.contains(
+                    "Modified · Layers: Staged, Unstaged · Text · +2 −1 · Inside Project"
+                )
+                && detailInitialCopy.contains(
+                    "Added · Layers: Committed · Text · +1 −0 · Outside Project"
+                ),
+            "native Changes must visibly preserve attribution, HEAD, and display-only file facts"
         )
         try require(
             initialCategoryFilter.itemTitles == [
@@ -2360,6 +2686,94 @@ struct NativeHealthTests {
             }),
             "Back must restore the Dashboard and stale evidence controls must be inert"
         )
+        for (response, expectedIdentifier, expectedCopy) in [
+            (
+                detailUnavailableRunChangesFixture,
+                "flit.runChanges.unavailable",
+                FoundationCopy.format(
+                    .runChangesUnavailable,
+                    FoundationCopy.text(.runChangesChangeSetNotAvailable)
+                )
+            ),
+            (
+                detailEmptyRunChangesFixture,
+                "flit.runChanges.noChanges",
+                FoundationCopy.text(.runChangesNoChanges)
+            ),
+            (
+                detailObservedRunChangesFixture,
+                "flit.runChanges.attribution",
+                FoundationCopy.text(.runChangesAttributionObserved)
+            ),
+        ] {
+            let stateController = FoundationViewController(
+                client: client,
+                dashboardClient: DashboardClient(
+                    fixtureLoader: { completedDashboardFixture }
+                ),
+                runDetailClient: RunDetailClient(
+                    fixtureLoader: { _ in completedRunDetailFixture }
+                ),
+                runChangesClient: RunChangesClient(
+                    fixtureLoader: { _ in response }
+                )
+            )
+            _ = stateController.view
+            guard
+                let stateButton = descendants(of: stateController.view).first(where: {
+                    $0.accessibilityIdentifier()
+                        == "flit.dashboard.runDetail.run-dashboard-1"
+                }) as? NSButton
+            else {
+                throw NativeHealthTestFailure.failed(
+                    "Changes state fixture must expose Run Detail"
+                )
+            }
+            stateButton.performClick(nil)
+            let stateViews = descendants(of: stateController.view)
+            try require(
+                stateViews.contains(where: {
+                    $0.accessibilityIdentifier() == expectedIdentifier
+                })
+                    && stateViews.compactMap({ ($0 as? NSTextField)?.stringValue })
+                        .contains(expectedCopy),
+                "native Changes must distinguish unavailable, empty, and observed states"
+            )
+        }
+        let unavailableChangesController = FoundationViewController(
+            client: client,
+            dashboardClient: DashboardClient(
+                fixtureLoader: { completedDashboardFixture }
+            ),
+            runDetailClient: RunDetailClient(
+                fixtureLoader: { _ in completedRunDetailFixture }
+            ),
+            runChangesClient: RunChangesClient(
+                fixtureLoader: { _ in
+                    throw NativeHealthTestFailure.failed("first Changes page unavailable")
+                }
+            )
+        )
+        _ = unavailableChangesController.view
+        guard
+            let unavailableChangesButton = descendants(
+                of: unavailableChangesController.view
+            ).first(where: {
+                $0.accessibilityIdentifier()
+                    == "flit.dashboard.runDetail.run-dashboard-1"
+            }) as? NSButton
+        else {
+            throw NativeHealthTestFailure.failed(
+                "first-page failure fixture must expose Run Detail"
+            )
+        }
+        unavailableChangesButton.performClick(nil)
+        try require(
+            descendants(of: unavailableChangesController.view).contains(where: {
+                $0.accessibilityIdentifier() == "flit.runChanges.firstPageUnavailable"
+            }),
+            "native Changes must distinguish a read failure from explicit unavailable"
+        )
         let malformedDetailController = FoundationViewController(
             client: client,
             dashboardClient: DashboardClient(
@@ -2416,6 +2830,29 @@ struct NativeHealthTests {
                     default:
                         throw NativeHealthTestFailure.failed(
                             "paged Run detail must request only the accepted cursor"
+                        )
+                    }
+                }
+            ),
+            runChangesClient: RunChangesClient(
+                fixtureLoader: { request in
+                    guard
+                        request.runId == "run-dashboard-1",
+                        request.expectedRunVersion == 51,
+                        request.requestedChangeLimit == 50,
+                        request.clientProtocolVersion == flitClientProtocolVersion
+                    else {
+                        throw NativeHealthTestFailure.failed(
+                            "paged Run Changes request must preserve exact scope"
+                        )
+                    }
+                    switch request.afterCursor {
+                    case nil: return pagedRunChangesFixture
+                    case String(format: "%032llx", UInt64(50)):
+                        return finalRunChangesFixture
+                    default:
+                        throw NativeHealthTestFailure.failed(
+                            "paged Run Changes must request only the accepted cursor"
                         )
                     }
                 }
@@ -2571,6 +3008,30 @@ struct NativeHealthTests {
             }),
             "expanded evidence must survive filtering, pagination, and a later rerender"
         )
+        guard
+            let changesLoadMore = descendants(of: pagedController.view).first(where: {
+                $0.accessibilityIdentifier() == "flit.runChanges.loadMore"
+            }) as? NSButton
+        else {
+            throw NativeHealthTestFailure.failed(
+                "bounded Changes first page must expose Load more"
+            )
+        }
+        changesLoadMore.performClick(nil)
+        let completedChangesViews = descendants(of: pagedController.view)
+        try require(
+            completedChangesViews.filter({
+                $0.accessibilityIdentifier().hasPrefix("flit.runChanges.row.")
+            }).count == 51
+                && completedChangesViews.contains(where: {
+                    $0.accessibilityIdentifier()
+                        == "flit.runChanges.row.00000000000000000000000000000033"
+                })
+                && !completedChangesViews.contains(where: {
+                    $0.accessibilityIdentifier() == "flit.runChanges.loadMore"
+                }),
+            "Changes pagination must append once without changing Activity state"
+        )
         let failingPageController = FoundationViewController(
             client: client,
             dashboardClient: DashboardClient(
@@ -2582,6 +3043,16 @@ struct NativeHealthTests {
                         throw NativeHealthTestFailure.failed("next page unavailable")
                     }
                     return fullPageRunDetail
+                }
+            ),
+            runChangesClient: RunChangesClient(
+                fixtureLoader: { request in
+                    guard request.afterCursor == nil else {
+                        throw NativeHealthTestFailure.failed(
+                            "next Changes page unavailable"
+                        )
+                    }
+                    return pagedRunChangesFixture
                 }
             )
         )
@@ -2595,6 +3066,31 @@ struct NativeHealthTests {
             throw NativeHealthTestFailure.failed("failure Dashboard must expose Activity")
         }
         failingDetailButton.performClick(nil)
+        guard
+            let failingChangesLoadMore = descendants(
+                of: failingPageController.view
+            ).first(where: {
+                $0.accessibilityIdentifier() == "flit.runChanges.loadMore"
+            }) as? NSButton
+        else {
+            throw NativeHealthTestFailure.failed(
+                "failure fixture must expose Changes Load more"
+            )
+        }
+        failingChangesLoadMore.performClick(nil)
+        let failedChangesViews = descendants(of: failingPageController.view)
+        try require(
+            failedChangesViews.filter({
+                $0.accessibilityIdentifier().hasPrefix("flit.runChanges.row.")
+            }).count == 50
+                && failedChangesViews.contains(where: {
+                    $0.accessibilityIdentifier() == "flit.runChanges.loadMore"
+                })
+                && failedChangesViews.contains(where: {
+                    $0.accessibilityIdentifier() == "flit.runChanges.pageUnavailable"
+                }),
+            "failed Changes next page must preserve rows and expose retry"
+        )
         guard
             let failingEvidenceToggle = descendants(of: failingPageController.view).first(where: {
                 $0.accessibilityIdentifier() == "flit.runDetail.evidenceToggle.50"

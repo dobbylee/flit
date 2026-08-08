@@ -58,6 +58,7 @@ final class FoundationViewController: NSViewController {
     private let client: SystemHealthClient
     private let dashboardClient: DashboardClient
     private let runDetailClient: RunDetailClient
+    private let runChangesClient: RunChangesClient
     private var state: FoundationState = .checking
     private var dashboardState = DashboardPresentationState()
     private var statusHost: NSHostingView<FoundationStatusBadge>?
@@ -70,17 +71,22 @@ final class FoundationViewController: NSViewController {
     private var activeRunCompletionSummary: RunCompletionSummary?
     private var activeRunDetailFilter = RunActivityFilter.all
     private var activeRunDetailPageFailure = false
+    private var activeRunChanges: RunChangesPresentationState?
+    private var activeRunChangesFirstPageFailure = false
+    private var activeRunChangesPageFailure = false
     private var expandedRunEvidenceIds: Set<String> = []
     private var runEvidenceButtonsByCursor: [UInt64: NSButton] = [:]
 
     init(
         client: SystemHealthClient,
         dashboardClient: DashboardClient = DashboardClient(),
-        runDetailClient: RunDetailClient = RunDetailClient()
+        runDetailClient: RunDetailClient = RunDetailClient(),
+        runChangesClient: RunChangesClient = RunChangesClient()
     ) {
         self.client = client
         self.dashboardClient = dashboardClient
         self.runDetailClient = runDetailClient
+        self.runChangesClient = runChangesClient
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -354,6 +360,8 @@ final class FoundationViewController: NSViewController {
     @objc private func showRunDetail(_ sender: RunDetailButton) {
         activeRunDetailFilter = .all
         activeRunDetailPageFailure = false
+        activeRunChangesFirstPageFailure = false
+        activeRunChangesPageFailure = false
         expandedRunEvidenceIds = []
         do {
             let completionSummary = try runCompletionSummary(for: sender.run)
@@ -369,6 +377,24 @@ final class FoundationViewController: NSViewController {
                 requestedAfterCursor: 0,
                 requestedEventLimit: 50
             )
+            do {
+                let changesResponse = try runChangesClient.loadFirstPage(
+                    runId: sender.run.runId,
+                    expectedRunVersion: sender.run.version
+                )
+                var changes = RunChangesPresentationState()
+                try changes.apply(
+                    changesResponse,
+                    requestedRunId: sender.run.runId,
+                    expectedRunVersion: sender.run.version,
+                    requestedAfterCursor: nil,
+                    requestedChangeLimit: 50
+                )
+                activeRunChanges = changes
+            } catch {
+                activeRunChanges = nil
+                activeRunChangesFirstPageFailure = true
+            }
             activeRunDetail = detail
             activeRunTitle = sender.run.title
             activeRunCompletionSummary = completionSummary
@@ -377,6 +403,9 @@ final class FoundationViewController: NSViewController {
             activeRunDetail = nil
             activeRunTitle = nil
             activeRunCompletionSummary = nil
+            activeRunChanges = nil
+            activeRunChangesFirstPageFailure = false
+            activeRunChangesPageFailure = false
             renderRunDetailFailure()
         }
     }
@@ -387,6 +416,9 @@ final class FoundationViewController: NSViewController {
         activeRunCompletionSummary = nil
         activeRunDetailFilter = .all
         activeRunDetailPageFailure = false
+        activeRunChanges = nil
+        activeRunChangesFirstPageFailure = false
+        activeRunChangesPageFailure = false
         expandedRunEvidenceIds = []
         renderDashboard()
     }
@@ -422,6 +454,42 @@ final class FoundationViewController: NSViewController {
             activeRunDetailPageFailure = true
             renderRunDetail(detail, runTitle: runTitle, pageFailure: true)
         }
+    }
+
+    @objc private func loadMoreRunChanges(_: NSButton) {
+        guard
+            var changes = activeRunChanges,
+            let runId = changes.runId,
+            let runVersion = changes.runVersion,
+            let afterCursor = changes.nextCursor,
+            let detail = activeRunDetail,
+            let runTitle = activeRunTitle
+        else {
+            return
+        }
+        do {
+            let response = try runChangesClient.loadPage(
+                runId: runId,
+                expectedRunVersion: runVersion,
+                afterCursor: afterCursor
+            )
+            try changes.append(
+                response,
+                requestedRunId: runId,
+                expectedRunVersion: runVersion,
+                requestedAfterCursor: afterCursor,
+                requestedChangeLimit: 50
+            )
+            activeRunChanges = changes
+            activeRunChangesPageFailure = false
+        } catch {
+            activeRunChangesPageFailure = true
+        }
+        renderRunDetail(
+            detail,
+            runTitle: runTitle,
+            pageFailure: activeRunDetailPageFailure
+        )
     }
 
     @objc private func changeRunDetailFilter(_ sender: NSPopUpButton) {
@@ -533,6 +601,7 @@ final class FoundationViewController: NSViewController {
         )
         identify(openInProviderReason, as: "flit.runDetail.openInProvider.reason")
         dashboardStack.addArrangedSubview(openInProviderReason)
+        dashboardStack.addArrangedSubview(runChangesView())
         dashboardStack.addArrangedSubview(runDetailFilterControl())
         let visibleGroups = activeRunDetailFilter.visibleGroups(in: detail.events)
         if visibleGroups.isEmpty {
@@ -605,6 +674,197 @@ final class FoundationViewController: NSViewController {
         } else {
             scrollDashboardToTop()
         }
+    }
+
+    private func runChangesView() -> NSView {
+        let stack = NSStackView()
+        identify(stack, as: "flit.runChanges.section")
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 3
+        let title = label(
+            FoundationCopy.text(.runChangesTitle),
+            size: 13,
+            weight: .semibold
+        )
+        identify(title, as: "flit.runChanges.title")
+        stack.addArrangedSubview(title)
+
+        if activeRunChangesFirstPageFailure {
+            let failure = label(
+                FoundationCopy.text(.runChangesFirstPageUnavailable),
+                size: 12,
+                weight: .semibold,
+                color: .systemRed
+            )
+            identify(failure, as: "flit.runChanges.firstPageUnavailable")
+            stack.addArrangedSubview(failure)
+            return stack
+        }
+        guard
+            let changes = activeRunChanges,
+            let availability = changes.availability
+        else {
+            let failure = label(
+                FoundationCopy.text(.runChangesFirstPageUnavailable),
+                size: 12,
+                weight: .semibold,
+                color: .systemRed
+            )
+            identify(failure, as: "flit.runChanges.firstPageUnavailable")
+            stack.addArrangedSubview(failure)
+            return stack
+        }
+
+        switch availability {
+        case let .unavailable(reason):
+            let reasonCopy: String
+            switch reason {
+            case .changeSetNotAvailable:
+                reasonCopy = FoundationCopy.text(.runChangesChangeSetNotAvailable)
+            }
+            let unavailable = label(
+                FoundationCopy.format(.runChangesUnavailable, reasonCopy),
+                size: 12,
+                weight: .regular,
+                color: .secondaryLabelColor
+            )
+            identify(unavailable, as: "flit.runChanges.unavailable")
+            stack.addArrangedSubview(unavailable)
+        case let .available(attribution, baselineHead, terminalHead):
+            let attributionCopy = FoundationCopy.text(
+                attribution == .exact
+                    ? .runChangesAttributionExact
+                    : .runChangesAttributionObserved
+            )
+            let attributionLabel = label(
+                attributionCopy,
+                size: 11,
+                weight: .regular,
+                color: .secondaryLabelColor
+            )
+            identify(attributionLabel, as: "flit.runChanges.attribution")
+            stack.addArrangedSubview(attributionLabel)
+            let baseline = label(
+                FoundationCopy.format(
+                    .runChangesBaselineHead,
+                    runChangeHeadCopy(baselineHead)
+                ),
+                size: 11,
+                weight: .regular,
+                color: .secondaryLabelColor
+            )
+            identify(baseline, as: "flit.runChanges.baselineHead")
+            stack.addArrangedSubview(baseline)
+            let terminal = label(
+                FoundationCopy.format(
+                    .runChangesTerminalHead,
+                    runChangeHeadCopy(terminalHead)
+                ),
+                size: 11,
+                weight: .regular,
+                color: .secondaryLabelColor
+            )
+            identify(terminal, as: "flit.runChanges.terminalHead")
+            stack.addArrangedSubview(terminal)
+            if changes.changes.isEmpty {
+                let empty = label(
+                    FoundationCopy.text(.runChangesNoChanges),
+                    size: 12,
+                    weight: .regular,
+                    color: .secondaryLabelColor
+                )
+                identify(empty, as: "flit.runChanges.noChanges")
+                stack.addArrangedSubview(empty)
+            } else {
+                changes.changes.forEach {
+                    stack.addArrangedSubview(runChangeRowView($0))
+                }
+            }
+            if changes.hasMore {
+                let loadMore = NSButton(
+                    title: FoundationCopy.text(.runChangesLoadMore),
+                    target: self,
+                    action: #selector(loadMoreRunChanges(_:))
+                )
+                loadMore.bezelStyle = .inline
+                identify(loadMore, as: "flit.runChanges.loadMore")
+                stack.addArrangedSubview(loadMore)
+            }
+            if activeRunChangesPageFailure {
+                let failure = label(
+                    FoundationCopy.text(.runChangesPageUnavailable),
+                    size: 12,
+                    weight: .semibold,
+                    color: .systemRed
+                )
+                identify(failure, as: "flit.runChanges.pageUnavailable")
+                stack.addArrangedSubview(failure)
+            }
+        }
+        return stack
+    }
+
+    private func runChangeRowView(_ change: RunChangeRow) -> NSView {
+        let stack = NSStackView()
+        identify(stack, as: "flit.runChanges.row.\(change.changeId)")
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 1
+        let path = label(change.displayPath, size: 12, weight: .regular)
+        path.maximumNumberOfLines = 2
+        identify(path, as: "flit.runChanges.path.\(change.changeId)")
+        stack.addArrangedSubview(path)
+        let layers = [
+            change.committed ? FoundationCopy.text(.runChangesCommitted) : nil,
+            change.staged ? FoundationCopy.text(.runChangesStaged) : nil,
+            change.unstaged ? FoundationCopy.text(.runChangesUnstaged) : nil,
+        ].compactMap { $0 }.joined(separator: ", ")
+        let counts = if let insertions = change.insertions, let deletions = change.deletions {
+            FoundationCopy.format(.runChangesLineCounts, insertions, deletions)
+        } else {
+            FoundationCopy.text(.runChangesLineCountsUnavailable)
+        }
+        let scope = FoundationCopy.text(
+            change.projectScope == .insideProject
+                ? .runChangesScopeInside
+                : .runChangesScopeOutside
+        )
+        let facts = [
+            runChangeStatusCopy(change.status),
+            FoundationCopy.format(.runChangesLayers, layers),
+            FoundationCopy.text(change.binary ? .runChangesBinary : .runChangesText),
+            counts,
+            scope,
+        ].joined(separator: " · ")
+        let factsLabel = label(
+            facts,
+            size: 11,
+            weight: .regular,
+            color: .secondaryLabelColor
+        )
+        identify(factsLabel, as: "flit.runChanges.facts.\(change.changeId)")
+        stack.addArrangedSubview(factsLabel)
+        return stack
+    }
+
+    private func runChangeHeadCopy(_ head: RunChangeHeadPresentation) -> String {
+        switch head {
+        case let .available(oid): oid
+        case .unavailable: FoundationCopy.text(.runChangesHeadUnavailable)
+        }
+    }
+
+    private func runChangeStatusCopy(_ status: FlitRunFileChangeStatus) -> String {
+        let key: FoundationCopyKey
+        switch status {
+        case .added: key = .runChangesStatusAdded
+        case .modified: key = .runChangesStatusModified
+        case .deleted: key = .runChangesStatusDeleted
+        case .typeChanged: key = .runChangesStatusTypeChanged
+        case .untracked: key = .runChangesStatusUntracked
+        }
+        return FoundationCopy.text(key)
     }
 
     private func runCompletionSummaryView(_ summary: RunCompletionSummary) -> NSView {
