@@ -31,8 +31,10 @@ use flit_protocol::{
     ProviderCapability as ProtocolProviderCapability, ProviderCapabilityEntry,
     ProviderCompatibility as ProtocolProviderCompatibility, ProviderDiagnosticsResponse,
     ProviderExecutionAfterQuit, ProviderKind as ProtocolProviderKind, ProviderUnavailableReason,
-    QuitImpactReason, QuitImpactResponse, QuitImpactRun, RunDetailReadRequest,
-    RunDetailReadResponse, RunEvidenceRecord, SystemHealthResponse,
+    QuitImpactReason, QuitImpactResponse, QuitImpactRun, RunChangeHead, RunChangesReadRequest,
+    RunChangesReadResponse, RunChangesUnavailableReason, RunDetailReadRequest,
+    RunDetailReadResponse, RunEvidenceRecord, RunFileChangeRecord, RunFileChangeStatus,
+    RunFileProjectScope, SystemHealthResponse,
 };
 use flit_providers::{
     CapabilityStatus, CodexCompatibilityProbe, CodexCompatibilityProbeError,
@@ -44,18 +46,20 @@ use flit_store::{
     AppendEventOutcome, DashboardChangeAttribution as StoreDashboardChangeAttribution,
     DashboardChangeSummary as StoreDashboardChangeSummary,
     DashboardRunSnapshot as StoreDashboardRunSnapshot, MAX_DASHBOARD_DELTA_EVENTS,
-    MAX_LIVE_MANAGED_SESSIONS, MAX_PROJECT_PAGE_SIZE, MAX_RUN_DETAIL_EVENTS,
-    ManagedPermissionDecision, ManagedPermissionDeliveryUnknownReason,
-    ManagedPermissionResponseAttemptOutcome, ManagedPermissionResponseResult,
-    ManagedPermissionResponseResultKind, ManagedSession, Project, ProjectDirectoryInspection,
-    ProjectListCursor as StoreProjectListCursor, ProjectRegistration, ProjectRegistrationOutcome,
-    ProjectTrustConfirmation, ProjectTrustOutcome, Store, StoreError,
+    MAX_LIVE_MANAGED_SESSIONS, MAX_MANAGED_GIT_CHANGE_PAGE_SIZE, MAX_PROJECT_PAGE_SIZE,
+    MAX_RUN_DETAIL_EVENTS, ManagedGitChangeAttribution as StoreManagedGitChangeAttribution,
+    ManagedGitFileStatus as StoreManagedGitFileStatus,
+    ManagedGitProjectScope as StoreManagedGitProjectScope, ManagedPermissionDecision,
+    ManagedPermissionDeliveryUnknownReason, ManagedPermissionResponseAttemptOutcome,
+    ManagedPermissionResponseResult, ManagedPermissionResponseResultKind, ManagedSession, Project,
+    ProjectDirectoryInspection, ProjectListCursor as StoreProjectListCursor, ProjectRegistration,
+    ProjectRegistrationOutcome, ProjectTrustConfirmation, ProjectTrustOutcome, Store, StoreError,
 };
 #[cfg(test)]
 use flit_store::{
     ManagedGitChangeAttribution, ManagedGitChangeSet, ManagedGitChangeSummary,
     ManagedGitFileChange, ManagedGitFileStatus, ManagedGitProjectScope,
-    ManagedGitRepositoryIdentity,
+    ManagedGitRepositoryIdentity, ManagedProviderObservation, ManagedProviderObservationKind,
 };
 use sha2::{Digest, Sha256};
 
@@ -1834,6 +1838,128 @@ pub fn run_detail_read_json(request_json: String) -> Result<String, BridgeError>
     protect(|| run_detail_read_with(&CORE, &request_json))
 }
 
+fn run_change_head(oid: Option<String>) -> RunChangeHead {
+    match oid {
+        Some(oid) => RunChangeHead::Available { oid },
+        None => RunChangeHead::Unavailable,
+    }
+}
+
+fn run_changes_read_with(
+    core_manager: &CoreManager,
+    request_json: &str,
+) -> Result<String, BridgeError> {
+    if request_json.len() > MAX_MANAGED_RUN_REQUEST_BYTES {
+        return run_command_json(|| -> Result<RunChangesReadResponse, _> {
+            Err(BridgeError::InvalidRunRequest)
+        });
+    }
+    let request = serde_json::from_str::<RunChangesReadRequest>(request_json)
+        .map_err(|_| BridgeError::InvalidRunRequest);
+    run_command_json(|| {
+        let request = request?;
+        if request.client_protocol_version != PROTOCOL_VERSION {
+            return Err(BridgeError::ProtocolMismatch);
+        }
+        let limit = usize::try_from(request.requested_change_limit)
+            .map_err(|_| BridgeError::InvalidRunRequest)?;
+        if request.run_id.trim().is_empty()
+            || request.run_id.len() > MAX_PROJECT_ID_BYTES
+            || request.run_id.contains('\0')
+            || request.expected_run_version == 0
+            || request.expected_run_version > flit_protocol::MAX_JSON_SAFE_INTEGER
+            || !(1..=MAX_MANAGED_GIT_CHANGE_PAGE_SIZE).contains(&limit)
+        {
+            return Err(BridgeError::InvalidRunRequest);
+        }
+        core_manager.with_ready_core(|core| {
+            let context = core
+                .store
+                .managed_run_detail_context(&request.run_id)
+                .map_err(|error| match error {
+                    StoreError::MissingRun { .. } => BridgeError::RunNotFound,
+                    _ => BridgeError::StorageFailure,
+                })?;
+            if context.run_version != request.expected_run_version {
+                return Err(BridgeError::RunVersionStale);
+            }
+            let Some(page) = core
+                .store
+                .managed_git_change_page(&request.run_id, request.after_cursor.as_deref(), limit)
+                .map_err(|error| match error {
+                    StoreError::InvalidManagedGitChangeRead { .. } => {
+                        BridgeError::InvalidRunRequest
+                    }
+                    StoreError::ManagedGitChangeReadTooLarge { .. } => {
+                        BridgeError::ManagedRunResponseTooLarge
+                    }
+                    _ => BridgeError::StorageFailure,
+                })?
+            else {
+                return Ok(RunChangesReadResponse::Unavailable {
+                    protocol_version: PROTOCOL_VERSION.to_owned(),
+                    run_id: request.run_id,
+                    run_version: context.run_version,
+                    reason: RunChangesUnavailableReason::ChangeSetNotAvailable,
+                });
+            };
+            let attribution = match page.metadata.attribution {
+                StoreManagedGitChangeAttribution::Exact => {
+                    ProtocolDashboardChangeAttribution::Exact
+                }
+                StoreManagedGitChangeAttribution::ObservedDuringRun => {
+                    ProtocolDashboardChangeAttribution::ObservedDuringRun
+                }
+            };
+            let changes = page
+                .changes
+                .into_iter()
+                .map(|change| RunFileChangeRecord {
+                    change_id: change.change_id,
+                    display_path: change.display_path,
+                    status: match change.status {
+                        StoreManagedGitFileStatus::Added => RunFileChangeStatus::Added,
+                        StoreManagedGitFileStatus::Modified => RunFileChangeStatus::Modified,
+                        StoreManagedGitFileStatus::Deleted => RunFileChangeStatus::Deleted,
+                        StoreManagedGitFileStatus::TypeChanged => RunFileChangeStatus::TypeChanged,
+                        StoreManagedGitFileStatus::Untracked => RunFileChangeStatus::Untracked,
+                    },
+                    committed: change.committed,
+                    staged: change.staged,
+                    unstaged: change.unstaged,
+                    binary: change.binary,
+                    insertions: change.insertions,
+                    deletions: change.deletions,
+                    project_scope: match change.project_scope {
+                        StoreManagedGitProjectScope::InsideProject => {
+                            RunFileProjectScope::InsideProject
+                        }
+                        StoreManagedGitProjectScope::OutsideProject => {
+                            RunFileProjectScope::OutsideProject
+                        }
+                    },
+                })
+                .collect();
+            Ok(RunChangesReadResponse::Available {
+                protocol_version: PROTOCOL_VERSION.to_owned(),
+                run_id: request.run_id,
+                run_version: context.run_version,
+                attribution,
+                baseline_head: run_change_head(page.metadata.baseline_head),
+                terminal_head: run_change_head(page.metadata.terminal_head),
+                next_cursor: page.next_cursor,
+                has_more: page.has_more,
+                changes,
+            })
+        })
+    })
+}
+
+#[uniffi::export]
+pub fn run_changes_read_json(request_json: String) -> Result<String, BridgeError> {
+    protect(|| run_changes_read_with(&CORE, &request_json))
+}
+
 fn managed_run_open_in_provider_with(
     core_manager: &CoreManager,
     request_json: &str,
@@ -3031,6 +3157,50 @@ mod tests {
             thread_id: CodexManagedThreadId::new("thread-observe").expect("thread ID"),
             turn_id: CodexManagedTurnId::new("turn-observe").expect("turn ID"),
             outcome: CodexTurnTerminalOutcome::Completed,
+        }
+    }
+
+    fn exact_bridge_change_set(project: &Path) -> ManagedGitChangeSet {
+        let project_identity = ProjectDirectoryInspection::inspect(project)
+            .expect("Project identity")
+            .identity;
+        let root = project
+            .to_str()
+            .expect("UTF-8 test Project")
+            .as_bytes()
+            .to_vec();
+        let mut git_directory = root.clone();
+        git_directory.extend_from_slice(b"/.git");
+        let raw_path = b"non-utf8-\xff.txt".to_vec();
+        ManagedGitChangeSet {
+            attribution: ManagedGitChangeAttribution::Exact,
+            baseline_head: Some("1".repeat(40)),
+            terminal_head: Some("2".repeat(40)),
+            repository_identity: ManagedGitRepositoryIdentity {
+                project_filesystem_id: project_identity.filesystem_id.clone(),
+                repository_root: root,
+                repository_root_filesystem_id: project_identity.filesystem_id,
+                git_directory: git_directory.clone(),
+                git_directory_filesystem_id: "unix:11:12".to_owned(),
+                common_directory: git_directory,
+                common_directory_filesystem_id: "unix:11:12".to_owned(),
+            },
+            files: 1,
+            insertions: Some(2),
+            deletions: Some(1),
+            changes: vec![ManagedGitFileChange {
+                change_id: "0123456789abcdef0123456789abcdef".to_owned(),
+                display_path: String::from_utf8_lossy(&raw_path).into_owned(),
+                raw_path,
+                status: ManagedGitFileStatus::Modified,
+                committed: true,
+                staged: false,
+                unstaged: false,
+                binary: false,
+                insertions: Some(2),
+                deletions: Some(1),
+                project_scope: ManagedGitProjectScope::InsideProject,
+            }],
         }
     }
 
@@ -5065,49 +5235,10 @@ mod tests {
     fn terminal_file_receipt_is_committed_atomically_without_exposing_raw_paths() {
         let (_directory, manager, response, project) =
             observation_core_with_baseline("terminal-file-receipt", true);
-        let project_identity = ProjectDirectoryInspection::inspect(&project)
-            .expect("Project identity")
-            .identity;
-        let root = project
-            .to_str()
-            .expect("UTF-8 test Project")
-            .as_bytes()
-            .to_vec();
-        let mut git_directory = root.clone();
-        git_directory.extend_from_slice(b"/.git");
-        let raw_path = b"non-utf8-\xff.txt".to_vec();
-        let display_path = String::from_utf8_lossy(&raw_path).into_owned();
-        let change_id = "0123456789abcdef0123456789abcdef".to_owned();
-        let change_set = ManagedGitChangeSet {
-            attribution: ManagedGitChangeAttribution::Exact,
-            baseline_head: Some("1".repeat(40)),
-            terminal_head: Some("2".repeat(40)),
-            repository_identity: ManagedGitRepositoryIdentity {
-                project_filesystem_id: project_identity.filesystem_id.clone(),
-                repository_root: root,
-                repository_root_filesystem_id: project_identity.filesystem_id,
-                git_directory: git_directory.clone(),
-                git_directory_filesystem_id: "unix:11:12".to_owned(),
-                common_directory: git_directory,
-                common_directory_filesystem_id: "unix:11:12".to_owned(),
-            },
-            files: 1,
-            insertions: Some(2),
-            deletions: Some(1),
-            changes: vec![ManagedGitFileChange {
-                change_id: change_id.clone(),
-                raw_path: raw_path.clone(),
-                display_path: display_path.clone(),
-                status: ManagedGitFileStatus::Modified,
-                committed: true,
-                staged: false,
-                unstaged: false,
-                binary: false,
-                insertions: Some(2),
-                deletions: Some(1),
-                project_scope: ManagedGitProjectScope::InsideProject,
-            }],
-        };
+        let change_set = exact_bridge_change_set(&project);
+        let raw_path = change_set.changes[0].raw_path.clone();
+        let display_path = change_set.changes[0].display_path.clone();
+        let change_id = change_set.changes[0].change_id.clone();
         manager
             .with_ready_core(|core| {
                 core.managed_runtimes.insert(
@@ -5168,6 +5299,142 @@ mod tests {
                 Ok(())
             })
             .expect("atomic terminal receipt");
+    }
+
+    #[test]
+    fn run_changes_read_is_versioned_cursor_bounded_and_path_free() {
+        let (_directory, manager, _response, project) =
+            observation_core_with_baseline("run-changes-read", true);
+        let change_set = exact_bridge_change_set(&project);
+        let expected_display = change_set.changes[0].display_path.clone();
+        let expected_cursor = change_set.changes[0].change_id.clone();
+        let run_version = manager
+            .with_ready_core(|core| {
+                let outcome = core
+                    .store
+                    .append_managed_provider_observation(ManagedProviderObservation {
+                        run_id: "run-observe".to_owned(),
+                        session_id: "session-observe".to_owned(),
+                        external_session_key: "thread-observe".to_owned(),
+                        provider_turn_id: "turn-observe".to_owned(),
+                        contract_version: "codex-app-server/0.145.0".to_owned(),
+                        event_id: "event-run-changes-read-terminal".to_owned(),
+                        observed_at: "2026-07-27T12:00:02Z".to_owned(),
+                        kind: ManagedProviderObservationKind::TurnCompleted {
+                            changes: ManagedGitChangeSummary::Exact {
+                                files: 1,
+                                insertions: 2,
+                                deletions: 1,
+                            },
+                            change_set: Some(Box::new(change_set)),
+                        },
+                    })
+                    .expect("terminal change set");
+                Ok(appended_event(&outcome).ingest_seq)
+            })
+            .expect("seed terminal change set");
+        let request = |after_cursor: Option<String>, expected_run_version: u64| {
+            serde_json::to_string(&RunChangesReadRequest {
+                run_id: "run-observe".to_owned(),
+                expected_run_version,
+                after_cursor,
+                requested_change_limit: 1,
+                client_protocol_version: PROTOCOL_VERSION.to_owned(),
+            })
+            .expect("Run Changes request")
+        };
+
+        let first = run_changes_read_with(&manager, &request(None, run_version))
+            .expect("first Run Changes response");
+        assert!(!first.contains("raw_path"));
+        assert!(!first.contains("filesystem_id"));
+        assert!(!first.contains("repository_root"));
+        let first: RunChangesReadResponse =
+            serde_json::from_str(&first).expect("first Run Changes JSON");
+        let RunChangesReadResponse::Available {
+            attribution,
+            baseline_head,
+            terminal_head,
+            next_cursor,
+            has_more,
+            changes,
+            ..
+        } = first
+        else {
+            panic!("expected available Run Changes");
+        };
+        assert_eq!(attribution, ProtocolDashboardChangeAttribution::Exact);
+        assert!(matches!(baseline_head, RunChangeHead::Available { .. }));
+        assert!(matches!(terminal_head, RunChangeHead::Available { .. }));
+        assert_eq!(next_cursor.as_deref(), Some(expected_cursor.as_str()));
+        assert!(!has_more);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].display_path, expected_display);
+
+        let exhausted = run_changes_read_with(
+            &manager,
+            &request(Some(expected_cursor.clone()), run_version),
+        )
+        .expect("exhausted Run Changes response");
+        let RunChangesReadResponse::Available {
+            next_cursor,
+            has_more,
+            changes,
+            ..
+        } = serde_json::from_str(&exhausted).expect("exhausted Run Changes JSON")
+        else {
+            panic!("expected available exhausted Run Changes");
+        };
+        assert_eq!(next_cursor.as_deref(), Some(expected_cursor.as_str()));
+        assert!(!has_more);
+        assert!(changes.is_empty());
+
+        let stale = run_changes_read_with(&manager, &request(None, run_version - 1))
+            .expect("typed stale version");
+        assert_eq!(
+            command_error(&stale).code,
+            CommandErrorCode::RunVersionStale
+        );
+        for invalid_cursor in ["not-an-opaque-cursor".to_owned(), "0".repeat(32)] {
+            let response =
+                run_changes_read_with(&manager, &request(Some(invalid_cursor), run_version))
+                    .expect("typed invalid cursor");
+            assert_eq!(
+                command_error(&response).code,
+                CommandErrorCode::InvalidRunRequest
+            );
+        }
+
+        let (_missing_directory, missing_manager, _) = observation_core("run-changes-missing");
+        let missing_version = missing_manager
+            .with_ready_core(|core| {
+                Ok(core
+                    .store
+                    .run_snapshot("run-observe")
+                    .expect("missing-set snapshot")
+                    .expect("missing-set snapshot")
+                    .version)
+            })
+            .expect("missing-set version");
+        let unavailable = run_changes_read_with(&missing_manager, &request(None, missing_version))
+            .expect("unavailable Run Changes response");
+        assert!(matches!(
+            serde_json::from_str::<RunChangesReadResponse>(&unavailable)
+                .expect("unavailable Run Changes JSON"),
+            RunChangesReadResponse::Unavailable {
+                reason: RunChangesUnavailableReason::ChangeSetNotAvailable,
+                ..
+            }
+        ));
+        let missing_cursor = run_changes_read_with(
+            &missing_manager,
+            &request(Some("0".repeat(32)), missing_version),
+        )
+        .expect("typed missing-set cursor");
+        assert_eq!(
+            command_error(&missing_cursor).code,
+            CommandErrorCode::InvalidRunRequest
+        );
     }
 
     #[test]

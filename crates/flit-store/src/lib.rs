@@ -15,8 +15,10 @@ use flit_protocol::{
     MAX_JSON_SAFE_INTEGER, NullableSessionId, RunEvidenceCategory, UnsequencedEventEnvelope,
 };
 use rusqlite::{
-    Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params, params_from_iter,
-    types::Value as SqlValue,
+    Connection, OptionalExtension, Row, Transaction, TransactionBehavior,
+    functions::FunctionFlags,
+    params, params_from_iter,
+    types::{Value as SqlValue, ValueRef},
 };
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -75,6 +77,8 @@ pub const MAX_DASHBOARD_SNAPSHOT_RUNS: usize = 1_000;
 pub const MAX_DASHBOARD_SNAPSHOT_SOURCE_BYTES: usize = 1_048_576;
 pub const MAX_RUN_DETAIL_EVENTS: usize = 50;
 pub const MAX_RUN_DETAIL_SOURCE_BYTES: usize = 1_048_576;
+pub const MAX_MANAGED_GIT_CHANGE_PAGE_SIZE: usize = 50;
+pub const MAX_MANAGED_GIT_CHANGE_PAGE_SOURCE_BYTES: usize = 1_048_576;
 pub const MAX_DASHBOARD_PROJECTION_EVENTS: usize = 100_000;
 pub const MAX_DASHBOARD_PROJECTION_SOURCE_BYTES: usize = 8 * 1_048_576;
 
@@ -381,6 +385,14 @@ pub struct ManagedRunDetailContext {
     pub open_in_provider_status: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedGitChangePage {
+    pub metadata: ManagedGitChangeSetMetadata,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+    pub changes: Vec<ManagedGitFileChange>,
+}
+
 impl Store {
     pub fn current_utc_timestamp(&self) -> Result<String, StoreError> {
         self.connection
@@ -408,6 +420,7 @@ impl Store {
         let mut connection = Connection::open(path).map_err(StoreError::Sqlite)?;
         let needs_bootstrap = preflight_database(&connection)?;
         configure_connection(&connection)?;
+        register_validation_functions(&connection)?;
         if needs_bootstrap {
             apply_pending_migrations(&mut connection, migration_applied_at, 0)?;
         } else {
@@ -1790,6 +1803,140 @@ impl Store {
             return Ok(None);
         }
         load_managed_git_file_change(&self.connection, run_id, change_id)
+    }
+
+    pub fn managed_git_change_page(
+        &self,
+        run_id: &str,
+        after_cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Option<ManagedGitChangePage>, StoreError> {
+        managed_runs::validate_read_id(run_id)
+            .map_err(|()| StoreError::InvalidManagedGitChangeRead { field: "run_id" })?;
+        if !(1..=MAX_MANAGED_GIT_CHANGE_PAGE_SIZE).contains(&limit) {
+            return Err(StoreError::InvalidManagedGitChangeRead { field: "limit" });
+        }
+        if let Some(cursor) = after_cursor {
+            managed_runs::validate_git_change_read_id(cursor)
+                .map_err(|()| StoreError::InvalidManagedGitChangeRead { field: "cursor" })?;
+        }
+        let change_set_exists = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM run_git_change_sets WHERE run_id = ?1)",
+                [run_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(StoreError::Sqlite)?;
+        if change_set_exists == 0 {
+            if after_cursor.is_some() {
+                return Err(StoreError::InvalidManagedGitChangeRead { field: "cursor" });
+            }
+            return Ok(None);
+        }
+        let metadata = load_managed_git_change_set_metadata_header(&self.connection, run_id)?
+            .ok_or_else(|| StoreError::StoredManagedGitChangeSetInvalid {
+                run_id: run_id.to_owned(),
+                field: "metadata",
+            })?;
+        validate_stored_git_change_set_page_integrity(&self.connection, &metadata)?;
+        let after_path = after_cursor
+            .map(|cursor| {
+                self.connection
+                    .query_row(
+                        "SELECT raw_path FROM run_git_file_changes
+                         WHERE run_id = ?1 AND change_id = ?2",
+                        params![run_id, cursor],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )
+                    .optional()
+                    .map_err(StoreError::Sqlite)?
+                    .ok_or(StoreError::InvalidManagedGitChangeRead { field: "cursor" })
+            })
+            .transpose()?;
+        let after_path = after_path.as_deref();
+
+        let (count, source_bytes) = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(
+                    LENGTH(raw_path) + LENGTH(CAST(change_id AS BLOB))
+                    + LENGTH(CAST(display_path AS BLOB)) + LENGTH(CAST(status AS BLOB))
+                    + LENGTH(CAST(project_scope AS BLOB)) + 64
+                 ), 0)
+                 FROM (
+                    SELECT raw_path, change_id, display_path, status, project_scope
+                    FROM run_git_file_changes
+                    WHERE run_id = ?1 AND (
+                        ?2 IS NULL OR raw_path > ?3 OR (raw_path = ?3 AND change_id > ?2)
+                    )
+                    ORDER BY raw_path, change_id
+                    LIMIT ?4
+                 )",
+                params![run_id, after_cursor, after_path, limit as i64],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(StoreError::Sqlite)?;
+        if count < 0
+            || source_bytes < 0
+            || usize::try_from(count).map_or(true, |count| count > limit)
+            || usize::try_from(source_bytes).map_or(true, |bytes| {
+                bytes > MAX_MANAGED_GIT_CHANGE_PAGE_SOURCE_BYTES
+            })
+        {
+            return Err(StoreError::ManagedGitChangeReadTooLarge {
+                count,
+                source_bytes,
+            });
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT change_id FROM run_git_file_changes
+                 WHERE run_id = ?1 AND (
+                    ?2 IS NULL OR raw_path > ?3 OR (raw_path = ?3 AND change_id > ?2)
+                 )
+                 ORDER BY raw_path, change_id
+                 LIMIT ?4",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let mut change_ids = statement
+            .query_map(
+                params![run_id, after_cursor, after_path, (limit + 1) as i64],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(StoreError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::Sqlite)?;
+        drop(statement);
+        let has_more = change_ids.len() > limit;
+        change_ids.truncate(limit);
+        if i64::try_from(change_ids.len()).ok() != Some(count) {
+            return Err(StoreError::StoredManagedGitChangeSetInvalid {
+                run_id: run_id.to_owned(),
+                field: "page",
+            });
+        }
+        let changes = change_ids
+            .into_iter()
+            .map(|change_id| {
+                load_managed_git_file_change(&self.connection, run_id, &change_id)?.ok_or_else(
+                    || StoreError::StoredManagedGitChangeSetInvalid {
+                        run_id: run_id.to_owned(),
+                        field: "page",
+                    },
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(ManagedGitChangePage {
+            next_cursor: changes
+                .last()
+                .map(|change| change.change_id.clone())
+                .or_else(|| after_cursor.map(ToOwned::to_owned)),
+            metadata,
+            has_more,
+            changes,
+        }))
     }
 
     pub fn managed_run_detail_context(
@@ -3411,6 +3558,17 @@ fn load_managed_git_change_set_metadata(
     connection: &Connection,
     run_id: &str,
 ) -> Result<Option<ManagedGitChangeSetMetadata>, StoreError> {
+    let metadata = load_managed_git_change_set_metadata_header(connection, run_id)?;
+    if let Some(metadata) = &metadata {
+        validate_stored_git_change_set_integrity(connection, metadata)?;
+    }
+    Ok(metadata)
+}
+
+fn load_managed_git_change_set_metadata_header(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<Option<ManagedGitChangeSetMetadata>, StoreError> {
     let stored = connection
         .query_row(
             "SELECT terminal_event_id, attribution, baseline_head, terminal_head,
@@ -3556,7 +3714,6 @@ fn load_managed_git_change_set_metadata(
             field: "terminal_event_changes",
         });
     }
-    validate_stored_git_change_set_integrity(connection, &metadata)?;
     Ok(Some(metadata))
 }
 
@@ -3646,6 +3803,96 @@ fn load_managed_git_file_change(
     managed_runs::validate_stored_git_file_change(&change)
         .map_err(|field| stored_git_change_error(run_id, change_id, field))?;
     Ok(Some(change))
+}
+
+fn validate_stored_git_change_set_page_integrity(
+    connection: &Connection,
+    metadata: &ManagedGitChangeSetMetadata,
+) -> Result<(), StoreError> {
+    let (record_count, insertion_count, insertions, deletion_count, deletions, invalid_count) =
+        connection
+            .query_row(
+                "SELECT COUNT(*), COUNT(insertions), COALESCE(SUM(insertions), 0),
+                        COUNT(deletions), COALESCE(SUM(deletions), 0),
+                        COALESCE(SUM(CASE WHEN
+                            typeof(change_id) <> 'text'
+                            OR length(CAST(change_id AS BLOB)) <> 32
+                            OR change_id GLOB '*[^0-9a-f]*'
+                            OR typeof(raw_path) <> 'blob'
+                            OR length(raw_path) NOT BETWEEN 1 AND 16384
+                            OR substr(raw_path, 1, 1) = X'2F'
+                            OR instr(raw_path, X'00') > 0
+                            OR raw_path IN (X'2E', X'2E2E')
+                            OR substr(raw_path, 1, 2) = X'2E2F'
+                            OR substr(raw_path, 1, 3) = X'2E2E2F'
+                            OR substr(raw_path, -2) = X'2F2E'
+                            OR substr(raw_path, -3) = X'2F2E2E'
+                            OR instr(raw_path, X'2F2F') > 0
+                            OR instr(raw_path, X'2F2E2F') > 0
+                            OR instr(raw_path, X'2F2E2E2F') > 0
+                            OR typeof(display_path) <> 'text'
+                            OR length(CAST(display_path AS BLOB)) NOT BETWEEN 1 AND 49152
+                            OR instr(CAST(display_path AS BLOB), X'00') > 0
+                            OR flit_git_display_matches(raw_path, display_path) = 0
+                            OR status NOT IN ('added', 'modified', 'deleted', 'type_changed', 'untracked')
+                            OR committed NOT IN (0, 1)
+                            OR staged NOT IN (0, 1)
+                            OR unstaged NOT IN (0, 1)
+                            OR binary NOT IN (0, 1)
+                            OR (committed = 0 AND staged = 0 AND unstaged = 0)
+                            OR (insertions IS NULL) <> (deletions IS NULL)
+                            OR insertions < 0 OR insertions > ?2
+                            OR deletions < 0 OR deletions > ?2
+                            OR (binary = 1 AND insertions IS NOT NULL)
+                            OR project_scope NOT IN ('inside_project', 'outside_project')
+                            OR (?3 = 'exact' AND (status = 'untracked' OR insertions IS NULL))
+                        THEN 1 ELSE 0 END), 0)
+                 FROM run_git_file_changes WHERE run_id = ?1",
+                params![
+                    metadata.run_id,
+                    MAX_JSON_SAFE_INTEGER as i64,
+                    metadata.attribution.as_str(),
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .map_err(StoreError::Sqlite)?;
+    let invalid = || StoreError::StoredManagedGitChangeSetInvalid {
+        run_id: metadata.run_id.clone(),
+        field: "aggregate",
+    };
+    if record_count < 0
+        || record_count as u64 != metadata.files
+        || insertion_count < 0
+        || insertion_count > record_count
+        || deletion_count < 0
+        || deletion_count > record_count
+        || invalid_count != 0
+    {
+        return Err(invalid());
+    }
+    let insertions = if insertion_count == record_count {
+        Some(u64::try_from(insertions).map_err(|_| invalid())?)
+    } else {
+        None
+    };
+    let deletions = if deletion_count == record_count {
+        Some(u64::try_from(deletions).map_err(|_| invalid())?)
+    } else {
+        None
+    };
+    if insertions != metadata.insertions || deletions != metadata.deletions {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 fn validate_stored_git_change_set_integrity(
@@ -5209,6 +5456,29 @@ fn configure_connection(connection: &Connection) -> Result<(), StoreError> {
         .map_err(StoreError::Sqlite)
 }
 
+fn register_validation_functions(connection: &Connection) -> Result<(), StoreError> {
+    connection
+        .create_scalar_function(
+            "flit_git_display_matches",
+            2,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            |context| {
+                let (ValueRef::Blob(raw_path), ValueRef::Text(display_path)) =
+                    (context.get_raw(0), context.get_raw(1))
+                else {
+                    return Ok(false);
+                };
+                if raw_path.len() > MAX_MANAGED_GIT_PATH_BYTES
+                    || display_path.len() > MAX_MANAGED_GIT_DISPLAY_PATH_BYTES
+                {
+                    return Ok(false);
+                }
+                Ok(String::from_utf8_lossy(raw_path).as_bytes() == display_path)
+            },
+        )
+        .map_err(StoreError::Sqlite)
+}
+
 fn preflight_database(connection: &Connection) -> Result<bool, StoreError> {
     let objects = schema_objects(connection)?;
     let has_registry = objects
@@ -5571,6 +5841,10 @@ pub enum StoreError {
     InvalidManagedGitChangeRead {
         field: &'static str,
     },
+    ManagedGitChangeReadTooLarge {
+        count: i64,
+        source_bytes: i64,
+    },
     ManagedGitChangeSetConflict {
         run_id: String,
     },
@@ -5914,6 +6188,13 @@ impl fmt::Display for StoreError {
             Self::InvalidManagedGitChangeRead { field } => {
                 write!(formatter, "invalid managed Git change read field: {field}")
             }
+            Self::ManagedGitChangeReadTooLarge {
+                count,
+                source_bytes,
+            } => write!(
+                formatter,
+                "managed Git change read exceeds bounds: count={count}, source_bytes={source_bytes}"
+            ),
             Self::ManagedGitChangeSetConflict { run_id } => {
                 write!(
                     formatter,

@@ -1,0 +1,32 @@
+{
+  "protocol_version": "1.18",
+  "event_schema_version": "1.2",
+  "run_id": "run-dashboard-1",
+  "run_version": 3,
+  "next_cursor": 2,
+  "has_more": true,
+  "history_status": "unsupported",
+  "open_in_provider_status": "unsupported",
+  "events": [
+    {
+      "cursor": 1,
+      "event_id": "event-dashboard-created",
+      "session_id": null,
+      "event_type": "run.created",
+      "category": "lifecycle",
+      "source_kind": "core",
+      "confidence": 1.0,
+      "observed_at": "2026-07-28T00:00:00.000Z"
+    },
+    {
+      "cursor": 2,
+      "event_id": "event-dashboard-start-requested",
+      "session_id": null,
+      "event_type": "run.start_requested",
+      "category": "lifecycle",
+      "source_kind": "core",
+      "confidence": 1.0,
+      "observed_at": "2026-07-28T00:00:01.000Z"
+    }
+  ]
+}

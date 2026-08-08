@@ -14,6 +14,7 @@ use flit_protocol::{
 use flit_store::{
     AppendEventOutcome, DashboardChangeSummary, InitialManagedSessionConnection,
     InitialManagedSessionOutcome, MAX_DASHBOARD_PROJECTION_SOURCE_BYTES, MAX_LIVE_MANAGED_SESSIONS,
+    MAX_MANAGED_GIT_CHANGE_PAGE_SIZE, MAX_MANAGED_GIT_CHANGE_PAGE_SOURCE_BYTES,
     ManagedGitChangeAttribution, ManagedGitChangeSet, ManagedGitChangeSummary,
     ManagedGitFileChange, ManagedGitFileStatus, ManagedGitProjectScope,
     ManagedGitRepositoryIdentity, ManagedPermissionDecision,
@@ -28,7 +29,7 @@ use flit_store::{
     ManagedSessionTerminationOutcome, ManagedTurnTerminalOutcome, ProjectDirectoryInspection,
     ProjectRegistration, ProjectTrustConfirmation, Store, StoreError,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use serde_json::{Map, Value, json};
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -934,6 +935,47 @@ fn terminal_file_changes_are_atomic_sensitive_idempotent_and_restart_durable() {
     assert_eq!(metadata.terminal_head, change_set.terminal_head);
     assert_eq!(metadata.repository_identity, change_set.repository_identity);
     assert_eq!(metadata.files, 2);
+    let first_page = store
+        .managed_git_change_page("run-changes", None, 1)
+        .expect("first change page")
+        .expect("available first page");
+    assert_eq!(first_page.metadata, metadata);
+    assert_eq!(first_page.changes, change_set.changes[..1]);
+    assert_eq!(first_page.next_cursor.as_deref(), Some(CHANGE_INSIDE_ID));
+    assert!(first_page.has_more);
+    let second_page = store
+        .managed_git_change_page(
+            "run-changes",
+            first_page.next_cursor.as_deref(),
+            MAX_MANAGED_GIT_CHANGE_PAGE_SIZE,
+        )
+        .expect("second change page")
+        .expect("available second page");
+    assert_eq!(second_page.changes, change_set.changes[1..]);
+    assert_eq!(second_page.next_cursor.as_deref(), Some(CHANGE_OUTSIDE_ID));
+    assert!(!second_page.has_more);
+    let exhausted = store
+        .managed_git_change_page(
+            "run-changes",
+            second_page.next_cursor.as_deref(),
+            MAX_MANAGED_GIT_CHANGE_PAGE_SIZE,
+        )
+        .expect("exhausted change page")
+        .expect("available exhausted page");
+    assert!(exhausted.changes.is_empty());
+    assert_eq!(exhausted.next_cursor, second_page.next_cursor);
+    assert!(!exhausted.has_more);
+    for (cursor, limit) in [
+        (Some("not-an-opaque-id"), 1),
+        (Some("00000000000000000000000000000000"), 1),
+        (None, 0),
+        (None, MAX_MANAGED_GIT_CHANGE_PAGE_SIZE + 1),
+    ] {
+        assert!(matches!(
+            store.managed_git_change_page("run-changes", cursor, limit),
+            Err(StoreError::InvalidManagedGitChangeRead { .. })
+        ));
+    }
     assert_eq!(
         store
             .managed_git_file_change("run-changes", CHANGE_INSIDE_ID)
@@ -1100,6 +1142,167 @@ fn terminal_file_changes_are_atomic_sensitive_idempotent_and_restart_durable() {
         )
         .expect("remaining locator rows");
     assert_eq!(remaining, 0);
+}
+
+#[test]
+fn managed_git_change_page_rejects_oversized_source_before_returning_records() {
+    let directory = TestDirectory::new("change-page-source-bound");
+    let (mut store, database, project_path) = trusted_store(&directory);
+    store
+        .create_managed_run_intent(run_intent_with_clean_baseline(
+            "run-large-changes",
+            "event-large-changes-created",
+            "event-large-changes-requested",
+        ))
+        .expect("managed Run");
+    store
+        .connect_initial_managed_session(session_connection(
+            "session-large-changes",
+            "run-large-changes",
+            "thread-large-changes",
+            &project_path,
+        ))
+        .expect("managed session");
+    assert!(
+        store
+            .managed_git_change_page("run-large-changes", None, 1)
+            .expect("missing change set")
+            .is_none()
+    );
+    assert!(matches!(
+        store.managed_git_change_page(
+            "run-large-changes",
+            Some("00000000000000000000000000000000"),
+            1,
+        ),
+        Err(StoreError::InvalidManagedGitChangeRead { field: "cursor" })
+    ));
+
+    let changes = (0_u8..51)
+        .map(|index| {
+            let mut raw_path = format!("{index:02}-").into_bytes();
+            raw_path.resize(16 * 1024, 0xff);
+            ManagedGitFileChange {
+                change_id: format!("{index:032x}"),
+                display_path: String::from_utf8_lossy(&raw_path).into_owned(),
+                raw_path,
+                status: ManagedGitFileStatus::Modified,
+                committed: false,
+                staged: true,
+                unstaged: false,
+                binary: false,
+                insertions: Some(1),
+                deletions: Some(0),
+                project_scope: ManagedGitProjectScope::InsideProject,
+            }
+        })
+        .collect::<Vec<_>>();
+    let first_change_id = changes[0].change_id.clone();
+    let late_change_id = changes[50].change_id.clone();
+    let late_display_path = changes[50].display_path.clone();
+    assert!(
+        changes
+            .iter()
+            .map(|change| change.raw_path.len() + change.display_path.len())
+            .sum::<usize>()
+            > MAX_MANAGED_GIT_CHANGE_PAGE_SOURCE_BYTES
+    );
+    let file_count = changes.len() as u64;
+    let change_set = ManagedGitChangeSet {
+        attribution: ManagedGitChangeAttribution::Exact,
+        baseline_head: Some("1".repeat(40)),
+        terminal_head: Some("2".repeat(40)),
+        repository_identity: test_repository_identity(&project_path),
+        files: file_count,
+        insertions: Some(file_count),
+        deletions: Some(0),
+        changes,
+    };
+    store
+        .append_managed_provider_observation(ManagedProviderObservation {
+            run_id: "run-large-changes".to_owned(),
+            session_id: "session-large-changes".to_owned(),
+            external_session_key: "thread-large-changes".to_owned(),
+            provider_turn_id: "turn-large-changes".to_owned(),
+            contract_version: "codex-app-server/0.145.0".to_owned(),
+            event_id: "event-large-changes-terminal".to_owned(),
+            observed_at: ENDED_AT.to_owned(),
+            kind: ManagedProviderObservationKind::TurnCompleted {
+                changes: ManagedGitChangeSummary::Exact {
+                    files: file_count,
+                    insertions: file_count,
+                    deletions: 0,
+                },
+                change_set: Some(Box::new(change_set)),
+            },
+        })
+        .expect("terminal large changes");
+
+    let first = store
+        .managed_git_change_page("run-large-changes", None, 1)
+        .expect("bounded first page")
+        .expect("available first page");
+    assert_eq!(first.changes.len(), 1);
+    assert!(first.has_more);
+
+    assert!(matches!(
+        store.managed_git_change_page(
+            "run-large-changes",
+            None,
+            MAX_MANAGED_GIT_CHANGE_PAGE_SIZE,
+        ),
+        Err(StoreError::ManagedGitChangeReadTooLarge {
+            count: 50,
+            source_bytes,
+        }) if source_bytes > MAX_MANAGED_GIT_CHANGE_PAGE_SOURCE_BYTES as i64
+    ));
+
+    let corruption = Connection::open(&database).expect("late corruption fixture");
+    corruption
+        .pragma_update(None, "ignore_check_constraints", "ON")
+        .expect("allow corruption fixture");
+    corruption
+        .execute(
+            "UPDATE run_git_file_changes SET display_path = 'mismatched-display'
+             WHERE run_id = 'run-large-changes' AND change_id = ?1",
+            [&late_change_id],
+        )
+        .expect("corrupt late display path");
+    assert!(matches!(
+        store.managed_git_change_page("run-large-changes", None, 1),
+        Err(StoreError::StoredManagedGitChangeSetInvalid {
+            ref run_id,
+            field: "aggregate",
+        }) if run_id == "run-large-changes"
+    ));
+    corruption
+        .execute(
+            "UPDATE run_git_file_changes SET display_path = ?1
+             WHERE run_id = 'run-large-changes' AND change_id = ?2",
+            params![late_display_path, late_change_id],
+        )
+        .expect("restore late display path");
+    corruption
+        .execute(
+            "UPDATE run_git_file_changes SET display_path = ?1
+             WHERE run_id = 'run-large-changes' AND change_id = ?2",
+            params![
+                "x".repeat(MAX_MANAGED_GIT_CHANGE_PAGE_SOURCE_BYTES + 1),
+                first_change_id,
+            ],
+        )
+        .expect("corrupt cursor display path beyond bounds");
+    assert!(matches!(
+        store.managed_git_change_page(
+            "run-large-changes",
+            Some("00000000000000000000000000000000"),
+            1,
+        ),
+        Err(StoreError::StoredManagedGitChangeSetInvalid {
+            ref run_id,
+            field: "aggregate",
+        }) if run_id == "run-large-changes"
+    ));
 }
 
 #[test]

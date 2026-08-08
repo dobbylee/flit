@@ -4,7 +4,7 @@ use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: &str = "1.17";
+pub const PROTOCOL_VERSION: &str = "1.18";
 pub const EVENT_PROTOCOL_VERSION: &str = "1.2";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -602,6 +602,81 @@ pub struct RunDetailReadResponse {
     pub history_status: CapabilityStatus,
     pub open_in_provider_status: CapabilityStatus,
     pub events: Vec<RunEvidenceRecord>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RunChangesReadRequest {
+    pub run_id: String,
+    pub expected_run_version: u64,
+    pub after_cursor: Option<String>,
+    pub requested_change_limit: u32,
+    pub client_protocol_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "availability", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RunChangeHead {
+    Available { oid: String },
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunFileChangeStatus {
+    Added,
+    Modified,
+    Deleted,
+    TypeChanged,
+    Untracked,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunFileProjectScope {
+    InsideProject,
+    OutsideProject,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RunFileChangeRecord {
+    pub change_id: String,
+    pub display_path: String,
+    pub status: RunFileChangeStatus,
+    pub committed: bool,
+    pub staged: bool,
+    pub unstaged: bool,
+    pub binary: bool,
+    pub insertions: Option<u64>,
+    pub deletions: Option<u64>,
+    pub project_scope: RunFileProjectScope,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunChangesUnavailableReason {
+    ChangeSetNotAvailable,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "availability", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RunChangesReadResponse {
+    Available {
+        protocol_version: String,
+        run_id: String,
+        run_version: u64,
+        attribution: DashboardChangeAttribution,
+        baseline_head: RunChangeHead,
+        terminal_head: RunChangeHead,
+        next_cursor: Option<String>,
+        has_more: bool,
+        changes: Vec<RunFileChangeRecord>,
+    },
+    Unavailable {
+        protocol_version: String,
+        run_id: String,
+        run_version: u64,
+        reason: RunChangesUnavailableReason,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1795,6 +1870,183 @@ struct FlitRunDetailReadResponse: Codable, Equatable, Sendable {
         case historyStatus = "history_status"
         case openInProviderStatus = "open_in_provider_status"
         case events
+    }
+}
+
+struct FlitRunChangesReadRequest: Codable, Equatable, Sendable {
+    let runId: String
+    let expectedRunVersion: UInt64
+    let afterCursor: String?
+    let requestedChangeLimit: UInt32
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case runId = "run_id"
+        case expectedRunVersion = "expected_run_version"
+        case afterCursor = "after_cursor"
+        case requestedChangeLimit = "requested_change_limit"
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+enum FlitRunChangeHeadAvailability: String, Codable, Sendable {
+    case available
+    case unavailable
+}
+
+enum FlitRunChangeHead: Codable, Equatable, Sendable {
+    case available(oid: String)
+    case unavailable
+
+    private enum CodingKeys: String, CodingKey {
+        case availability
+        case oid
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(FlitRunChangeHeadAvailability.self, forKey: .availability) {
+        case .available:
+            self = .available(oid: try container.decode(String.self, forKey: .oid))
+        case .unavailable:
+            guard !container.contains(.oid) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .oid,
+                    in: container,
+                    debugDescription: "An unavailable change HEAD cannot include an object ID"
+                )
+            }
+            self = .unavailable
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case let .available(oid):
+            try container.encode(FlitRunChangeHeadAvailability.available, forKey: .availability)
+            try container.encode(oid, forKey: .oid)
+        case .unavailable:
+            try container.encode(FlitRunChangeHeadAvailability.unavailable, forKey: .availability)
+        }
+    }
+}
+
+enum FlitRunFileChangeStatus: String, Codable, Sendable {
+    case added
+    case modified
+    case deleted
+    case typeChanged = "type_changed"
+    case untracked
+}
+
+enum FlitRunFileProjectScope: String, Codable, Sendable {
+    case insideProject = "inside_project"
+    case outsideProject = "outside_project"
+}
+
+struct FlitRunFileChangeRecord: Codable, Equatable, Sendable {
+    let changeId: String
+    let displayPath: String
+    let status: FlitRunFileChangeStatus
+    let committed: Bool
+    let staged: Bool
+    let unstaged: Bool
+    let binary: Bool
+    let insertions: UInt64?
+    let deletions: UInt64?
+    let projectScope: FlitRunFileProjectScope
+
+    private enum CodingKeys: String, CodingKey {
+        case changeId = "change_id"
+        case displayPath = "display_path"
+        case status
+        case committed
+        case staged
+        case unstaged
+        case binary
+        case insertions
+        case deletions
+        case projectScope = "project_scope"
+    }
+}
+
+enum FlitRunChangesUnavailableReason: String, Codable, Sendable {
+    case changeSetNotAvailable = "change_set_not_available"
+}
+
+enum FlitRunChangesAvailability: String, Codable, Sendable {
+    case available
+    case unavailable
+}
+
+struct FlitRunChangesAvailableResponse: Codable, Equatable, Sendable {
+    let availability: FlitRunChangesAvailability
+    let protocolVersion: String
+    let runId: String
+    let runVersion: UInt64
+    let attribution: FlitDashboardChangeAttribution
+    let baselineHead: FlitRunChangeHead
+    let terminalHead: FlitRunChangeHead
+    let nextCursor: String?
+    let hasMore: Bool
+    let changes: [FlitRunFileChangeRecord]
+
+    private enum CodingKeys: String, CodingKey {
+        case availability
+        case protocolVersion = "protocol_version"
+        case runId = "run_id"
+        case runVersion = "run_version"
+        case attribution
+        case baselineHead = "baseline_head"
+        case terminalHead = "terminal_head"
+        case nextCursor = "next_cursor"
+        case hasMore = "has_more"
+        case changes
+    }
+}
+
+struct FlitRunChangesUnavailableResponse: Codable, Equatable, Sendable {
+    let availability: FlitRunChangesAvailability
+    let protocolVersion: String
+    let runId: String
+    let runVersion: UInt64
+    let reason: FlitRunChangesUnavailableReason
+
+    private enum CodingKeys: String, CodingKey {
+        case availability
+        case protocolVersion = "protocol_version"
+        case runId = "run_id"
+        case runVersion = "run_version"
+        case reason
+    }
+}
+
+enum FlitRunChangesReadResponse: Codable, Equatable, Sendable {
+    case available(FlitRunChangesAvailableResponse)
+    case unavailable(FlitRunChangesUnavailableResponse)
+
+    private enum CodingKeys: String, CodingKey {
+        case availability
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(FlitRunChangesAvailability.self, forKey: .availability) {
+        case .available:
+            self = .available(try FlitRunChangesAvailableResponse(from: decoder))
+        case .unavailable:
+            self = .unavailable(try FlitRunChangesUnavailableResponse(from: decoder))
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        switch self {
+        case let .available(response):
+            try response.encode(to: encoder)
+        case let .unavailable(response):
+            try response.encode(to: encoder)
+        }
     }
 }
 

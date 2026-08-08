@@ -11,9 +11,9 @@ use flit_protocol::{
     ProjectTrustResponse, ProjectsListRequest, ProjectsListResponse, ProviderCompatibility,
     ProviderDiagnosticsRequest, ProviderDiagnosticsResponse, ProviderExecutionAfterQuit,
     ProviderUnavailableReason, QuitImpactReason, QuitImpactRequest, QuitImpactResponse,
-    RunDetailReadRequest, RunDetailReadResponse, RunEvidenceCategory, SystemHealthRequest,
-    SystemHealthResponse, event_schema_id, event_schema_relative_path,
-    generated_swift_command_contract,
+    RunChangesReadRequest, RunChangesReadResponse, RunDetailReadRequest, RunDetailReadResponse,
+    RunEvidenceCategory, SystemHealthRequest, SystemHealthResponse, event_schema_id,
+    event_schema_relative_path, generated_swift_command_contract,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -450,6 +450,16 @@ fn current_run_detail_and_provider_open_fixtures_are_exact_and_path_free() {
         current,
         "run_detail_read.response.json",
     ));
+    assert_fixture_round_trip::<RunChangesReadRequest>(&command_fixture(
+        current,
+        "run_changes_read.request.json",
+    ));
+    for name in [
+        "run_changes_read.available.response.json",
+        "run_changes_read.unavailable.response.json",
+    ] {
+        assert_fixture_round_trip::<RunChangesReadResponse>(&command_fixture(current, name));
+    }
     assert_fixture_round_trip::<ManagedRunOpenInProviderRequest>(&command_fixture(
         current,
         "managed_run_open_in_provider.request.json",
@@ -500,6 +510,24 @@ fn current_run_detail_and_provider_open_fixtures_are_exact_and_path_free() {
     let mut unknown_category = serde_json::to_value(&response).expect("Run detail JSON");
     unknown_category["events"][0]["category"] = serde_json::json!("future_category");
     assert!(serde_json::from_value::<RunDetailReadResponse>(unknown_category).is_err());
+
+    let changes = fs::read_to_string(repository_path(&command_fixture(
+        current,
+        "run_changes_read.available.response.json",
+    )))
+    .expect("Run Changes response should be readable");
+    for forbidden in [
+        "raw_path",
+        "repository_root",
+        "filesystem_id",
+        "git_directory",
+        "common_directory",
+    ] {
+        assert!(
+            !changes.contains(forbidden),
+            "Run Changes must not expose {forbidden}"
+        );
+    }
 }
 
 #[test]
@@ -1040,6 +1068,13 @@ fn generated_swift_project_contract_is_current_and_required_fields_fail_closed()
         "FlitRunEvidenceCategory",
         "FlitRunEvidenceRecord",
         "FlitRunDetailReadResponse",
+        "FlitRunChangesReadRequest",
+        "FlitRunChangeHead",
+        "FlitRunFileChangeStatus",
+        "FlitRunFileProjectScope",
+        "FlitRunFileChangeRecord",
+        "FlitRunChangesUnavailableReason",
+        "FlitRunChangesReadResponse",
         "FlitManagedRunOpenInProviderRequest",
         "FlitCommandError",
         "FlitProviderDiagnosticsRequest",
