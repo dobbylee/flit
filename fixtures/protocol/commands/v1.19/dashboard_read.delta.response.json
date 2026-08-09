@@ -1,7 +1,7 @@
 {
   "delivery": "delta",
   "protocol_version": "1.19",
-  "event_schema_version": "1.2",
+  "event_schema_version": "1.3",
   "core_instance_id": "core-instance-1",
   "requested_after_cursor": 3,
   "retained_after_cursor": 0,

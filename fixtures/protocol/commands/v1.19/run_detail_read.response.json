@@ -1,6 +1,6 @@
 {
   "protocol_version": "1.19",
-  "event_schema_version": "1.2",
+  "event_schema_version": "1.3",
   "run_id": "run-dashboard-1",
   "run_version": 3,
   "next_cursor": 2,

@@ -9,7 +9,8 @@ use std::{
 use flit_protocol::{
     EventProtocolVersion, EventSource, EventSourceKind, GitBaselinePayload,
     GitBaselineUnavailableReason, GitDirtySummary, GitHead, NullableSessionId,
-    UnsequencedEventEnvelope,
+    PossiblyStuckPayload, StuckCauseCode, StuckClearReasonCode, StuckClearedPayload,
+    StuckProcessReceipt, UnsequencedEventEnvelope,
 };
 use flit_store::{
     AppendEventOutcome, DashboardChangeSummary, InitialManagedSessionConnection,
@@ -26,7 +27,8 @@ use flit_store::{
     ManagedRunIntent, ManagedRunIntentOutcome, ManagedRunStartFailure,
     ManagedRunStartFailureOutcome, ManagedSessionReconciliation,
     ManagedSessionReconciliationOutcome, ManagedSessionTermination,
-    ManagedSessionTerminationOutcome, ManagedTurnTerminalOutcome, ProjectDirectoryInspection,
+    ManagedSessionTerminationOutcome, ManagedStuckAssessment, ManagedStuckTransition,
+    ManagedStuckTransitionOutcome, ManagedTurnTerminalOutcome, ProjectDirectoryInspection,
     ProjectRegistration, ProjectTrustConfirmation, Store, StoreError,
 };
 use rusqlite::{Connection, params};
@@ -51,6 +53,623 @@ impl TestDirectory {
         fs::create_dir(&path).expect("test directory");
         Self(path)
     }
+}
+
+#[test]
+fn stuck_transitions_are_exact_atomic_and_same_state_consumes_no_cursor() {
+    let directory = TestDirectory::new("stuck-transitions");
+    let (mut store, _database, project_path) = trusted_store(&directory);
+    store
+        .create_managed_run_intent(run_intent(
+            "run-stuck",
+            "event-stuck-run-created",
+            "event-stuck-start-requested",
+        ))
+        .expect("managed Run");
+    store
+        .connect_initial_managed_session(session_connection(
+            "session-stuck",
+            "run-stuck",
+            "thread-stuck",
+            &project_path,
+        ))
+        .expect("managed session");
+
+    let first_payload = PossiblyStuckPayload {
+        occurrence_id: "occurrence-stuck-1".to_owned(),
+        cause: StuckCauseCode::Unknown,
+        threshold_seconds: 120,
+        progress_event_id: "event-stuck-run-created".to_owned(),
+        progress_observed_at: CREATED_AT.to_owned(),
+        progress_monotonic_ms: 5_000,
+        baseline_monotonic_ms: 5_000,
+        stuck_since_monotonic_ms: 125_000,
+        process: StuckProcessReceipt::Alive {
+            generation: "process-generation-stuck-1".to_owned(),
+            observed_monotonic_ms: 130_000,
+        },
+        evidence_unavailable_reason: "raw_provider_content_not_retained".to_owned(),
+    };
+    let first = ManagedStuckTransition {
+        run_id: "run-stuck".to_owned(),
+        expected_run_version: 4,
+        event_id: "event-stuck-1".to_owned(),
+        observed_at: "2026-07-24T10:02:10Z".to_owned(),
+        assessment: ManagedStuckAssessment::PossiblyStuck(first_payload.clone()),
+    };
+    for invalid in [
+        {
+            let mut invalid = first.clone();
+            let ManagedStuckAssessment::PossiblyStuck(payload) = &mut invalid.assessment else {
+                unreachable!()
+            };
+            payload.progress_event_id = "event-missing-progress".to_owned();
+            invalid
+        },
+        {
+            let mut invalid = first.clone();
+            let ManagedStuckAssessment::PossiblyStuck(payload) = &mut invalid.assessment else {
+                unreachable!()
+            };
+            payload.progress_observed_at = "2026-07-24T10:00:09Z".to_owned();
+            invalid
+        },
+        {
+            let mut invalid = first.clone();
+            let ManagedStuckAssessment::PossiblyStuck(payload) = &mut invalid.assessment else {
+                unreachable!()
+            };
+            payload.cause = StuckCauseCode::Editing;
+            invalid
+        },
+    ] {
+        assert!(matches!(
+            store.append_managed_stuck_transition(invalid),
+            Err(StoreError::ManagedStuckProgressMismatch { .. })
+        ));
+        assert_eq!(
+            store
+                .run_snapshot("run-stuck")
+                .expect("unchanged authority snapshot")
+                .expect("unchanged authority projection")
+                .version,
+            4
+        );
+    }
+    let first_event = match store
+        .append_managed_stuck_transition(first.clone())
+        .expect("first stuck transition")
+    {
+        ManagedStuckTransitionOutcome::Appended(event) => event,
+        other => panic!("unexpected first transition: {other:?}"),
+    };
+    assert_eq!(first_event.ingest_seq, 5);
+    let stuck = store
+        .run_snapshot("run-stuck")
+        .expect("stuck snapshot")
+        .expect("stuck projection");
+    assert_eq!(stuck.version, 5);
+    assert_eq!(stuck.dashboard_bucket, "PossiblyStuck");
+    assert_eq!(stuck.attention_level, "Informational");
+    assert_eq!(stuck.snapshot["attention"]["open_count"], 1);
+
+    let mut same_payload = first_payload.clone();
+    same_payload.process = StuckProcessReceipt::Alive {
+        generation: "process-generation-stuck-1".to_owned(),
+        observed_monotonic_ms: 140_000,
+    };
+    let unchanged = ManagedStuckTransition {
+        run_id: "run-stuck".to_owned(),
+        expected_run_version: 5,
+        event_id: "event-stuck-same-assessment".to_owned(),
+        observed_at: "2026-07-24T10:02:20Z".to_owned(),
+        assessment: ManagedStuckAssessment::PossiblyStuck(same_payload),
+    };
+    assert_eq!(
+        store
+            .append_managed_stuck_transition(unchanged)
+            .expect("same assessment"),
+        ManagedStuckTransitionOutcome::Unchanged {
+            run_id: "run-stuck".to_owned(),
+            version: 5,
+        }
+    );
+    assert_eq!(
+        store
+            .run_snapshot("run-stuck")
+            .expect("unchanged snapshot")
+            .expect("unchanged projection")
+            .version,
+        5
+    );
+    assert!(matches!(
+        store.append_managed_stuck_transition(first),
+        Err(StoreError::ManagedStuckRunVersionStale {
+            expected: 4,
+            current: 5,
+            ..
+        })
+    ));
+
+    let mismatched_clear = ManagedStuckTransition {
+        run_id: "run-stuck".to_owned(),
+        expected_run_version: 5,
+        event_id: "event-stuck-clear-stale".to_owned(),
+        observed_at: "2026-07-24T10:02:16Z".to_owned(),
+        assessment: ManagedStuckAssessment::Clear(StuckClearedPayload {
+            occurrence_id: "occurrence-stale".to_owned(),
+            reason: StuckClearReasonCode::ProgressObserved,
+            process: StuckProcessReceipt::Alive {
+                generation: "process-generation-stuck-1".to_owned(),
+                observed_monotonic_ms: 136_000,
+            },
+            evidence_unavailable_reason: "raw_provider_content_not_retained".to_owned(),
+        }),
+    };
+    assert!(matches!(
+        store.append_managed_stuck_transition(mismatched_clear),
+        Err(StoreError::ManagedStuckOccurrenceMismatch { .. })
+    ));
+
+    let clear_first = ManagedStuckTransition {
+        run_id: "run-stuck".to_owned(),
+        expected_run_version: 5,
+        event_id: "event-stuck-clear-1".to_owned(),
+        observed_at: "2026-07-24T10:02:17Z".to_owned(),
+        assessment: ManagedStuckAssessment::Clear(StuckClearedPayload {
+            occurrence_id: "occurrence-stuck-1".to_owned(),
+            reason: StuckClearReasonCode::ProgressObserved,
+            process: StuckProcessReceipt::Alive {
+                generation: "process-generation-stuck-1".to_owned(),
+                observed_monotonic_ms: 137_000,
+            },
+            evidence_unavailable_reason: "raw_provider_content_not_retained".to_owned(),
+        }),
+    };
+    let first_clear_event = match store
+        .append_managed_stuck_transition(clear_first)
+        .expect("first clear transition")
+    {
+        ManagedStuckTransitionOutcome::Appended(event) => event,
+        other => panic!("unexpected clear: {other:?}"),
+    };
+    assert_eq!(first_clear_event.ingest_seq, 6);
+    let working = store
+        .run_snapshot("run-stuck")
+        .expect("working snapshot")
+        .expect("working projection");
+    assert_eq!(working.dashboard_bucket, "Working");
+    assert_eq!(working.snapshot["attention"]["open_count"], 0);
+
+    let second_payload = PossiblyStuckPayload {
+        occurrence_id: "occurrence-stuck-2".to_owned(),
+        process: StuckProcessReceipt::Alive {
+            generation: "process-generation-stuck-1".to_owned(),
+            observed_monotonic_ms: 145_000,
+        },
+        ..first_payload
+    };
+    let second = ManagedStuckTransition {
+        run_id: "run-stuck".to_owned(),
+        expected_run_version: 6,
+        event_id: "event-stuck-2".to_owned(),
+        observed_at: "2026-07-24T10:02:25Z".to_owned(),
+        assessment: ManagedStuckAssessment::PossiblyStuck(second_payload),
+    };
+    let second_event = match store
+        .append_managed_stuck_transition(second)
+        .expect("same facts with a new occurrence identity")
+    {
+        ManagedStuckTransitionOutcome::Appended(event) => event,
+        other => panic!("unexpected second occurrence: {other:?}"),
+    };
+    assert_eq!(second_event.ingest_seq, 7);
+    assert_eq!(
+        store
+            .run_snapshot("run-stuck")
+            .expect("second stuck snapshot")
+            .expect("second stuck projection")
+            .snapshot["attention"]["open_count"],
+        1
+    );
+
+    let clear = ManagedStuckTransition {
+        run_id: "run-stuck".to_owned(),
+        expected_run_version: 7,
+        event_id: "event-stuck-clear-2".to_owned(),
+        observed_at: "2026-07-24T10:02:27Z".to_owned(),
+        assessment: ManagedStuckAssessment::Clear(StuckClearedPayload {
+            occurrence_id: "occurrence-stuck-2".to_owned(),
+            reason: StuckClearReasonCode::ProgressObserved,
+            process: StuckProcessReceipt::Alive {
+                generation: "process-generation-stuck-1".to_owned(),
+                observed_monotonic_ms: 147_000,
+            },
+            evidence_unavailable_reason: "raw_provider_content_not_retained".to_owned(),
+        }),
+    };
+    let clear_event = match store
+        .append_managed_stuck_transition(clear.clone())
+        .expect("second clear transition")
+    {
+        ManagedStuckTransitionOutcome::Appended(event) => event,
+        other => panic!("unexpected second clear: {other:?}"),
+    };
+    assert_eq!(clear_event.ingest_seq, 8);
+
+    let already_clear = ManagedStuckTransition {
+        expected_run_version: 8,
+        event_id: "event-stuck-already-clear".to_owned(),
+        ..clear
+    };
+    assert_eq!(
+        store
+            .append_managed_stuck_transition(already_clear)
+            .expect("already clear"),
+        ManagedStuckTransitionOutcome::Unchanged {
+            run_id: "run-stuck".to_owned(),
+            version: 8,
+        }
+    );
+}
+
+#[test]
+fn stuck_transition_rejects_cross_run_progress_and_non_core_sources() {
+    let directory = TestDirectory::new("stuck-authority");
+    let (mut store, database, project_path) = trusted_store(&directory);
+    for (run, session, thread) in [
+        ("run-stuck-a", "session-stuck-a", "thread-stuck-a"),
+        ("run-stuck-b", "session-stuck-b", "thread-stuck-b"),
+    ] {
+        store
+            .create_managed_run_intent(run_intent(
+                run,
+                &format!("event-{run}-created"),
+                &format!("event-{run}-start-requested"),
+            ))
+            .expect("managed Run");
+        store
+            .connect_initial_managed_session(session_connection(
+                session,
+                run,
+                thread,
+                &project_path,
+            ))
+            .expect("managed session");
+    }
+    let run_a_version = store
+        .run_snapshot("run-stuck-a")
+        .expect("Run A snapshot")
+        .expect("Run A projection")
+        .version;
+    let cross_run = ManagedStuckTransition {
+        run_id: "run-stuck-a".to_owned(),
+        expected_run_version: run_a_version,
+        event_id: "event-cross-run-stuck".to_owned(),
+        observed_at: "2026-07-24T10:02:10Z".to_owned(),
+        assessment: ManagedStuckAssessment::PossiblyStuck(PossiblyStuckPayload {
+            occurrence_id: "occurrence-cross-run".to_owned(),
+            cause: StuckCauseCode::Unknown,
+            threshold_seconds: 120,
+            progress_event_id: "event-run-stuck-b-created".to_owned(),
+            progress_observed_at: CREATED_AT.to_owned(),
+            progress_monotonic_ms: 5_000,
+            baseline_monotonic_ms: 5_000,
+            stuck_since_monotonic_ms: 125_000,
+            process: StuckProcessReceipt::Alive {
+                generation: "process-generation-a".to_owned(),
+                observed_monotonic_ms: 130_000,
+            },
+            evidence_unavailable_reason: "raw_provider_content_not_retained".to_owned(),
+        }),
+    };
+    let mut valid = cross_run.clone();
+    valid.event_id = "event-valid-stuck-source".to_owned();
+    let ManagedStuckAssessment::PossiblyStuck(payload) = &mut valid.assessment else {
+        unreachable!()
+    };
+    payload.progress_event_id = "event-run-stuck-a-created".to_owned();
+    assert!(matches!(
+        store.append_managed_stuck_transition(cross_run),
+        Err(StoreError::ManagedStuckProgressMismatch { .. })
+    ));
+
+    let mut provider_owned = session_event(
+        "event-provider-owned-stuck",
+        "run-stuck-a",
+        "session-stuck-a",
+        2,
+        "run.possibly_stuck",
+    );
+    provider_owned.protocol_version = EventProtocolVersion::V1_3;
+    assert!(matches!(
+        store.append_event(provider_owned),
+        Err(StoreError::InvalidEvent {
+            field: "stuck_source"
+        })
+    ));
+
+    let mut ui_owned = session_event(
+        "event-ui-owned-clear",
+        "run-stuck-a",
+        "session-stuck-a",
+        2,
+        "run.stuck_cleared",
+    );
+    ui_owned.protocol_version = EventProtocolVersion::V1_3;
+    ui_owned.session_id = NullableSessionId::Null;
+    ui_owned.source.kind = EventSourceKind::Ui;
+    ui_owned.source.provider = None;
+    assert!(matches!(
+        store.append_event(ui_owned),
+        Err(StoreError::InvalidEvent {
+            field: "stuck_source"
+        })
+    ));
+    assert_eq!(
+        store
+            .run_snapshot("run-stuck-a")
+            .expect("unchanged source snapshot")
+            .expect("unchanged source projection")
+            .version,
+        run_a_version
+    );
+
+    assert!(matches!(
+        store
+            .append_managed_stuck_transition(valid)
+            .expect("valid authoritative stuck transition"),
+        ManagedStuckTransitionOutcome::Appended(_)
+    ));
+    drop(store);
+
+    let connection = Connection::open(&database).expect("stuck source mutation connection");
+    let stored_source: String = connection
+        .query_row(
+            "SELECT source_json FROM events WHERE event_id = 'event-valid-stuck-source'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("stored stuck source");
+    let mut malformed: Value = serde_json::from_str(&stored_source).expect("source JSON");
+    malformed["unexpected"] = json!(true);
+    connection
+        .execute(
+            "UPDATE events SET source_json = ?1 WHERE event_id = 'event-valid-stuck-source'",
+            [serde_json::to_string(&malformed).expect("malformed source JSON")],
+        )
+        .expect("install malformed stuck source");
+    drop(connection);
+
+    assert!(matches!(
+        Store::open(&database, CREATED_AT),
+        Err(StoreError::DashboardProjection { .. })
+    ));
+}
+
+#[test]
+fn persisted_stuck_string_bounds_fail_closed_on_reopen() {
+    let directory = TestDirectory::new("stuck-string-bounds");
+    let (mut store, database, project_path) = trusted_store(&directory);
+    store
+        .create_managed_run_intent(run_intent(
+            "run-stuck-string-bounds",
+            "event-stuck-string-bounds-created",
+            "event-stuck-string-bounds-start-requested",
+        ))
+        .expect("managed Run");
+    store
+        .connect_initial_managed_session(session_connection(
+            "session-stuck-string-bounds",
+            "run-stuck-string-bounds",
+            "thread-stuck-string-bounds",
+            &project_path,
+        ))
+        .expect("managed session");
+
+    let occurrence_id = "occurrence-stuck-string-bounds";
+    assert!(matches!(
+        store
+            .append_managed_stuck_transition(ManagedStuckTransition {
+                run_id: "run-stuck-string-bounds".to_owned(),
+                expected_run_version: 4,
+                event_id: "event-stuck-string-bounds-open".to_owned(),
+                observed_at: "2026-07-24T10:02:10Z".to_owned(),
+                assessment: ManagedStuckAssessment::PossiblyStuck(PossiblyStuckPayload {
+                    occurrence_id: occurrence_id.to_owned(),
+                    cause: StuckCauseCode::Unknown,
+                    threshold_seconds: 120,
+                    progress_event_id: "event-stuck-string-bounds-created".to_owned(),
+                    progress_observed_at: CREATED_AT.to_owned(),
+                    progress_monotonic_ms: 5_000,
+                    baseline_monotonic_ms: 5_000,
+                    stuck_since_monotonic_ms: 125_000,
+                    process: StuckProcessReceipt::Alive {
+                        generation: "process-generation-bounded".to_owned(),
+                        observed_monotonic_ms: 130_000,
+                    },
+                    evidence_unavailable_reason: "raw_provider_content_not_retained".to_owned(),
+                }),
+            })
+            .expect("open stuck occurrence"),
+        ManagedStuckTransitionOutcome::Appended(_)
+    ));
+    assert!(matches!(
+        store
+            .append_managed_stuck_transition(ManagedStuckTransition {
+                run_id: "run-stuck-string-bounds".to_owned(),
+                expected_run_version: 5,
+                event_id: "event-stuck-string-bounds-clear".to_owned(),
+                observed_at: "2026-07-24T10:02:20Z".to_owned(),
+                assessment: ManagedStuckAssessment::Clear(StuckClearedPayload {
+                    occurrence_id: occurrence_id.to_owned(),
+                    reason: StuckClearReasonCode::ProcessUnavailable,
+                    process: StuckProcessReceipt::Unavailable {
+                        generation: Some("process-generation-bounded".to_owned()),
+                        reason: "provider_process_probe_unavailable".to_owned(),
+                        observed_monotonic_ms: 140_000,
+                    },
+                    evidence_unavailable_reason: "raw_provider_content_not_retained".to_owned(),
+                }),
+            })
+            .expect("clear stuck occurrence"),
+        ManagedStuckTransitionOutcome::Appended(_)
+    ));
+    drop(store);
+
+    let connection = Connection::open(&database).expect("stuck string mutation connection");
+    let open_source: String = connection
+        .query_row(
+            "SELECT payload_json FROM events WHERE event_id = 'event-stuck-string-bounds-open'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("open payload JSON");
+    let clear_source: String = connection
+        .query_row(
+            "SELECT payload_json FROM events WHERE event_id = 'event-stuck-string-bounds-clear'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("clear payload JSON");
+    drop(connection);
+    let open_payload: Value = serde_json::from_str(&open_source).expect("open payload");
+    let clear_payload: Value = serde_json::from_str(&clear_source).expect("clear payload");
+
+    let mut malformed_cases = Vec::new();
+    for (path, value) in [
+        ("/occurrence_id", json!("x".repeat(257))),
+        ("/progress_event_id", json!("x".repeat(257))),
+        ("/progress_observed_at", json!("x".repeat(129))),
+        ("/process/generation", json!("x".repeat(257))),
+        (
+            "/evidence_unavailable_reason",
+            json!("x".repeat(4 * 1024 + 1)),
+        ),
+    ] {
+        let mut malformed = open_payload.clone();
+        *malformed.pointer_mut(path).expect("open mutation path") = value;
+        malformed_cases.push(("event-stuck-string-bounds-open", malformed));
+    }
+    for (path, value) in [
+        ("/occurrence_id", json!("x".repeat(257))),
+        ("/process/generation", json!("x".repeat(257))),
+        ("/process/reason", json!("x".repeat(4 * 1024 + 1))),
+        (
+            "/evidence_unavailable_reason",
+            json!("x".repeat(4 * 1024 + 1)),
+        ),
+    ] {
+        let mut malformed = clear_payload.clone();
+        *malformed.pointer_mut(path).expect("clear mutation path") = value;
+        malformed_cases.push(("event-stuck-string-bounds-clear", malformed));
+    }
+
+    for (event_id, malformed) in malformed_cases {
+        let connection = Connection::open(&database).expect("malformed payload connection");
+        connection
+            .execute(
+                "UPDATE events SET payload_json = ?1 WHERE event_id = ?2",
+                params![
+                    serde_json::to_string(&malformed).expect("malformed payload JSON"),
+                    event_id
+                ],
+            )
+            .expect("install malformed payload");
+        drop(connection);
+        assert!(matches!(
+            Store::open(&database, CREATED_AT),
+            Err(StoreError::DashboardProjection { .. })
+        ));
+        let connection = Connection::open(&database).expect("restore payload connection");
+        connection
+            .execute(
+                "UPDATE events SET payload_json = ?1 WHERE event_id = ?2",
+                params![
+                    if event_id == "event-stuck-string-bounds-open" {
+                        &open_source
+                    } else {
+                        &clear_source
+                    },
+                    event_id
+                ],
+            )
+            .expect("restore valid payload");
+    }
+}
+
+#[test]
+fn legacy_same_name_stuck_events_remain_unknown_compatible_across_reopen() {
+    let directory = TestDirectory::new("legacy-stuck-names");
+    let (mut store, database, project_path) = trusted_store(&directory);
+    store
+        .create_managed_run_intent(run_intent(
+            "run-legacy-stuck-names",
+            "event-legacy-stuck-run-created",
+            "event-legacy-stuck-start-requested",
+        ))
+        .expect("managed Run");
+    store
+        .connect_initial_managed_session(session_connection(
+            "session-legacy-stuck-names",
+            "run-legacy-stuck-names",
+            "thread-legacy-stuck-names",
+            &project_path,
+        ))
+        .expect("managed session");
+    let initial = store
+        .run_snapshot("run-legacy-stuck-names")
+        .expect("initial snapshot")
+        .expect("initial projection");
+
+    let versions = [
+        EventProtocolVersion::V1_0,
+        EventProtocolVersion::V1_1,
+        EventProtocolVersion::V1_2,
+    ];
+    let names = ["run.possibly_stuck", "run.stuck_cleared"];
+    for (index, (version, name)) in versions
+        .into_iter()
+        .flat_map(|version| names.into_iter().map(move |name| (version, name)))
+        .enumerate()
+    {
+        let mut event = session_event(
+            &format!("event-legacy-stuck-name-{index}"),
+            "run-legacy-stuck-names",
+            "session-legacy-stuck-names",
+            index as u64 + 2,
+            name,
+        );
+        event.protocol_version = version;
+        assert!(matches!(
+            store.append_event(event).expect("legacy event append"),
+            AppendEventOutcome::Inserted(_)
+        ));
+    }
+
+    let appended = store.events_after(4, 6).expect("read legacy events");
+    assert_eq!(appended.len(), 6);
+    let projected = store
+        .run_snapshot("run-legacy-stuck-names")
+        .expect("unknown-compatible snapshot")
+        .expect("unknown-compatible projection");
+    assert_eq!(projected.lifecycle, initial.lifecycle);
+    assert_eq!(projected.activity, initial.activity);
+    assert_eq!(projected.dashboard_bucket, initial.dashboard_bucket);
+    assert_eq!(projected.attention_level, initial.attention_level);
+    assert_eq!(projected.snapshot["attention"]["open_count"], 0);
+
+    drop(store);
+    let reopened = Store::open(&database, "2026-07-24T10:10:00Z").expect("reopen Store");
+    let reopened_events = reopened.events_after(4, 6).expect("read reopened events");
+    assert_eq!(reopened_events, appended);
+    assert_eq!(
+        reopened
+            .run_snapshot("run-legacy-stuck-names")
+            .expect("reopened snapshot")
+            .expect("reopened projection"),
+        projected
+    );
 }
 
 #[test]
@@ -267,6 +886,48 @@ fn startup_projection_source_bound_counts_utf8_bytes_before_hydration() {
         }) if run_id == "run-byte-bound"
             && source_bytes > MAX_DASHBOARD_PROJECTION_SOURCE_BYTES as i64
     ));
+}
+
+#[test]
+fn startup_projection_bound_does_not_charge_legacy_source_extensions() {
+    let directory = TestDirectory::new("legacy-source-projection-byte-bound");
+    let (mut store, database, _project_path) = trusted_store(&directory);
+    store
+        .create_managed_run_intent(run_intent(
+            "run-legacy-source-bound",
+            "event-legacy-source-bound-created",
+            "event-legacy-source-bound-requested",
+        ))
+        .expect("managed Run");
+    let expected = store
+        .run_snapshot("run-legacy-source-bound")
+        .expect("projection read")
+        .expect("projection");
+    drop(store);
+
+    let legacy_source = serde_json::to_string(&json!({
+        "kind": "core",
+        "legacy_extension": "x".repeat(MAX_DASHBOARD_PROJECTION_SOURCE_BYTES + 1)
+    }))
+    .expect("large legacy source");
+    assert!(legacy_source.len() > MAX_DASHBOARD_PROJECTION_SOURCE_BYTES);
+    let connection = Connection::open(&database).expect("legacy source connection");
+    connection
+        .execute(
+            "UPDATE events SET source_json = ?1 WHERE event_id = 'event-legacy-source-bound-created'",
+            [legacy_source],
+        )
+        .expect("install legacy source extension");
+    drop(connection);
+
+    let reopened = Store::open(&database, CREATED_AT).expect("reopen legacy source Store");
+    assert_eq!(
+        reopened
+            .run_snapshot("run-legacy-source-bound")
+            .expect("reopened projection read")
+            .expect("reopened projection"),
+        expected
+    );
 }
 
 #[test]

@@ -196,6 +196,33 @@ pub struct StuckOccurrenceId {
 }
 
 impl StuckOccurrenceId {
+    pub fn from_persisted(
+        cause: StuckCause,
+        progress_at: TimestampMs,
+        progress_evidence_id: EvidenceId,
+        baseline_at: TimestampMs,
+        stuck_since: TimestampMs,
+        threshold: StuckThresholdSeconds,
+    ) -> Result<Self, StuckError> {
+        if baseline_at < progress_at {
+            return Err(StuckError::NonMonotonicTime {
+                current: progress_at,
+                received: baseline_at,
+            });
+        }
+        let expected_stuck_since = add_seconds(baseline_at, threshold.as_u16())?;
+        if stuck_since != expected_stuck_since {
+            return Err(StuckError::PersistedOccurrenceMismatch);
+        }
+        Ok(Self {
+            cause,
+            progress_at,
+            progress_evidence_id,
+            baseline_at,
+            stuck_since,
+        })
+    }
+
     #[must_use]
     pub const fn cause(&self) -> StuckCause {
         self.cause
@@ -220,6 +247,31 @@ impl StuckOccurrenceId {
     pub const fn stuck_since(&self) -> TimestampMs {
         self.stuck_since
     }
+
+    #[must_use]
+    pub fn persistent_identity(&self) -> String {
+        let cause = match self.cause {
+            StuckCause::Starting => "starting",
+            StuckCause::Activity(activity) => match activity {
+                Activity::Planning => "planning",
+                Activity::Reading => "reading",
+                Activity::Editing => "editing",
+                Activity::Testing => "testing",
+                Activity::Building => "building",
+                Activity::Reviewing => "reviewing",
+                Activity::Waiting => "waiting",
+                Activity::Unknown => "unknown",
+            },
+        };
+        let evidence = self.progress_evidence_id.as_str();
+        format!(
+            "{cause}:{}:{}:{}:{}:{evidence}",
+            self.progress_at.as_u64(),
+            self.baseline_at.as_u64(),
+            self.stuck_since.as_u64(),
+            evidence.len(),
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -234,9 +286,23 @@ pub enum StuckNotificationState {
 pub struct StuckOccurrence {
     id: StuckOccurrenceId,
     notification: StuckNotificationState,
+    persisted_id: Option<String>,
 }
 
 impl StuckOccurrence {
+    #[must_use]
+    pub const fn from_persisted(
+        id: StuckOccurrenceId,
+        notification: StuckNotificationState,
+        persisted_id: String,
+    ) -> Self {
+        Self {
+            id,
+            notification,
+            persisted_id: Some(persisted_id),
+        }
+    }
+
     #[must_use]
     pub const fn id(&self) -> &StuckOccurrenceId {
         &self.id
@@ -245,6 +311,11 @@ impl StuckOccurrence {
     #[must_use]
     pub const fn notification(&self) -> StuckNotificationState {
         self.notification
+    }
+
+    #[must_use]
+    pub fn persisted_id(&self) -> Option<&str> {
+        self.persisted_id.as_deref()
     }
 }
 
@@ -357,6 +428,7 @@ impl StuckProjection {
         Ok(StuckAssessment::PossiblyStuck(StuckOccurrence {
             id,
             notification,
+            persisted_id: None,
         }))
     }
 
@@ -524,6 +596,7 @@ pub enum StuckError {
         base: TimestampMs,
         seconds: u16,
     },
+    PersistedOccurrenceMismatch,
 }
 
 impl fmt::Display for StuckError {
@@ -547,6 +620,9 @@ impl fmt::Display for StuckError {
                 "stuck deadline overflow: base={}, seconds={seconds}",
                 base.as_u64()
             ),
+            Self::PersistedOccurrenceMismatch => {
+                formatter.write_str("persisted stuck occurrence does not match its threshold")
+            }
         }
     }
 }

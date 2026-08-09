@@ -42,7 +42,8 @@ pub use managed_runs::{
     ManagedProviderTerminalOutcome, ManagedReconciliationState, ManagedRun, ManagedRunIntent,
     ManagedRunIntentOutcome, ManagedRunStartFailure, ManagedRunStartFailureOutcome, ManagedSession,
     ManagedSessionReconciliation, ManagedSessionReconciliationOutcome, ManagedSessionTermination,
-    ManagedSessionTerminationOutcome, ManagedTurnTerminalOutcome,
+    ManagedSessionTerminationOutcome, ManagedStuckAssessment, ManagedStuckTransition,
+    ManagedStuckTransitionOutcome, ManagedTurnTerminalOutcome,
 };
 pub use projects::{
     MAX_PROJECT_PAGE_SIZE, Project, ProjectDirectoryInspection, ProjectIdentity,
@@ -394,6 +395,85 @@ pub struct ManagedGitChangePage {
 }
 
 impl Store {
+    pub fn append_managed_stuck_transition(
+        &mut self,
+        transition: ManagedStuckTransition,
+    ) -> Result<ManagedStuckTransitionOutcome, StoreError> {
+        managed_runs::validate_stuck_transition(&transition)
+            .map_err(|field| StoreError::InvalidManagedStuckTransition { field })?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+        let current_version = latest_run_event_version(&transaction, &transition.run_id)?
+            .ok_or_else(|| StoreError::MissingRun {
+                run_id: transition.run_id.clone(),
+            })?;
+        if current_version != transition.expected_run_version {
+            return Err(StoreError::ManagedStuckRunVersionStale {
+                run_id: transition.run_id,
+                expected: transition.expected_run_version,
+                current: current_version,
+            });
+        }
+        validate_managed_stuck_authority(&transaction, &transition)?;
+
+        let active = load_active_stuck_transition(&transaction, &transition.run_id)?;
+        let desired_payload = managed_stuck_payload(&transition.assessment)?;
+        match (&transition.assessment, active) {
+            (ManagedStuckAssessment::PossiblyStuck(desired), Some(current))
+                if desired.occurrence_id == current.occurrence_id =>
+            {
+                if !same_stuck_occurrence_payload(&desired_payload, &current.payload) {
+                    return Err(StoreError::ManagedStuckTransitionConflict {
+                        run_id: transition.run_id,
+                        occurrence_id: current.occurrence_id,
+                    });
+                }
+                transaction.commit().map_err(StoreError::Sqlite)?;
+                return Ok(ManagedStuckTransitionOutcome::Unchanged {
+                    run_id: transition.run_id,
+                    version: current_version,
+                });
+            }
+            (ManagedStuckAssessment::Clear(_), None) => {
+                transaction.commit().map_err(StoreError::Sqlite)?;
+                return Ok(ManagedStuckTransitionOutcome::Unchanged {
+                    run_id: transition.run_id,
+                    version: current_version,
+                });
+            }
+            (ManagedStuckAssessment::Clear(desired), Some(current))
+                if desired.occurrence_id != current.occurrence_id =>
+            {
+                return Err(StoreError::ManagedStuckOccurrenceMismatch {
+                    run_id: transition.run_id,
+                    expected: current.occurrence_id,
+                    received: desired.occurrence_id.clone(),
+                });
+            }
+            _ => {}
+        }
+
+        let stream_seq = next_managed_run_core_stream_seq(&transaction, &transition.run_id)?;
+        let event = managed_stuck_transition_event(&transition, stream_seq, desired_payload);
+        let mut outcomes = append_event_batch_in_transaction(&transaction, vec![event])?;
+        let outcome = outcomes
+            .pop()
+            .expect("one stuck transition must produce one append outcome");
+        let AppendEventOutcome::Inserted(event) = outcome else {
+            return Err(StoreError::ManagedStuckTransitionConflict {
+                run_id: transition.run_id,
+                occurrence_id: match transition.assessment {
+                    ManagedStuckAssessment::PossiblyStuck(payload) => payload.occurrence_id,
+                    ManagedStuckAssessment::Clear(payload) => payload.occurrence_id,
+                },
+            });
+        };
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(ManagedStuckTransitionOutcome::Appended(Box::new(event)))
+    }
+
     pub fn current_utc_timestamp(&self) -> Result<String, StoreError> {
         self.connection
             .query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
@@ -2789,6 +2869,222 @@ fn managed_run_intent_events(
     ])
 }
 
+fn latest_run_event_version(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<Option<u64>, StoreError> {
+    let stored = connection
+        .query_row(
+            "SELECT MAX(ingest_seq) FROM events WHERE run_id = ?1",
+            [run_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .map_err(StoreError::Sqlite)?;
+    stored.map(assigned_sequence).transpose()
+}
+
+fn next_managed_run_core_stream_seq(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<u64, StoreError> {
+    let current = connection
+        .query_row(
+            "SELECT COALESCE(MAX(stream_seq), 0)
+             FROM events
+             WHERE run_id = ?1 AND session_id IS NULL",
+            [run_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(StoreError::Sqlite)?;
+    u64::try_from(current)
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .filter(|value| *value <= flit_protocol::MAX_JSON_SAFE_INTEGER)
+        .ok_or(StoreError::InvalidManagedStuckTransition {
+            field: "stream_seq",
+        })
+}
+
+fn validate_managed_stuck_authority(
+    connection: &Connection,
+    transition: &ManagedStuckTransition,
+) -> Result<(), StoreError> {
+    let ManagedStuckAssessment::PossiblyStuck(payload) = &transition.assessment else {
+        return Ok(());
+    };
+    let events = load_run_event_history(connection, &transition.run_id)?;
+    let projection =
+        replay_dashboard_projection(&events).map_err(|source| StoreError::DashboardProjection {
+            run_id: transition.run_id.clone(),
+            source,
+        })?;
+    if projection.version != transition.expected_run_version
+        || projection.last_progress_event_id != payload.progress_event_id
+        || projection.last_progress_at.as_deref() != Some(payload.progress_observed_at.as_str())
+    {
+        return Err(StoreError::ManagedStuckProgressMismatch {
+            run_id: transition.run_id.clone(),
+        });
+    }
+    let expected_cause = match (projection.lifecycle.as_str(), projection.activity.as_str()) {
+        ("Starting", _) => flit_protocol::StuckCauseCode::Starting,
+        ("Running", "Planning") => flit_protocol::StuckCauseCode::Planning,
+        ("Running", "Reading") => flit_protocol::StuckCauseCode::Reading,
+        ("Running", "Editing") => flit_protocol::StuckCauseCode::Editing,
+        ("Running", "Testing") => flit_protocol::StuckCauseCode::Testing,
+        ("Running", "Building") => flit_protocol::StuckCauseCode::Building,
+        ("Running", "Reviewing") => flit_protocol::StuckCauseCode::Reviewing,
+        ("Running", "Waiting") => flit_protocol::StuckCauseCode::Waiting,
+        ("Running", "Unknown") => flit_protocol::StuckCauseCode::Unknown,
+        _ => {
+            return Err(StoreError::ManagedStuckProgressMismatch {
+                run_id: transition.run_id.clone(),
+            });
+        }
+    };
+    if payload.cause != expected_cause {
+        return Err(StoreError::ManagedStuckProgressMismatch {
+            run_id: transition.run_id.clone(),
+        });
+    }
+    Ok(())
+}
+
+struct ActiveStuckTransition {
+    occurrence_id: String,
+    payload: Map<String, Value>,
+}
+
+fn load_active_stuck_transition(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<Option<ActiveStuckTransition>, StoreError> {
+    let stored = connection
+        .query_row(
+            "SELECT ingest_seq, event_type, payload_json
+             FROM events
+             WHERE run_id = ?1
+               AND protocol_version = '1.3'
+               AND event_type IN ('run.possibly_stuck', 'run.stuck_cleared')
+             ORDER BY ingest_seq DESC
+             LIMIT 1",
+            [run_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(StoreError::Sqlite)?;
+    let Some((ingest_seq, event_type, payload_json)) = stored else {
+        return Ok(None);
+    };
+    let ingest_seq = assigned_sequence(ingest_seq)?;
+    let payload: Map<String, Value> = stored_json(ingest_seq, "payload_json", &payload_json)?;
+    if event_type == "run.stuck_cleared" {
+        let decoded =
+            serde_json::from_value::<flit_protocol::StuckClearedPayload>(Value::Object(payload))
+                .map_err(|_| StoreError::StoredManagedStuckTransitionInvalid {
+                    run_id: run_id.to_owned(),
+                })?;
+        managed_runs::validate_stuck_transition(&ManagedStuckTransition {
+            run_id: run_id.to_owned(),
+            expected_run_version: ingest_seq,
+            event_id: "stored-stuck-validation".to_owned(),
+            observed_at: "stored-stuck-validation".to_owned(),
+            assessment: ManagedStuckAssessment::Clear(decoded),
+        })
+        .map_err(|_| StoreError::StoredManagedStuckTransitionInvalid {
+            run_id: run_id.to_owned(),
+        })?;
+        return Ok(None);
+    }
+    let decoded = serde_json::from_value::<flit_protocol::PossiblyStuckPayload>(Value::Object(
+        payload.clone(),
+    ))
+    .map_err(|_| StoreError::StoredManagedStuckTransitionInvalid {
+        run_id: run_id.to_owned(),
+    })?;
+    managed_runs::validate_stuck_transition(&ManagedStuckTransition {
+        run_id: run_id.to_owned(),
+        expected_run_version: ingest_seq,
+        event_id: "stored-stuck-validation".to_owned(),
+        observed_at: "stored-stuck-validation".to_owned(),
+        assessment: ManagedStuckAssessment::PossiblyStuck(decoded.clone()),
+    })
+    .map_err(|_| StoreError::StoredManagedStuckTransitionInvalid {
+        run_id: run_id.to_owned(),
+    })?;
+    Ok(Some(ActiveStuckTransition {
+        occurrence_id: decoded.occurrence_id,
+        payload,
+    }))
+}
+
+fn same_stuck_occurrence_payload(
+    desired: &Map<String, Value>,
+    stored: &Map<String, Value>,
+) -> bool {
+    let mut desired = desired.clone();
+    let mut stored = stored.clone();
+    for payload in [&mut desired, &mut stored] {
+        if let Some(process) = payload.get_mut("process").and_then(Value::as_object_mut) {
+            process.remove("observed_monotonic_ms");
+        }
+    }
+    desired == stored
+}
+
+fn managed_stuck_payload(
+    assessment: &ManagedStuckAssessment,
+) -> Result<Map<String, Value>, StoreError> {
+    let value = match assessment {
+        ManagedStuckAssessment::PossiblyStuck(payload) => serde_json::to_value(payload),
+        ManagedStuckAssessment::Clear(payload) => serde_json::to_value(payload),
+    }
+    .map_err(StoreError::Json)?;
+    value
+        .as_object()
+        .cloned()
+        .ok_or(StoreError::InvalidManagedStuckTransition {
+            field: "assessment",
+        })
+}
+
+fn managed_stuck_transition_event(
+    transition: &ManagedStuckTransition,
+    stream_seq: u64,
+    payload: Map<String, Value>,
+) -> UnsequencedEventEnvelope {
+    UnsequencedEventEnvelope {
+        protocol_version: EventProtocolVersion::V1_3,
+        event_id: transition.event_id.clone(),
+        run_id: transition.run_id.clone(),
+        session_id: NullableSessionId::Null,
+        stream_seq,
+        occurred_at: transition.observed_at.clone(),
+        observed_at: transition.observed_at.clone(),
+        event_type: match &transition.assessment {
+            ManagedStuckAssessment::PossiblyStuck(_) => "run.possibly_stuck",
+            ManagedStuckAssessment::Clear(_) => "run.stuck_cleared",
+        }
+        .to_owned(),
+        source: EventSource {
+            kind: EventSourceKind::Core,
+            provider: None,
+            contract_version: Some("stuck-transition/1.0".to_owned()),
+            extensions: BTreeMap::new(),
+        },
+        confidence: 1.0,
+        evidence_ids: Vec::new(),
+        payload,
+        extensions: BTreeMap::new(),
+    }
+}
+
 fn git_baseline_head(baseline: &GitBaselinePayload) -> Option<String> {
     match baseline {
         GitBaselinePayload::Available {
@@ -4424,6 +4720,7 @@ fn append_event_batch_in_transaction(
             EventProtocolVersion::V1_0 => "1.0",
             EventProtocolVersion::V1_1 => "1.1",
             EventProtocolVersion::V1_2 => "1.2",
+            EventProtocolVersion::V1_3 => "1.3",
         };
         let session_id = match &event.session_id {
             NullableSessionId::Id(session_id) => Some(session_id.as_str()),
@@ -4585,6 +4882,12 @@ fn load_run_event_history(
                         LENGTH(CAST(event_id AS BLOB)) +
                         LENGTH(CAST(run_id AS BLOB)) +
                         COALESCE(LENGTH(CAST(session_id AS BLOB)), 0) +
+                        CASE
+                            WHEN protocol_version = '1.3'
+                             AND event_type IN ('run.possibly_stuck', 'run.stuck_cleared')
+                            THEN LENGTH(CAST(source_json AS BLOB))
+                            ELSE 0
+                        END +
                         LENGTH(CAST(observed_at AS BLOB)) +
                         LENGTH(CAST(event_type AS BLOB)) +
                         LENGTH(CAST(payload_json AS BLOB))
@@ -4599,7 +4902,14 @@ fn load_run_event_history(
 
     let mut statement = connection
         .prepare(
-            "SELECT ingest_seq, protocol_version, event_id, session_id, observed_at, event_type, payload_json
+            "SELECT ingest_seq, protocol_version, event_id, session_id,
+                    CASE
+                        WHEN protocol_version = '1.3'
+                         AND event_type IN ('run.possibly_stuck', 'run.stuck_cleared')
+                        THEN source_json
+                        ELSE NULL
+                    END,
+                    observed_at, event_type, payload_json
              FROM events INDEXED BY events_by_run_seq
              WHERE run_id = ?1
              ORDER BY ingest_seq",
@@ -4612,9 +4922,10 @@ fn load_run_event_history(
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
             ))
         })
         .map_err(StoreError::Sqlite)?
@@ -4628,16 +4939,45 @@ fn load_run_event_history(
                 protocol_version,
                 event_id,
                 session_id,
+                source_json,
                 observed_at,
                 event_type,
                 payload_json,
             )| {
                 let ingest_seq = assigned_sequence(ingest_seq)?;
+                let (source_kind, source_provider, source_contract_version, source_has_extensions) =
+                    if let Some(source_json) = source_json {
+                        let source: EventSource =
+                            stored_json(ingest_seq, "source_json", &source_json)?;
+                        (
+                            match source.kind {
+                                EventSourceKind::Core => "core",
+                                EventSourceKind::ProviderAdapter => "provider_adapter",
+                                EventSourceKind::GitWatcher => "git_watcher",
+                                EventSourceKind::FileWatcher => "file_watcher",
+                                EventSourceKind::Classifier => "classifier",
+                                EventSourceKind::Policy => "policy",
+                                EventSourceKind::Ui => "ui",
+                                EventSourceKind::Notifier => "notifier",
+                                EventSourceKind::Recovery => "recovery",
+                            }
+                            .to_owned(),
+                            source.provider,
+                            source.contract_version,
+                            !source.extensions.is_empty(),
+                        )
+                    } else {
+                        (String::new(), None, None, false)
+                    };
                 Ok(ProjectionEvent {
                     protocol_version,
                     event_id,
                     run_id: run_id.to_owned(),
                     session_id,
+                    source_kind,
+                    source_provider,
+                    source_contract_version,
+                    source_has_extensions,
                     ingest_seq,
                     observed_at,
                     event_type,
@@ -5137,6 +5477,21 @@ fn validate_event(event: &UnsequencedEventEnvelope) -> Result<(), StoreError> {
             field: "evidence_ids",
         });
     }
+    if event.protocol_version == EventProtocolVersion::V1_3
+        && matches!(
+            event.event_type.as_str(),
+            "run.possibly_stuck" | "run.stuck_cleared"
+        )
+        && (!matches!(event.session_id, NullableSessionId::Null)
+            || event.source.kind != EventSourceKind::Core
+            || event.source.provider.is_some()
+            || event.source.contract_version.as_deref() != Some("stuck-transition/1.0")
+            || !event.source.extensions.is_empty())
+    {
+        return Err(StoreError::InvalidEvent {
+            field: "stuck_source",
+        });
+    }
     Ok(())
 }
 
@@ -5277,6 +5632,7 @@ fn load_event(connection: &Connection, ingest_seq: i64) -> Result<EventEnvelope,
         "1.0" => EventProtocolVersion::V1_0,
         "1.1" => EventProtocolVersion::V1_1,
         "1.2" => EventProtocolVersion::V1_2,
+        "1.3" => EventProtocolVersion::V1_3,
         _ => {
             return Err(StoreError::StoredEventInvalid {
                 ingest_seq: assigned_ingest_seq,
@@ -5815,6 +6171,29 @@ pub enum StoreError {
     InvalidManagedRunStartFailure {
         field: &'static str,
     },
+    InvalidManagedStuckTransition {
+        field: &'static str,
+    },
+    ManagedStuckRunVersionStale {
+        run_id: String,
+        expected: u64,
+        current: u64,
+    },
+    ManagedStuckOccurrenceMismatch {
+        run_id: String,
+        expected: String,
+        received: String,
+    },
+    ManagedStuckProgressMismatch {
+        run_id: String,
+    },
+    ManagedStuckTransitionConflict {
+        run_id: String,
+        occurrence_id: String,
+    },
+    StoredManagedStuckTransitionInvalid {
+        run_id: String,
+    },
     ManagedRunIdentityConflict {
         run_id: String,
     },
@@ -6158,6 +6537,40 @@ impl fmt::Display for StoreError {
                     "invalid managed Run start failure field: {field}"
                 )
             }
+            Self::InvalidManagedStuckTransition { field } => {
+                write!(formatter, "invalid managed stuck transition field: {field}")
+            }
+            Self::ManagedStuckRunVersionStale {
+                run_id,
+                expected,
+                current,
+            } => write!(
+                formatter,
+                "managed stuck transition for Run {run_id} expected version {expected}, current {current}"
+            ),
+            Self::ManagedStuckOccurrenceMismatch {
+                run_id,
+                expected,
+                received,
+            } => write!(
+                formatter,
+                "managed stuck transition for Run {run_id} expected occurrence {expected}, received {received}"
+            ),
+            Self::ManagedStuckProgressMismatch { run_id } => write!(
+                formatter,
+                "managed stuck transition progress authority conflicts for Run {run_id}"
+            ),
+            Self::ManagedStuckTransitionConflict {
+                run_id,
+                occurrence_id,
+            } => write!(
+                formatter,
+                "managed stuck transition conflicts for Run {run_id} occurrence {occurrence_id}"
+            ),
+            Self::StoredManagedStuckTransitionInvalid { run_id } => write!(
+                formatter,
+                "stored managed stuck transition is invalid for Run {run_id}"
+            ),
             Self::ManagedRunIdentityConflict { run_id } => {
                 write!(formatter, "managed Run identity conflicts: {run_id}")
             }

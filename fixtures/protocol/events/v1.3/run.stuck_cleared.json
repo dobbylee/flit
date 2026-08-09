@@ -1,0 +1,28 @@
+{
+  "protocol_version": "1.3",
+  "event_id": "event-run-managed-1-stuck-cleared-1",
+  "run_id": "run-managed-1",
+  "session_id": null,
+  "stream_seq": 7,
+  "ingest_seq": 7,
+  "occurred_at": "2026-08-09T10:02:20Z",
+  "observed_at": "2026-08-09T10:02:20Z",
+  "type": "run.stuck_cleared",
+  "source": {
+    "kind": "core",
+    "contract_version": "stuck-transition/1.0"
+  },
+  "confidence": 1.0,
+  "evidence_ids": [],
+  "payload": {
+    "occurrence_id": "stuck-run-managed-1-1",
+    "reason": "process_unavailable",
+    "process": {
+      "status": "unavailable",
+      "generation": "process-run-managed-1-1",
+      "reason": "provider_transport_unavailable",
+      "observed_monotonic_ms": 140000
+    },
+    "evidence_unavailable_reason": "provider_process_health_unavailable"
+  }
+}

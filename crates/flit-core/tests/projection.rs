@@ -17,11 +17,148 @@ fn event(
         event_id: format!("event-{ingest_seq}"),
         run_id: RUN_ID.to_owned(),
         session_id: session_id.map(ToOwned::to_owned),
+        source_kind: if session_id.is_some() {
+            "provider_adapter"
+        } else {
+            "core"
+        }
+        .to_owned(),
+        source_provider: session_id.map(|_| "codex".to_owned()),
+        source_contract_version: None,
+        source_has_extensions: false,
         ingest_seq,
         observed_at: format!("2026-07-28T01:00:{ingest_seq:02}.000Z"),
         event_type: event_type.to_owned(),
         payload: payload.as_object().cloned().unwrap_or_else(Map::new),
     }
+}
+
+fn stuck_event(
+    ingest_seq: u64,
+    occurrence_id: &str,
+    progress_event_id: &str,
+    progress_ms: u64,
+) -> ProjectionEvent {
+    let mut event = event(
+        ingest_seq,
+        "run.possibly_stuck",
+        None,
+        json!({
+            "occurrence_id": occurrence_id,
+            "cause": "unknown",
+            "threshold_seconds": 120,
+            "progress_event_id": progress_event_id,
+            "progress_observed_at": "2026-08-09T10:00:00Z",
+            "progress_monotonic_ms": progress_ms,
+            "baseline_monotonic_ms": progress_ms,
+            "stuck_since_monotonic_ms": progress_ms + 120_000,
+            "process": {
+                "status": "alive",
+                "generation": "process-generation-1",
+                "observed_monotonic_ms": progress_ms + 130_000
+            },
+            "evidence_unavailable_reason": "raw_provider_content_not_retained"
+        }),
+    );
+    event.protocol_version = "1.3".to_owned();
+    event.source_contract_version = Some("stuck-transition/1.0".to_owned());
+    event
+}
+
+#[test]
+fn explicit_stuck_transitions_own_dashboard_and_attention_replay() {
+    let base = vec![
+        event(1, "run.created", None, json!({})),
+        event(2, "session.connected", Some("session-1"), json!({})),
+        event(3, "command.started", Some("session-1"), json!({})),
+    ];
+    let first = stuck_event(4, "occurrence-1", "event-3", 5_000);
+    let stuck = replay_dashboard_projection(&[base.clone(), vec![first.clone()]].concat())
+        .expect("first explicit stuck transition");
+    assert_eq!(stuck.dashboard_bucket, "PossiblyStuck");
+    assert_eq!(stuck.attention_level, "Informational");
+    assert_eq!(stuck.attention_open_count, 1);
+    assert_eq!(
+        stuck.last_liveness_at.as_deref(),
+        Some(base[2].observed_at.as_str())
+    );
+
+    let second = stuck_event(5, "occurrence-2", "event-progress-2", 10_000);
+    let replaced =
+        replay_dashboard_projection(&[base.clone(), vec![first.clone(), second.clone()]].concat())
+            .expect("changed occurrence transition");
+    assert_eq!(replaced.dashboard_bucket, "PossiblyStuck");
+    assert_eq!(replaced.attention_open_count, 1);
+
+    let mut clear = event(
+        6,
+        "run.stuck_cleared",
+        None,
+        json!({
+            "occurrence_id": "occurrence-2",
+            "reason": "progress_observed",
+            "process": {
+                "status": "alive",
+                "generation": "process-generation-1",
+                "observed_monotonic_ms": 140_000
+            },
+            "evidence_unavailable_reason": "raw_provider_content_not_retained"
+        }),
+    );
+    clear.protocol_version = "1.3".to_owned();
+    clear.source_contract_version = Some("stuck-transition/1.0".to_owned());
+    let cleared = replay_dashboard_projection(&[base, vec![first, second, clear.clone()]].concat())
+        .expect("explicit clear transition");
+    assert_eq!(cleared.dashboard_bucket, "Working");
+    assert_eq!(cleared.attention_open_count, 0);
+
+    clear.payload["occurrence_id"] = json!("stale-occurrence");
+    assert_eq!(
+        replay_dashboard_projection(&[
+            event(1, "run.created", None, json!({})),
+            event(2, "session.connected", Some("session-1"), json!({})),
+            stuck_event(3, "occurrence-1", "event-progress-1", 5_000),
+            clear,
+        ]),
+        Err(ProjectionError::Stuck)
+    );
+}
+
+#[test]
+fn legacy_stuck_named_events_remain_unknown_and_non_core_v13_is_rejected() {
+    let legacy = replay_dashboard_projection(&[
+        event(1, "run.created", None, json!({})),
+        event(2, "session.connected", Some("session-1"), json!({})),
+        event(3, "run.possibly_stuck", None, json!({"legacy": true})),
+        event(4, "run.stuck_cleared", None, json!({"legacy": true})),
+    ])
+    .expect("legacy event names remain unknown-compatible");
+    assert_eq!(legacy.dashboard_bucket, "Working");
+    assert_eq!(legacy.attention_open_count, 0);
+
+    let mut provider_owned = stuck_event(3, "occurrence-provider", "event-2", 5_000);
+    provider_owned.session_id = Some("session-1".to_owned());
+    provider_owned.source_kind = "provider_adapter".to_owned();
+    provider_owned.source_provider = Some("codex".to_owned());
+    assert_eq!(
+        replay_dashboard_projection(&[
+            event(1, "run.created", None, json!({})),
+            event(2, "session.connected", Some("session-1"), json!({})),
+            provider_owned,
+        ]),
+        Err(ProjectionError::Stuck)
+    );
+
+    let mut extended_source = stuck_event(3, "occurrence-extended", "event-2", 5_000);
+    extended_source.source_has_extensions = true;
+    assert_eq!(
+        replay_dashboard_projection(&[
+            event(1, "run.created", None, json!({})),
+            event(2, "session.connected", Some("session-1"), json!({})),
+            extended_source,
+        ]),
+        Err(ProjectionError::Stuck)
+    );
 }
 
 #[test]

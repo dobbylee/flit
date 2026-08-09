@@ -6,15 +6,15 @@ use flit_protocol::{
     GitObservationRequest, GitObservationResponse, MAX_JSON_SAFE_INTEGER, ManagedRunObserveRequest,
     ManagedRunObserveResponse, ManagedRunOpenInProviderRequest, ManagedRunPermissionRespondRequest,
     ManagedRunPermissionRespondResponse, ManagedRunStartRequest, ManagedRunStartResponse,
-    PROTOCOL_VERSION, ProjectInspectionRequest, ProjectInspectionResponse,
+    PROTOCOL_VERSION, PossiblyStuckPayload, ProjectInspectionRequest, ProjectInspectionResponse,
     ProjectRegistrationRequest, ProjectRegistrationResponse, ProjectTrustRequest,
     ProjectTrustResponse, ProjectsListRequest, ProjectsListResponse, ProviderCompatibility,
     ProviderDiagnosticsRequest, ProviderDiagnosticsResponse, ProviderExecutionAfterQuit,
     ProviderUnavailableReason, QuitImpactReason, QuitImpactRequest, QuitImpactResponse,
     RunChangeExternalOpenRequest, RunChangeExternalOpenResponse, RunChangesReadRequest,
     RunChangesReadResponse, RunDetailReadRequest, RunDetailReadResponse, RunEvidenceCategory,
-    SystemHealthRequest, SystemHealthResponse, event_schema_id, event_schema_relative_path,
-    generated_swift_command_contract,
+    StuckClearedPayload, StuckProcessReceipt, SystemHealthRequest, SystemHealthResponse,
+    event_schema_id, event_schema_relative_path, generated_swift_command_contract,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -1211,6 +1211,50 @@ fn current_event_fixture_round_trips_without_losing_unknown_fields() {
 }
 
 #[test]
+fn current_possibly_stuck_payload_is_exact_bounded_and_path_free() {
+    let fixture: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repository_path(
+            "fixtures/protocol/events/v1.3/run.possibly_stuck.json",
+        ))
+        .expect("Possibly Stuck fixture should be readable"),
+    )
+    .expect("Possibly Stuck fixture should contain valid JSON");
+    let payload = fixture["payload"].clone();
+    let decoded: PossiblyStuckPayload =
+        serde_json::from_value(payload.clone()).expect("typed Possibly Stuck payload");
+    assert_eq!(serde_json::to_value(&decoded).unwrap(), payload);
+    assert!(matches!(decoded.process, StuckProcessReceipt::Alive { .. }));
+    let encoded = serde_json::to_string(&decoded).unwrap();
+    for forbidden in ["path", "cwd", "prompt", "credential"] {
+        assert!(!encoded.to_ascii_lowercase().contains(forbidden));
+    }
+
+    let mut unknown = payload.clone();
+    unknown["raw_path"] = serde_json::json!("/tmp/escaped");
+    assert!(serde_json::from_value::<PossiblyStuckPayload>(unknown).is_err());
+
+    let mut unsafe_number = payload.clone();
+    unsafe_number["progress_monotonic_ms"] = serde_json::json!(MAX_JSON_SAFE_INTEGER + 1);
+    assert!(serde_json::from_value::<PossiblyStuckPayload>(unsafe_number).is_err());
+    let mut short_threshold = payload;
+    short_threshold["threshold_seconds"] = serde_json::json!(29);
+    assert!(serde_json::from_value::<PossiblyStuckPayload>(short_threshold).is_err());
+
+    assert_fixture_round_trip::<EventEnvelope>(
+        "fixtures/protocol/events/v1.3/run.stuck_cleared.json",
+    );
+    let cleared: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repository_path(
+            "fixtures/protocol/events/v1.3/run.stuck_cleared.json",
+        ))
+        .expect("Stuck clear fixture should be readable"),
+    )
+    .expect("Stuck clear fixture should contain valid JSON");
+    serde_json::from_value::<StuckClearedPayload>(cleared["payload"].clone())
+        .expect("typed Stuck clear payload");
+}
+
+#[test]
 fn current_git_baseline_event_payload_is_exact_and_mixed_variants_fail_closed() {
     let fixture: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(repository_path(
@@ -1361,7 +1405,7 @@ fn current_contract_snapshot() -> CurrentContractSnapshot {
             .expect("current fixture should be readable"),
     )
     .expect("current fixture should contain valid JSON");
-    let serialized_version = serde_json::to_value(EventProtocolVersion::V1_2)
+    let serialized_version = serde_json::to_value(EventProtocolVersion::V1_3)
         .expect("event version should serialize")
         .as_str()
         .expect("event version should serialize as a string")

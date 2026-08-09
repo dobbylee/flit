@@ -6,6 +6,10 @@ use std::{
 
 use serde_json::{Map, Value};
 
+const MAX_PERSISTED_STUCK_ID_BYTES: usize = 256;
+const MAX_PERSISTED_STUCK_TIMESTAMP_BYTES: usize = 128;
+const MAX_PERSISTED_STUCK_REASON_BYTES: usize = 4 * 1024;
+
 use crate::{
     activity::{
         Activity, ActivityEvent, ActivityProjection, EvidenceId, ProgressKind, ScoreFactor,
@@ -17,7 +21,14 @@ use crate::{
     },
     dashboard::{DashboardBucket, dashboard_bucket},
     lifecycle::{LifecycleEvent, LifecycleProjection, RunLifecycle, SessionId},
-    stuck::{StuckAssessment, StuckClearReason},
+    run_attention::{
+        RunAttentionObservation, StuckAttentionAssessment, StuckAttentionSource,
+        plan_stuck_attention_events,
+    },
+    stuck::{
+        StuckAssessment, StuckCause, StuckClearReason, StuckNotificationState, StuckOccurrence,
+        StuckOccurrenceId, StuckThresholdSeconds,
+    },
 };
 
 pub const CHANGES_UNAVAILABLE_REASON: &str = "git_observation_not_configured";
@@ -29,6 +40,10 @@ pub struct ProjectionEvent {
     pub event_id: String,
     pub run_id: String,
     pub session_id: Option<String>,
+    pub source_kind: String,
+    pub source_provider: Option<String>,
+    pub source_contract_version: Option<String>,
+    pub source_has_extensions: bool,
     pub ingest_seq: u64,
     pub observed_at: String,
     pub event_type: String,
@@ -65,6 +80,7 @@ pub struct DashboardProjection {
     pub attention_open_count: u64,
     pub dashboard_bucket: String,
     pub last_progress_at: Option<String>,
+    pub last_progress_event_id: String,
     pub last_liveness_at: Option<String>,
     pub changes: ChangeSummary,
     pub updated_at: String,
@@ -119,6 +135,9 @@ pub fn replay_dashboard_projection(
     let mut changes = ChangeSummary::Unavailable {
         reason: CHANGES_UNAVAILABLE_REASON.to_owned(),
     };
+    let mut stuck_assessment = StuckAssessment::Clear(StuckClearReason::ProcessUnavailable);
+    let mut stuck_source = None;
+    let mut stuck_occurrence_id = None;
     let mut observed_at_by_evidence =
         BTreeMap::from([(first.event_id.clone(), first.observed_at.clone())]);
 
@@ -135,8 +154,45 @@ pub fn replay_dashboard_projection(
                 activity_event(event)?,
             )
             .map_err(|_| ProjectionError::Activity)?;
-        let attention_events =
+        let mut attention_events =
             attention_events(event, &mut permission_requests, &mut provider_decision_ids)?;
+        update_stuck_replay(
+            event,
+            &mut stuck_assessment,
+            &mut stuck_source,
+            &mut stuck_occurrence_id,
+        )?;
+        if stuck_occurrence_id.is_none() {
+            stuck_assessment = StuckAssessment::Clear(if lifecycle.lifecycle().is_terminal() {
+                StuckClearReason::LifecycleInactive
+            } else {
+                StuckClearReason::ProcessUnavailable
+            });
+        }
+        let stuck = StuckAttentionAssessment::new(
+            event.ingest_seq,
+            &lifecycle,
+            &activity,
+            stuck_assessment.clone(),
+            stuck_source.clone(),
+        )
+        .map_err(|_| ProjectionError::Stuck)?;
+        let observation = RunAttentionObservation::new(
+            SourceEventId::new(event.event_id.clone()).map_err(|_| ProjectionError::Attention)?,
+            TimestampMs::new(event.ingest_seq),
+            evidence_id(event)?,
+        );
+        attention_events.extend(
+            plan_stuck_attention_events(
+                &attention,
+                event.ingest_seq,
+                &lifecycle,
+                &activity,
+                &stuck,
+                &observation,
+            )
+            .map_err(|_| ProjectionError::Stuck)?,
+        );
         attention
             .apply_batch(event.ingest_seq, attention_events)
             .map_err(|_| ProjectionError::Attention)?;
@@ -154,7 +210,6 @@ pub fn replay_dashboard_projection(
         }
     }
 
-    let clear = StuckAssessment::Clear(StuckClearReason::ProcessUnavailable);
     let last_progress_at = observed_at_by_evidence
         .get(activity.last_progress().evidence_id().as_str())
         .cloned();
@@ -180,8 +235,10 @@ pub fn replay_dashboard_projection(
             .map_or(0.0, |confidence| f64::from(confidence.as_milli()) / 1_000.0),
         attention_level,
         attention_open_count,
-        dashboard_bucket: bucket_name(dashboard_bucket(&lifecycle, &attention, &clear)).to_owned(),
+        dashboard_bucket: bucket_name(dashboard_bucket(&lifecycle, &attention, &stuck_assessment))
+            .to_owned(),
         last_progress_at,
+        last_progress_event_id: activity.last_progress().evidence_id().as_str().to_owned(),
         last_liveness_at,
         changes,
         updated_at: last.observed_at.clone(),
@@ -280,8 +337,264 @@ fn activity_event(event: &ProjectionEvent) -> Result<ActivityEvent, ProjectionEr
         "run.completed" | "run.failed" | "run.stopped" | "run.interrupted" => {
             ActivityEvent::LifecycleTerminated { evidence_id }
         }
+        "run.possibly_stuck" | "run.stuck_cleared" if is_authoritative_stuck_event(event) => {
+            ActivityEvent::ProjectionObserved
+        }
         _ => ActivityEvent::LivenessObserved { evidence_id },
     })
+}
+
+fn update_stuck_replay(
+    event: &ProjectionEvent,
+    assessment: &mut StuckAssessment,
+    source: &mut Option<StuckAttentionSource>,
+    current_occurrence_id: &mut Option<String>,
+) -> Result<(), ProjectionError> {
+    if matches!(
+        event.event_type.as_str(),
+        "run.possibly_stuck" | "run.stuck_cleared"
+    ) {
+        if event.protocol_version != "1.3" {
+            return Ok(());
+        }
+        if !is_authoritative_stuck_event(event) {
+            return Err(ProjectionError::Stuck);
+        }
+    }
+    match event.event_type.as_str() {
+        "run.possibly_stuck" => {
+            let occurrence = persisted_stuck_occurrence(event)?;
+            let occurrence_id =
+                payload_bounded_token(event, "occurrence_id", MAX_PERSISTED_STUCK_ID_BYTES)?;
+            if current_occurrence_id.as_deref() == Some(occurrence_id) {
+                return Err(ProjectionError::Stuck);
+            }
+            *source = Some(
+                StuckAttentionSource::new_at(
+                    &occurrence,
+                    SourceEventId::new(event.event_id.clone())
+                        .map_err(|_| ProjectionError::Attention)?,
+                    TimestampMs::new(event.ingest_seq),
+                )
+                .map_err(|_| ProjectionError::Stuck)?,
+            );
+            *assessment = StuckAssessment::PossiblyStuck(occurrence);
+            *current_occurrence_id = Some(occurrence_id.to_owned());
+        }
+        "run.stuck_cleared" => {
+            if event.payload.len() != 4
+                || payload_bounded_token(
+                    event,
+                    "evidence_unavailable_reason",
+                    MAX_PERSISTED_STUCK_REASON_BYTES,
+                )
+                .is_err()
+                || !matches!(
+                    payload_string(event, "reason")?,
+                    "lifecycle_inactive"
+                        | "blocking_request_open"
+                        | "structured_wait"
+                        | "progress_observed"
+                        | "process_unavailable"
+                        | "within_deadline"
+                )
+            {
+                return Err(ProjectionError::Stuck);
+            }
+            validate_stuck_clear_process(
+                event
+                    .payload
+                    .get("process")
+                    .and_then(Value::as_object)
+                    .ok_or(ProjectionError::Stuck)?,
+            )?;
+            let StuckAssessment::PossiblyStuck(current) = assessment else {
+                return Err(ProjectionError::Stuck);
+            };
+            let _ = current;
+            if current_occurrence_id.as_deref()
+                != Some(payload_bounded_token(
+                    event,
+                    "occurrence_id",
+                    MAX_PERSISTED_STUCK_ID_BYTES,
+                )?)
+            {
+                return Err(ProjectionError::Stuck);
+            }
+            *assessment = StuckAssessment::Clear(StuckClearReason::ProcessUnavailable);
+            *source = None;
+            *current_occurrence_id = None;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn persisted_stuck_occurrence(event: &ProjectionEvent) -> Result<StuckOccurrence, ProjectionError> {
+    if !is_authoritative_stuck_event(event) || event.payload.len() != 10 {
+        return Err(ProjectionError::Stuck);
+    }
+    let cause = match payload_string(event, "cause")? {
+        "starting" => StuckCause::Starting,
+        "planning" => StuckCause::Activity(Activity::Planning),
+        "reading" => StuckCause::Activity(Activity::Reading),
+        "editing" => StuckCause::Activity(Activity::Editing),
+        "testing" => StuckCause::Activity(Activity::Testing),
+        "building" => StuckCause::Activity(Activity::Building),
+        "reviewing" => StuckCause::Activity(Activity::Reviewing),
+        "waiting" => StuckCause::Activity(Activity::Waiting),
+        "unknown" => StuckCause::Activity(Activity::Unknown),
+        _ => return Err(ProjectionError::Stuck),
+    };
+    let threshold = payload_u64(event, "threshold_seconds")
+        .and_then(|value| u16::try_from(value).ok())
+        .and_then(|value| StuckThresholdSeconds::new(value).ok())
+        .ok_or(ProjectionError::Stuck)?;
+    let progress_at = payload_safe_u64(event, "progress_monotonic_ms")?;
+    let baseline_at = payload_safe_u64(event, "baseline_monotonic_ms")?;
+    let stuck_since = payload_safe_u64(event, "stuck_since_monotonic_ms")?;
+    let progress_evidence_id = EvidenceId::new(payload_bounded_token(
+        event,
+        "progress_event_id",
+        MAX_PERSISTED_STUCK_ID_BYTES,
+    )?)
+    .map_err(|_| ProjectionError::Stuck)?;
+    let process = event
+        .payload
+        .get("process")
+        .and_then(Value::as_object)
+        .ok_or(ProjectionError::Stuck)?;
+    validate_stuck_process(cause, process, stuck_since)?;
+    payload_bounded_token(
+        event,
+        "progress_observed_at",
+        MAX_PERSISTED_STUCK_TIMESTAMP_BYTES,
+    )?;
+    payload_bounded_token(
+        event,
+        "evidence_unavailable_reason",
+        MAX_PERSISTED_STUCK_REASON_BYTES,
+    )?;
+    let id = StuckOccurrenceId::from_persisted(
+        cause,
+        TimestampMs::new(progress_at),
+        progress_evidence_id,
+        TimestampMs::new(baseline_at),
+        TimestampMs::new(stuck_since),
+        threshold,
+    )
+    .map_err(|_| ProjectionError::Stuck)?;
+    let due_at = stuck_since
+        .checked_add(300_000)
+        .filter(|value| *value <= MAX_JSON_SAFE_INTEGER)
+        .ok_or(ProjectionError::Stuck)?;
+    Ok(StuckOccurrence::from_persisted(
+        id,
+        StuckNotificationState::NotDue {
+            due_at: TimestampMs::new(due_at),
+        },
+        payload_bounded_token(event, "occurrence_id", MAX_PERSISTED_STUCK_ID_BYTES)?.to_owned(),
+    ))
+}
+
+fn is_authoritative_stuck_event(event: &ProjectionEvent) -> bool {
+    event.protocol_version == "1.3"
+        && event.session_id.is_none()
+        && event.source_kind == "core"
+        && event.source_provider.is_none()
+        && event.source_contract_version.as_deref() == Some("stuck-transition/1.0")
+        && !event.source_has_extensions
+}
+
+fn validate_stuck_process(
+    cause: StuckCause,
+    process: &Map<String, Value>,
+    stuck_since: u64,
+) -> Result<(), ProjectionError> {
+    let status = process
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or(ProjectionError::Stuck)?;
+    let observed = process
+        .get("observed_monotonic_ms")
+        .and_then(Value::as_u64)
+        .filter(|value| *value <= MAX_JSON_SAFE_INTEGER && *value >= stuck_since)
+        .ok_or(ProjectionError::Stuck)?;
+    let _ = observed;
+    match (cause, status) {
+        (StuckCause::Starting, "not_spawned") if process.len() == 2 => Ok(()),
+        (StuckCause::Activity(_), "alive")
+            if process.len() == 3
+                && process
+                    .get("generation")
+                    .and_then(|value| bounded_token(value, MAX_PERSISTED_STUCK_ID_BYTES))
+                    .is_some() =>
+        {
+            Ok(())
+        }
+        _ => Err(ProjectionError::Stuck),
+    }
+}
+
+fn validate_stuck_clear_process(process: &Map<String, Value>) -> Result<(), ProjectionError> {
+    let status = process
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or(ProjectionError::Stuck)?;
+    process
+        .get("observed_monotonic_ms")
+        .and_then(Value::as_u64)
+        .filter(|value| *value <= MAX_JSON_SAFE_INTEGER)
+        .ok_or(ProjectionError::Stuck)?;
+    match status {
+        "not_spawned" if process.len() == 2 => Ok(()),
+        "alive"
+            if process.len() == 3
+                && process
+                    .get("generation")
+                    .and_then(|value| bounded_token(value, MAX_PERSISTED_STUCK_ID_BYTES))
+                    .is_some() =>
+        {
+            Ok(())
+        }
+        "unavailable"
+            if process.len() == 4
+                && process
+                    .get("reason")
+                    .and_then(|value| bounded_token(value, MAX_PERSISTED_STUCK_REASON_BYTES))
+                    .is_some()
+                && process.get("generation").is_some_and(|value| {
+                    value.is_null() || bounded_token(value, MAX_PERSISTED_STUCK_ID_BYTES).is_some()
+                }) =>
+        {
+            Ok(())
+        }
+        _ => Err(ProjectionError::Stuck),
+    }
+}
+
+fn payload_bounded_token<'a>(
+    event: &'a ProjectionEvent,
+    field: &'static str,
+    max_bytes: usize,
+) -> Result<&'a str, ProjectionError> {
+    let value = event
+        .payload
+        .get(field)
+        .ok_or(ProjectionError::InvalidPayload { field })?;
+    bounded_token(value, max_bytes).ok_or(ProjectionError::InvalidPayload { field })
+}
+
+fn bounded_token(value: &Value, max_bytes: usize) -> Option<&str> {
+    value.as_str().filter(|value| {
+        !value.trim().is_empty() && value.len() <= max_bytes && !value.chars().any(char::is_control)
+    })
+}
+
+fn payload_safe_u64(event: &ProjectionEvent, field: &'static str) -> Result<u64, ProjectionError> {
+    payload_u64(event, field)
+        .filter(|value| *value <= MAX_JSON_SAFE_INTEGER)
+        .ok_or(ProjectionError::InvalidPayload { field })
 }
 
 fn attention_events(
@@ -658,6 +971,7 @@ pub enum ProjectionError {
     Attention,
     Permission,
     Changes,
+    Stuck,
 }
 
 impl fmt::Display for ProjectionError {
@@ -684,6 +998,7 @@ impl fmt::Display for ProjectionError {
             Self::Attention => formatter.write_str("Run attention projection failed"),
             Self::Permission => formatter.write_str("Run permission projection failed"),
             Self::Changes => formatter.write_str("Run change projection failed"),
+            Self::Stuck => formatter.write_str("Run stuck projection failed"),
         }
     }
 }

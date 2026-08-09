@@ -4,7 +4,10 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use flit_protocol::{EventEnvelope, GitBaselinePayload, GitHead};
+use flit_protocol::{
+    EventEnvelope, GitBaselinePayload, GitHead, PossiblyStuckPayload, StuckClearedPayload,
+    StuckProcessReceipt,
+};
 use serde_json::{Map, Value};
 
 pub const MANAGED_PROVIDER_KIND_CODEX: &str = "codex";
@@ -51,6 +54,27 @@ pub struct ManagedRun {
     pub created_at: String,
     pub started_at: Option<String>,
     pub ended_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ManagedStuckAssessment {
+    PossiblyStuck(PossiblyStuckPayload),
+    Clear(StuckClearedPayload),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedStuckTransition {
+    pub run_id: String,
+    pub expected_run_version: u64,
+    pub event_id: String,
+    pub observed_at: String,
+    pub assessment: ManagedStuckAssessment,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ManagedStuckTransitionOutcome {
+    Appended(Box<EventEnvelope>),
+    Unchanged { run_id: String, version: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -669,6 +693,111 @@ pub(crate) fn validate_run_intent(intent: &ManagedRunIntent) -> Result<(), &'sta
         return Err("event_ids");
     }
     validate_json_size(&intent.start_request).map_err(|()| "start_request")
+}
+
+pub(crate) fn validate_stuck_transition(
+    transition: &ManagedStuckTransition,
+) -> Result<(), &'static str> {
+    validate_id(&transition.run_id).map_err(|()| "run_id")?;
+    validate_id(&transition.event_id).map_err(|()| "event_id")?;
+    validate_timestamp(&transition.observed_at).map_err(|()| "observed_at")?;
+    if transition.expected_run_version == 0
+        || transition.expected_run_version > flit_protocol::MAX_JSON_SAFE_INTEGER
+    {
+        return Err("expected_run_version");
+    }
+    match &transition.assessment {
+        ManagedStuckAssessment::PossiblyStuck(payload) => {
+            validate_id(&payload.occurrence_id).map_err(|()| "occurrence_id")?;
+            validate_id(&payload.progress_event_id).map_err(|()| "progress_event_id")?;
+            validate_timestamp(&payload.progress_observed_at)
+                .map_err(|()| "progress_observed_at")?;
+            validate_token(
+                &payload.evidence_unavailable_reason,
+                MAX_MANAGED_FAILURE_REASON_BYTES,
+            )
+            .map_err(|()| "evidence_unavailable_reason")?;
+            if !(30..=1_800).contains(&payload.threshold_seconds)
+                || payload.progress_monotonic_ms > flit_protocol::MAX_JSON_SAFE_INTEGER
+                || payload.baseline_monotonic_ms > flit_protocol::MAX_JSON_SAFE_INTEGER
+                || payload.stuck_since_monotonic_ms > flit_protocol::MAX_JSON_SAFE_INTEGER
+                || payload.baseline_monotonic_ms < payload.progress_monotonic_ms
+                || payload.stuck_since_monotonic_ms
+                    != payload
+                        .baseline_monotonic_ms
+                        .checked_add(u64::from(payload.threshold_seconds) * 1_000)
+                        .ok_or("stuck_since_monotonic_ms")?
+            {
+                return Err("monotonic_occurrence");
+            }
+            match (&payload.cause, &payload.process) {
+                (
+                    flit_protocol::StuckCauseCode::Starting,
+                    StuckProcessReceipt::NotSpawned {
+                        observed_monotonic_ms,
+                    },
+                ) if *observed_monotonic_ms >= payload.stuck_since_monotonic_ms
+                    && *observed_monotonic_ms <= flit_protocol::MAX_JSON_SAFE_INTEGER => {}
+                (
+                    flit_protocol::StuckCauseCode::Planning
+                    | flit_protocol::StuckCauseCode::Reading
+                    | flit_protocol::StuckCauseCode::Editing
+                    | flit_protocol::StuckCauseCode::Testing
+                    | flit_protocol::StuckCauseCode::Building
+                    | flit_protocol::StuckCauseCode::Reviewing
+                    | flit_protocol::StuckCauseCode::Waiting
+                    | flit_protocol::StuckCauseCode::Unknown,
+                    StuckProcessReceipt::Alive {
+                        generation,
+                        observed_monotonic_ms,
+                    },
+                ) if validate_id(generation).is_ok()
+                    && *observed_monotonic_ms >= payload.stuck_since_monotonic_ms
+                    && *observed_monotonic_ms <= flit_protocol::MAX_JSON_SAFE_INTEGER => {}
+                _ => return Err("process"),
+            }
+        }
+        ManagedStuckAssessment::Clear(payload) => {
+            validate_id(&payload.occurrence_id).map_err(|()| "occurrence_id")?;
+            validate_token(
+                &payload.evidence_unavailable_reason,
+                MAX_MANAGED_FAILURE_REASON_BYTES,
+            )
+            .map_err(|()| "evidence_unavailable_reason")?;
+            match &payload.process {
+                StuckProcessReceipt::NotSpawned {
+                    observed_monotonic_ms,
+                } => {
+                    if *observed_monotonic_ms > flit_protocol::MAX_JSON_SAFE_INTEGER {
+                        return Err("process");
+                    }
+                }
+                StuckProcessReceipt::Alive {
+                    generation,
+                    observed_monotonic_ms,
+                } => {
+                    validate_id(generation).map_err(|()| "process")?;
+                    if *observed_monotonic_ms > flit_protocol::MAX_JSON_SAFE_INTEGER {
+                        return Err("process");
+                    }
+                }
+                StuckProcessReceipt::Unavailable {
+                    generation,
+                    reason,
+                    observed_monotonic_ms,
+                } => {
+                    validate_optional_token(generation.as_deref(), MAX_MANAGED_ID_BYTES)
+                        .map_err(|()| "process")?;
+                    validate_token(reason, MAX_MANAGED_FAILURE_REASON_BYTES)
+                        .map_err(|()| "process")?;
+                    if *observed_monotonic_ms > flit_protocol::MAX_JSON_SAFE_INTEGER {
+                        return Err("process");
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_run_start_failure(

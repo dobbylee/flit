@@ -5,7 +5,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
 pub const PROTOCOL_VERSION: &str = "1.19";
-pub const EVENT_PROTOCOL_VERSION: &str = "1.2";
+pub const EVENT_PROTOCOL_VERSION: &str = "1.3";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[must_use]
@@ -1064,6 +1064,109 @@ pub enum EventProtocolVersion {
     V1_1,
     #[serde(rename = "1.2")]
     V1_2,
+    #[serde(rename = "1.3")]
+    V1_3,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StuckCauseCode {
+    Starting,
+    Planning,
+    Reading,
+    Editing,
+    Testing,
+    Building,
+    Reviewing,
+    Waiting,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StuckProcessReceipt {
+    NotSpawned {
+        #[serde(deserialize_with = "deserialize_json_safe_u64")]
+        observed_monotonic_ms: u64,
+    },
+    Alive {
+        generation: String,
+        #[serde(deserialize_with = "deserialize_json_safe_u64")]
+        observed_monotonic_ms: u64,
+    },
+    Unavailable {
+        generation: Option<String>,
+        reason: String,
+        #[serde(deserialize_with = "deserialize_json_safe_u64")]
+        observed_monotonic_ms: u64,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PossiblyStuckPayload {
+    pub occurrence_id: String,
+    pub cause: StuckCauseCode,
+    #[serde(deserialize_with = "deserialize_stuck_threshold")]
+    pub threshold_seconds: u16,
+    pub progress_event_id: String,
+    pub progress_observed_at: String,
+    #[serde(deserialize_with = "deserialize_json_safe_u64")]
+    pub progress_monotonic_ms: u64,
+    #[serde(deserialize_with = "deserialize_json_safe_u64")]
+    pub baseline_monotonic_ms: u64,
+    #[serde(deserialize_with = "deserialize_json_safe_u64")]
+    pub stuck_since_monotonic_ms: u64,
+    pub process: StuckProcessReceipt,
+    pub evidence_unavailable_reason: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StuckClearReasonCode {
+    LifecycleInactive,
+    BlockingRequestOpen,
+    StructuredWait,
+    ProgressObserved,
+    ProcessUnavailable,
+    WithinDeadline,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StuckClearedPayload {
+    pub occurrence_id: String,
+    pub reason: StuckClearReasonCode,
+    pub process: StuckProcessReceipt,
+    pub evidence_unavailable_reason: String,
+}
+
+fn deserialize_json_safe_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = u64::deserialize(deserializer)?;
+    if value <= MAX_JSON_SAFE_INTEGER {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom(
+            "monotonic milliseconds exceed the JSON safe integer bound",
+        ))
+    }
+}
+
+fn deserialize_stuck_threshold<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = u16::deserialize(deserializer)?;
+    if (30..=1_800).contains(&value) {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom(
+            "stuck threshold must be between 30 and 1800 seconds",
+        ))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

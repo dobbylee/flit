@@ -207,6 +207,7 @@ pub enum ActivityEvent {
     LifecycleActivated {
         evidence_id: EvidenceId,
     },
+    ProjectionObserved,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -408,6 +409,7 @@ impl ActivityProjection {
                 self.transition_to_unknown(observed_at, evidence_id);
                 ActivityDisposition::ActivityChanged
             }
+            ActivityEvent::ProjectionObserved => ActivityDisposition::NoChange,
         }
     }
 

@@ -1,7 +1,7 @@
 use std::{error::Error, fmt};
 
 use crate::{
-    activity::{Activity, ActivityProjection, EvidenceId, TimestampMs},
+    activity::{ActivityProjection, EvidenceId, TimestampMs},
     attention::{
         AttentionCategory, AttentionDedupeKey, AttentionDisposition, AttentionError,
         AttentionEvent, AttentionEvidence, AttentionItem, AttentionItemDraft, AttentionItemId,
@@ -9,7 +9,7 @@ use crate::{
     },
     lifecycle::{LifecycleDisposition, LifecycleEvent, LifecycleProjection, RunLifecycle},
     request_attention::RequestAttentionPlan,
-    stuck::{StuckAssessment, StuckCause, StuckClearReason, StuckOccurrence, StuckOccurrenceId},
+    stuck::{StuckAssessment, StuckClearReason, StuckOccurrence, StuckOccurrenceId},
 };
 
 const LIFECYCLE_ITEM_PREFIX: &str = "lifecycle:";
@@ -260,6 +260,7 @@ fn validate_lifecycle_slot_empty(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StuckAttentionSource {
     occurrence_id: StuckOccurrenceId,
+    persisted_occurrence_id: Option<String>,
     item_id: AttentionItemId,
     dedupe_key: AttentionDedupeKey,
     source_event_id: SourceEventId,
@@ -273,13 +274,21 @@ impl StuckAttentionSource {
         occurrence: &StuckOccurrence,
         source_event_id: SourceEventId,
     ) -> Result<Self, RunAttentionError> {
+        Self::new_at(occurrence, source_event_id, occurrence.id().stuck_since())
+    }
+
+    pub fn new_at(
+        occurrence: &StuckOccurrence,
+        source_event_id: SourceEventId,
+        created_at: TimestampMs,
+    ) -> Result<Self, RunAttentionError> {
         let occurrence_id = occurrence.id().clone();
-        let identity = stuck_identity(&occurrence_id);
+        let persisted_occurrence_id = occurrence.persisted_id().map(ToOwned::to_owned);
+        let identity = stuck_identity(occurrence);
         let item_id = AttentionItemId::new(format!("{STUCK_ITEM_PREFIX}{identity}"))?;
         let dedupe_key = AttentionDedupeKey::new(format!("{STUCK_ITEM_PREFIX}{identity}"))?;
         let evidence =
             AttentionEvidence::new(vec![occurrence_id.progress_evidence_id().clone()], None)?;
-        let created_at = occurrence_id.stuck_since();
         let draft = AttentionItemDraft::new(
             item_id.clone(),
             source_event_id.clone(),
@@ -292,6 +301,7 @@ impl StuckAttentionSource {
         )?;
         Ok(Self {
             occurrence_id,
+            persisted_occurrence_id,
             item_id,
             dedupe_key,
             source_event_id,
@@ -304,6 +314,11 @@ impl StuckAttentionSource {
     #[must_use]
     pub const fn occurrence_id(&self) -> &StuckOccurrenceId {
         &self.occurrence_id
+    }
+
+    fn matches_occurrence(&self, occurrence: &StuckOccurrence) -> bool {
+        self.occurrence_id == *occurrence.id()
+            && self.persisted_occurrence_id.as_deref() == occurrence.persisted_id()
     }
 
     #[must_use]
@@ -387,13 +402,25 @@ fn stuck_events(
     Ok(events)
 }
 
+pub fn plan_stuck_attention_events(
+    attention: &AttentionProjection,
+    ingest_seq: u64,
+    lifecycle: &LifecycleProjection,
+    activity: &ActivityProjection,
+    stuck: &StuckAttentionAssessment,
+    observation: &RunAttentionObservation,
+) -> Result<Vec<AttentionEvent>, RunAttentionError> {
+    validate_stuck_binding(ingest_seq, lifecycle, activity, stuck)?;
+    stuck_events(attention, stuck, observation)
+}
+
 fn validate_stuck_source<'a>(
     assessment: &StuckAssessment,
     source: Option<&'a StuckAttentionSource>,
 ) -> Result<Option<&'a StuckAttentionSource>, RunAttentionError> {
     match (assessment, source) {
         (StuckAssessment::PossiblyStuck(occurrence), Some(source))
-            if occurrence.id() == source.occurrence_id() =>
+            if source.matches_occurrence(occurrence) =>
         {
             Ok(Some(source))
         }
@@ -407,32 +434,11 @@ fn encoded_source_identity(source_event_id: &SourceEventId) -> String {
     format!("{}:{source}", source.len())
 }
 
-fn stuck_identity(occurrence: &StuckOccurrenceId) -> String {
-    let cause = match occurrence.cause() {
-        StuckCause::Starting => "starting",
-        StuckCause::Activity(activity) => activity_identity(activity),
-    };
-    let evidence = occurrence.progress_evidence_id().as_str();
-    format!(
-        "{cause}:{}:{}:{}:{}:{evidence}",
-        occurrence.progress_at().as_u64(),
-        occurrence.baseline_at().as_u64(),
-        occurrence.stuck_since().as_u64(),
-        evidence.len(),
+fn stuck_identity(occurrence: &StuckOccurrence) -> String {
+    occurrence.persisted_id().map_or_else(
+        || occurrence.id().persistent_identity(),
+        |persisted| format!("persisted:{}:{persisted}", persisted.len()),
     )
-}
-
-const fn activity_identity(activity: Activity) -> &'static str {
-    match activity {
-        Activity::Planning => "planning",
-        Activity::Reading => "reading",
-        Activity::Editing => "editing",
-        Activity::Testing => "testing",
-        Activity::Building => "building",
-        Activity::Reviewing => "reviewing",
-        Activity::Waiting => "waiting",
-        Activity::Unknown => "unknown",
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
