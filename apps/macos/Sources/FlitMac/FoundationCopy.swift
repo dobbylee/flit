@@ -9,11 +9,16 @@ enum FoundationCopyKey: String {
     case dashboardChangesUnavailable = "dashboard.changes.unavailable"
     case dashboardDataUnavailable = "dashboard.data.unavailable"
     case dashboardNoRuns = "dashboard.noRuns"
+    case dashboardMonitoringUnavailable = "dashboard.monitoring.unavailable"
     case dashboardSectionFinished = "dashboard.section.finished"
     case dashboardSectionNeedsAttention = "dashboard.section.needsAttention"
     case dashboardSectionPossiblyStuck = "dashboard.section.possiblyStuck"
     case dashboardSectionWorking = "dashboard.section.working"
     case dashboardUnavailable = "dashboard.unavailable"
+    case dashboardStillWorking = "dashboard.stillWorking"
+    case dashboardStillWorkingApplied = "dashboard.stillWorking.applied"
+    case dashboardStillWorkingRejected = "dashboard.stillWorking.rejected"
+    case dashboardStillWorkingUnavailable = "dashboard.stillWorking.unavailable"
     case dashboardViewActivity = "dashboard.viewActivity"
     case closeToTrayAcknowledgement = "lifecycle.closeToTray.acknowledgement"
     case closeToTrayMessage = "lifecycle.closeToTray.message"
@@ -138,11 +143,17 @@ enum FoundationCopy {
         .dashboardChangesUnavailable: "Changes unavailable: %@",
         .dashboardDataUnavailable: "Dashboard data unavailable",
         .dashboardNoRuns: "No Runs",
+        .dashboardMonitoringUnavailable:
+            "Dashboard monitoring could not converge. Showing the last accepted state.",
         .dashboardSectionFinished: "Finished",
         .dashboardSectionNeedsAttention: "Needs Attention",
         .dashboardSectionPossiblyStuck: "Possibly Stuck",
         .dashboardSectionWorking: "Working",
         .dashboardUnavailable: "Dashboard unavailable",
+        .dashboardStillWorking: "Still working",
+        .dashboardStillWorkingApplied: "Still working was recorded",
+        .dashboardStillWorkingRejected: "Still working was not applied: %@",
+        .dashboardStillWorkingUnavailable: "Still working could not be completed",
         .dashboardViewActivity: "View activity",
         .closeToTrayAcknowledgement: "Keep Flit Running",
         .closeToTrayMessage:

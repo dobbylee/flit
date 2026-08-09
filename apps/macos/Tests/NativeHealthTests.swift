@@ -194,6 +194,63 @@ private func changingDashboard(
     )
 }
 
+private func dashboardDeltaResponse(
+    coreInstanceId: String,
+    requestedAfterCursor: UInt64,
+    nextCursor: UInt64,
+    hasMore: Bool,
+    eventCursors: [UInt64]? = nil
+) throws -> FlitDashboardReadResponse {
+    let cursors = eventCursors
+        ?? (nextCursor > requestedAfterCursor ? [nextCursor] : [])
+    let events: [[String: Any]] = cursors.map { cursor in
+        [
+            "cursor": cursor,
+            "event_id": "event-dashboard-page-\(cursor)",
+            "run_id": "run-dashboard-page",
+            "event_type": "run.event_observed",
+            "observed_at": "2026-08-09T00:00:00.000Z",
+        ]
+    }
+    let object: [String: Any] = [
+        "delivery": "delta",
+        "protocol_version": flitClientProtocolVersion,
+        "event_schema_version": flitEventSchemaVersion,
+        "core_instance_id": coreInstanceId,
+        "requested_after_cursor": requestedAfterCursor,
+        "retained_after_cursor": 0,
+        "next_cursor": nextCursor,
+        "has_more": hasMore,
+        "events": events,
+        "runs": [],
+    ]
+    return try JSONDecoder().decode(
+        FlitDashboardReadResponse.self,
+        from: JSONSerialization.data(withJSONObject: object)
+    )
+}
+
+@MainActor
+private final class ManualDashboardCadence: DashboardCadenceScheduling {
+    private var tick: (@MainActor @Sendable () -> Void)?
+    private(set) var startCount = 0
+    private(set) var stopCount = 0
+
+    func start(_ tick: @escaping @MainActor @Sendable () -> Void) {
+        startCount += 1
+        self.tick = tick
+    }
+
+    func stop() {
+        stopCount += 1
+        tick = nil
+    }
+
+    func fire() {
+        tick?()
+    }
+}
+
 @MainActor
 private func requireCommandError(
     _ text: String,
@@ -717,6 +774,316 @@ struct NativeHealthTests {
                 && presentation.cursor == initialSnapshotFixture.nextCursor,
             "native snapshot must replace presentation state with exact Core records"
         )
+        let stuckDeltaFixture = try changingDashboard(deltaDashboardFixture) { object in
+            guard
+                var events = object["events"] as? [[String: Any]],
+                var runs = object["runs"] as? [[String: Any]]
+            else {
+                throw NativeHealthTestFailure.failed(
+                    "Dashboard stuck delta must contain one event and Run"
+                )
+            }
+            events[0]["event_type"] = "run.possibly_stuck"
+            runs[0]["attention_level"] = "Informational"
+            runs[0]["attention_open_count"] = 1
+            runs[0]["dashboard_bucket"] = "PossiblyStuck"
+            runs[0]["active_stuck_occurrence_id"] = "occurrence-dashboard-action"
+            object["events"] = events
+            object["runs"] = runs
+        }
+        let firstFullPageFixture = try dashboardDeltaResponse(
+            coreInstanceId: "core-instance-1",
+            requestedAfterCursor: 3,
+            nextCursor: 53,
+            hasMore: true,
+            eventCursors: Array(4...53)
+        )
+        let secondPageResyncFixture = try changingDashboard(
+            resyncDashboardFixture
+        ) { object in
+            object["requested_after_cursor"] = 53
+        }
+        let clearedDeltaFixture = try changingDashboard(deltaDashboardFixture) { object in
+            guard
+                var events = object["events"] as? [[String: Any]],
+                var runs = object["runs"] as? [[String: Any]]
+            else {
+                throw NativeHealthTestFailure.failed(
+                    "Dashboard clear delta must contain one event and Run"
+                )
+            }
+            object["requested_after_cursor"] = 4
+            object["next_cursor"] = 5
+            events[0]["cursor"] = 5
+            events[0]["event_id"] = "event-dashboard-still-working"
+            events[0]["event_type"] = "run.still_working"
+            runs[0]["version"] = 5
+            runs[0]["attention_level"] = "None"
+            runs[0]["attention_open_count"] = 0
+            runs[0]["dashboard_bucket"] = "Working"
+            runs[0]["active_stuck_occurrence_id"] = NSNull()
+            object["events"] = events
+            object["runs"] = runs
+        }
+        var acceptedDashboardState = DashboardPresentationState()
+        try acceptedDashboardState.apply(initialDashboardFixture)
+        var failedPageCalls = 0
+        let failedPageClient = DashboardClient(
+            requestLoader: { request in
+                failedPageCalls += 1
+                guard
+                    request.expectedCoreInstanceId == "core-instance-1",
+                    request.afterCursor == (failedPageCalls == 1 ? 3 : 53),
+                    request.requestedEventLimit == DashboardClient.requestedEventLimit,
+                    request.clientProtocolVersion == flitClientProtocolVersion
+                else {
+                    throw NativeHealthTestFailure.failed(
+                        "Dashboard convergence must preserve exact accepted cursor scope"
+                    )
+                }
+                if failedPageCalls == 1 {
+                    return firstFullPageFixture
+                }
+                throw NativeHealthTestFailure.failed("later Dashboard page unavailable")
+            }
+        )
+        var pageFailureObserved = false
+        do {
+            _ = try failedPageClient.convergedState(from: acceptedDashboardState)
+        } catch {
+            pageFailureObserved = true
+        }
+        let acceptedWorkingCount = try acceptedDashboardState.runs(in: .working).count
+        let acceptedStuckRuns = try acceptedDashboardState.runs(in: .possiblyStuck)
+        try require(
+            pageFailureObserved
+                && failedPageCalls == 2
+                && acceptedDashboardState.cursor == 3
+                && acceptedWorkingCount == 1
+                && acceptedStuckRuns.isEmpty,
+            "failed later page must preserve the complete previously accepted Dashboard"
+        )
+        var resyncPageCalls = 0
+        let resyncClient = DashboardClient(
+            requestLoader: { request in
+                resyncPageCalls += 1
+                switch resyncPageCalls {
+                case 1:
+                    guard request.afterCursor == 3 else {
+                        throw NativeHealthTestFailure.failed(
+                            "first convergence page must start at the accepted cursor"
+                        )
+                    }
+                    return firstFullPageFixture
+                case 2:
+                    guard request.afterCursor == 53 else {
+                        throw NativeHealthTestFailure.failed(
+                            "resync must follow the accepted candidate cursor"
+                        )
+                    }
+                    return secondPageResyncFixture
+                default:
+                    throw NativeHealthTestFailure.failed("resync must terminate convergence")
+                }
+            }
+        )
+        let resyncedState = try resyncClient.convergedState(from: acceptedDashboardState)
+        try require(
+            resyncPageCalls == 2
+                && resyncedState.coreInstanceId == "core-instance-2"
+                && resyncedState.cursor == 4
+                && resyncedState.runsById.isEmpty,
+            "Core snapshot resync must atomically replace prior candidate pages"
+        )
+        let initialWithResyncReason = try changingDashboard(
+            initialDashboardFixture
+        ) { object in
+            object["reason"] = "core_instance_mismatch"
+        }
+        do {
+            _ = try DashboardClient(
+                fixtureLoader: { initialWithResyncReason }
+            ).loadInitial()
+            throw NativeHealthTestFailure.failed(
+                "initial Dashboard load must reject a resync reason"
+            )
+        } catch let error as DashboardPresentationError {
+            try require(
+                error == .contractMismatch,
+                "initial Dashboard load must bind the snapshot reason to its null cursor request"
+            )
+        }
+        let resyncWithInitialReason = try changingDashboard(
+            secondPageResyncFixture
+        ) { object in
+            object["reason"] = "initial"
+        }
+        for (label, invalidResync) in [
+            ("mismatched requested cursor", resyncDashboardFixture),
+            ("initial reason", resyncWithInitialReason),
+        ] {
+            var invalidResyncCalls = 0
+            let invalidResyncClient = DashboardClient(
+                requestLoader: { _ in
+                    invalidResyncCalls += 1
+                    return invalidResyncCalls == 1
+                        ? firstFullPageFixture
+                        : invalidResync
+                }
+            )
+            do {
+                _ = try invalidResyncClient.convergedState(
+                    from: acceptedDashboardState
+                )
+                throw NativeHealthTestFailure.failed(
+                    "Dashboard convergence must reject \(label) resync"
+                )
+            } catch let error as DashboardPresentationError {
+                try require(
+                    error == .contractMismatch,
+                    "Dashboard convergence must type \(label) resync as a contract failure"
+                )
+            }
+            try require(
+                invalidResyncCalls == 2
+                    && acceptedDashboardState.cursor == 3
+                    && acceptedDashboardState.coreInstanceId == "core-instance-1",
+                "invalid resync must preserve the previously accepted Dashboard"
+            )
+        }
+        var boundedPageCalls = 0
+        let boundedPageClient = DashboardClient(
+            requestLoader: { request in
+                boundedPageCalls += 1
+                guard
+                    let coreInstanceId = request.expectedCoreInstanceId,
+                    let afterCursor = request.afterCursor
+                else {
+                    throw NativeHealthTestFailure.failed(
+                        "bounded convergence must always use delta scope"
+                    )
+                }
+                return try dashboardDeltaResponse(
+                    coreInstanceId: coreInstanceId,
+                    requestedAfterCursor: afterCursor,
+                    nextCursor: afterCursor + 50,
+                    hasMore: true,
+                    eventCursors: Array((afterCursor + 1)...(afterCursor + 50))
+                )
+            }
+        )
+        do {
+            _ = try boundedPageClient.convergedState(from: acceptedDashboardState)
+            throw NativeHealthTestFailure.failed(
+                "Dashboard convergence must stop at its hard page bound"
+            )
+        } catch let error as DashboardPresentationError {
+            try require(
+                error == .pageLimitExceeded
+                    && boundedPageCalls == DashboardClient.maximumConvergencePages,
+                "Dashboard convergence must expose the exact hard page bound"
+            )
+        }
+        let nonAdvancingClient = DashboardClient(
+            requestLoader: { request in
+                guard
+                    let coreInstanceId = request.expectedCoreInstanceId,
+                    let afterCursor = request.afterCursor
+                else {
+                    throw NativeHealthTestFailure.failed(
+                        "non-advancing fixture must receive delta scope"
+                    )
+                }
+                return try dashboardDeltaResponse(
+                    coreInstanceId: coreInstanceId,
+                    requestedAfterCursor: afterCursor,
+                    nextCursor: afterCursor,
+                    hasMore: true
+                )
+            }
+        )
+        do {
+            _ = try nonAdvancingClient.convergedState(from: acceptedDashboardState)
+            throw NativeHealthTestFailure.failed(
+                "has-more Dashboard page must advance its cursor"
+            )
+        } catch let error as DashboardPresentationError {
+            try require(
+                error == .nonAdvancingPage,
+                "non-advancing Dashboard page must retain its typed failure"
+            )
+        }
+        let malformedDeltaPages = [
+            (
+                "empty advancing",
+                try dashboardDeltaResponse(
+                    coreInstanceId: "core-instance-1",
+                    requestedAfterCursor: 3,
+                    nextCursor: 4,
+                    hasMore: false,
+                    eventCursors: []
+                )
+            ),
+            (
+                "short has-more",
+                try dashboardDeltaResponse(
+                    coreInstanceId: "core-instance-1",
+                    requestedAfterCursor: 3,
+                    nextCursor: 4,
+                    hasMore: true
+                )
+            ),
+            (
+                "oversized",
+                try dashboardDeltaResponse(
+                    coreInstanceId: "core-instance-1",
+                    requestedAfterCursor: 3,
+                    nextCursor: 54,
+                    hasMore: false,
+                    eventCursors: Array(4...54)
+                )
+            ),
+            (
+                "unordered",
+                try dashboardDeltaResponse(
+                    coreInstanceId: "core-instance-1",
+                    requestedAfterCursor: 3,
+                    nextCursor: 5,
+                    hasMore: false,
+                    eventCursors: [4, 6, 5]
+                )
+            ),
+            (
+                "tail mismatch",
+                try dashboardDeltaResponse(
+                    coreInstanceId: "core-instance-1",
+                    requestedAfterCursor: 3,
+                    nextCursor: 5,
+                    hasMore: false,
+                    eventCursors: [4]
+                )
+            ),
+        ]
+        for (label, malformedPage) in malformedDeltaPages {
+            var malformedState = acceptedDashboardState
+            do {
+                try malformedState.apply(malformedPage)
+                throw NativeHealthTestFailure.failed(
+                    "Dashboard must reject \(label) event pages"
+                )
+            } catch let error as DashboardPresentationError {
+                try require(
+                    error == .invalidEventPage,
+                    "Dashboard must type \(label) as an invalid event page"
+                )
+            }
+            try require(
+                malformedState.coreInstanceId == acceptedDashboardState.coreInstanceId
+                    && malformedState.cursor == acceptedDashboardState.cursor
+                    && malformedState.runsById == acceptedDashboardState.runsById,
+                "invalid event pages must not partially mutate Dashboard state"
+            )
+        }
         try presentation.apply(deltaDashboardFixture)
         let deltaWorkingRuns = try presentation.runs(in: .working)
         try require(
@@ -2608,6 +2975,344 @@ struct NativeHealthTests {
                     FoundationCopy.format(.dashboardChangesUnavailable, reason)
                 ),
             "fixture-backed Run card must render exact Unknown, attention, and unavailable facts"
+        )
+        let stuckAssessmentFixture = try decodeFixture(
+            FlitManagedRunsAssessStuckResponse.self,
+            at: "\(fixtureRoot)/managed_runs_assess_stuck.response.json"
+        )
+        let malformedAssessmentClient = StuckAssessmentClient(
+            fixtureLoader: { _ in
+                FlitManagedRunsAssessStuckResponse(
+                    protocolVersion: flitClientProtocolVersion,
+                    assessedRuns: 1,
+                    transitionsAppended: 1,
+                    unchangedRuns: 1,
+                    unavailableRuns: 0
+                )
+            }
+        )
+        do {
+            try malformedAssessmentClient.assess()
+            throw NativeHealthTestFailure.failed(
+                "native assessment must reject impossible aggregate facts"
+            )
+        } catch let error as StuckMonitoringClientError {
+            try require(
+                error == .invalidResponse,
+                "impossible assessment aggregate must retain a typed contract failure"
+            )
+        }
+        let maximumAssessment = try StuckAssessmentClient(
+            fixtureLoader: { _ in
+                FlitManagedRunsAssessStuckResponse(
+                    protocolVersion: flitClientProtocolVersion,
+                    assessedRuns: StuckAssessmentClient.maximumAssessedRuns,
+                    transitionsAppended: 0,
+                    unchangedRuns: StuckAssessmentClient.maximumAssessedRuns,
+                    unavailableRuns: StuckAssessmentClient.maximumAssessedRuns
+                )
+            }
+        ).assess()
+        try require(
+            maximumAssessment.assessedRuns == StuckAssessmentClient.maximumAssessedRuns,
+            "native assessment must accept Core's exact 100-Run hard bound"
+        )
+        let oversizedAssessmentClient = StuckAssessmentClient(
+            fixtureLoader: { _ in
+                FlitManagedRunsAssessStuckResponse(
+                    protocolVersion: flitClientProtocolVersion,
+                    assessedRuns: StuckAssessmentClient.maximumAssessedRuns + 1,
+                    transitionsAppended: 0,
+                    unchangedRuns: StuckAssessmentClient.maximumAssessedRuns + 1,
+                    unavailableRuns: 0
+                )
+            }
+        )
+        do {
+            try oversizedAssessmentClient.assess()
+            throw NativeHealthTestFailure.failed(
+                "native assessment must reject results beyond the Core hard bound"
+            )
+        } catch let error as StuckMonitoringClientError {
+            try require(
+                error == .invalidResponse,
+                "oversized assessment must retain a typed contract failure"
+            )
+        }
+        var assessmentBoundDashboardLoads = 0
+        let assessmentBoundCadence = ManualDashboardCadence()
+        let assessmentBoundController = FoundationViewController(
+            client: client,
+            dashboardClient: DashboardClient(
+                requestLoader: { _ in
+                    assessmentBoundDashboardLoads += 1
+                    guard assessmentBoundDashboardLoads == 1 else {
+                        throw NativeHealthTestFailure.failed(
+                            "invalid assessment must not start Dashboard convergence"
+                        )
+                    }
+                    return initialDashboardFixture
+                }
+            ),
+            stuckAssessmentClient: oversizedAssessmentClient,
+            dashboardCadence: assessmentBoundCadence
+        )
+        _ = assessmentBoundController.view
+        assessmentBoundCadence.fire()
+        let assessmentBoundViews = descendants(of: assessmentBoundController.view)
+        try require(
+            assessmentBoundDashboardLoads == 1
+                && assessmentBoundViews.contains(where: {
+                    $0.accessibilityIdentifier()
+                        == "flit.dashboard.monitoringUnavailable"
+                })
+                && assessmentBoundViews.contains(where: {
+                    $0.accessibilityIdentifier()
+                        == "flit.dashboard.run.run-dashboard-1"
+                }),
+            "oversized assessment must preserve Dashboard state and expose monitoring failure"
+        )
+        assessmentBoundController.stopMonitoring()
+        let appliedStillWorkingResponse = try JSONDecoder().decode(
+            FlitManagedRunStillWorkingResponse.self,
+            from: Data(
+                """
+                {
+                  "status":"applied",
+                  "protocol_version":"\(flitClientProtocolVersion)",
+                  "run_id":"run-dashboard-1",
+                  "previous_version":4,
+                  "event_id":"event-dashboard-still-working",
+                  "event_version":5,
+                  "occurrence_id":"occurrence-dashboard-action"
+                }
+                """.utf8
+            )
+        )
+        var monitoringOperations: [String] = []
+        var dashboardLoadStep = 0
+        var assessmentCallCount = 0
+        let manualCadence = ManualDashboardCadence()
+        let monitoringController = FoundationViewController(
+            client: client,
+            dashboardClient: DashboardClient(
+                requestLoader: { request in
+                    dashboardLoadStep += 1
+                    switch dashboardLoadStep {
+                    case 1:
+                        monitoringOperations.append("dashboard.initial")
+                        guard
+                            request.expectedCoreInstanceId == nil,
+                            request.afterCursor == nil
+                        else {
+                            throw NativeHealthTestFailure.failed(
+                                "monitoring must start from one exact Dashboard snapshot"
+                            )
+                        }
+                        return initialDashboardFixture
+                    case 2:
+                        monitoringOperations.append("dashboard.delta.3")
+                        guard
+                            request.expectedCoreInstanceId == "core-instance-1",
+                            request.afterCursor == 3
+                        else {
+                            throw NativeHealthTestFailure.failed(
+                                "monitoring must read after the accepted snapshot cursor"
+                            )
+                        }
+                        return stuckDeltaFixture
+                    case 3:
+                        monitoringOperations.append("dashboard.delta.failed")
+                        throw NativeHealthTestFailure.failed(
+                            "authoritative action convergence unavailable"
+                        )
+                    case 4:
+                        monitoringOperations.append("dashboard.delta.4")
+                        guard request.afterCursor == 4 else {
+                            throw NativeHealthTestFailure.failed(
+                                "retry convergence must preserve the stuck cursor"
+                            )
+                        }
+                        return clearedDeltaFixture
+                    default:
+                        throw NativeHealthTestFailure.failed(
+                            "monitoring fixture received an unbounded read"
+                        )
+                    }
+                }
+            ),
+            stuckAssessmentClient: StuckAssessmentClient(
+                fixtureLoader: { request in
+                    assessmentCallCount += 1
+                    monitoringOperations.append("assess")
+                    guard request.clientProtocolVersion == flitClientProtocolVersion else {
+                        throw NativeHealthTestFailure.failed(
+                            "assessment must submit only the generated protocol version"
+                        )
+                    }
+                    return stuckAssessmentFixture
+                }
+            ),
+            stillWorkingClient: StillWorkingClient(
+                fixtureLoader: { request in
+                    monitoringOperations.append("still-working")
+                    guard
+                        request.runId == "run-dashboard-1",
+                        request.expectedRunVersion == 4,
+                        request.occurrenceId == "occurrence-dashboard-action",
+                        request.clientProtocolVersion == flitClientProtocolVersion
+                    else {
+                        throw NativeHealthTestFailure.failed(
+                            "Still working must submit the exact visible Run occurrence"
+                        )
+                    }
+                    return appliedStillWorkingResponse
+                }
+            ),
+            dashboardCadence: manualCadence
+        )
+        _ = monitoringController.view
+        try require(
+            manualCadence.startCount == 1
+                && monitoringOperations == ["dashboard.initial"],
+            "ready Dashboard must start exactly one lifecycle-owned cadence"
+        )
+        manualCadence.fire()
+        try require(
+            Array(monitoringOperations.suffix(2)) == ["assess", "dashboard.delta.3"],
+            "each cadence tick must assess before authoritative Dashboard convergence"
+        )
+        guard
+            let stillWorkingButton = descendants(of: monitoringController.view).first(where: {
+                $0.accessibilityIdentifier()
+                    == "flit.dashboard.stillWorking.run-dashboard-1"
+            }) as? NSButton
+        else {
+            throw NativeHealthTestFailure.failed(
+                "exact active occurrence must expose one accessible Still working action"
+            )
+        }
+        stillWorkingButton.performClick(nil)
+        let failedActionViews = descendants(of: monitoringController.view)
+        try require(
+            failedActionViews.contains(where: {
+                $0.accessibilityIdentifier() == "flit.dashboard.monitoringUnavailable"
+            })
+                && failedActionViews.contains(where: {
+                    $0.accessibilityIdentifier()
+                        == "flit.dashboard.stillWorking.run-dashboard-1"
+                })
+                && failedActionViews.compactMap({ ($0 as? NSTextField)?.stringValue })
+                    .contains(FoundationCopy.text(.dashboardStillWorkingApplied)),
+            "applied action with failed convergence must retain the stuck card and show both facts"
+        )
+        manualCadence.fire()
+        let convergedActionViews = descendants(of: monitoringController.view)
+        try require(
+            assessmentCallCount == 2
+                && !convergedActionViews.contains(where: {
+                    $0.accessibilityIdentifier() == "flit.dashboard.monitoringUnavailable"
+                })
+                && !convergedActionViews.contains(where: {
+                    $0.accessibilityIdentifier()
+                        == "flit.dashboard.stillWorking.run-dashboard-1"
+                })
+                && convergedActionViews.contains(where: {
+                    $0.accessibilityIdentifier() == "flit.dashboard.run.run-dashboard-1"
+                }),
+            "a later authoritative clear must move the card without optimistic native mutation"
+        )
+        monitoringController.stopMonitoring()
+        manualCadence.fire()
+        try require(
+            manualCadence.stopCount == 1 && assessmentCallCount == 2,
+            "monitoring teardown must prevent every later scheduled tick"
+        )
+
+        let noChangeStuckDashboardClient = DashboardClient(
+            requestLoader: { request in
+                if request.expectedCoreInstanceId == nil {
+                    return possiblyStuckDashboardFixture
+                }
+                guard request.afterCursor == 4 else {
+                    throw NativeHealthTestFailure.failed(
+                        "stable action presentation must converge from the visible cursor"
+                    )
+                }
+                return try dashboardDeltaResponse(
+                    coreInstanceId: "core-instance-1",
+                    requestedAfterCursor: 4,
+                    nextCursor: 4,
+                    hasMore: false
+                )
+            }
+        )
+        let rejectedStillWorkingResponse = try JSONDecoder().decode(
+            FlitManagedRunStillWorkingResponse.self,
+            from: Data(
+                """
+                {
+                  "status":"rejected",
+                  "protocol_version":"\(flitClientProtocolVersion)",
+                  "run_id":"run-dashboard-stuck",
+                  "expected_run_version":4,
+                  "occurrence_id":"occurrence-dashboard-stuck-1",
+                  "reason":"process_unavailable"
+                }
+                """.utf8
+            )
+        )
+        let rejectedActionController = FoundationViewController(
+            client: client,
+            dashboardClient: noChangeStuckDashboardClient,
+            stillWorkingClient: StillWorkingClient(
+                fixtureLoader: { _ in rejectedStillWorkingResponse }
+            )
+        )
+        _ = rejectedActionController.view
+        guard
+            let rejectedAction = descendants(of: rejectedActionController.view).first(where: {
+                $0.accessibilityIdentifier()
+                    == "flit.dashboard.stillWorking.run-dashboard-stuck"
+            }) as? NSButton
+        else {
+            throw NativeHealthTestFailure.failed("rejected action fixture must expose its action")
+        }
+        rejectedAction.performClick(nil)
+        try require(
+            descendants(of: rejectedActionController.view)
+                .compactMap({ ($0 as? NSTextField)?.stringValue })
+                .contains(
+                    FoundationCopy.format(.dashboardStillWorkingRejected, "process_unavailable")
+                ),
+            "typed Still working rejection must remain visibly stable"
+        )
+        let unavailableActionController = FoundationViewController(
+            client: client,
+            dashboardClient: noChangeStuckDashboardClient,
+            stillWorkingClient: StillWorkingClient(
+                fixtureLoader: { _ in
+                    throw NativeHealthTestFailure.failed("action unavailable")
+                }
+            )
+        )
+        _ = unavailableActionController.view
+        guard
+            let unavailableAction = descendants(of: unavailableActionController.view).first(where: {
+                $0.accessibilityIdentifier()
+                    == "flit.dashboard.stillWorking.run-dashboard-stuck"
+            }) as? NSButton
+        else {
+            throw NativeHealthTestFailure.failed(
+                "unavailable action fixture must expose its action"
+            )
+        }
+        unavailableAction.performClick(nil)
+        try require(
+            descendants(of: unavailableActionController.view)
+                .compactMap({ ($0 as? NSTextField)?.stringValue })
+                .contains(FoundationCopy.text(.dashboardStillWorkingUnavailable)),
+            "transport-unavailable Still working action must remain visibly stable"
         )
         let detailController = FoundationViewController(
             client: client,

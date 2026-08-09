@@ -55,6 +55,48 @@ private final class RunChangeExternalOpenButton: NSButton {
     }
 }
 
+private struct StillWorkingActionIdentity: Equatable {
+    let runId: String
+    let runVersion: UInt64
+    let occurrenceId: String
+}
+
+private final class StillWorkingButton: NSButton {
+    let identity: StillWorkingActionIdentity
+
+    init(identity: StillWorkingActionIdentity) {
+        self.identity = identity
+        super.init(frame: .zero)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
+}
+
+private enum StillWorkingPresentationResult: Equatable {
+    case applied
+    case rejected(FlitManagedRunStillWorkingRejectedReason)
+    case unavailable
+
+    var copy: String {
+        switch self {
+        case .applied:
+            FoundationCopy.text(.dashboardStillWorkingApplied)
+        case let .rejected(reason):
+            FoundationCopy.format(.dashboardStillWorkingRejected, reason.rawValue)
+        case .unavailable:
+            FoundationCopy.text(.dashboardStillWorkingUnavailable)
+        }
+    }
+}
+
+private struct StillWorkingPresentation {
+    let identity: StillWorkingActionIdentity
+    let result: StillWorkingPresentationResult
+}
+
 private func dashboardChangesCopy(_ changes: FlitDashboardChangeSummary) -> String {
     switch changes {
     case let .available(attribution, files, insertions, deletions):
@@ -75,6 +117,9 @@ private func dashboardChangesCopy(_ changes: FlitDashboardChangeSummary) -> Stri
 final class FoundationViewController: NSViewController {
     private let client: SystemHealthClient
     private let dashboardClient: DashboardClient
+    private let stuckAssessmentClient: StuckAssessmentClient
+    private let stillWorkingClient: StillWorkingClient
+    private let dashboardCadence: any DashboardCadenceScheduling
     private let runDetailClient: RunDetailClient
     private let runChangesClient: RunChangesClient
     private let runChangeExternalOpenClient: RunChangeExternalOpenClient
@@ -85,6 +130,11 @@ final class FoundationViewController: NSViewController {
     private var foundationPanel: NSStackView?
     private var dashboardStack: NSStackView?
     private var dashboardScroll: NSScrollView?
+    private var dashboardIsVisible = true
+    private var monitoringStarted = false
+    private var monitoringTickInFlight = false
+    private var monitoringFailure = false
+    private var lastStillWorkingPresentation: StillWorkingPresentation?
     private var activeRunDetail: RunDetailPresentationState?
     private var activeRunTitle: String?
     private var activeRunCompletionSummary: RunCompletionSummary?
@@ -102,6 +152,10 @@ final class FoundationViewController: NSViewController {
     init(
         client: SystemHealthClient,
         dashboardClient: DashboardClient = DashboardClient(),
+        stuckAssessmentClient: StuckAssessmentClient = StuckAssessmentClient(),
+        stillWorkingClient: StillWorkingClient = StillWorkingClient(),
+        dashboardCadence: any DashboardCadenceScheduling =
+            DashboardCadenceFactory.makeDefault(),
         runDetailClient: RunDetailClient = RunDetailClient(),
         runChangesClient: RunChangesClient = RunChangesClient(),
         runChangeExternalOpenClient: RunChangeExternalOpenClient =
@@ -109,6 +163,9 @@ final class FoundationViewController: NSViewController {
     ) {
         self.client = client
         self.dashboardClient = dashboardClient
+        self.stuckAssessmentClient = stuckAssessmentClient
+        self.stillWorkingClient = stillWorkingClient
+        self.dashboardCadence = dashboardCadence
         self.runDetailClient = runDetailClient
         self.runChangesClient = runChangesClient
         self.runChangeExternalOpenClient = runChangeExternalOpenClient
@@ -277,9 +334,41 @@ final class FoundationViewController: NSViewController {
     private func loadDashboard() {
         do {
             try dashboardState.apply(dashboardClient.loadInitial())
+            dashboardIsVisible = true
+            monitoringFailure = false
             renderDashboard()
+            startMonitoring()
         } catch {
             renderDashboardFailure(FoundationCopy.text(.dashboardUnavailable))
+        }
+    }
+
+    private func startMonitoring() {
+        guard !monitoringStarted else { return }
+        monitoringStarted = true
+        dashboardCadence.start { [weak self] in
+            self?.performMonitoringTick()
+        }
+    }
+
+    func stopMonitoring() {
+        dashboardCadence.stop()
+        monitoringStarted = false
+    }
+
+    private func performMonitoringTick() {
+        guard state == .ready, !monitoringTickInFlight else { return }
+        monitoringTickInFlight = true
+        defer { monitoringTickInFlight = false }
+        do {
+            try stuckAssessmentClient.assess()
+            dashboardState = try dashboardClient.convergedState(from: dashboardState)
+            monitoringFailure = false
+        } catch {
+            monitoringFailure = true
+        }
+        if dashboardIsVisible {
+            renderDashboard()
         }
     }
 
@@ -288,6 +377,28 @@ final class FoundationViewController: NSViewController {
         dashboardStack.arrangedSubviews.forEach { view in
             dashboardStack.removeArrangedSubview(view)
             view.removeFromSuperview()
+        }
+        if monitoringFailure {
+            let failure = label(
+                FoundationCopy.text(.dashboardMonitoringUnavailable),
+                size: 12,
+                weight: .semibold,
+                color: .systemRed
+            )
+            identify(failure, as: "flit.dashboard.monitoringUnavailable")
+            dashboardStack.addArrangedSubview(failure)
+        }
+        if let presentation = lastStillWorkingPresentation {
+            let result = label(
+                presentation.result.copy,
+                size: 12,
+                weight: .semibold,
+                color: presentation.result == .applied
+                    ? .secondaryLabelColor
+                    : .systemRed
+            )
+            identify(result, as: "flit.dashboard.stillWorking.result")
+            dashboardStack.addArrangedSubview(result)
         }
         for section in DashboardSection.allCases {
             let heading = label(section.title, size: 14, weight: .semibold)
@@ -372,6 +483,24 @@ final class FoundationViewController: NSViewController {
                 color: .secondaryLabelColor
             )
         )
+        if let occurrenceId = run.activeStuckOccurrenceId {
+            let identity = StillWorkingActionIdentity(
+                runId: run.runId,
+                runVersion: run.version,
+                occurrenceId: occurrenceId
+            )
+            let stillWorking = StillWorkingButton(identity: identity)
+            stillWorking.title = FoundationCopy.text(.dashboardStillWorking)
+            stillWorking.bezelStyle = .inline
+            stillWorking.target = self
+            stillWorking.action = #selector(confirmStillWorking(_:))
+            stillWorking.isEnabled = !(
+                lastStillWorkingPresentation?.identity == identity
+                    && lastStillWorkingPresentation?.result == .applied
+            )
+            identify(stillWorking, as: "flit.dashboard.stillWorking.\(run.runId)")
+            card.addArrangedSubview(stillWorking)
+        }
         let detail = RunDetailButton(run: run)
         detail.title = FoundationCopy.text(.dashboardViewActivity)
         detail.bezelStyle = .inline
@@ -382,7 +511,42 @@ final class FoundationViewController: NSViewController {
         return card
     }
 
+    @objc private func confirmStillWorking(_ sender: StillWorkingButton) {
+        let identity = sender.identity
+        let result: StillWorkingPresentationResult
+        do {
+            let response = try stillWorkingClient.submit(
+                runId: identity.runId,
+                expectedRunVersion: identity.runVersion,
+                occurrenceId: identity.occurrenceId
+            )
+            switch response.status {
+            case .applied:
+                result = .applied
+            case .rejected:
+                guard let reason = response.reason else {
+                    throw StuckMonitoringClientError.invalidResponse
+                }
+                result = .rejected(reason)
+            }
+        } catch {
+            result = .unavailable
+        }
+        lastStillWorkingPresentation = StillWorkingPresentation(
+            identity: identity,
+            result: result
+        )
+        do {
+            dashboardState = try dashboardClient.convergedState(from: dashboardState)
+            monitoringFailure = false
+        } catch {
+            monitoringFailure = true
+        }
+        renderDashboard()
+    }
+
     @objc private func showRunDetail(_ sender: RunDetailButton) {
+        dashboardIsVisible = false
         activeRunDetailFilter = .all
         activeRunDetailPageFailure = false
         activeRunChangesFirstPageFailure = false
@@ -440,6 +604,7 @@ final class FoundationViewController: NSViewController {
     }
 
     @objc private func showDashboard(_: NSButton) {
+        dashboardIsVisible = true
         activeRunDetail = nil
         activeRunTitle = nil
         activeRunCompletionSummary = nil

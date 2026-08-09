@@ -47,6 +47,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         false
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        (windowController?.window?.contentViewController as? FoundationViewController)?
+            .stopMonitoring()
+    }
+
     func applicationShouldTerminate(
         _ sender: NSApplication
     ) -> NSApplication.TerminateReply {
