@@ -16,8 +16,8 @@ use flit_store::{
     AppendEventOutcome, DashboardChangeSummary, InitialManagedSessionConnection,
     InitialManagedSessionOutcome, MAX_DASHBOARD_PROJECTION_SOURCE_BYTES, MAX_LIVE_MANAGED_SESSIONS,
     MAX_MANAGED_GIT_CHANGE_PAGE_SIZE, MAX_MANAGED_GIT_CHANGE_PAGE_SOURCE_BYTES,
-    ManagedGitChangeAttribution, ManagedGitChangeSet, ManagedGitChangeSummary,
-    ManagedGitFileChange, ManagedGitFileStatus, ManagedGitProjectScope,
+    MAX_MANAGED_STUCK_ASSESSMENT_RUNS, ManagedGitChangeAttribution, ManagedGitChangeSet,
+    ManagedGitChangeSummary, ManagedGitFileChange, ManagedGitFileStatus, ManagedGitProjectScope,
     ManagedGitRepositoryIdentity, ManagedPermissionDecision,
     ManagedPermissionDeliveryUnknownReason, ManagedPermissionResolutionKind,
     ManagedPermissionResponseAttempt, ManagedPermissionResponseAttemptOutcome,
@@ -27,8 +27,9 @@ use flit_store::{
     ManagedRunIntent, ManagedRunIntentOutcome, ManagedRunStartFailure,
     ManagedRunStartFailureOutcome, ManagedSessionReconciliation,
     ManagedSessionReconciliationOutcome, ManagedSessionTermination,
-    ManagedSessionTerminationOutcome, ManagedStuckAssessment, ManagedStuckTransition,
-    ManagedStuckTransitionOutcome, ManagedTurnTerminalOutcome, ProjectDirectoryInspection,
+    ManagedSessionTerminationOutcome, ManagedStuckActivity, ManagedStuckAssessment,
+    ManagedStuckLifecycle, ManagedStuckTransition, ManagedStuckTransitionOutcome,
+    ManagedStuckWaitKind, ManagedTurnTerminalOutcome, ProjectDirectoryInspection,
     ProjectRegistration, ProjectTrustConfirmation, Store, StoreError,
 };
 use rusqlite::{Connection, params};
@@ -40,6 +41,296 @@ const STARTED_AT: &str = "2026-07-24T10:00:01Z";
 const ENDED_AT: &str = "2026-07-24T10:05:00Z";
 const CHANGE_INSIDE_ID: &str = "11111111111111111111111111111111";
 const CHANGE_OUTSIDE_ID: &str = "22222222222222222222222222222222";
+
+#[test]
+fn stuck_assessment_contexts_are_bounded_exact_read_only_and_reopen() {
+    let directory = TestDirectory::new("stuck-assessment-contexts");
+    let (mut store, database, project_path) = trusted_store(&directory);
+    for run_id in [
+        "run-context-a-starting",
+        "run-context-b-blocked",
+        "run-context-c-stuck",
+    ] {
+        store
+            .create_managed_run_intent(run_intent(
+                run_id,
+                &format!("event-{run_id}-created"),
+                &format!("event-{run_id}-start-requested"),
+            ))
+            .expect("managed Run");
+    }
+    for (run_id, session_id, thread_id) in [
+        (
+            "run-context-b-blocked",
+            "session-context-b",
+            "thread-context-b",
+        ),
+        (
+            "run-context-c-stuck",
+            "session-context-c",
+            "thread-context-c",
+        ),
+    ] {
+        store
+            .connect_initial_managed_session(session_connection(
+                session_id,
+                run_id,
+                thread_id,
+                &project_path,
+            ))
+            .expect("managed session");
+    }
+    store
+        .append_managed_provider_observation(ManagedProviderObservation {
+            run_id: "run-context-b-blocked".to_owned(),
+            session_id: "session-context-b".to_owned(),
+            external_session_key: "thread-context-b".to_owned(),
+            provider_turn_id: "turn-context-b".to_owned(),
+            contract_version: "codex-app-server/0.145.0".to_owned(),
+            event_id: "event-context-b-permission".to_owned(),
+            observed_at: "2026-07-24T10:00:02Z".to_owned(),
+            kind: ManagedProviderObservationKind::PermissionRequested {
+                request_id: "request-context-b".to_owned(),
+                provider_request_id: 41,
+                provider_item_id: "permission-context-b".to_owned(),
+                provider_started_at_ms: 42,
+            },
+        })
+        .expect("blocking request");
+    let run_c_version = store
+        .run_snapshot("run-context-c-stuck")
+        .expect("Run C snapshot")
+        .expect("Run C projection")
+        .version;
+    let stuck_version = match store
+        .append_managed_stuck_transition(ManagedStuckTransition {
+            run_id: "run-context-c-stuck".to_owned(),
+            expected_run_version: run_c_version,
+            event_id: "event-context-c-stuck".to_owned(),
+            observed_at: "2026-07-24T10:02:10Z".to_owned(),
+            assessment: ManagedStuckAssessment::PossiblyStuck(PossiblyStuckPayload {
+                occurrence_id: "occurrence-context-c".to_owned(),
+                cause: StuckCauseCode::Unknown,
+                threshold_seconds: 120,
+                progress_event_id: "event-run-context-c-stuck-created".to_owned(),
+                progress_observed_at: CREATED_AT.to_owned(),
+                progress_monotonic_ms: 5_000,
+                baseline_monotonic_ms: 5_000,
+                stuck_since_monotonic_ms: 125_000,
+                process: StuckProcessReceipt::Alive {
+                    generation: "process-generation-context-c".to_owned(),
+                    observed_monotonic_ms: 130_000,
+                },
+                evidence_unavailable_reason: "raw_provider_content_not_retained".to_owned(),
+            }),
+        })
+        .expect("stuck occurrence")
+    {
+        ManagedStuckTransitionOutcome::Appended(event) => event.ingest_seq,
+        other => panic!("unexpected stuck context transition: {other:?}"),
+    };
+    store
+        .create_managed_run_intent(run_intent(
+            "run-context-d-terminal",
+            "event-context-d-created",
+            "event-context-d-start-requested",
+        ))
+        .expect("terminal candidate");
+    store
+        .fail_managed_run_start(start_failure(
+            "run-context-d-terminal",
+            "event-context-d-failed",
+        ))
+        .expect("terminal Run");
+    store
+        .create_managed_run_intent(run_intent(
+            "run-context-e-replay-terminal",
+            "event-context-e-created",
+            "event-context-e-start-requested",
+        ))
+        .expect("replay-terminal candidate");
+    store
+        .connect_initial_managed_session(session_connection(
+            "session-context-e",
+            "run-context-e-replay-terminal",
+            "thread-context-e",
+            &project_path,
+        ))
+        .expect("replay-terminal session");
+    store
+        .append_event(session_event(
+            "event-context-e-completed",
+            "run-context-e-replay-terminal",
+            "session-context-e",
+            2,
+            "run.completed",
+        ))
+        .expect("generic replay terminal");
+    assert_eq!(
+        store
+            .managed_run("run-context-e-replay-terminal")
+            .expect("replay-terminal Run")
+            .expect("replay-terminal row")
+            .ended_at,
+        None
+    );
+    let connection = Connection::open(&database).expect("stale active row connection");
+    connection
+        .execute(
+            "UPDATE runs SET ended_at = ?1 WHERE id = 'run-context-a-starting'",
+            [ENDED_AT],
+        )
+        .expect("install stale active row terminal marker");
+    drop(connection);
+
+    let cursor = store.latest_ingest_seq().expect("assessment cursor");
+    let contexts = store
+        .managed_stuck_assessment_contexts()
+        .expect("assessment contexts");
+    assert_eq!(
+        contexts
+            .iter()
+            .map(|context| context.run_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "run-context-a-starting",
+            "run-context-b-blocked",
+            "run-context-c-stuck"
+        ]
+    );
+    assert_eq!(contexts[0].lifecycle, ManagedStuckLifecycle::Starting);
+    assert_eq!(contexts[0].activity, ManagedStuckActivity::Unknown);
+    assert_eq!(contexts[0].version, 3);
+    assert_eq!(
+        contexts[0].progress_event_id,
+        "event-run-context-a-starting-created"
+    );
+    assert_eq!(contexts[0].progress_observed_at, CREATED_AT);
+    assert_eq!(contexts[0].active_occurrence_id, None);
+    assert_eq!(contexts[1].lifecycle, ManagedStuckLifecycle::Running);
+    assert_eq!(contexts[1].activity, ManagedStuckActivity::Waiting);
+    assert_eq!(
+        contexts[1].wait_kind,
+        Some(ManagedStuckWaitKind::BlockingRequest)
+    );
+    assert!(contexts[1].has_open_blocking_request);
+    assert_eq!(contexts[1].active_occurrence_id, None);
+    assert_eq!(contexts[2].lifecycle, ManagedStuckLifecycle::Running);
+    assert_eq!(contexts[2].activity, ManagedStuckActivity::Unknown);
+    assert_eq!(contexts[2].version, stuck_version);
+    assert_eq!(
+        contexts[2].active_occurrence_id.as_deref(),
+        Some("occurrence-context-c")
+    );
+    assert_eq!(store.latest_ingest_seq().expect("unchanged cursor"), cursor);
+
+    drop(store);
+    let reopened = Store::open(&database, "2026-07-24T10:10:00Z").expect("reopen Store");
+    assert_eq!(
+        reopened
+            .managed_stuck_assessment_contexts()
+            .expect("reopened contexts"),
+        contexts
+    );
+}
+
+#[test]
+fn stuck_assessment_contexts_reject_oversized_sets_and_partial_corrupt_replay() {
+    let directory = TestDirectory::new("stuck-assessment-context-bounds");
+    let (mut store, database, _project_path) = trusted_store(&directory);
+    for index in 0..MAX_MANAGED_STUCK_ASSESSMENT_RUNS {
+        store
+            .create_managed_run_intent(run_intent(
+                &format!("run-context-bound-{index:03}"),
+                &format!("event-context-bound-{index:03}-created"),
+                &format!("event-context-bound-{index:03}-requested"),
+            ))
+            .expect("bounded managed Run");
+    }
+    store
+        .create_managed_run_intent(run_intent(
+            "run-context-bound-terminal",
+            "event-context-bound-terminal-created",
+            "event-context-bound-terminal-requested",
+        ))
+        .expect("replay-terminal bounded Run");
+    let project_path = store
+        .project("project-1")
+        .expect("bounded Project")
+        .expect("bounded Project row")
+        .canonical_path;
+    store
+        .connect_initial_managed_session(session_connection(
+            "session-context-bound-terminal",
+            "run-context-bound-terminal",
+            "thread-context-bound-terminal",
+            &project_path,
+        ))
+        .expect("bounded terminal session");
+    store
+        .append_event(session_event(
+            "event-context-bound-terminal-completed",
+            "run-context-bound-terminal",
+            "session-context-bound-terminal",
+            2,
+            "run.completed",
+        ))
+        .expect("bounded generic terminal");
+    let bounded = store
+        .managed_stuck_assessment_contexts()
+        .expect("exactly bounded active contexts");
+    assert_eq!(bounded.len(), MAX_MANAGED_STUCK_ASSESSMENT_RUNS);
+    assert!(
+        bounded
+            .iter()
+            .all(|context| context.run_id != "run-context-bound-terminal")
+    );
+    let cursor = store.latest_ingest_seq().expect("bounded cursor");
+    let connection = Connection::open(&database).expect("assessment corruption connection");
+    connection
+        .execute(
+            "UPDATE events SET event_type = 'corrupt.created' WHERE event_id = 'event-context-bound-099-created'",
+            [],
+        )
+        .expect("corrupt last ordered Run");
+    drop(connection);
+
+    assert!(matches!(
+        store.managed_stuck_assessment_contexts(),
+        Err(StoreError::DashboardProjection { run_id, .. })
+            if run_id == "run-context-bound-099"
+    ));
+    assert_eq!(store.latest_ingest_seq().expect("corrupt cursor"), cursor);
+
+    let connection = Connection::open(&database).expect("assessment repair connection");
+    connection
+        .execute(
+            "UPDATE events SET event_type = 'run.created' WHERE event_id = 'event-context-bound-099-created'",
+            [],
+        )
+        .expect("restore last ordered Run");
+    drop(connection);
+    store
+        .create_managed_run_intent(run_intent(
+            "run-context-bound-overflow",
+            "event-context-bound-overflow-created",
+            "event-context-bound-overflow-requested",
+        ))
+        .expect("overflow managed Run");
+    let overflow_cursor = store.latest_ingest_seq().expect("overflow cursor");
+    assert!(matches!(
+        store.managed_stuck_assessment_contexts(),
+        Err(StoreError::ManagedStuckAssessmentRunLimitExceeded { count, max })
+            if count == MAX_MANAGED_STUCK_ASSESSMENT_RUNS + 1
+                && max == MAX_MANAGED_STUCK_ASSESSMENT_RUNS
+    ));
+    assert_eq!(
+        store
+            .latest_ingest_seq()
+            .expect("unchanged overflow cursor"),
+        overflow_cursor
+    );
+}
 
 struct TestDirectory(PathBuf);
 

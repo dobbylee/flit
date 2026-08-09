@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use flit_core::activity::WaitKind as CoreWaitKind;
 use flit_core::projection::{
     ChangeAttribution as CoreChangeAttribution, ChangeSummary as CoreChangeSummary,
     ProjectionError, ProjectionEvent, replay_dashboard_projection,
@@ -31,19 +32,21 @@ pub use managed_runs::{
     InitialManagedSessionConnection, InitialManagedSessionOutcome, MANAGED_PROVIDER_KIND_CODEX,
     MAX_LIVE_MANAGED_SESSIONS, MAX_MANAGED_GIT_CHANGE_ENTRIES, MAX_MANAGED_GIT_DISPLAY_PATH_BYTES,
     MAX_MANAGED_GIT_PATH_BYTES, MAX_MANAGED_METADATA_JSON_BYTES, MAX_MANAGED_METADATA_JSON_DEPTH,
-    MAX_MANAGED_METADATA_JSON_VALUES, ManagedGitChangeAttribution, ManagedGitChangeSet,
-    ManagedGitChangeSetMetadata, ManagedGitChangeSummary, ManagedGitFileChange,
-    ManagedGitFileStatus, ManagedGitProjectScope, ManagedGitRepositoryIdentity,
-    ManagedPermissionDecision, ManagedPermissionDeliveryUnknownReason,
-    ManagedPermissionResolutionKind, ManagedPermissionResponseAttempt,
-    ManagedPermissionResponseAttemptOutcome, ManagedPermissionResponseResult,
-    ManagedPermissionResponseResultKind, ManagedProviderDecision, ManagedProviderObservation,
-    ManagedProviderObservationKind, ManagedProviderOutcome, ManagedProviderOutcomeCommit,
-    ManagedProviderTerminalOutcome, ManagedReconciliationState, ManagedRun, ManagedRunIntent,
-    ManagedRunIntentOutcome, ManagedRunStartFailure, ManagedRunStartFailureOutcome, ManagedSession,
-    ManagedSessionReconciliation, ManagedSessionReconciliationOutcome, ManagedSessionTermination,
-    ManagedSessionTerminationOutcome, ManagedStuckAssessment, ManagedStuckTransition,
-    ManagedStuckTransitionOutcome, ManagedTurnTerminalOutcome,
+    MAX_MANAGED_METADATA_JSON_VALUES, MAX_MANAGED_STUCK_ASSESSMENT_RUNS,
+    ManagedGitChangeAttribution, ManagedGitChangeSet, ManagedGitChangeSetMetadata,
+    ManagedGitChangeSummary, ManagedGitFileChange, ManagedGitFileStatus, ManagedGitProjectScope,
+    ManagedGitRepositoryIdentity, ManagedPermissionDecision,
+    ManagedPermissionDeliveryUnknownReason, ManagedPermissionResolutionKind,
+    ManagedPermissionResponseAttempt, ManagedPermissionResponseAttemptOutcome,
+    ManagedPermissionResponseResult, ManagedPermissionResponseResultKind, ManagedProviderDecision,
+    ManagedProviderObservation, ManagedProviderObservationKind, ManagedProviderOutcome,
+    ManagedProviderOutcomeCommit, ManagedProviderTerminalOutcome, ManagedReconciliationState,
+    ManagedRun, ManagedRunIntent, ManagedRunIntentOutcome, ManagedRunStartFailure,
+    ManagedRunStartFailureOutcome, ManagedSession, ManagedSessionReconciliation,
+    ManagedSessionReconciliationOutcome, ManagedSessionTermination,
+    ManagedSessionTerminationOutcome, ManagedStuckActivity, ManagedStuckAssessment,
+    ManagedStuckAssessmentContext, ManagedStuckLifecycle, ManagedStuckTransition,
+    ManagedStuckTransitionOutcome, ManagedStuckWaitKind, ManagedTurnTerminalOutcome,
 };
 pub use projects::{
     MAX_PROJECT_PAGE_SIZE, Project, ProjectDirectoryInspection, ProjectIdentity,
@@ -395,6 +398,97 @@ pub struct ManagedGitChangePage {
 }
 
 impl Store {
+    pub fn managed_stuck_assessment_contexts(
+        &self,
+    ) -> Result<Vec<ManagedStuckAssessmentContext>, StoreError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT run_id
+                 FROM run_snapshots
+                 WHERE lifecycle IN ('Starting', 'Running')
+                 ORDER BY run_id
+                 LIMIT ?1",
+            )
+            .map_err(StoreError::Sqlite)?;
+        let run_ids = statement
+            .query_map([MAX_MANAGED_STUCK_ASSESSMENT_RUNS as i64 + 1], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(StoreError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::Sqlite)?;
+        drop(statement);
+        if run_ids.len() > MAX_MANAGED_STUCK_ASSESSMENT_RUNS {
+            return Err(StoreError::ManagedStuckAssessmentRunLimitExceeded {
+                count: run_ids.len(),
+                max: MAX_MANAGED_STUCK_ASSESSMENT_RUNS,
+            });
+        }
+
+        run_ids
+            .into_iter()
+            .map(|run_id| {
+                let events = load_run_event_history(&self.connection, &run_id)?;
+                let projection = replay_dashboard_projection(&events).map_err(|source| {
+                    StoreError::DashboardProjection {
+                        run_id: run_id.clone(),
+                        source,
+                    }
+                })?;
+                let lifecycle = match projection.lifecycle.as_str() {
+                    "Starting" => ManagedStuckLifecycle::Starting,
+                    "Running" => ManagedStuckLifecycle::Running,
+                    _ => {
+                        return Err(StoreError::ManagedStuckAssessmentContextInvalid {
+                            run_id,
+                            field: "lifecycle",
+                        });
+                    }
+                };
+                let activity = match projection.activity.as_str() {
+                    "Planning" => ManagedStuckActivity::Planning,
+                    "Reading" => ManagedStuckActivity::Reading,
+                    "Editing" => ManagedStuckActivity::Editing,
+                    "Testing" => ManagedStuckActivity::Testing,
+                    "Building" => ManagedStuckActivity::Building,
+                    "Reviewing" => ManagedStuckActivity::Reviewing,
+                    "Waiting" => ManagedStuckActivity::Waiting,
+                    "Unknown" => ManagedStuckActivity::Unknown,
+                    _ => {
+                        return Err(StoreError::ManagedStuckAssessmentContextInvalid {
+                            run_id,
+                            field: "activity",
+                        });
+                    }
+                };
+                let wait_kind = projection.activity_wait_kind.map(|kind| match kind {
+                    CoreWaitKind::BlockingRequest => ManagedStuckWaitKind::BlockingRequest,
+                    CoreWaitKind::External => ManagedStuckWaitKind::External,
+                    CoreWaitKind::Service => ManagedStuckWaitKind::Service,
+                    CoreWaitKind::Unstructured => ManagedStuckWaitKind::Unstructured,
+                });
+                let progress_observed_at = projection.last_progress_at.ok_or_else(|| {
+                    StoreError::ManagedStuckAssessmentContextInvalid {
+                        run_id: run_id.clone(),
+                        field: "progress_observed_at",
+                    }
+                })?;
+                Ok(ManagedStuckAssessmentContext {
+                    run_id,
+                    version: projection.version,
+                    lifecycle,
+                    activity,
+                    wait_kind,
+                    has_open_blocking_request: projection.has_active_blocking_request,
+                    progress_event_id: projection.last_progress_event_id,
+                    progress_observed_at,
+                    active_occurrence_id: projection.current_stuck_occurrence_id,
+                })
+            })
+            .collect()
+    }
+
     pub fn append_managed_stuck_transition(
         &mut self,
         transition: ManagedStuckTransition,
@@ -6174,6 +6268,14 @@ pub enum StoreError {
     InvalidManagedStuckTransition {
         field: &'static str,
     },
+    ManagedStuckAssessmentRunLimitExceeded {
+        count: usize,
+        max: usize,
+    },
+    ManagedStuckAssessmentContextInvalid {
+        run_id: String,
+        field: &'static str,
+    },
     ManagedStuckRunVersionStale {
         run_id: String,
         expected: u64,
@@ -6540,6 +6642,14 @@ impl fmt::Display for StoreError {
             Self::InvalidManagedStuckTransition { field } => {
                 write!(formatter, "invalid managed stuck transition field: {field}")
             }
+            Self::ManagedStuckAssessmentRunLimitExceeded { count, max } => write!(
+                formatter,
+                "managed stuck assessment active Run count {count} exceeds {max}"
+            ),
+            Self::ManagedStuckAssessmentContextInvalid { run_id, field } => write!(
+                formatter,
+                "managed stuck assessment context for Run {run_id} has invalid {field}"
+            ),
             Self::ManagedStuckRunVersionStale {
                 run_id,
                 expected,

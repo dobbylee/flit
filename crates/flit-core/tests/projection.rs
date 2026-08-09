@@ -1,6 +1,9 @@
-use flit_core::projection::{
-    CHANGES_UNAVAILABLE_REASON, ChangeAttribution, ChangeSummary, ProjectionError, ProjectionEvent,
-    replay_dashboard_projection,
+use flit_core::{
+    activity::WaitKind,
+    projection::{
+        CHANGES_UNAVAILABLE_REASON, ChangeAttribution, ChangeSummary, ProjectionError,
+        ProjectionEvent, replay_dashboard_projection,
+    },
 };
 use serde_json::{Map, Value, json};
 
@@ -78,6 +81,10 @@ fn explicit_stuck_transitions_own_dashboard_and_attention_replay() {
     assert_eq!(stuck.dashboard_bucket, "PossiblyStuck");
     assert_eq!(stuck.attention_level, "Informational");
     assert_eq!(stuck.attention_open_count, 1);
+    assert_eq!(
+        stuck.current_stuck_occurrence_id.as_deref(),
+        Some("occurrence-1")
+    );
     assert_eq!(
         stuck.last_liveness_at.as_deref(),
         Some(base[2].observed_at.as_str())
@@ -328,6 +335,8 @@ fn managed_history_replays_lifecycle_activity_attention_and_unavailable_changes(
     assert_eq!(unknown.lifecycle, "Running");
     assert_eq!(unknown.activity, "Waiting");
     assert_eq!(unknown.activity_confidence, 0.95);
+    assert_eq!(unknown.activity_wait_kind, Some(WaitKind::BlockingRequest));
+    assert!(unknown.has_active_blocking_request);
     assert_eq!(unknown.attention_level, "ActionRequired");
     assert_eq!(unknown.attention_open_count, 1);
     assert_eq!(unknown.dashboard_bucket, "NeedsAttention");
@@ -352,6 +361,7 @@ fn managed_history_replays_lifecycle_activity_attention_and_unavailable_changes(
     let resolved = replay_dashboard_projection(&events).expect("resolved projection");
     assert_eq!(resolved.attention_level, "None");
     assert_eq!(resolved.attention_open_count, 0);
+    assert!(!resolved.has_active_blocking_request);
     assert_eq!(resolved.dashboard_bucket, "Working");
 
     events.push(event(

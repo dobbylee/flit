@@ -15,6 +15,7 @@ pub const MAX_MANAGED_METADATA_JSON_BYTES: usize = 256 * 1024;
 pub const MAX_MANAGED_METADATA_JSON_DEPTH: usize = 32;
 pub const MAX_MANAGED_METADATA_JSON_VALUES: usize = 4_096;
 pub const MAX_LIVE_MANAGED_SESSIONS: usize = 100;
+pub const MAX_MANAGED_STUCK_ASSESSMENT_RUNS: usize = 100;
 const MAX_MANAGED_ID_BYTES: usize = 256;
 const MAX_MANAGED_TITLE_BYTES: usize = 4 * 1024;
 const MAX_MANAGED_GOAL_BYTES: usize = 64 * 1024;
@@ -69,6 +70,45 @@ pub struct ManagedStuckTransition {
     pub event_id: String,
     pub observed_at: String,
     pub assessment: ManagedStuckAssessment,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedStuckLifecycle {
+    Starting,
+    Running,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedStuckActivity {
+    Planning,
+    Reading,
+    Editing,
+    Testing,
+    Building,
+    Reviewing,
+    Waiting,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedStuckWaitKind {
+    BlockingRequest,
+    External,
+    Service,
+    Unstructured,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedStuckAssessmentContext {
+    pub run_id: String,
+    pub version: u64,
+    pub lifecycle: ManagedStuckLifecycle,
+    pub activity: ManagedStuckActivity,
+    pub wait_kind: Option<ManagedStuckWaitKind>,
+    pub has_open_blocking_request: bool,
+    pub progress_event_id: String,
+    pub progress_observed_at: String,
+    pub active_occurrence_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

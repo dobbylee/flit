@@ -76,12 +76,15 @@ pub struct DashboardProjection {
     pub lifecycle: String,
     pub activity: String,
     pub activity_confidence: f64,
+    pub activity_wait_kind: Option<WaitKind>,
+    pub has_active_blocking_request: bool,
     pub attention_level: String,
     pub attention_open_count: u64,
     pub dashboard_bucket: String,
     pub last_progress_at: Option<String>,
     pub last_progress_event_id: String,
     pub last_liveness_at: Option<String>,
+    pub current_stuck_occurrence_id: Option<String>,
     pub changes: ChangeSummary,
     pub updated_at: String,
 }
@@ -233,6 +236,8 @@ pub fn replay_dashboard_projection(
         activity_confidence: activity
             .confidence()
             .map_or(0.0, |confidence| f64::from(confidence.as_milli()) / 1_000.0),
+        activity_wait_kind: activity.wait_kind(),
+        has_active_blocking_request: attention.has_active_blocking_request(),
         attention_level,
         attention_open_count,
         dashboard_bucket: bucket_name(dashboard_bucket(&lifecycle, &attention, &stuck_assessment))
@@ -240,6 +245,7 @@ pub fn replay_dashboard_projection(
         last_progress_at,
         last_progress_event_id: activity.last_progress().evidence_id().as_str().to_owned(),
         last_liveness_at,
+        current_stuck_occurrence_id: stuck_occurrence_id,
         changes,
         updated_at: last.observed_at.clone(),
     })
