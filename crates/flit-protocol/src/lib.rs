@@ -4,8 +4,8 @@ use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: &str = "1.20";
-pub const EVENT_PROTOCOL_VERSION: &str = "1.3";
+pub const PROTOCOL_VERSION: &str = "1.21";
+pub const EVENT_PROTOCOL_VERSION: &str = "1.4";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 #[must_use]
@@ -925,6 +925,45 @@ pub struct ManagedRunsAssessStuckResponse {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRunStillWorkingRequest {
+    pub run_id: String,
+    pub expected_run_version: u64,
+    pub occurrence_id: String,
+    pub client_protocol_version: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedRunStillWorkingRejectedReason {
+    RunVersionStale,
+    OccurrenceMismatch,
+    NotCurrentlyStuck,
+    ProcessUnavailable,
+    AlreadyApplied,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ManagedRunStillWorkingResponse {
+    Applied {
+        protocol_version: String,
+        run_id: String,
+        previous_version: u64,
+        event_id: String,
+        event_version: u64,
+        occurrence_id: String,
+    },
+    Rejected {
+        protocol_version: String,
+        run_id: String,
+        expected_run_version: u64,
+        occurrence_id: String,
+        reason: ManagedRunStillWorkingRejectedReason,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ManagedRunObserveResponse {
     PermissionRequested {
@@ -1081,6 +1120,8 @@ pub enum EventProtocolVersion {
     V1_2,
     #[serde(rename = "1.3")]
     V1_3,
+    #[serde(rename = "1.4")]
+    V1_4,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1154,6 +1195,36 @@ pub struct StuckClearedPayload {
     pub reason: StuckClearReasonCode,
     pub process: StuckProcessReceipt,
     pub evidence_unavailable_reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StillWorkingPayload {
+    pub occurrence_id: String,
+    pub progress_event_id: String,
+    #[serde(deserialize_with = "deserialize_json_safe_u64")]
+    pub reset_monotonic_ms: u64,
+    #[serde(deserialize_with = "deserialize_json_safe_u64")]
+    pub notification_suppressed_until_monotonic_ms: u64,
+    pub process: StuckProcessReceipt,
+    pub evidence_unavailable_reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StuckNotificationDuePayload {
+    pub occurrence_id: String,
+    #[serde(deserialize_with = "deserialize_json_safe_u64")]
+    pub due_at_monotonic_ms: u64,
+    pub process: StuckProcessReceipt,
+    pub evidence_unavailable_reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StuckNotificationDeliveredPayload {
+    pub occurrence_id: String,
+    pub platform_id: String,
 }
 
 fn deserialize_json_safe_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
@@ -2599,6 +2670,117 @@ struct FlitManagedRunsAssessStuckResponse: Codable, Equatable, Sendable {
         case transitionsAppended = "transitions_appended"
         case unchangedRuns = "unchanged_runs"
         case unavailableRuns = "unavailable_runs"
+    }
+}
+
+struct FlitManagedRunStillWorkingRequest: Codable, Equatable, Sendable {
+    let runId: String
+    let expectedRunVersion: UInt64
+    let occurrenceId: String
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case runId = "run_id"
+        case expectedRunVersion = "expected_run_version"
+        case occurrenceId = "occurrence_id"
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+enum FlitManagedRunStillWorkingStatus: String, Codable, Sendable {
+    case applied
+    case rejected
+}
+
+enum FlitManagedRunStillWorkingRejectedReason: String, Codable, Sendable {
+    case runVersionStale = "run_version_stale"
+    case occurrenceMismatch = "occurrence_mismatch"
+    case notCurrentlyStuck = "not_currently_stuck"
+    case processUnavailable = "process_unavailable"
+    case alreadyApplied = "already_applied"
+}
+
+struct FlitManagedRunStillWorkingResponse: Codable, Equatable, Sendable {
+    let status: FlitManagedRunStillWorkingStatus
+    let protocolVersion: String
+    let runId: String
+    let occurrenceId: String
+    let previousVersion: UInt64?
+    let eventId: String?
+    let eventVersion: UInt64?
+    let expectedRunVersion: UInt64?
+    let reason: FlitManagedRunStillWorkingRejectedReason?
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case status
+        case protocolVersion = "protocol_version"
+        case runId = "run_id"
+        case occurrenceId = "occurrence_id"
+        case previousVersion = "previous_version"
+        case eventId = "event_id"
+        case eventVersion = "event_version"
+        case expectedRunVersion = "expected_run_version"
+        case reason
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        status = try values.decode(FlitManagedRunStillWorkingStatus.self, forKey: .status)
+        protocolVersion = try values.decode(String.self, forKey: .protocolVersion)
+        runId = try values.decode(String.self, forKey: .runId)
+        occurrenceId = try values.decode(String.self, forKey: .occurrenceId)
+        switch status {
+        case .applied:
+            previousVersion = try values.decode(UInt64.self, forKey: .previousVersion)
+            eventId = try values.decode(String.self, forKey: .eventId)
+            eventVersion = try values.decode(UInt64.self, forKey: .eventVersion)
+            expectedRunVersion = nil
+            reason = nil
+            for key in [CodingKeys.expectedRunVersion, .reason] where values.contains(key) {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: values,
+                    debugDescription: "applied Still working response must not contain rejection fields"
+                )
+            }
+        case .rejected:
+            expectedRunVersion = try values.decode(UInt64.self, forKey: .expectedRunVersion)
+            reason = try values.decode(
+                FlitManagedRunStillWorkingRejectedReason.self,
+                forKey: .reason
+            )
+            previousVersion = nil
+            eventId = nil
+            eventVersion = nil
+            for key in [
+                CodingKeys.previousVersion,
+                .eventId,
+                .eventVersion,
+            ] where values.contains(key) {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: values,
+                    debugDescription: "rejected Still working response must not contain applied fields"
+                )
+            }
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(status, forKey: .status)
+        try values.encode(protocolVersion, forKey: .protocolVersion)
+        try values.encode(runId, forKey: .runId)
+        try values.encode(occurrenceId, forKey: .occurrenceId)
+        switch status {
+        case .applied:
+            try values.encode(previousVersion, forKey: .previousVersion)
+            try values.encode(eventId, forKey: .eventId)
+            try values.encode(eventVersion, forKey: .eventVersion)
+        case .rejected:
+            try values.encode(expectedRunVersion, forKey: .expectedRunVersion)
+            try values.encode(reason, forKey: .reason)
+        }
     }
 }
 

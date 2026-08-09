@@ -1,0 +1,43 @@
+{
+  "availability": "available",
+  "protocol_version": "1.21",
+  "run_id": "run-changes-1",
+  "run_version": 5,
+  "attribution": "exact",
+  "baseline_head": {
+    "availability": "available",
+    "oid": "1111111111111111111111111111111111111111"
+  },
+  "terminal_head": {
+    "availability": "available",
+    "oid": "2222222222222222222222222222222222222222"
+  },
+  "next_cursor": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "has_more": true,
+  "changes": [
+    {
+      "change_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "display_path": "project/inside-�.txt",
+      "status": "modified",
+      "committed": false,
+      "staged": true,
+      "unstaged": true,
+      "binary": false,
+      "insertions": 2,
+      "deletions": 1,
+      "project_scope": "inside_project"
+    },
+    {
+      "change_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "display_path": "outside.txt",
+      "status": "added",
+      "committed": true,
+      "staged": false,
+      "unstaged": false,
+      "binary": false,
+      "insertions": 1,
+      "deletions": 0,
+      "project_scope": "outside_project"
+    }
+  ]
+}

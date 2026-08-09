@@ -6,16 +6,18 @@ use flit_protocol::{
     GitObservationRequest, GitObservationResponse, MAX_JSON_SAFE_INTEGER, ManagedRunObserveRequest,
     ManagedRunObserveResponse, ManagedRunOpenInProviderRequest, ManagedRunPermissionRespondRequest,
     ManagedRunPermissionRespondResponse, ManagedRunStartRequest, ManagedRunStartResponse,
-    ManagedRunsAssessStuckRequest, ManagedRunsAssessStuckResponse, PROTOCOL_VERSION,
-    PossiblyStuckPayload, ProjectInspectionRequest, ProjectInspectionResponse,
-    ProjectRegistrationRequest, ProjectRegistrationResponse, ProjectTrustRequest,
-    ProjectTrustResponse, ProjectsListRequest, ProjectsListResponse, ProviderCompatibility,
-    ProviderDiagnosticsRequest, ProviderDiagnosticsResponse, ProviderExecutionAfterQuit,
-    ProviderUnavailableReason, QuitImpactReason, QuitImpactRequest, QuitImpactResponse,
-    RunChangeExternalOpenRequest, RunChangeExternalOpenResponse, RunChangesReadRequest,
-    RunChangesReadResponse, RunDetailReadRequest, RunDetailReadResponse, RunEvidenceCategory,
-    StuckClearedPayload, StuckProcessReceipt, SystemHealthRequest, SystemHealthResponse,
-    event_schema_id, event_schema_relative_path, generated_swift_command_contract,
+    ManagedRunStillWorkingRequest, ManagedRunStillWorkingResponse, ManagedRunsAssessStuckRequest,
+    ManagedRunsAssessStuckResponse, PROTOCOL_VERSION, PossiblyStuckPayload,
+    ProjectInspectionRequest, ProjectInspectionResponse, ProjectRegistrationRequest,
+    ProjectRegistrationResponse, ProjectTrustRequest, ProjectTrustResponse, ProjectsListRequest,
+    ProjectsListResponse, ProviderCompatibility, ProviderDiagnosticsRequest,
+    ProviderDiagnosticsResponse, ProviderExecutionAfterQuit, ProviderUnavailableReason,
+    QuitImpactReason, QuitImpactRequest, QuitImpactResponse, RunChangeExternalOpenRequest,
+    RunChangeExternalOpenResponse, RunChangesReadRequest, RunChangesReadResponse,
+    RunDetailReadRequest, RunDetailReadResponse, RunEvidenceCategory, StillWorkingPayload,
+    StuckClearedPayload, StuckNotificationDeliveredPayload, StuckNotificationDuePayload,
+    StuckProcessReceipt, SystemHealthRequest, SystemHealthResponse, event_schema_id,
+    event_schema_relative_path, generated_swift_command_contract,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -123,6 +125,20 @@ fn fixtures_are_bound_to_the_current_protocol_version() {
     assert_eq!(manifest.current.version, PROTOCOL_VERSION);
     assert_eq!(request.client_protocol_version, PROTOCOL_VERSION);
     assert_eq!(response.protocol_version, PROTOCOL_VERSION);
+    for name in [
+        "dashboard_read.initial.response.json",
+        "dashboard_read.delta.response.json",
+        "dashboard_read.resync.response.json",
+        "dashboard_read.unavailable_changes.response.json",
+        "run_detail_read.response.json",
+    ] {
+        let fixture: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(repository_path(&command_fixture(&manifest.current, name)))
+                .expect("event-bearing command fixture should be readable"),
+        )
+        .expect("event-bearing command fixture should be JSON");
+        assert_eq!(fixture["event_schema_version"], EVENT_PROTOCOL_VERSION);
+    }
 }
 
 #[test]
@@ -937,11 +953,33 @@ fn current_managed_stuck_assessment_fixtures_round_trip_without_native_facts() {
         "managed_runs_assess_stuck.response.json",
     ));
     assert!(
-        serde_json::from_str::<ManagedRunsAssessStuckRequest>(
-            r#"{"client_protocol_version":"1.20","observed_at":"fabricated"}"#,
-        )
+        serde_json::from_str::<ManagedRunsAssessStuckRequest>(&format!(
+            r#"{{"client_protocol_version":"{PROTOCOL_VERSION}","observed_at":"fabricated"}}"#
+        ),)
         .is_err()
     );
+}
+
+#[test]
+fn current_still_working_fixtures_are_exact_cas_without_native_facts() {
+    let manifest = read_command_compatibility_manifest();
+    let current = &manifest.current;
+    assert_fixture_round_trip::<ManagedRunStillWorkingRequest>(&command_fixture(
+        current,
+        "managed_run_still_working.request.json",
+    ));
+    for name in [
+        "managed_run_still_working.applied.response.json",
+        "managed_run_still_working.rejected.response.json",
+    ] {
+        assert_fixture_round_trip::<ManagedRunStillWorkingResponse>(&command_fixture(
+            current, name,
+        ));
+    }
+    let request = format!(
+        r#"{{"run_id":"run-1","expected_run_version":6,"occurrence_id":"occurrence-1","client_protocol_version":"{PROTOCOL_VERSION}","process":"alive"}}"#
+    );
+    assert!(serde_json::from_str::<ManagedRunStillWorkingRequest>(&request).is_err());
 }
 
 #[test]
@@ -1144,6 +1182,10 @@ fn generated_swift_project_contract_is_current_and_required_fields_fail_closed()
         "FlitManagedRunObserveRequest",
         "FlitManagedRunsAssessStuckRequest",
         "FlitManagedRunsAssessStuckResponse",
+        "FlitManagedRunStillWorkingRequest",
+        "FlitManagedRunStillWorkingStatus",
+        "FlitManagedRunStillWorkingRejectedReason",
+        "FlitManagedRunStillWorkingResponse",
         "FlitManagedRunObservationStatus",
         "FlitManagedRunProviderDecision",
         "FlitManagedRunProviderTerminalOutcome",
@@ -1275,6 +1317,50 @@ fn current_possibly_stuck_payload_is_exact_bounded_and_path_free() {
     .expect("Stuck clear fixture should contain valid JSON");
     serde_json::from_value::<StuckClearedPayload>(cleared["payload"].clone())
         .expect("typed Stuck clear payload");
+}
+
+#[test]
+fn current_stuck_action_and_notification_payloads_are_exact_and_path_free() {
+    let cases = [
+        (
+            "fixtures/protocol/events/v1.4/run.still_working.json",
+            "still_working",
+        ),
+        (
+            "fixtures/protocol/events/v1.4/notification.due.json",
+            "notification_due",
+        ),
+        (
+            "fixtures/protocol/events/v1.4/notification.delivered.json",
+            "notification_delivered",
+        ),
+    ];
+    for (relative, kind) in cases {
+        assert_fixture_round_trip::<EventEnvelope>(relative);
+        let event: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(repository_path(relative)).expect("event fixture"),
+        )
+        .expect("event JSON");
+        let payload = event["payload"].clone();
+        match kind {
+            "still_working" => {
+                serde_json::from_value::<StillWorkingPayload>(payload).expect("Still working");
+            }
+            "notification_due" => {
+                serde_json::from_value::<StuckNotificationDuePayload>(payload)
+                    .expect("notification due");
+            }
+            "notification_delivered" => {
+                serde_json::from_value::<StuckNotificationDeliveredPayload>(payload)
+                    .expect("notification delivered");
+            }
+            _ => unreachable!(),
+        };
+        let encoded = serde_json::to_string(&event["payload"]).unwrap();
+        for forbidden in ["path", "cwd", "prompt", "credential", "pid"] {
+            assert!(!encoded.to_ascii_lowercase().contains(forbidden));
+        }
+    }
 }
 
 #[test]
@@ -1428,7 +1514,7 @@ fn current_contract_snapshot() -> CurrentContractSnapshot {
             .expect("current fixture should be readable"),
     )
     .expect("current fixture should contain valid JSON");
-    let serialized_version = serde_json::to_value(EventProtocolVersion::V1_3)
+    let serialized_version = serde_json::to_value(EventProtocolVersion::V1_4)
         .expect("event version should serialize")
         .as_str()
         .expect("event version should serialize as a string")

@@ -25,7 +25,8 @@ use flit_protocol::{
     GitNotWorktreeReason, GitObservationResponse, GitObservationUnavailableReason, HealthStatus,
     ManagedRunObserveRequest, ManagedRunObserveResponse, ManagedRunOpenInProviderRequest,
     ManagedRunPermissionRespondRequest, ManagedRunPermissionRespondResponse,
-    ManagedRunStartRequest, ManagedRunsAssessStuckRequest, PROTOCOL_VERSION,
+    ManagedRunStartRequest, ManagedRunStillWorkingRejectedReason, ManagedRunStillWorkingRequest,
+    ManagedRunStillWorkingResponse, ManagedRunsAssessStuckRequest, PROTOCOL_VERSION,
     ProjectInspectionResponse, ProjectListCursor as ProjectListCursorResponse, ProjectRecord,
     ProjectRegistrationResponse, ProjectRegistrationStatus, ProjectTrustResponse,
     ProjectTrustStatus, ProjectsListResponse, ProviderCapability as ProtocolProviderCapability,
@@ -54,7 +55,9 @@ use flit_store::{
     ManagedGitFileStatus as StoreManagedGitFileStatus,
     ManagedGitProjectScope as StoreManagedGitProjectScope, ManagedPermissionDecision,
     ManagedPermissionDeliveryUnknownReason, ManagedPermissionResponseAttemptOutcome,
-    ManagedPermissionResponseResult, ManagedPermissionResponseResultKind, ManagedSession, Project,
+    ManagedPermissionResponseResult, ManagedPermissionResponseResultKind, ManagedSession,
+    ManagedStillWorkingAction, ManagedStillWorkingOutcome,
+    ManagedStillWorkingRejectedReason as StoreStillWorkingRejectedReason, Project,
     ProjectDirectoryInspection, ProjectListCursor as StoreProjectListCursor, ProjectRegistration,
     ProjectRegistrationOutcome, ProjectTrustConfirmation, ProjectTrustOutcome, Store, StoreError,
 };
@@ -2503,6 +2506,225 @@ fn managed_runs_assess_stuck_with(
     }
 }
 
+#[uniffi::export]
+pub fn managed_run_still_working_json(request_json: String) -> Result<String, BridgeError> {
+    protect(|| managed_run_still_working_with(&CORE, request_json))
+}
+
+fn managed_run_still_working_with(
+    core_manager: &CoreManager,
+    request_json: String,
+) -> Result<String, BridgeError> {
+    managed_run_still_working_with_observation(core_manager, request_json, None)
+}
+
+fn managed_run_still_working_with_observation(
+    core_manager: &CoreManager,
+    request_json: String,
+    observation: Option<(u64, flit_protocol::StuckProcessReceipt)>,
+) -> Result<String, BridgeError> {
+    if request_json.len() > MAX_MANAGED_RUN_REQUEST_BYTES {
+        return project_json(&CommandError::for_code(CommandErrorCode::InvalidRunRequest));
+    }
+    let request = match serde_json::from_str::<ManagedRunStillWorkingRequest>(&request_json) {
+        Ok(request)
+            if !request.run_id.trim().is_empty()
+                && request.run_id.len() <= 256
+                && !request.occurrence_id.trim().is_empty()
+                && request.occurrence_id.len() <= 256
+                && request.expected_run_version > 0
+                && request.expected_run_version <= flit_protocol::MAX_JSON_SAFE_INTEGER =>
+        {
+            request
+        }
+        _ => {
+            return project_json(&CommandError::for_code(CommandErrorCode::InvalidRunRequest));
+        }
+    };
+    if request.client_protocol_version != PROTOCOL_VERSION {
+        return project_json(&CommandError::protocol_mismatch());
+    }
+    let response = core_manager.with_ready_core(|core| {
+        let event_id = still_working_event_id(&request);
+        if core
+            .store
+            .managed_still_working_was_applied(&request.run_id, &event_id, &request.occurrence_id)
+            .map_err(|_| BridgeError::StorageFailure)?
+        {
+            return Ok(still_working_rejected_response(
+                &request,
+                ManagedRunStillWorkingRejectedReason::AlreadyApplied,
+            ));
+        }
+        let now_monotonic_ms = observation.as_ref().map_or_else(
+            || {
+                let elapsed = core.stuck_assessment.clock_origin.elapsed().as_millis();
+                u64::try_from(elapsed)
+                    .unwrap_or(flit_protocol::MAX_JSON_SAFE_INTEGER)
+                    .min(flit_protocol::MAX_JSON_SAFE_INTEGER)
+            },
+            |(now, _)| *now,
+        );
+        let contexts = core
+            .store
+            .managed_stuck_assessment_contexts()
+            .map_err(|_| BridgeError::StorageFailure)?;
+        let Some(context) = contexts
+            .into_iter()
+            .find(|context| context.run_id == request.run_id)
+        else {
+            let snapshot = core
+                .store
+                .run_snapshot(&request.run_id)
+                .map_err(|_| BridgeError::StorageFailure)?;
+            return if snapshot.is_some() {
+                Ok(still_working_rejected_response(
+                    &request,
+                    ManagedRunStillWorkingRejectedReason::NotCurrentlyStuck,
+                ))
+            } else {
+                Err(BridgeError::RunNotFound)
+            };
+        };
+        if context.version != request.expected_run_version {
+            return Ok(still_working_rejected_response(
+                &request,
+                ManagedRunStillWorkingRejectedReason::RunVersionStale,
+            ));
+        }
+        if context.active_occurrence_id.as_deref() != Some(request.occurrence_id.as_str()) {
+            return Ok(still_working_rejected_response(
+                &request,
+                if context.active_occurrence_id.is_some() {
+                    ManagedRunStillWorkingRejectedReason::OccurrenceMismatch
+                } else {
+                    ManagedRunStillWorkingRejectedReason::NotCurrentlyStuck
+                },
+            ));
+        }
+        let process = observation.as_ref().map_or_else(
+            || {
+                stuck_assessment::process_receipt(
+                    &context,
+                    core.stuck_assessment.process_probes.get(&request.run_id),
+                    now_monotonic_ms,
+                )
+            },
+            |(_, process)| process.clone(),
+        );
+        if !matches!(process, flit_protocol::StuckProcessReceipt::Alive { .. }) {
+            return Ok(still_working_rejected_response(
+                &request,
+                ManagedRunStillWorkingRejectedReason::ProcessUnavailable,
+            ));
+        }
+        let observed_at = core
+            .store
+            .current_utc_timestamp()
+            .map_err(|_| BridgeError::StorageFailure)?;
+        let outcome = core
+            .store
+            .apply_managed_still_working(ManagedStillWorkingAction {
+                run_id: request.run_id.clone(),
+                expected_run_version: request.expected_run_version,
+                occurrence_id: request.occurrence_id.clone(),
+                event_id,
+                observed_at,
+                reset_monotonic_ms: now_monotonic_ms,
+                process,
+                evidence_unavailable_reason: "provider_content_not_retained".to_owned(),
+            })
+            .map_err(|error| match error {
+                StoreError::MissingRun { .. } => BridgeError::RunNotFound,
+                _ => BridgeError::StorageFailure,
+            })?;
+        match outcome {
+            ManagedStillWorkingOutcome::Applied(event) => {
+                core.stuck_assessment.progress_baselines.insert(
+                    request.run_id.clone(),
+                    stuck_assessment::ProgressBaseline {
+                        progress_event_id: context.progress_event_id,
+                        monotonic_ms: now_monotonic_ms,
+                    },
+                );
+                Ok(ManagedRunStillWorkingResponse::Applied {
+                    protocol_version: PROTOCOL_VERSION.to_owned(),
+                    run_id: request.run_id,
+                    previous_version: request.expected_run_version,
+                    event_id: event.event_id.clone(),
+                    event_version: event.ingest_seq,
+                    occurrence_id: request.occurrence_id,
+                })
+            }
+            ManagedStillWorkingOutcome::Rejected { reason, .. } => Ok(
+                still_working_rejected_response(&request, still_working_rejected_reason(reason)),
+            ),
+        }
+    });
+    match response {
+        Ok(response) => bounded_json(
+            &response,
+            MAX_PROJECT_RESPONSE_BYTES,
+            BridgeError::ManagedRunResponseTooLarge,
+        ),
+        Err(BridgeError::RunNotFound) => {
+            project_json(&CommandError::for_code(CommandErrorCode::RunNotFound))
+        }
+        Err(BridgeError::StorageFailure) => project_json(&CommandError::for_code(
+            CommandErrorCode::StorageUnavailable,
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+fn still_working_rejected_response(
+    request: &ManagedRunStillWorkingRequest,
+    reason: ManagedRunStillWorkingRejectedReason,
+) -> ManagedRunStillWorkingResponse {
+    ManagedRunStillWorkingResponse::Rejected {
+        protocol_version: PROTOCOL_VERSION.to_owned(),
+        run_id: request.run_id.clone(),
+        expected_run_version: request.expected_run_version,
+        occurrence_id: request.occurrence_id.clone(),
+        reason,
+    }
+}
+
+fn still_working_rejected_reason(
+    reason: StoreStillWorkingRejectedReason,
+) -> ManagedRunStillWorkingRejectedReason {
+    match reason {
+        StoreStillWorkingRejectedReason::RunVersionStale => {
+            ManagedRunStillWorkingRejectedReason::RunVersionStale
+        }
+        StoreStillWorkingRejectedReason::OccurrenceMismatch => {
+            ManagedRunStillWorkingRejectedReason::OccurrenceMismatch
+        }
+        StoreStillWorkingRejectedReason::NotCurrentlyStuck => {
+            ManagedRunStillWorkingRejectedReason::NotCurrentlyStuck
+        }
+        StoreStillWorkingRejectedReason::ProcessUnavailable => {
+            ManagedRunStillWorkingRejectedReason::ProcessUnavailable
+        }
+        StoreStillWorkingRejectedReason::AlreadyApplied => {
+            ManagedRunStillWorkingRejectedReason::AlreadyApplied
+        }
+    }
+}
+
+fn still_working_event_id(request: &ManagedRunStillWorkingRequest) -> String {
+    let mut digest = Sha256::new();
+    for part in [
+        request.run_id.as_str(),
+        &request.expected_run_version.to_string(),
+        request.occurrence_id.as_str(),
+    ] {
+        digest.update(part.len().to_le_bytes());
+        digest.update(part.as_bytes());
+    }
+    format!("stuck-action-{:x}", digest.finalize())
+}
+
 fn start_managed_run_in_core(
     core: &mut FoundationCore,
     connector: &dyn managed_start::ManagedCodexConnector,
@@ -3282,9 +3504,10 @@ mod tests {
     use flit_protocol::{
         EventProtocolVersion, ManagedRunOpenInProviderRequest, ManagedRunPermissionDecision,
         ManagedRunPermissionMode, ManagedRunPermissionRespondRequest,
-        ManagedRunPermissionRespondResponse, ManagedRunStartResponse, ProviderExecutionAfterQuit,
-        QuitImpactReason, QuitImpactResponse, RunDetailReadRequest, RunDetailReadResponse,
-        SystemHealthRequest,
+        ManagedRunPermissionRespondResponse, ManagedRunStartResponse,
+        ManagedRunStillWorkingRequest, ManagedRunStillWorkingResponse, PossiblyStuckPayload,
+        ProviderExecutionAfterQuit, QuitImpactReason, QuitImpactResponse, RunDetailReadRequest,
+        RunDetailReadResponse, StuckCauseCode, StuckProcessReceipt, SystemHealthRequest,
     };
     use flit_providers::{
         CodexManagedItemId, CodexManagedThreadId, CodexManagedTurnId, CodexManualStartedThread,
@@ -3294,8 +3517,8 @@ mod tests {
         validated_codex_0_144_6_fingerprint, validated_codex_0_145_0_fingerprint,
     };
     use flit_store::{
-        InitialManagedSessionConnection, ManagedRunIntent, ProjectRegistration,
-        ProjectTrustConfirmation,
+        InitialManagedSessionConnection, ManagedRunIntent, ManagedStuckAssessment,
+        ManagedStuckTransition, ProjectRegistration, ProjectTrustConfirmation,
     };
 
     use super::*;
@@ -3528,6 +3751,168 @@ mod tests {
                 Ok(())
             })
             .expect("read starting Run");
+    }
+
+    #[test]
+    fn still_working_command_revalidates_exact_process_and_is_retry_safe() {
+        let (_directory, manager, _response) = observation_core("still-working-command");
+        let (version, cursor) = manager
+            .with_ready_core(|core| {
+                let version = core
+                    .store
+                    .run_snapshot("run-observe")
+                    .expect("running snapshot")
+                    .expect("running projection")
+                    .version;
+                core.store
+                    .append_managed_stuck_transition(ManagedStuckTransition {
+                        run_id: "run-observe".to_owned(),
+                        expected_run_version: version,
+                        event_id: "event-still-working-command-open".to_owned(),
+                        observed_at: "2026-08-09T10:02:10Z".to_owned(),
+                        assessment: ManagedStuckAssessment::PossiblyStuck(PossiblyStuckPayload {
+                            occurrence_id: "occurrence-still-working-command".to_owned(),
+                            cause: StuckCauseCode::Unknown,
+                            threshold_seconds: 120,
+                            progress_event_id: "event-observe-created".to_owned(),
+                            progress_observed_at: "2026-07-27T12:00:00Z".to_owned(),
+                            progress_monotonic_ms: 5_000,
+                            baseline_monotonic_ms: 5_000,
+                            stuck_since_monotonic_ms: 125_000,
+                            process: StuckProcessReceipt::Alive {
+                                generation: "process-still-working-command".to_owned(),
+                                observed_monotonic_ms: 130_000,
+                            },
+                            evidence_unavailable_reason: "raw_provider_content_not_retained"
+                                .to_owned(),
+                        }),
+                    })
+                    .expect("open stuck occurrence");
+                let stuck_version = core
+                    .store
+                    .run_snapshot("run-observe")
+                    .expect("stuck snapshot")
+                    .expect("stuck projection")
+                    .version;
+                Ok((
+                    stuck_version,
+                    core.store.latest_ingest_seq().expect("stuck cursor"),
+                ))
+            })
+            .expect("seed stuck Run");
+        let request = ManagedRunStillWorkingRequest {
+            run_id: "run-observe".to_owned(),
+            expected_run_version: version,
+            occurrence_id: "occurrence-still-working-command".to_owned(),
+            client_protocol_version: PROTOCOL_VERSION.to_owned(),
+        };
+        let request_json = serde_json::to_string(&request).expect("Still working request");
+
+        let unavailable: ManagedRunStillWorkingResponse = serde_json::from_str(
+            &managed_run_still_working_with_observation(
+                &manager,
+                request_json.clone(),
+                Some((
+                    140_000,
+                    StuckProcessReceipt::Unavailable {
+                        generation: Some("process-still-working-command".to_owned()),
+                        reason: "provider_process_observation_unavailable".to_owned(),
+                        observed_monotonic_ms: 140_000,
+                    },
+                )),
+            )
+            .expect("unavailable response"),
+        )
+        .expect("typed unavailable response");
+        assert!(matches!(
+            unavailable,
+            ManagedRunStillWorkingResponse::Rejected {
+                reason: ManagedRunStillWorkingRejectedReason::ProcessUnavailable,
+                ..
+            }
+        ));
+        manager
+            .with_ready_core(|core| {
+                assert_eq!(
+                    core.store.latest_ingest_seq().expect("no-write cursor"),
+                    cursor
+                );
+                Ok(())
+            })
+            .expect("verify unavailable no-write");
+
+        let applied: ManagedRunStillWorkingResponse = serde_json::from_str(
+            &managed_run_still_working_with_observation(
+                &manager,
+                request_json.clone(),
+                Some((
+                    140_000,
+                    StuckProcessReceipt::Alive {
+                        generation: "process-still-working-command".to_owned(),
+                        observed_monotonic_ms: 140_000,
+                    },
+                )),
+            )
+            .expect("applied response"),
+        )
+        .expect("typed applied response");
+        assert!(matches!(
+            applied,
+            ManagedRunStillWorkingResponse::Applied { .. }
+        ));
+
+        let retry: ManagedRunStillWorkingResponse = serde_json::from_str(
+            &managed_run_still_working_with_observation(
+                &manager,
+                request_json,
+                Some((
+                    140_000,
+                    StuckProcessReceipt::Alive {
+                        generation: "process-still-working-command".to_owned(),
+                        observed_monotonic_ms: 140_000,
+                    },
+                )),
+            )
+            .expect("retry response"),
+        )
+        .expect("typed retry response");
+        assert!(matches!(
+            retry,
+            ManagedRunStillWorkingResponse::Rejected {
+                reason: ManagedRunStillWorkingRejectedReason::AlreadyApplied,
+                ..
+            }
+        ));
+        manager
+            .with_ready_core(|core| {
+                let snapshot = core
+                    .store
+                    .run_snapshot("run-observe")
+                    .expect("reset snapshot")
+                    .expect("reset projection");
+                assert_eq!(snapshot.dashboard_bucket, "Working");
+                assert_eq!(
+                    snapshot.snapshot["stuck"]["notification"]["status"],
+                    "suppressed"
+                );
+                assert_eq!(
+                    core.store.latest_ingest_seq().expect("one action cursor"),
+                    cursor + 1
+                );
+                Ok(())
+            })
+            .expect("verify exact action");
+
+        let smuggled = format!(
+            r#"{{"run_id":"run-observe","expected_run_version":{version},"occurrence_id":"occurrence-still-working-command","client_protocol_version":"{PROTOCOL_VERSION}","process":"alive"}}"#
+        );
+        assert_eq!(
+            command_error(
+                &managed_run_still_working_with(&manager, smuggled)
+                    .expect("fact-smuggling response")
+            ),
+            CommandError::for_code(CommandErrorCode::InvalidRunRequest)
+        );
     }
 
     fn observation_request_json() -> String {

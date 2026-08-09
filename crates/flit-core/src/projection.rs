@@ -9,6 +9,8 @@ use serde_json::{Map, Value};
 const MAX_PERSISTED_STUCK_ID_BYTES: usize = 256;
 const MAX_PERSISTED_STUCK_TIMESTAMP_BYTES: usize = 128;
 const MAX_PERSISTED_STUCK_REASON_BYTES: usize = 4 * 1024;
+const STUCK_NOTIFICATION_DELAY_MS: u64 = 300_000;
+const STUCK_NOTIFICATION_SUPPRESSION_MS: u64 = 600_000;
 
 use crate::{
     activity::{
@@ -69,6 +71,41 @@ pub enum ChangeSummary {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StuckNotificationProjection {
+    Inactive,
+    NotDue {
+        occurrence_id: String,
+        due_at_monotonic_ms: u64,
+    },
+    Suppressed {
+        occurrence_id: String,
+        until_monotonic_ms: u64,
+    },
+    Due {
+        occurrence_id: String,
+        due_at_monotonic_ms: u64,
+    },
+    Delivered {
+        occurrence_id: String,
+        platform_id: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StuckResetProjection {
+    pub occurrence_id: String,
+    pub progress_event_id: String,
+    pub reset_monotonic_ms: u64,
+    pub notification_suppressed_until_monotonic_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StuckProcessAuthority {
+    generation: String,
+    observed_monotonic_ms: u64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct DashboardProjection {
     pub run_id: String,
@@ -85,6 +122,8 @@ pub struct DashboardProjection {
     pub last_progress_event_id: String,
     pub last_liveness_at: Option<String>,
     pub current_stuck_occurrence_id: Option<String>,
+    pub stuck_notification: StuckNotificationProjection,
+    pub stuck_reset: Option<StuckResetProjection>,
     pub changes: ChangeSummary,
     pub updated_at: String,
 }
@@ -141,6 +180,9 @@ pub fn replay_dashboard_projection(
     let mut stuck_assessment = StuckAssessment::Clear(StuckClearReason::ProcessUnavailable);
     let mut stuck_source = None;
     let mut stuck_occurrence_id = None;
+    let mut stuck_process_authority = None;
+    let mut stuck_notification = StuckNotificationProjection::Inactive;
+    let mut stuck_reset = None;
     let mut observed_at_by_evidence =
         BTreeMap::from([(first.event_id.clone(), first.observed_at.clone())]);
 
@@ -164,6 +206,9 @@ pub fn replay_dashboard_projection(
             &mut stuck_assessment,
             &mut stuck_source,
             &mut stuck_occurrence_id,
+            &mut stuck_process_authority,
+            &mut stuck_notification,
+            &mut stuck_reset,
         )?;
         if stuck_occurrence_id.is_none() {
             stuck_assessment = StuckAssessment::Clear(if lifecycle.lifecycle().is_terminal() {
@@ -246,6 +291,8 @@ pub fn replay_dashboard_projection(
         last_progress_event_id: activity.last_progress().evidence_id().as_str().to_owned(),
         last_liveness_at,
         current_stuck_occurrence_id: stuck_occurrence_id,
+        stuck_notification,
+        stuck_reset,
         changes,
         updated_at: last.observed_at.clone(),
     })
@@ -346,6 +393,15 @@ fn activity_event(event: &ProjectionEvent) -> Result<ActivityEvent, ProjectionEr
         "run.possibly_stuck" | "run.stuck_cleared" if is_authoritative_stuck_event(event) => {
             ActivityEvent::ProjectionObserved
         }
+        "run.still_working" if is_authoritative_still_working_event(event) => {
+            ActivityEvent::ProjectionObserved
+        }
+        "notification.due" if is_authoritative_stuck_notification_due_event(event) => {
+            ActivityEvent::ProjectionObserved
+        }
+        "notification.delivered" if is_authoritative_stuck_notification_delivered_event(event) => {
+            ActivityEvent::ProjectionObserved
+        }
         _ => ActivityEvent::LivenessObserved { evidence_id },
     })
 }
@@ -355,6 +411,9 @@ fn update_stuck_replay(
     assessment: &mut StuckAssessment,
     source: &mut Option<StuckAttentionSource>,
     current_occurrence_id: &mut Option<String>,
+    current_process_authority: &mut Option<StuckProcessAuthority>,
+    notification: &mut StuckNotificationProjection,
+    reset: &mut Option<StuckResetProjection>,
 ) -> Result<(), ProjectionError> {
     if matches!(
         event.event_type.as_str(),
@@ -364,6 +423,23 @@ fn update_stuck_replay(
             return Ok(());
         }
         if !is_authoritative_stuck_event(event) {
+            return Err(ProjectionError::Stuck);
+        }
+    }
+    if matches!(
+        event.event_type.as_str(),
+        "run.still_working" | "notification.due" | "notification.delivered"
+    ) {
+        if event.protocol_version != "1.4" {
+            return Ok(());
+        }
+        let authoritative = match event.event_type.as_str() {
+            "run.still_working" => is_authoritative_still_working_event(event),
+            "notification.due" => is_authoritative_stuck_notification_due_event(event),
+            "notification.delivered" => is_authoritative_stuck_notification_delivered_event(event),
+            _ => unreachable!("matched Event 1.4 stuck receipt name"),
+        };
+        if !authoritative {
             return Err(ProjectionError::Stuck);
         }
     }
@@ -386,6 +462,35 @@ fn update_stuck_replay(
             );
             *assessment = StuckAssessment::PossiblyStuck(occurrence);
             *current_occurrence_id = Some(occurrence_id.to_owned());
+            let process_generation = stuck_alive_generation(event)?;
+            let due_at_monotonic_ms = stuck_notification_due_at(assessment)?;
+            let progress_event_id =
+                payload_bounded_token(event, "progress_event_id", MAX_PERSISTED_STUCK_ID_BYTES)?;
+            let baseline_monotonic_ms = payload_safe_u64(event, "baseline_monotonic_ms")?;
+            let process_observed_monotonic_ms = stuck_process_observed(event)?;
+            *current_process_authority = Some(StuckProcessAuthority {
+                generation: process_generation,
+                observed_monotonic_ms: process_observed_monotonic_ms,
+            });
+            *notification = if reset.as_ref().is_some_and(|reset| {
+                reset.progress_event_id == progress_event_id
+                    && reset.reset_monotonic_ms == baseline_monotonic_ms
+                    && process_observed_monotonic_ms
+                        < reset.notification_suppressed_until_monotonic_ms
+            }) {
+                StuckNotificationProjection::Suppressed {
+                    occurrence_id: occurrence_id.to_owned(),
+                    until_monotonic_ms: reset
+                        .as_ref()
+                        .expect("matching reset exists")
+                        .notification_suppressed_until_monotonic_ms,
+                }
+            } else {
+                StuckNotificationProjection::NotDue {
+                    occurrence_id: occurrence_id.to_owned(),
+                    due_at_monotonic_ms,
+                }
+            };
         }
         "run.stuck_cleared" => {
             if event.payload.len() != 4
@@ -430,6 +535,82 @@ fn update_stuck_replay(
             *assessment = StuckAssessment::Clear(StuckClearReason::ProcessUnavailable);
             *source = None;
             *current_occurrence_id = None;
+            *current_process_authority = None;
+            *notification = StuckNotificationProjection::Inactive;
+        }
+        "run.still_working" => {
+            validate_still_working_event(
+                event,
+                assessment,
+                current_occurrence_id,
+                current_process_authority,
+            )?;
+            let occurrence_id =
+                payload_bounded_token(event, "occurrence_id", MAX_PERSISTED_STUCK_ID_BYTES)?
+                    .to_owned();
+            let progress_event_id =
+                payload_bounded_token(event, "progress_event_id", MAX_PERSISTED_STUCK_ID_BYTES)?
+                    .to_owned();
+            let reset_monotonic_ms = payload_safe_u64(event, "reset_monotonic_ms")?;
+            let notification_suppressed_until_monotonic_ms =
+                payload_safe_u64(event, "notification_suppressed_until_monotonic_ms")?;
+            *reset = Some(StuckResetProjection {
+                occurrence_id: occurrence_id.clone(),
+                progress_event_id,
+                reset_monotonic_ms,
+                notification_suppressed_until_monotonic_ms,
+            });
+            *notification = StuckNotificationProjection::Suppressed {
+                occurrence_id,
+                until_monotonic_ms: notification_suppressed_until_monotonic_ms,
+            };
+            *assessment = StuckAssessment::Clear(StuckClearReason::ProcessUnavailable);
+            *source = None;
+            *current_occurrence_id = None;
+            *current_process_authority = None;
+        }
+        "notification.due" => {
+            validate_stuck_notification_due_event(
+                event,
+                assessment,
+                current_occurrence_id,
+                current_process_authority,
+                notification,
+            )?;
+            *current_process_authority = Some(StuckProcessAuthority {
+                generation: stuck_alive_generation(event)?,
+                observed_monotonic_ms: stuck_process_observed(event)?,
+            });
+            *notification = StuckNotificationProjection::Due {
+                occurrence_id: payload_bounded_token(
+                    event,
+                    "occurrence_id",
+                    MAX_PERSISTED_STUCK_ID_BYTES,
+                )?
+                .to_owned(),
+                due_at_monotonic_ms: payload_safe_u64(event, "due_at_monotonic_ms")?,
+            };
+        }
+        "notification.delivered" => {
+            validate_stuck_notification_delivered_event(
+                event,
+                current_occurrence_id,
+                notification,
+            )?;
+            *notification = StuckNotificationProjection::Delivered {
+                occurrence_id: payload_bounded_token(
+                    event,
+                    "occurrence_id",
+                    MAX_PERSISTED_STUCK_ID_BYTES,
+                )?
+                .to_owned(),
+                platform_id: payload_bounded_token(
+                    event,
+                    "platform_id",
+                    MAX_PERSISTED_STUCK_ID_BYTES,
+                )?
+                .to_owned(),
+            };
         }
         _ => {}
     }
@@ -503,12 +684,197 @@ fn persisted_stuck_occurrence(event: &ProjectionEvent) -> Result<StuckOccurrence
     ))
 }
 
+fn stuck_notification_due_at(assessment: &StuckAssessment) -> Result<u64, ProjectionError> {
+    let StuckAssessment::PossiblyStuck(occurrence) = assessment else {
+        return Err(ProjectionError::Stuck);
+    };
+    occurrence
+        .id()
+        .stuck_since()
+        .as_u64()
+        .checked_add(STUCK_NOTIFICATION_DELAY_MS)
+        .filter(|value| *value <= MAX_JSON_SAFE_INTEGER)
+        .ok_or(ProjectionError::Stuck)
+}
+
+fn stuck_process_observed(event: &ProjectionEvent) -> Result<u64, ProjectionError> {
+    event
+        .payload
+        .get("process")
+        .and_then(Value::as_object)
+        .and_then(|process| process.get("observed_monotonic_ms"))
+        .and_then(Value::as_u64)
+        .filter(|value| *value <= MAX_JSON_SAFE_INTEGER)
+        .ok_or(ProjectionError::Stuck)
+}
+
+fn stuck_alive_generation(event: &ProjectionEvent) -> Result<String, ProjectionError> {
+    let process = event
+        .payload
+        .get("process")
+        .and_then(Value::as_object)
+        .ok_or(ProjectionError::Stuck)?;
+    if process.len() != 3 || process.get("status").and_then(Value::as_str) != Some("alive") {
+        return Err(ProjectionError::Stuck);
+    }
+    let generation = process
+        .get("generation")
+        .and_then(|value| bounded_token(value, MAX_PERSISTED_STUCK_ID_BYTES))
+        .ok_or(ProjectionError::Stuck)?;
+    let _ = stuck_process_observed(event)?;
+    Ok(generation.to_owned())
+}
+
+fn validate_still_working_event(
+    event: &ProjectionEvent,
+    assessment: &StuckAssessment,
+    current_occurrence_id: &Option<String>,
+    current_process_authority: &Option<StuckProcessAuthority>,
+) -> Result<(), ProjectionError> {
+    if event.payload.len() != 6
+        || payload_bounded_token(
+            event,
+            "evidence_unavailable_reason",
+            MAX_PERSISTED_STUCK_REASON_BYTES,
+        )
+        .is_err()
+    {
+        return Err(ProjectionError::Stuck);
+    }
+    let StuckAssessment::PossiblyStuck(occurrence) = assessment else {
+        return Err(ProjectionError::Stuck);
+    };
+    let occurrence_id =
+        payload_bounded_token(event, "occurrence_id", MAX_PERSISTED_STUCK_ID_BYTES)?;
+    if current_occurrence_id.as_deref() != Some(occurrence_id)
+        || payload_bounded_token(event, "progress_event_id", MAX_PERSISTED_STUCK_ID_BYTES)?
+            != occurrence.id().progress_evidence_id().as_str()
+    {
+        return Err(ProjectionError::Stuck);
+    }
+    let reset_monotonic_ms = payload_safe_u64(event, "reset_monotonic_ms")?;
+    let suppressed_until = payload_safe_u64(event, "notification_suppressed_until_monotonic_ms")?;
+    let process_observed_monotonic_ms = stuck_process_observed(event)?;
+    let process_generation = stuck_alive_generation(event)?;
+    if reset_monotonic_ms < occurrence.id().stuck_since().as_u64()
+        || reset_monotonic_ms.checked_add(STUCK_NOTIFICATION_SUPPRESSION_MS)
+            != Some(suppressed_until)
+        || process_observed_monotonic_ms != reset_monotonic_ms
+        || current_process_authority.as_ref().is_none_or(|current| {
+            process_observed_monotonic_ms < current.observed_monotonic_ms
+                || current.generation.as_str() != process_generation.as_str()
+        })
+    {
+        return Err(ProjectionError::Stuck);
+    }
+    Ok(())
+}
+
+fn validate_stuck_notification_due_event(
+    event: &ProjectionEvent,
+    assessment: &StuckAssessment,
+    current_occurrence_id: &Option<String>,
+    current_process_authority: &Option<StuckProcessAuthority>,
+    notification: &StuckNotificationProjection,
+) -> Result<(), ProjectionError> {
+    if event.payload.len() != 4
+        || payload_bounded_token(
+            event,
+            "evidence_unavailable_reason",
+            MAX_PERSISTED_STUCK_REASON_BYTES,
+        )
+        .is_err()
+    {
+        return Err(ProjectionError::Stuck);
+    }
+    let occurrence_id =
+        payload_bounded_token(event, "occurrence_id", MAX_PERSISTED_STUCK_ID_BYTES)?;
+    let due_at = payload_safe_u64(event, "due_at_monotonic_ms")?;
+    let process_observed_monotonic_ms = stuck_process_observed(event)?;
+    let process_generation = stuck_alive_generation(event)?;
+    if current_occurrence_id.as_deref() != Some(occurrence_id)
+        || stuck_notification_due_at(assessment)? != due_at
+        || process_observed_monotonic_ms < due_at
+        || current_process_authority.as_ref().is_none_or(|current| {
+            process_observed_monotonic_ms < current.observed_monotonic_ms
+                || current.generation.as_str() != process_generation.as_str()
+        })
+    {
+        return Err(ProjectionError::Stuck);
+    }
+    match notification {
+        StuckNotificationProjection::NotDue {
+            occurrence_id: current,
+            due_at_monotonic_ms,
+        } if current == occurrence_id && *due_at_monotonic_ms == due_at => Ok(()),
+        StuckNotificationProjection::Suppressed {
+            occurrence_id: current,
+            until_monotonic_ms,
+        } if current == occurrence_id && process_observed_monotonic_ms >= *until_monotonic_ms => {
+            Ok(())
+        }
+        _ => Err(ProjectionError::Stuck),
+    }
+}
+
+fn validate_stuck_notification_delivered_event(
+    event: &ProjectionEvent,
+    current_occurrence_id: &Option<String>,
+    notification: &StuckNotificationProjection,
+) -> Result<(), ProjectionError> {
+    if event.payload.len() != 2 {
+        return Err(ProjectionError::Stuck);
+    }
+    let occurrence_id =
+        payload_bounded_token(event, "occurrence_id", MAX_PERSISTED_STUCK_ID_BYTES)?;
+    payload_bounded_token(event, "platform_id", MAX_PERSISTED_STUCK_ID_BYTES)?;
+    if current_occurrence_id.as_deref() != Some(occurrence_id)
+        || !matches!(
+            notification,
+            StuckNotificationProjection::Due {
+                occurrence_id: current,
+                ..
+            } if current == occurrence_id
+        )
+    {
+        return Err(ProjectionError::Stuck);
+    }
+    Ok(())
+}
+
 fn is_authoritative_stuck_event(event: &ProjectionEvent) -> bool {
     event.protocol_version == "1.3"
         && event.session_id.is_none()
         && event.source_kind == "core"
         && event.source_provider.is_none()
         && event.source_contract_version.as_deref() == Some("stuck-transition/1.0")
+        && !event.source_has_extensions
+}
+
+fn is_authoritative_still_working_event(event: &ProjectionEvent) -> bool {
+    event.protocol_version == "1.4"
+        && event.session_id.is_none()
+        && event.source_kind == "core"
+        && event.source_provider.is_none()
+        && event.source_contract_version.as_deref() == Some("stuck-action/1.0")
+        && !event.source_has_extensions
+}
+
+fn is_authoritative_stuck_notification_due_event(event: &ProjectionEvent) -> bool {
+    event.protocol_version == "1.4"
+        && event.session_id.is_none()
+        && event.source_kind == "core"
+        && event.source_provider.is_none()
+        && event.source_contract_version.as_deref() == Some("stuck-notification/1.0")
+        && !event.source_has_extensions
+}
+
+fn is_authoritative_stuck_notification_delivered_event(event: &ProjectionEvent) -> bool {
+    event.protocol_version == "1.4"
+        && event.session_id.is_none()
+        && event.source_kind == "notifier"
+        && event.source_provider.is_none()
+        && event.source_contract_version.as_deref() == Some("stuck-notification/1.0")
         && !event.source_has_extensions
 }
 

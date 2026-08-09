@@ -10,13 +10,13 @@ use flit_core::{
 };
 use flit_protocol::{
     ManagedRunsAssessStuckResponse, PossiblyStuckPayload, StuckCauseCode, StuckClearReasonCode,
-    StuckClearedPayload, StuckProcessReceipt,
+    StuckClearedPayload, StuckNotificationDuePayload, StuckProcessReceipt,
 };
 use flit_providers::{CodexProcessHealth, CodexProcessProbe};
 use flit_store::{
     ManagedStuckActivity, ManagedStuckAssessment, ManagedStuckAssessmentContext,
-    ManagedStuckLifecycle, ManagedStuckTransition, ManagedStuckTransitionOutcome,
-    ManagedStuckWaitKind, Store, StoreError,
+    ManagedStuckLifecycle, ManagedStuckNotificationState, ManagedStuckTransition,
+    ManagedStuckTransitionOutcome, ManagedStuckWaitKind, Store, StoreError,
 };
 use sha2::{Digest, Sha256};
 
@@ -24,8 +24,8 @@ const EVIDENCE_UNAVAILABLE_REASON: &str = "provider_content_not_retained";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProgressBaseline {
-    progress_event_id: String,
-    monotonic_ms: u64,
+    pub(crate) progress_event_id: String,
+    pub(crate) monotonic_ms: u64,
 }
 
 struct PlannedAssessment {
@@ -95,7 +95,7 @@ fn plan_assessment(
         let previous = baselines.get(&context.run_id);
         let progress_changed = previous
             .is_some_and(|baseline| baseline.progress_event_id != context.progress_event_id);
-        let baseline = match previous {
+        let mut baseline = match previous {
             Some(baseline) if baseline.progress_event_id == context.progress_event_id => {
                 baseline.clone()
             }
@@ -104,6 +104,13 @@ fn plan_assessment(
                 monotonic_ms: now_monotonic_ms,
             },
         };
+        if let Some(reset) = context.reset.as_ref().filter(|reset| {
+            reset.progress_event_id == context.progress_event_id
+                && reset.reset_monotonic_ms <= now_monotonic_ms
+        }) && reset.reset_monotonic_ms > baseline.monotonic_ms
+        {
+            baseline.monotonic_ms = reset.reset_monotonic_ms;
+        }
         next_baselines.insert(context.run_id.clone(), baseline.clone());
 
         let process = observe_process(context);
@@ -127,7 +134,7 @@ fn plan_assessment(
                 let threshold_seconds =
                     u16::try_from((id.stuck_since().as_u64() - id.baseline_at().as_u64()) / 1_000)
                         .expect("StuckPolicy thresholds fit u16");
-                ManagedStuckAssessment::PossiblyStuck(PossiblyStuckPayload {
+                let payload = PossiblyStuckPayload {
                     occurrence_id: occurrence_id(&context.run_id, &id.persistent_identity()),
                     cause: cause_code(id.cause()),
                     threshold_seconds,
@@ -138,7 +145,46 @@ fn plan_assessment(
                     stuck_since_monotonic_ms: id.stuck_since().as_u64(),
                     process: process.clone(),
                     evidence_unavailable_reason: EVIDENCE_UNAVAILABLE_REASON.to_owned(),
-                })
+                };
+                let due_at_monotonic_ms = payload
+                    .stuck_since_monotonic_ms
+                    .checked_add(300_000)
+                    .filter(|value| *value <= flit_protocol::MAX_JSON_SAFE_INTEGER)
+                    .ok_or(StoreError::ManagedStuckAssessmentContextInvalid {
+                        run_id: context.run_id.clone(),
+                        field: "notification_due_at",
+                    })?;
+                let notification_due = match &context.notification {
+                    ManagedStuckNotificationState::NotDue {
+                        occurrence_id,
+                        due_at_monotonic_ms: persisted_due_at,
+                    } => {
+                        occurrence_id == &payload.occurrence_id
+                            && *persisted_due_at == due_at_monotonic_ms
+                            && now_monotonic_ms >= due_at_monotonic_ms
+                    }
+                    ManagedStuckNotificationState::Suppressed {
+                        occurrence_id,
+                        until_monotonic_ms,
+                    } => {
+                        occurrence_id == &payload.occurrence_id
+                            && now_monotonic_ms >= due_at_monotonic_ms
+                            && now_monotonic_ms >= *until_monotonic_ms
+                    }
+                    ManagedStuckNotificationState::Inactive
+                    | ManagedStuckNotificationState::Due { .. }
+                    | ManagedStuckNotificationState::Delivered { .. } => false,
+                };
+                if notification_due {
+                    ManagedStuckAssessment::NotificationDue(StuckNotificationDuePayload {
+                        occurrence_id: payload.occurrence_id,
+                        due_at_monotonic_ms,
+                        process: process.clone(),
+                        evidence_unavailable_reason: EVIDENCE_UNAVAILABLE_REASON.to_owned(),
+                    })
+                } else {
+                    ManagedStuckAssessment::PossiblyStuck(payload)
+                }
             }
             StuckAssessment::Clear(reason) => {
                 let Some(occurrence_id) = context.active_occurrence_id.clone() else {
@@ -174,7 +220,7 @@ fn plan_assessment(
     })
 }
 
-fn process_receipt(
+pub(crate) fn process_receipt(
     context: &ManagedStuckAssessmentContext,
     probe: Option<&CodexProcessProbe>,
     observed_monotonic_ms: u64,
@@ -303,6 +349,9 @@ fn transition_event_id(
                 clear_reason_identity(payload.reason)
             )
         }
+        ManagedStuckAssessment::NotificationDue(payload) => {
+            format!("notification-due:{}", payload.occurrence_id)
+        }
     };
     opaque_id(
         "stuck-transition",
@@ -352,6 +401,8 @@ mod tests {
             progress_event_id: format!("event-{run_id}-progress"),
             progress_observed_at: OBSERVED_AT.to_owned(),
             active_occurrence_id: None,
+            reset: None,
+            notification: ManagedStuckNotificationState::Inactive,
         }
     }
 
@@ -485,6 +536,61 @@ mod tests {
             panic!("second assessment")
         };
         assert_eq!(first_payload.occurrence_id, second_payload.occurrence_id);
+    }
+
+    #[test]
+    fn persisted_notification_becomes_due_once_at_the_exact_boundary() {
+        let mut context = context(
+            "run-notification-due",
+            ManagedStuckLifecycle::Running,
+            ManagedStuckActivity::Reading,
+            None,
+        );
+        let baselines = BTreeMap::from([(
+            context.run_id.clone(),
+            ProgressBaseline {
+                progress_event_id: context.progress_event_id.clone(),
+                monotonic_ms: 1_000,
+            },
+        )]);
+        let opened = plan_assessment(
+            std::slice::from_ref(&context),
+            &baselines,
+            121_000,
+            OBSERVED_AT,
+            |_| alive(121_000),
+        )
+        .expect("open occurrence");
+        let ManagedStuckAssessment::PossiblyStuck(opened) = &opened.transitions[0].assessment
+        else {
+            panic!("threshold must open occurrence")
+        };
+        context.active_occurrence_id = Some(opened.occurrence_id.clone());
+        context.notification = ManagedStuckNotificationState::NotDue {
+            occurrence_id: opened.occurrence_id.clone(),
+            due_at_monotonic_ms: 421_000,
+        };
+        let before = plan_assessment(
+            std::slice::from_ref(&context),
+            &baselines,
+            420_999,
+            OBSERVED_AT,
+            |_| alive(420_999),
+        )
+        .expect("before due boundary");
+        assert!(matches!(
+            before.transitions[0].assessment,
+            ManagedStuckAssessment::PossiblyStuck(_)
+        ));
+        let exact = plan_assessment(&[context], &baselines, 421_000, OBSERVED_AT, |_| {
+            alive(421_000)
+        })
+        .expect("exact due boundary");
+        let ManagedStuckAssessment::NotificationDue(due) = &exact.transitions[0].assessment else {
+            panic!("exact due boundary must persist notification state")
+        };
+        assert_eq!(due.occurrence_id, opened.occurrence_id);
+        assert_eq!(due.due_at_monotonic_ms, 421_000);
     }
 
     #[test]

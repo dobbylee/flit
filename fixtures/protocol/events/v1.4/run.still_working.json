@@ -1,0 +1,29 @@
+{
+  "protocol_version": "1.4",
+  "event_id": "event-run-managed-1-still-working-1",
+  "run_id": "run-managed-1",
+  "session_id": null,
+  "stream_seq": 7,
+  "ingest_seq": 7,
+  "occurred_at": "2026-08-09T10:02:20Z",
+  "observed_at": "2026-08-09T10:02:20Z",
+  "type": "run.still_working",
+  "source": {
+    "kind": "core",
+    "contract_version": "stuck-action/1.0"
+  },
+  "confidence": 1.0,
+  "evidence_ids": [],
+  "payload": {
+    "occurrence_id": "stuck-run-managed-1-1",
+    "progress_event_id": "event-run-managed-1-command-1",
+    "reset_monotonic_ms": 140000,
+    "notification_suppressed_until_monotonic_ms": 740000,
+    "process": {
+      "status": "alive",
+      "generation": "process-run-managed-1-1",
+      "observed_monotonic_ms": 140000
+    },
+    "evidence_unavailable_reason": "raw_provider_content_not_retained"
+  }
+}

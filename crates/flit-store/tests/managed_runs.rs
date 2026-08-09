@@ -27,10 +27,11 @@ use flit_store::{
     ManagedRunIntent, ManagedRunIntentOutcome, ManagedRunStartFailure,
     ManagedRunStartFailureOutcome, ManagedSessionReconciliation,
     ManagedSessionReconciliationOutcome, ManagedSessionTermination,
-    ManagedSessionTerminationOutcome, ManagedStuckActivity, ManagedStuckAssessment,
-    ManagedStuckLifecycle, ManagedStuckTransition, ManagedStuckTransitionOutcome,
-    ManagedStuckWaitKind, ManagedTurnTerminalOutcome, ProjectDirectoryInspection,
-    ProjectRegistration, ProjectTrustConfirmation, Store, StoreError,
+    ManagedSessionTerminationOutcome, ManagedStillWorkingAction, ManagedStillWorkingOutcome,
+    ManagedStillWorkingRejectedReason, ManagedStuckActivity, ManagedStuckAssessment,
+    ManagedStuckLifecycle, ManagedStuckNotificationDelivery, ManagedStuckTransition,
+    ManagedStuckTransitionOutcome, ManagedStuckWaitKind, ManagedTurnTerminalOutcome,
+    ProjectDirectoryInspection, ProjectRegistration, ProjectTrustConfirmation, Store, StoreError,
 };
 use rusqlite::{Connection, params};
 use serde_json::{Map, Value, json};
@@ -421,6 +422,533 @@ fn stuck_transition_batches_roll_back_all_runs_on_late_stale_cas() {
 }
 
 #[test]
+fn still_working_is_exact_no_write_cas_and_replays_suppression() {
+    let directory = TestDirectory::new("still-working-cas");
+    let (mut store, database, project_path) = trusted_store(&directory);
+    let run_id = "run-still-working";
+    let occurrence_id = "occurrence-still-working";
+    let progress_event_id = "event-still-working-created";
+    store
+        .create_managed_run_intent(run_intent(
+            run_id,
+            progress_event_id,
+            "event-still-working-requested",
+        ))
+        .expect("managed Run");
+    store
+        .connect_initial_managed_session(session_connection(
+            "session-still-working",
+            run_id,
+            "thread-still-working",
+            &project_path,
+        ))
+        .expect("managed session");
+    let version = store
+        .run_snapshot(run_id)
+        .expect("running snapshot")
+        .expect("running projection")
+        .version;
+    store
+        .append_managed_stuck_transition(ManagedStuckTransition {
+            run_id: run_id.to_owned(),
+            expected_run_version: version,
+            event_id: "event-still-working-open".to_owned(),
+            observed_at: "2026-08-09T10:02:10Z".to_owned(),
+            assessment: ManagedStuckAssessment::PossiblyStuck(PossiblyStuckPayload {
+                occurrence_id: occurrence_id.to_owned(),
+                cause: StuckCauseCode::Unknown,
+                threshold_seconds: 120,
+                progress_event_id: progress_event_id.to_owned(),
+                progress_observed_at: CREATED_AT.to_owned(),
+                progress_monotonic_ms: 5_000,
+                baseline_monotonic_ms: 5_000,
+                stuck_since_monotonic_ms: 125_000,
+                process: StuckProcessReceipt::Alive {
+                    generation: "process-still-working".to_owned(),
+                    observed_monotonic_ms: 130_000,
+                },
+                evidence_unavailable_reason: "raw_provider_content_not_retained".to_owned(),
+            }),
+        })
+        .expect("open stuck occurrence");
+    let stuck_version = store
+        .run_snapshot(run_id)
+        .expect("stuck snapshot")
+        .expect("stuck projection")
+        .version;
+    let mut legacy_action_collision = session_event(
+        "event-still-working-legacy-collision",
+        run_id,
+        "session-still-working",
+        2,
+        "run.still_working",
+    );
+    legacy_action_collision.protocol_version = EventProtocolVersion::V1_3;
+    legacy_action_collision.payload = object(json!({"occurrence_id": occurrence_id}));
+    let collision_event = match store
+        .append_event(legacy_action_collision)
+        .expect("legacy action-name collision")
+    {
+        AppendEventOutcome::Inserted(event) => event,
+        other => panic!("legacy collision must insert: {other:?}"),
+    };
+    assert_eq!(collision_event.ingest_seq, stuck_version + 1);
+    let stuck_version = collision_event.ingest_seq;
+    assert!(
+        !store
+            .managed_still_working_was_applied(
+                run_id,
+                "event-still-working-legacy-collision",
+                occurrence_id,
+            )
+            .expect("legacy lookalike retry lookup")
+    );
+    let action = |event_id: &str, expected_run_version: u64, occurrence: &str, generation: &str| {
+        ManagedStillWorkingAction {
+            run_id: run_id.to_owned(),
+            expected_run_version,
+            occurrence_id: occurrence.to_owned(),
+            event_id: event_id.to_owned(),
+            observed_at: "2026-08-09T10:02:20Z".to_owned(),
+            reset_monotonic_ms: 140_000,
+            process: StuckProcessReceipt::Alive {
+                generation: generation.to_owned(),
+                observed_monotonic_ms: 140_000,
+            },
+            evidence_unavailable_reason: "raw_provider_content_not_retained".to_owned(),
+        }
+    };
+    let cursor = store.latest_ingest_seq().expect("stuck cursor");
+    let mut backdated = action(
+        "event-still-working-backdated",
+        stuck_version,
+        occurrence_id,
+        "process-still-working",
+    );
+    backdated.reset_monotonic_ms = 125_000;
+    backdated.process = StuckProcessReceipt::Alive {
+        generation: "process-still-working".to_owned(),
+        observed_monotonic_ms: 125_000,
+    };
+    assert!(matches!(
+        store.apply_managed_still_working(backdated),
+        Ok(ManagedStillWorkingOutcome::Rejected {
+            reason: ManagedStillWorkingRejectedReason::ProcessUnavailable,
+            ..
+        })
+    ));
+    assert_eq!(store.latest_ingest_seq().expect("backdated cursor"), cursor);
+    assert!(matches!(
+        store.apply_managed_still_working(action(
+            "event-still-working-legacy-collision",
+            stuck_version,
+            occurrence_id,
+            "process-still-working",
+        )),
+        Err(StoreError::EventIdentityConflict { event_id })
+            if event_id == "event-still-working-legacy-collision"
+    ));
+    assert_eq!(store.latest_ingest_seq().expect("collision cursor"), cursor);
+    for (attempt, expected_reason) in [
+        (
+            action(
+                "event-still-working-wrong-occurrence",
+                stuck_version,
+                "occurrence-other",
+                "process-still-working",
+            ),
+            ManagedStillWorkingRejectedReason::OccurrenceMismatch,
+        ),
+        (
+            action(
+                "event-still-working-wrong-process",
+                stuck_version,
+                occurrence_id,
+                "process-replaced",
+            ),
+            ManagedStillWorkingRejectedReason::ProcessUnavailable,
+        ),
+    ] {
+        assert!(matches!(
+            store.apply_managed_still_working(attempt),
+            Ok(ManagedStillWorkingOutcome::Rejected { reason, .. }) if reason == expected_reason
+        ));
+        assert_eq!(store.latest_ingest_seq().expect("rejected cursor"), cursor);
+    }
+
+    let exact = action(
+        "event-still-working-applied",
+        stuck_version,
+        occurrence_id,
+        "process-still-working",
+    );
+    let applied = store
+        .apply_managed_still_working(exact.clone())
+        .expect("exact Still working action");
+    let event = match applied {
+        ManagedStillWorkingOutcome::Applied(event) => event,
+        other => panic!("exact action must apply: {other:?}"),
+    };
+    assert_eq!(event.event_type, "run.still_working");
+    assert_eq!(event.protocol_version, EventProtocolVersion::V1_4);
+    assert!(
+        store
+            .managed_still_working_was_applied(
+                run_id,
+                "event-still-working-applied",
+                occurrence_id,
+            )
+            .expect("authoritative retry lookup")
+    );
+    let snapshot = store
+        .run_snapshot(run_id)
+        .expect("reset snapshot")
+        .expect("reset projection");
+    assert_eq!(snapshot.dashboard_bucket, "Working");
+    assert_eq!(snapshot.snapshot["stuck"]["occurrence_id"], Value::Null);
+    assert_eq!(
+        snapshot.snapshot["stuck"]["notification"],
+        json!({
+            "status": "suppressed",
+            "occurrence_id": occurrence_id,
+            "until_monotonic_ms": 740_000,
+        })
+    );
+    let applied_cursor = store.latest_ingest_seq().expect("applied cursor");
+    assert!(matches!(
+        store.apply_managed_still_working(exact),
+        Ok(ManagedStillWorkingOutcome::Rejected {
+            reason: ManagedStillWorkingRejectedReason::AlreadyApplied,
+            ..
+        })
+    ));
+    assert_eq!(
+        store.latest_ingest_seq().expect("retry cursor"),
+        applied_cursor
+    );
+    assert!(matches!(
+        store.apply_managed_still_working(action(
+            "event-still-working-stale",
+            stuck_version,
+            occurrence_id,
+            "process-still-working",
+        )),
+        Ok(ManagedStillWorkingOutcome::Rejected {
+            reason: ManagedStillWorkingRejectedReason::RunVersionStale,
+            ..
+        })
+    ));
+    assert_eq!(
+        store.latest_ingest_seq().expect("stale cursor"),
+        applied_cursor
+    );
+    store
+        .append_managed_stuck_transition(ManagedStuckTransition {
+            run_id: run_id.to_owned(),
+            expected_run_version: event.ingest_seq,
+            event_id: "event-still-working-reopened".to_owned(),
+            observed_at: "2026-08-09T10:04:30Z".to_owned(),
+            assessment: ManagedStuckAssessment::PossiblyStuck(PossiblyStuckPayload {
+                occurrence_id: "occurrence-still-working-reset".to_owned(),
+                cause: StuckCauseCode::Unknown,
+                threshold_seconds: 120,
+                progress_event_id: progress_event_id.to_owned(),
+                progress_observed_at: CREATED_AT.to_owned(),
+                progress_monotonic_ms: 5_000,
+                baseline_monotonic_ms: 140_000,
+                stuck_since_monotonic_ms: 260_000,
+                process: StuckProcessReceipt::Alive {
+                    generation: "process-still-working".to_owned(),
+                    observed_monotonic_ms: 270_000,
+                },
+                evidence_unavailable_reason: "raw_provider_content_not_retained".to_owned(),
+            }),
+        })
+        .expect("reopen occurrence on reset baseline");
+    let reopened_version = store
+        .run_snapshot(run_id)
+        .expect("reopened occurrence snapshot")
+        .expect("reopened occurrence projection")
+        .version;
+    assert_eq!(
+        store
+            .run_snapshot(run_id)
+            .expect("late occurrence snapshot")
+            .expect("late occurrence projection")
+            .snapshot["stuck"]["notification"]["status"],
+        "suppressed"
+    );
+    let before_due_cursor = store.latest_ingest_seq().expect("before due cursor");
+    assert!(matches!(
+        store.append_managed_stuck_transition(ManagedStuckTransition {
+            run_id: run_id.to_owned(),
+            expected_run_version: reopened_version,
+            event_id: "event-still-working-notification-backdated".to_owned(),
+            observed_at: "2026-08-09T10:12:18Z".to_owned(),
+            assessment: ManagedStuckAssessment::NotificationDue(
+                flit_protocol::StuckNotificationDuePayload {
+                    occurrence_id: "occurrence-still-working-reset".to_owned(),
+                    due_at_monotonic_ms: 560_000,
+                    process: StuckProcessReceipt::Alive {
+                        generation: "process-still-working".to_owned(),
+                        observed_monotonic_ms: 560_000,
+                    },
+                    evidence_unavailable_reason: "raw_provider_content_not_retained".to_owned(),
+                },
+            ),
+        }),
+        Err(StoreError::DashboardProjection { .. })
+    ));
+    assert_eq!(
+        store.latest_ingest_seq().expect("backdated due cursor"),
+        before_due_cursor
+    );
+    assert!(matches!(
+        store.append_managed_stuck_notification_delivered(ManagedStuckNotificationDelivery {
+            run_id: run_id.to_owned(),
+            expected_run_version: reopened_version,
+            occurrence_id: "occurrence-still-working-reset".to_owned(),
+            event_id: "event-still-working-delivery-before-due".to_owned(),
+            observed_at: "2026-08-09T10:12:19Z".to_owned(),
+            platform_id: "notification-before-due".to_owned(),
+        }),
+        Err(StoreError::ManagedStuckOccurrenceMismatch { .. })
+    ));
+    assert_eq!(
+        store
+            .latest_ingest_seq()
+            .expect("delivery-before-due cursor"),
+        before_due_cursor
+    );
+    let due = store
+        .append_managed_stuck_transition(ManagedStuckTransition {
+            run_id: run_id.to_owned(),
+            expected_run_version: reopened_version,
+            event_id: "event-still-working-notification-due".to_owned(),
+            observed_at: "2026-08-09T10:12:20Z".to_owned(),
+            assessment: ManagedStuckAssessment::NotificationDue(
+                flit_protocol::StuckNotificationDuePayload {
+                    occurrence_id: "occurrence-still-working-reset".to_owned(),
+                    due_at_monotonic_ms: 560_000,
+                    process: StuckProcessReceipt::Alive {
+                        generation: "process-still-working".to_owned(),
+                        observed_monotonic_ms: 740_000,
+                    },
+                    evidence_unavailable_reason: "raw_provider_content_not_retained".to_owned(),
+                },
+            ),
+        })
+        .expect("notification due transition");
+    let due_event = match due {
+        ManagedStuckTransitionOutcome::Appended(event) => event,
+        other => panic!("due transition must append: {other:?}"),
+    };
+    assert_eq!(due_event.event_type, "notification.due");
+    assert_eq!(
+        store
+            .run_snapshot(run_id)
+            .expect("due snapshot")
+            .expect("due projection")
+            .snapshot["stuck"]["notification"]["status"],
+        "due"
+    );
+    let after_due_cursor = store.latest_ingest_seq().expect("after due cursor");
+    assert!(matches!(
+        store.apply_managed_still_working(ManagedStillWorkingAction {
+            run_id: run_id.to_owned(),
+            expected_run_version: due_event.ingest_seq,
+            occurrence_id: "occurrence-still-working-reset".to_owned(),
+            event_id: "event-still-working-backdated-after-due".to_owned(),
+            observed_at: "2026-08-09T10:12:20Z".to_owned(),
+            reset_monotonic_ms: 600_000,
+            process: StuckProcessReceipt::Alive {
+                generation: "process-still-working".to_owned(),
+                observed_monotonic_ms: 600_000,
+            },
+            evidence_unavailable_reason: "raw_provider_content_not_retained".to_owned(),
+        }),
+        Ok(ManagedStillWorkingOutcome::Rejected {
+            reason: ManagedStillWorkingRejectedReason::ProcessUnavailable,
+            ..
+        })
+    ));
+    assert_eq!(
+        store
+            .latest_ingest_seq()
+            .expect("after due no-write cursor"),
+        after_due_cursor
+    );
+    let mut legacy_delivery_collision = session_event(
+        "event-still-working-notification-collision",
+        run_id,
+        "session-still-working",
+        3,
+        "notification.delivered",
+    );
+    legacy_delivery_collision.protocol_version = EventProtocolVersion::V1_3;
+    legacy_delivery_collision.payload = object(json!({
+        "occurrence_id": "occurrence-still-working-reset",
+        "platform_id": "notification-still-working-reset",
+    }));
+    let delivery_version = match store
+        .append_event(legacy_delivery_collision)
+        .expect("legacy delivery-name collision")
+    {
+        AppendEventOutcome::Inserted(event) => event.ingest_seq,
+        other => panic!("legacy delivery collision must insert: {other:?}"),
+    };
+    let delivery_collision = ManagedStuckNotificationDelivery {
+        run_id: run_id.to_owned(),
+        expected_run_version: delivery_version,
+        occurrence_id: "occurrence-still-working-reset".to_owned(),
+        event_id: "event-still-working-notification-collision".to_owned(),
+        observed_at: "2026-08-09T10:12:21Z".to_owned(),
+        platform_id: "notification-still-working-reset".to_owned(),
+    };
+    let collision_cursor = store
+        .latest_ingest_seq()
+        .expect("delivery collision cursor");
+    assert!(matches!(
+        store.append_managed_stuck_notification_delivered(delivery_collision),
+        Err(StoreError::EventIdentityConflict { event_id })
+            if event_id == "event-still-working-notification-collision"
+    ));
+    assert_eq!(
+        store.latest_ingest_seq().expect("delivery no-write cursor"),
+        collision_cursor
+    );
+    let delivery = ManagedStuckNotificationDelivery {
+        run_id: run_id.to_owned(),
+        expected_run_version: delivery_version,
+        occurrence_id: "occurrence-still-working-reset".to_owned(),
+        event_id: "event-still-working-notification-delivered".to_owned(),
+        observed_at: "2026-08-09T10:12:21Z".to_owned(),
+        platform_id: "notification-still-working-reset".to_owned(),
+    };
+    let delivered = store
+        .append_managed_stuck_notification_delivered(delivery.clone())
+        .expect("notification delivery receipt");
+    assert!(matches!(delivered, AppendEventOutcome::Inserted(_)));
+    let delivered_cursor = store.latest_ingest_seq().expect("delivered cursor");
+    assert!(matches!(
+        store.append_managed_stuck_notification_delivered(delivery),
+        Ok(AppendEventOutcome::Duplicate(_))
+    ));
+    assert_eq!(
+        store.latest_ingest_seq().expect("delivery retry cursor"),
+        delivered_cursor
+    );
+    assert_eq!(
+        store
+            .run_snapshot(run_id)
+            .expect("delivered snapshot")
+            .expect("delivered projection")
+            .snapshot["stuck"]["notification"]["status"],
+        "delivered"
+    );
+    drop(store);
+    let reopened = Store::open(&database, CREATED_AT).expect("reopen reset snapshot");
+    assert_eq!(
+        reopened
+            .run_snapshot(run_id)
+            .expect("reopened snapshot")
+            .expect("reopened projection")
+            .snapshot["stuck"]["notification"]["status"],
+        "delivered"
+    );
+}
+
+#[test]
+fn still_working_rejects_progress_that_advanced_after_the_card_version() {
+    let directory = TestDirectory::new("still-working-progress-drift");
+    let (mut store, _database, project_path) = trusted_store(&directory);
+    let run_id = "run-still-working-progress";
+    store
+        .create_managed_run_intent(run_intent(
+            run_id,
+            "event-still-working-progress-created",
+            "event-still-working-progress-requested",
+        ))
+        .expect("managed Run");
+    store
+        .connect_initial_managed_session(session_connection(
+            "session-still-working-progress",
+            run_id,
+            "thread-still-working-progress",
+            &project_path,
+        ))
+        .expect("managed session");
+    let version = store
+        .run_snapshot(run_id)
+        .expect("running snapshot")
+        .expect("running projection")
+        .version;
+    store
+        .append_managed_stuck_transition(ManagedStuckTransition {
+            run_id: run_id.to_owned(),
+            expected_run_version: version,
+            event_id: "event-still-working-progress-open".to_owned(),
+            observed_at: "2026-08-09T10:02:10Z".to_owned(),
+            assessment: ManagedStuckAssessment::PossiblyStuck(PossiblyStuckPayload {
+                occurrence_id: "occurrence-still-working-progress".to_owned(),
+                cause: StuckCauseCode::Unknown,
+                threshold_seconds: 120,
+                progress_event_id: "event-still-working-progress-created".to_owned(),
+                progress_observed_at: CREATED_AT.to_owned(),
+                progress_monotonic_ms: 5_000,
+                baseline_monotonic_ms: 5_000,
+                stuck_since_monotonic_ms: 125_000,
+                process: StuckProcessReceipt::Alive {
+                    generation: "process-still-working-progress".to_owned(),
+                    observed_monotonic_ms: 130_000,
+                },
+                evidence_unavailable_reason: "raw_provider_content_not_retained".to_owned(),
+            }),
+        })
+        .expect("open stuck occurrence");
+    store
+        .append_managed_provider_observation(ManagedProviderObservation {
+            run_id: run_id.to_owned(),
+            session_id: "session-still-working-progress".to_owned(),
+            external_session_key: "thread-still-working-progress".to_owned(),
+            provider_turn_id: "turn-still-working-progress".to_owned(),
+            contract_version: "codex-app-server/0.145.0".to_owned(),
+            event_id: "event-still-working-progress-command".to_owned(),
+            observed_at: "2026-08-09T10:02:15Z".to_owned(),
+            kind: ManagedProviderObservationKind::CommandStarted {
+                provider_item_id: "item-still-working-progress".to_owned(),
+            },
+        })
+        .expect("new progress");
+    let current_version = store
+        .run_snapshot(run_id)
+        .expect("progress snapshot")
+        .expect("progress projection")
+        .version;
+    let cursor = store.latest_ingest_seq().expect("progress cursor");
+    assert!(matches!(
+        store.apply_managed_still_working(ManagedStillWorkingAction {
+            run_id: run_id.to_owned(),
+            expected_run_version: current_version,
+            occurrence_id: "occurrence-still-working-progress".to_owned(),
+            event_id: "event-still-working-progress-action".to_owned(),
+            observed_at: "2026-08-09T10:02:20Z".to_owned(),
+            reset_monotonic_ms: 140_000,
+            process: StuckProcessReceipt::Alive {
+                generation: "process-still-working-progress".to_owned(),
+                observed_monotonic_ms: 140_000,
+            },
+            evidence_unavailable_reason: "raw_provider_content_not_retained".to_owned(),
+        }),
+        Ok(ManagedStillWorkingOutcome::Rejected {
+            reason: ManagedStillWorkingRejectedReason::NotCurrentlyStuck,
+            ..
+        })
+    ));
+    assert_eq!(store.latest_ingest_seq().expect("no-write cursor"), cursor);
+}
+
+#[test]
 fn managed_terminal_events_close_active_stuck_replay_in_the_same_transaction() {
     for (suffix, interrupted) in [("completed", false), ("interrupted", true)] {
         let directory = TestDirectory::new(&format!("stuck-terminal-{suffix}"));
@@ -472,6 +1000,30 @@ fn managed_terminal_events_close_active_stuck_replay_in_the_same_transaction() {
                 }),
             })
             .expect("open stuck occurrence");
+        let stuck_version = store
+            .run_snapshot(&run_id)
+            .expect("stuck snapshot")
+            .expect("stuck projection")
+            .version;
+        store
+            .append_managed_stuck_transition(ManagedStuckTransition {
+                run_id: run_id.clone(),
+                expected_run_version: stuck_version,
+                event_id: format!("event-stuck-terminal-{suffix}-due"),
+                observed_at: "2026-07-24T10:08:20Z".to_owned(),
+                assessment: ManagedStuckAssessment::NotificationDue(
+                    flit_protocol::StuckNotificationDuePayload {
+                        occurrence_id: format!("occurrence-stuck-terminal-{suffix}"),
+                        due_at_monotonic_ms: 425_000,
+                        process: StuckProcessReceipt::Alive {
+                            generation: format!("process-stuck-terminal-{suffix}"),
+                            observed_monotonic_ms: 500_000,
+                        },
+                        evidence_unavailable_reason: "raw_provider_content_not_retained".to_owned(),
+                    },
+                ),
+            })
+            .expect("notification due before terminal");
         let kind = if interrupted {
             ManagedProviderObservationKind::TurnInterrupted {
                 changes: ManagedGitChangeSummary::Unavailable {
@@ -515,6 +1067,7 @@ fn managed_terminal_events_close_active_stuck_replay_in_the_same_transaction() {
         let clear = &history.events[history.events.len() - 2];
         assert_eq!(clear.event_type, "run.stuck_cleared");
         assert_eq!(clear.payload["reason"], "lifecycle_inactive");
+        assert_eq!(clear.payload["process"]["observed_monotonic_ms"], 500_000);
         assert_eq!(
             clear.payload["occurrence_id"],
             format!("occurrence-stuck-terminal-{suffix}")
@@ -1135,8 +1688,40 @@ fn legacy_same_name_stuck_events_remain_unknown_compatible_across_reopen() {
         ));
     }
 
-    let appended = store.events_after(4, 6).expect("read legacy events");
-    assert_eq!(appended.len(), 6);
+    let action_versions = [
+        EventProtocolVersion::V1_0,
+        EventProtocolVersion::V1_1,
+        EventProtocolVersion::V1_2,
+        EventProtocolVersion::V1_3,
+    ];
+    let action_names = [
+        "run.still_working",
+        "notification.due",
+        "notification.delivered",
+    ];
+    for (index, (version, name)) in action_versions
+        .into_iter()
+        .flat_map(|version| action_names.into_iter().map(move |name| (version, name)))
+        .enumerate()
+    {
+        let mut event = session_event(
+            &format!("event-legacy-action-name-{index}"),
+            "run-legacy-stuck-names",
+            "session-legacy-stuck-names",
+            index as u64 + 8,
+            name,
+        );
+        event.protocol_version = version;
+        assert!(matches!(
+            store
+                .append_event(event)
+                .expect("legacy action event append"),
+            AppendEventOutcome::Inserted(_)
+        ));
+    }
+
+    let appended = store.events_after(4, 18).expect("read legacy events");
+    assert_eq!(appended.len(), 18);
     let projected = store
         .run_snapshot("run-legacy-stuck-names")
         .expect("unknown-compatible snapshot")
@@ -1149,7 +1734,7 @@ fn legacy_same_name_stuck_events_remain_unknown_compatible_across_reopen() {
 
     drop(store);
     let reopened = Store::open(&database, "2026-07-24T10:10:00Z").expect("reopen Store");
-    let reopened_events = reopened.events_after(4, 6).expect("read reopened events");
+    let reopened_events = reopened.events_after(4, 18).expect("read reopened events");
     assert_eq!(reopened_events, appended);
     assert_eq!(
         reopened

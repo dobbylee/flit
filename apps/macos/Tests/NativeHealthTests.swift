@@ -2084,6 +2084,29 @@ struct NativeHealthTests {
                 && stuckAssessmentResponse.unavailableRuns == 1,
             "generated stuck assessment contract must preserve bounded aggregate counts"
         )
+        let stillWorkingRequest = try decodeFixture(
+            FlitManagedRunStillWorkingRequest.self,
+            at: "\(fixtureRoot)/managed_run_still_working.request.json"
+        )
+        let stillWorkingApplied = try decodeFixture(
+            FlitManagedRunStillWorkingResponse.self,
+            at: "\(fixtureRoot)/managed_run_still_working.applied.response.json"
+        )
+        let stillWorkingRejected = try decodeFixture(
+            FlitManagedRunStillWorkingResponse.self,
+            at: "\(fixtureRoot)/managed_run_still_working.rejected.response.json"
+        )
+        try require(
+            stillWorkingRequest.clientProtocolVersion == flitClientProtocolVersion
+                && stillWorkingRequest.expectedRunVersion == 6
+                && stillWorkingApplied.status == .applied
+                && stillWorkingApplied.eventVersion == 7
+                && stillWorkingApplied.reason == nil
+                && stillWorkingRejected.status == .rejected
+                && stillWorkingRejected.reason == .runVersionStale
+                && stillWorkingRejected.eventId == nil,
+            "generated Still working contract must preserve exact CAS variants"
+        )
         for (name, expectedStatus) in [
             (
                 "managed_run_observe.permission_requested.response.json",

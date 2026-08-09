@@ -6,7 +6,7 @@ use std::{
 
 use flit_protocol::{
     EventEnvelope, GitBaselinePayload, GitHead, PossiblyStuckPayload, StuckClearedPayload,
-    StuckProcessReceipt,
+    StuckNotificationDuePayload, StuckProcessReceipt,
 };
 use serde_json::{Map, Value};
 
@@ -61,6 +61,7 @@ pub struct ManagedRun {
 pub enum ManagedStuckAssessment {
     PossiblyStuck(PossiblyStuckPayload),
     Clear(StuckClearedPayload),
+    NotificationDue(StuckNotificationDuePayload),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,6 +71,48 @@ pub struct ManagedStuckTransition {
     pub event_id: String,
     pub observed_at: String,
     pub assessment: ManagedStuckAssessment,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedStillWorkingAction {
+    pub run_id: String,
+    pub expected_run_version: u64,
+    pub occurrence_id: String,
+    pub event_id: String,
+    pub observed_at: String,
+    pub reset_monotonic_ms: u64,
+    pub process: StuckProcessReceipt,
+    pub evidence_unavailable_reason: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedStillWorkingRejectedReason {
+    RunVersionStale,
+    OccurrenceMismatch,
+    NotCurrentlyStuck,
+    ProcessUnavailable,
+    AlreadyApplied,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ManagedStillWorkingOutcome {
+    Applied(Box<EventEnvelope>),
+    Rejected {
+        run_id: String,
+        expected_run_version: u64,
+        occurrence_id: String,
+        reason: ManagedStillWorkingRejectedReason,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedStuckNotificationDelivery {
+    pub run_id: String,
+    pub expected_run_version: u64,
+    pub occurrence_id: String,
+    pub event_id: String,
+    pub observed_at: String,
+    pub platform_id: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -99,6 +142,34 @@ pub enum ManagedStuckWaitKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedStuckReset {
+    pub progress_event_id: String,
+    pub reset_monotonic_ms: u64,
+    pub notification_suppressed_until_monotonic_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ManagedStuckNotificationState {
+    Inactive,
+    NotDue {
+        occurrence_id: String,
+        due_at_monotonic_ms: u64,
+    },
+    Suppressed {
+        occurrence_id: String,
+        until_monotonic_ms: u64,
+    },
+    Due {
+        occurrence_id: String,
+        due_at_monotonic_ms: u64,
+    },
+    Delivered {
+        occurrence_id: String,
+        platform_id: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedStuckAssessmentContext {
     pub run_id: String,
     pub version: u64,
@@ -109,6 +180,8 @@ pub struct ManagedStuckAssessmentContext {
     pub progress_event_id: String,
     pub progress_observed_at: String,
     pub active_occurrence_id: Option<String>,
+    pub reset: Option<ManagedStuckReset>,
+    pub notification: ManagedStuckNotificationState,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -836,6 +909,76 @@ pub(crate) fn validate_stuck_transition(
                 }
             }
         }
+        ManagedStuckAssessment::NotificationDue(payload) => {
+            validate_id(&payload.occurrence_id).map_err(|()| "occurrence_id")?;
+            validate_token(
+                &payload.evidence_unavailable_reason,
+                MAX_MANAGED_FAILURE_REASON_BYTES,
+            )
+            .map_err(|()| "evidence_unavailable_reason")?;
+            if payload.due_at_monotonic_ms > flit_protocol::MAX_JSON_SAFE_INTEGER {
+                return Err("due_at_monotonic_ms");
+            }
+            match &payload.process {
+                StuckProcessReceipt::Alive {
+                    generation,
+                    observed_monotonic_ms,
+                } if validate_id(generation).is_ok()
+                    && *observed_monotonic_ms >= payload.due_at_monotonic_ms
+                    && *observed_monotonic_ms <= flit_protocol::MAX_JSON_SAFE_INTEGER => {}
+                _ => return Err("process"),
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_still_working_action(
+    action: &ManagedStillWorkingAction,
+) -> Result<(), &'static str> {
+    validate_id(&action.run_id).map_err(|()| "run_id")?;
+    validate_id(&action.occurrence_id).map_err(|()| "occurrence_id")?;
+    validate_id(&action.event_id).map_err(|()| "event_id")?;
+    validate_timestamp(&action.observed_at).map_err(|()| "observed_at")?;
+    validate_token(
+        &action.evidence_unavailable_reason,
+        MAX_MANAGED_FAILURE_REASON_BYTES,
+    )
+    .map_err(|()| "evidence_unavailable_reason")?;
+    if action.expected_run_version == 0
+        || action.expected_run_version > flit_protocol::MAX_JSON_SAFE_INTEGER
+        || action.reset_monotonic_ms > flit_protocol::MAX_JSON_SAFE_INTEGER
+    {
+        return Err("expected_run_version");
+    }
+    match &action.process {
+        StuckProcessReceipt::Alive {
+            generation,
+            observed_monotonic_ms,
+        } if validate_id(generation).is_ok()
+            && *observed_monotonic_ms == action.reset_monotonic_ms => {}
+        _ => return Err("process"),
+    }
+    action
+        .reset_monotonic_ms
+        .checked_add(600_000)
+        .filter(|value| *value <= flit_protocol::MAX_JSON_SAFE_INTEGER)
+        .ok_or("reset_monotonic_ms")?;
+    Ok(())
+}
+
+pub(crate) fn validate_stuck_notification_delivery(
+    delivery: &ManagedStuckNotificationDelivery,
+) -> Result<(), &'static str> {
+    validate_id(&delivery.run_id).map_err(|()| "run_id")?;
+    validate_id(&delivery.occurrence_id).map_err(|()| "occurrence_id")?;
+    validate_id(&delivery.event_id).map_err(|()| "event_id")?;
+    validate_id(&delivery.platform_id).map_err(|()| "platform_id")?;
+    validate_timestamp(&delivery.observed_at).map_err(|()| "observed_at")?;
+    if delivery.expected_run_version == 0
+        || delivery.expected_run_version > flit_protocol::MAX_JSON_SAFE_INTEGER
+    {
+        return Err("expected_run_version");
     }
     Ok(())
 }

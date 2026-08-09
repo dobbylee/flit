@@ -1,0 +1,9 @@
+{
+  "status": "applied",
+  "protocol_version": "1.21",
+  "run_id": "run-managed-1",
+  "previous_version": 6,
+  "event_id": "event-run-managed-1-still-working-1",
+  "event_version": 7,
+  "occurrence_id": "stuck-run-managed-1-1"
+}

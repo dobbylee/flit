@@ -1,0 +1,27 @@
+{
+  "protocol_version": "1.4",
+  "event_id": "event-run-managed-1-notification-due-1",
+  "run_id": "run-managed-1",
+  "session_id": null,
+  "stream_seq": 8,
+  "ingest_seq": 8,
+  "occurred_at": "2026-08-09T10:12:20Z",
+  "observed_at": "2026-08-09T10:12:20Z",
+  "type": "notification.due",
+  "source": {
+    "kind": "core",
+    "contract_version": "stuck-notification/1.0"
+  },
+  "confidence": 1.0,
+  "evidence_ids": [],
+  "payload": {
+    "occurrence_id": "stuck-run-managed-1-2",
+    "due_at_monotonic_ms": 560000,
+    "process": {
+      "status": "alive",
+      "generation": "process-run-managed-1-1",
+      "observed_monotonic_ms": 740000
+    },
+    "evidence_unavailable_reason": "raw_provider_content_not_retained"
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "protocol_version": "1.21",
+  "core_instance_id": "core-quit-fixture",
+  "cursor": 7,
+  "flit_monitoring_stops": true,
+  "flit_notifications_stop": true,
+  "runs": [
+    {
+      "run_id": "run-continues",
+      "title": "Continue in provider",
+      "provider": "codex",
+      "execution_after_quit": "continues",
+      "reason": "capability_supported"
+    },
+    {
+      "run_id": "run-stops",
+      "title": "Stop with Flit",
+      "provider": "codex",
+      "execution_after_quit": "stops",
+      "reason": "capability_unsupported"
+    },
+    {
+      "run_id": "run-unknown",
+      "title": "Unknown provider outcome",
+      "provider": "codex",
+      "execution_after_quit": "unknown",
+      "reason": "capability_missing"
+    }
+  ]
+}

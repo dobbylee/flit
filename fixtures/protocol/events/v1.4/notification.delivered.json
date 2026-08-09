@@ -1,0 +1,21 @@
+{
+  "protocol_version": "1.4",
+  "event_id": "event-run-managed-1-notification-delivered-1",
+  "run_id": "run-managed-1",
+  "session_id": null,
+  "stream_seq": 9,
+  "ingest_seq": 9,
+  "occurred_at": "2026-08-09T10:12:21Z",
+  "observed_at": "2026-08-09T10:12:21Z",
+  "type": "notification.delivered",
+  "source": {
+    "kind": "notifier",
+    "contract_version": "stuck-notification/1.0"
+  },
+  "confidence": 1.0,
+  "evidence_ids": [],
+  "payload": {
+    "occurrence_id": "stuck-run-managed-1-2",
+    "platform_id": "notification-run-managed-1-2"
+  }
+}

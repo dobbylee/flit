@@ -9,7 +9,8 @@ use std::{
 use flit_core::activity::WaitKind as CoreWaitKind;
 use flit_core::projection::{
     ChangeAttribution as CoreChangeAttribution, ChangeSummary as CoreChangeSummary,
-    ProjectionError, ProjectionEvent, replay_dashboard_projection,
+    ProjectionError, ProjectionEvent, StuckNotificationProjection as CoreStuckNotification,
+    replay_dashboard_projection,
 };
 use flit_protocol::{
     EventEnvelope, EventProtocolVersion, EventSource, EventSourceKind, GitBaselinePayload, GitHead,
@@ -44,8 +45,10 @@ pub use managed_runs::{
     ManagedRun, ManagedRunIntent, ManagedRunIntentOutcome, ManagedRunStartFailure,
     ManagedRunStartFailureOutcome, ManagedSession, ManagedSessionReconciliation,
     ManagedSessionReconciliationOutcome, ManagedSessionTermination,
-    ManagedSessionTerminationOutcome, ManagedStuckActivity, ManagedStuckAssessment,
-    ManagedStuckAssessmentContext, ManagedStuckLifecycle, ManagedStuckTransition,
+    ManagedSessionTerminationOutcome, ManagedStillWorkingAction, ManagedStillWorkingOutcome,
+    ManagedStillWorkingRejectedReason, ManagedStuckActivity, ManagedStuckAssessment,
+    ManagedStuckAssessmentContext, ManagedStuckLifecycle, ManagedStuckNotificationDelivery,
+    ManagedStuckNotificationState, ManagedStuckReset, ManagedStuckTransition,
     ManagedStuckTransitionOutcome, ManagedStuckWaitKind, ManagedTurnTerminalOutcome,
 };
 pub use projects::{
@@ -474,6 +477,43 @@ impl Store {
                         field: "progress_observed_at",
                     }
                 })?;
+                let reset = projection.stuck_reset.map(|reset| ManagedStuckReset {
+                    progress_event_id: reset.progress_event_id,
+                    reset_monotonic_ms: reset.reset_monotonic_ms,
+                    notification_suppressed_until_monotonic_ms: reset
+                        .notification_suppressed_until_monotonic_ms,
+                });
+                let notification = match projection.stuck_notification {
+                    CoreStuckNotification::Inactive => ManagedStuckNotificationState::Inactive,
+                    CoreStuckNotification::NotDue {
+                        occurrence_id,
+                        due_at_monotonic_ms,
+                    } => ManagedStuckNotificationState::NotDue {
+                        occurrence_id,
+                        due_at_monotonic_ms,
+                    },
+                    CoreStuckNotification::Suppressed {
+                        occurrence_id,
+                        until_monotonic_ms,
+                    } => ManagedStuckNotificationState::Suppressed {
+                        occurrence_id,
+                        until_monotonic_ms,
+                    },
+                    CoreStuckNotification::Due {
+                        occurrence_id,
+                        due_at_monotonic_ms,
+                    } => ManagedStuckNotificationState::Due {
+                        occurrence_id,
+                        due_at_monotonic_ms,
+                    },
+                    CoreStuckNotification::Delivered {
+                        occurrence_id,
+                        platform_id,
+                    } => ManagedStuckNotificationState::Delivered {
+                        occurrence_id,
+                        platform_id,
+                    },
+                };
                 Ok(ManagedStuckAssessmentContext {
                     run_id,
                     version: projection.version,
@@ -484,6 +524,8 @@ impl Store {
                     progress_event_id: projection.last_progress_event_id,
                     progress_observed_at,
                     active_occurrence_id: projection.current_stuck_occurrence_id,
+                    reset,
+                    notification,
                 })
             })
             .collect()
@@ -526,6 +568,223 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         transaction.commit().map_err(StoreError::Sqlite)?;
         Ok(outcomes)
+    }
+
+    pub fn apply_managed_still_working(
+        &mut self,
+        action: ManagedStillWorkingAction,
+    ) -> Result<ManagedStillWorkingOutcome, StoreError> {
+        managed_runs::validate_still_working_action(&action)
+            .map_err(|field| StoreError::InvalidManagedStillWorking { field })?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+        if let Some(ingest_seq) = event_ingest_seq(&transaction, &action.event_id)? {
+            let existing = load_event(&transaction, ingest_seq)?;
+            if managed_still_working_receipt_matches_action(&existing, &action) {
+                transaction.commit().map_err(StoreError::Sqlite)?;
+                return Ok(managed_still_working_rejected(
+                    action,
+                    ManagedStillWorkingRejectedReason::AlreadyApplied,
+                ));
+            }
+            return Err(StoreError::EventIdentityConflict {
+                event_id: action.event_id,
+            });
+        }
+        let Some(current_version) = latest_run_event_version(&transaction, &action.run_id)? else {
+            return Err(StoreError::MissingRun {
+                run_id: action.run_id,
+            });
+        };
+        if current_version != action.expected_run_version {
+            transaction.commit().map_err(StoreError::Sqlite)?;
+            return Ok(managed_still_working_rejected(
+                action,
+                ManagedStillWorkingRejectedReason::RunVersionStale,
+            ));
+        }
+        let Some(active) = load_active_stuck_transition(&transaction, &action.run_id)? else {
+            transaction.commit().map_err(StoreError::Sqlite)?;
+            return Ok(managed_still_working_rejected(
+                action,
+                ManagedStillWorkingRejectedReason::NotCurrentlyStuck,
+            ));
+        };
+        if active.occurrence_id != action.occurrence_id {
+            transaction.commit().map_err(StoreError::Sqlite)?;
+            return Ok(managed_still_working_rejected(
+                action,
+                ManagedStillWorkingRejectedReason::OccurrenceMismatch,
+            ));
+        }
+        let persisted = serde_json::from_value::<flit_protocol::PossiblyStuckPayload>(
+            Value::Object(active.payload),
+        )
+        .map_err(|_| StoreError::StoredManagedStuckTransitionInvalid {
+            run_id: action.run_id.clone(),
+        })?;
+        let projection =
+            replay_dashboard_projection(&load_run_event_history(&transaction, &action.run_id)?)
+                .map_err(|source| StoreError::DashboardProjection {
+                    run_id: action.run_id.clone(),
+                    source,
+                })?;
+        if projection.last_progress_event_id != persisted.progress_event_id {
+            transaction.commit().map_err(StoreError::Sqlite)?;
+            return Ok(managed_still_working_rejected(
+                action,
+                ManagedStillWorkingRejectedReason::NotCurrentlyStuck,
+            ));
+        }
+        validate_managed_stuck_authority(
+            &transaction,
+            &ManagedStuckTransition {
+                run_id: action.run_id.clone(),
+                expected_run_version: action.expected_run_version,
+                event_id: action.event_id.clone(),
+                observed_at: action.observed_at.clone(),
+                assessment: ManagedStuckAssessment::PossiblyStuck(persisted.clone()),
+            },
+        )?;
+        let exact_process = matches!(
+            (&active.process, &action.process),
+            (
+                flit_protocol::StuckProcessReceipt::Alive {
+                    generation: expected,
+                    observed_monotonic_ms: expected_observed,
+                },
+                flit_protocol::StuckProcessReceipt::Alive {
+                    generation: received,
+                    observed_monotonic_ms: received_observed,
+                }
+            ) if expected == received && received_observed >= expected_observed
+        );
+        if !exact_process {
+            transaction.commit().map_err(StoreError::Sqlite)?;
+            return Ok(managed_still_working_rejected(
+                action,
+                ManagedStillWorkingRejectedReason::ProcessUnavailable,
+            ));
+        }
+        if action.reset_monotonic_ms < persisted.stuck_since_monotonic_ms {
+            transaction.commit().map_err(StoreError::Sqlite)?;
+            return Ok(managed_still_working_rejected(
+                action,
+                ManagedStillWorkingRejectedReason::NotCurrentlyStuck,
+            ));
+        }
+        let suppressed_until = action
+            .reset_monotonic_ms
+            .checked_add(600_000)
+            .expect("validated Still working suppression bound");
+        let payload = flit_protocol::StillWorkingPayload {
+            occurrence_id: action.occurrence_id.clone(),
+            progress_event_id: persisted.progress_event_id,
+            reset_monotonic_ms: action.reset_monotonic_ms,
+            notification_suppressed_until_monotonic_ms: suppressed_until,
+            process: action.process.clone(),
+            evidence_unavailable_reason: action.evidence_unavailable_reason.clone(),
+        };
+        let event = managed_still_working_event(
+            &action,
+            payload,
+            next_managed_run_core_stream_seq(&transaction, &action.run_id)?,
+        );
+        let mut outcomes = append_event_batch_in_transaction(&transaction, vec![event])?;
+        let event = match outcomes
+            .pop()
+            .expect("one Still working action must produce one append outcome")
+        {
+            AppendEventOutcome::Inserted(event) => event,
+            AppendEventOutcome::Duplicate(_) => {
+                unreachable!("Still working duplicates are handled before append")
+            }
+        };
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(ManagedStillWorkingOutcome::Applied(Box::new(event)))
+    }
+
+    pub fn managed_still_working_was_applied(
+        &self,
+        run_id: &str,
+        event_id: &str,
+        occurrence_id: &str,
+    ) -> Result<bool, StoreError> {
+        let Some(ingest_seq) = event_ingest_seq(&self.connection, event_id)? else {
+            return Ok(false);
+        };
+        let event = load_event(&self.connection, ingest_seq)?;
+        Ok(is_authoritative_still_working_receipt(
+            &event,
+            run_id,
+            occurrence_id,
+        ))
+    }
+
+    pub fn append_managed_stuck_notification_delivered(
+        &mut self,
+        delivery: ManagedStuckNotificationDelivery,
+    ) -> Result<AppendEventOutcome, StoreError> {
+        managed_runs::validate_stuck_notification_delivery(&delivery)
+            .map_err(|field| StoreError::InvalidManagedStuckNotificationDelivery { field })?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+        if let Some(ingest_seq) = event_ingest_seq(&transaction, &delivery.event_id)? {
+            let existing = load_event(&transaction, ingest_seq)?;
+            let expected =
+                managed_stuck_notification_delivered_event(&delivery, existing.stream_seq);
+            if UnsequencedEventEnvelope::from(existing.clone()) == expected {
+                transaction.commit().map_err(StoreError::Sqlite)?;
+                return Ok(AppendEventOutcome::Duplicate(existing));
+            }
+            return Err(StoreError::EventIdentityConflict {
+                event_id: delivery.event_id,
+            });
+        }
+        let current_version = latest_run_event_version(&transaction, &delivery.run_id)?
+            .ok_or_else(|| StoreError::MissingRun {
+                run_id: delivery.run_id.clone(),
+            })?;
+        if current_version != delivery.expected_run_version {
+            return Err(StoreError::ManagedStuckRunVersionStale {
+                run_id: delivery.run_id,
+                expected: delivery.expected_run_version,
+                current: current_version,
+            });
+        }
+        let projection =
+            replay_dashboard_projection(&load_run_event_history(&transaction, &delivery.run_id)?)
+                .map_err(|source| StoreError::DashboardProjection {
+                run_id: delivery.run_id.clone(),
+                source,
+            })?;
+        if !matches!(
+            projection.stuck_notification,
+            CoreStuckNotification::Due { ref occurrence_id, .. }
+                if occurrence_id == &delivery.occurrence_id
+        ) {
+            return Err(StoreError::ManagedStuckOccurrenceMismatch {
+                run_id: delivery.run_id,
+                expected: projection
+                    .current_stuck_occurrence_id
+                    .unwrap_or_else(|| "active_due_occurrence".to_owned()),
+                received: delivery.occurrence_id,
+            });
+        }
+        let event = managed_stuck_notification_delivered_event(
+            &delivery,
+            next_managed_run_core_stream_seq(&transaction, &delivery.run_id)?,
+        );
+        let mut outcomes = append_event_batch_in_transaction(&transaction, vec![event])?;
+        let outcome = outcomes
+            .pop()
+            .expect("one notification delivery must produce one outcome");
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(outcome)
     }
 
     fn append_managed_stuck_transition_in_transaction(
@@ -577,6 +836,43 @@ impl Store {
                     received: desired.occurrence_id.clone(),
                 });
             }
+            (ManagedStuckAssessment::NotificationDue(_), None) => {
+                return Err(StoreError::ManagedStuckOccurrenceMismatch {
+                    run_id: transition.run_id,
+                    expected: "active_occurrence".to_owned(),
+                    received: "none".to_owned(),
+                });
+            }
+            (ManagedStuckAssessment::NotificationDue(desired), Some(current))
+                if desired.occurrence_id != current.occurrence_id =>
+            {
+                return Err(StoreError::ManagedStuckOccurrenceMismatch {
+                    run_id: transition.run_id,
+                    expected: current.occurrence_id,
+                    received: desired.occurrence_id.clone(),
+                });
+            }
+            (ManagedStuckAssessment::NotificationDue(desired), Some(_)) => {
+                let projection = replay_dashboard_projection(&load_run_event_history(
+                    transaction,
+                    &transition.run_id,
+                )?)
+                .map_err(|source| StoreError::DashboardProjection {
+                    run_id: transition.run_id.clone(),
+                    source,
+                })?;
+                if matches!(
+                    projection.stuck_notification,
+                    CoreStuckNotification::Due { ref occurrence_id, .. }
+                        | CoreStuckNotification::Delivered { ref occurrence_id, .. }
+                        if occurrence_id == &desired.occurrence_id
+                ) {
+                    return Ok(ManagedStuckTransitionOutcome::Unchanged {
+                        run_id: transition.run_id,
+                        version: current_version,
+                    });
+                }
+            }
             _ => {}
         }
 
@@ -592,6 +888,7 @@ impl Store {
                 occurrence_id: match transition.assessment {
                     ManagedStuckAssessment::PossiblyStuck(payload) => payload.occurrence_id,
                     ManagedStuckAssessment::Clear(payload) => payload.occurrence_id,
+                    ManagedStuckAssessment::NotificationDue(payload) => payload.occurrence_id,
                 },
             });
         };
@@ -3077,6 +3374,8 @@ fn validate_managed_stuck_authority(
 struct ActiveStuckTransition {
     occurrence_id: String,
     payload: Map<String, Value>,
+    process: flit_protocol::StuckProcessReceipt,
+    evidence_unavailable_reason: String,
 }
 
 fn load_active_stuck_transition(
@@ -3088,8 +3387,9 @@ fn load_active_stuck_transition(
             "SELECT ingest_seq, event_type, payload_json
              FROM events
              WHERE run_id = ?1
-               AND protocol_version = '1.3'
-               AND event_type IN ('run.possibly_stuck', 'run.stuck_cleared')
+               AND ((protocol_version = '1.3'
+                     AND event_type IN ('run.possibly_stuck', 'run.stuck_cleared'))
+                    OR (protocol_version = '1.4' AND event_type = 'run.still_working'))
              ORDER BY ingest_seq DESC
              LIMIT 1",
             [run_id],
@@ -3108,6 +3408,13 @@ fn load_active_stuck_transition(
     };
     let ingest_seq = assigned_sequence(ingest_seq)?;
     let payload: Map<String, Value> = stored_json(ingest_seq, "payload_json", &payload_json)?;
+    if event_type == "run.still_working" {
+        serde_json::from_value::<flit_protocol::StillWorkingPayload>(Value::Object(payload))
+            .map_err(|_| StoreError::StoredManagedStuckTransitionInvalid {
+                run_id: run_id.to_owned(),
+            })?;
+        return Ok(None);
+    }
     if event_type == "run.stuck_cleared" {
         let decoded =
             serde_json::from_value::<flit_protocol::StuckClearedPayload>(Value::Object(payload))
@@ -3142,9 +3449,50 @@ fn load_active_stuck_transition(
     .map_err(|_| StoreError::StoredManagedStuckTransitionInvalid {
         run_id: run_id.to_owned(),
     })?;
+    let mut process = decoded.process.clone();
+    let mut evidence_unavailable_reason = decoded.evidence_unavailable_reason.clone();
+    let latest_due_ingest_seq = connection
+        .query_row(
+            "SELECT ingest_seq
+             FROM events
+             WHERE run_id = ?1
+               AND ingest_seq > ?2
+               AND protocol_version = '1.4'
+               AND event_type = 'notification.due'
+             ORDER BY ingest_seq DESC
+             LIMIT 1",
+            params![run_id, ingest_seq as i64],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(StoreError::Sqlite)?;
+    if let Some(latest_due_ingest_seq) = latest_due_ingest_seq {
+        assigned_sequence(latest_due_ingest_seq)?;
+        let latest_due = load_event(connection, latest_due_ingest_seq)?;
+        if validate_event(&UnsequencedEventEnvelope::from(latest_due.clone())).is_err() {
+            return Err(StoreError::StoredManagedStuckTransitionInvalid {
+                run_id: run_id.to_owned(),
+            });
+        }
+        let due = serde_json::from_value::<flit_protocol::StuckNotificationDuePayload>(
+            Value::Object(latest_due.payload),
+        )
+        .map_err(|_| StoreError::StoredManagedStuckTransitionInvalid {
+            run_id: run_id.to_owned(),
+        })?;
+        if due.occurrence_id != decoded.occurrence_id {
+            return Err(StoreError::StoredManagedStuckTransitionInvalid {
+                run_id: run_id.to_owned(),
+            });
+        }
+        process = due.process;
+        evidence_unavailable_reason = due.evidence_unavailable_reason;
+    }
     Ok(Some(ActiveStuckTransition {
         occurrence_id: decoded.occurrence_id,
         payload,
+        process,
+        evidence_unavailable_reason,
     }))
 }
 
@@ -3168,6 +3516,7 @@ fn managed_stuck_payload(
     let value = match assessment {
         ManagedStuckAssessment::PossiblyStuck(payload) => serde_json::to_value(payload),
         ManagedStuckAssessment::Clear(payload) => serde_json::to_value(payload),
+        ManagedStuckAssessment::NotificationDue(payload) => serde_json::to_value(payload),
     }
     .map_err(StoreError::Json)?;
     value
@@ -3184,7 +3533,12 @@ fn managed_stuck_transition_event(
     payload: Map<String, Value>,
 ) -> UnsequencedEventEnvelope {
     UnsequencedEventEnvelope {
-        protocol_version: EventProtocolVersion::V1_3,
+        protocol_version: match &transition.assessment {
+            ManagedStuckAssessment::PossiblyStuck(_) | ManagedStuckAssessment::Clear(_) => {
+                EventProtocolVersion::V1_3
+            }
+            ManagedStuckAssessment::NotificationDue(_) => EventProtocolVersion::V1_4,
+        },
         event_id: transition.event_id.clone(),
         run_id: transition.run_id.clone(),
         session_id: NullableSessionId::Null,
@@ -3194,17 +3548,154 @@ fn managed_stuck_transition_event(
         event_type: match &transition.assessment {
             ManagedStuckAssessment::PossiblyStuck(_) => "run.possibly_stuck",
             ManagedStuckAssessment::Clear(_) => "run.stuck_cleared",
+            ManagedStuckAssessment::NotificationDue(_) => "notification.due",
         }
         .to_owned(),
         source: EventSource {
             kind: EventSourceKind::Core,
             provider: None,
-            contract_version: Some("stuck-transition/1.0".to_owned()),
+            contract_version: Some(
+                match &transition.assessment {
+                    ManagedStuckAssessment::PossiblyStuck(_) | ManagedStuckAssessment::Clear(_) => {
+                        "stuck-transition/1.0"
+                    }
+                    ManagedStuckAssessment::NotificationDue(_) => "stuck-notification/1.0",
+                }
+                .to_owned(),
+            ),
             extensions: BTreeMap::new(),
         },
         confidence: 1.0,
         evidence_ids: Vec::new(),
         payload,
+        extensions: BTreeMap::new(),
+    }
+}
+
+fn managed_still_working_rejected(
+    action: ManagedStillWorkingAction,
+    reason: ManagedStillWorkingRejectedReason,
+) -> ManagedStillWorkingOutcome {
+    ManagedStillWorkingOutcome::Rejected {
+        run_id: action.run_id,
+        expected_run_version: action.expected_run_version,
+        occurrence_id: action.occurrence_id,
+        reason,
+    }
+}
+
+fn is_authoritative_still_working_receipt(
+    event: &EventEnvelope,
+    run_id: &str,
+    occurrence_id: &str,
+) -> bool {
+    let unsequenced = UnsequencedEventEnvelope::from(event.clone());
+    if validate_event(&unsequenced).is_err()
+        || event.protocol_version != EventProtocolVersion::V1_4
+        || event.run_id != run_id
+        || event.event_type != "run.still_working"
+        || !matches!(event.session_id, NullableSessionId::Null)
+        || event.source.kind != EventSourceKind::Core
+        || event.source.provider.is_some()
+        || event.source.contract_version.as_deref() != Some("stuck-action/1.0")
+        || !event.source.extensions.is_empty()
+        || event.confidence != 1.0
+        || event.occurred_at != event.observed_at
+        || !event.extensions.is_empty()
+        || !event.evidence_ids.is_empty()
+    {
+        return false;
+    }
+    serde_json::from_value::<flit_protocol::StillWorkingPayload>(Value::Object(
+        event.payload.clone(),
+    ))
+    .is_ok_and(|payload| payload.occurrence_id == occurrence_id)
+}
+
+fn managed_still_working_receipt_matches_action(
+    event: &EventEnvelope,
+    action: &ManagedStillWorkingAction,
+) -> bool {
+    if !is_authoritative_still_working_receipt(event, &action.run_id, &action.occurrence_id)
+        || event.event_id != action.event_id
+        || event.occurred_at != action.observed_at
+        || event.observed_at != action.observed_at
+    {
+        return false;
+    }
+    let Ok(payload) = serde_json::from_value::<flit_protocol::StillWorkingPayload>(Value::Object(
+        event.payload.clone(),
+    )) else {
+        return false;
+    };
+    payload.reset_monotonic_ms == action.reset_monotonic_ms
+        && payload.notification_suppressed_until_monotonic_ms
+            == action.reset_monotonic_ms.checked_add(600_000).unwrap_or(0)
+        && payload.process == action.process
+        && payload.evidence_unavailable_reason == action.evidence_unavailable_reason
+}
+
+fn managed_still_working_event(
+    action: &ManagedStillWorkingAction,
+    payload: flit_protocol::StillWorkingPayload,
+    stream_seq: u64,
+) -> UnsequencedEventEnvelope {
+    UnsequencedEventEnvelope {
+        protocol_version: EventProtocolVersion::V1_4,
+        event_id: action.event_id.clone(),
+        run_id: action.run_id.clone(),
+        session_id: NullableSessionId::Null,
+        stream_seq,
+        occurred_at: action.observed_at.clone(),
+        observed_at: action.observed_at.clone(),
+        event_type: "run.still_working".to_owned(),
+        source: EventSource {
+            kind: EventSourceKind::Core,
+            provider: None,
+            contract_version: Some("stuck-action/1.0".to_owned()),
+            extensions: BTreeMap::new(),
+        },
+        confidence: 1.0,
+        evidence_ids: Vec::new(),
+        payload: serde_json::to_value(payload)
+            .expect("Still working payload serializes")
+            .as_object()
+            .expect("Still working payload is an object")
+            .clone(),
+        extensions: BTreeMap::new(),
+    }
+}
+
+fn managed_stuck_notification_delivered_event(
+    delivery: &ManagedStuckNotificationDelivery,
+    stream_seq: u64,
+) -> UnsequencedEventEnvelope {
+    let payload = flit_protocol::StuckNotificationDeliveredPayload {
+        occurrence_id: delivery.occurrence_id.clone(),
+        platform_id: delivery.platform_id.clone(),
+    };
+    UnsequencedEventEnvelope {
+        protocol_version: EventProtocolVersion::V1_4,
+        event_id: delivery.event_id.clone(),
+        run_id: delivery.run_id.clone(),
+        session_id: NullableSessionId::Null,
+        stream_seq,
+        occurred_at: delivery.observed_at.clone(),
+        observed_at: delivery.observed_at.clone(),
+        event_type: "notification.delivered".to_owned(),
+        source: EventSource {
+            kind: EventSourceKind::Notifier,
+            provider: None,
+            contract_version: Some("stuck-notification/1.0".to_owned()),
+            extensions: BTreeMap::new(),
+        },
+        confidence: 1.0,
+        evidence_ids: Vec::new(),
+        payload: serde_json::to_value(payload)
+            .expect("notification delivery payload serializes")
+            .as_object()
+            .expect("notification delivery payload is an object")
+            .clone(),
         extensions: BTreeMap::new(),
     }
 }
@@ -4851,6 +5342,7 @@ fn append_event_batch_in_transaction(
             EventProtocolVersion::V1_1 => "1.1",
             EventProtocolVersion::V1_2 => "1.2",
             EventProtocolVersion::V1_3 => "1.3",
+            EventProtocolVersion::V1_4 => "1.4",
         };
         let session_id = match &event.session_id {
             NullableSessionId::Id(session_id) => Some(session_id.as_str()),
@@ -4982,17 +5474,11 @@ fn terminal_lifecycle_stuck_clear_event(
     let Some(active) = load_active_stuck_transition(transaction, &terminal.run_id)? else {
         return Ok(None);
     };
-    let persisted = serde_json::from_value::<flit_protocol::PossiblyStuckPayload>(Value::Object(
-        active.payload,
-    ))
-    .map_err(|_| StoreError::StoredManagedStuckTransitionInvalid {
-        run_id: terminal.run_id.clone(),
-    })?;
     let assessment = ManagedStuckAssessment::Clear(flit_protocol::StuckClearedPayload {
         occurrence_id: active.occurrence_id.clone(),
         reason: flit_protocol::StuckClearReasonCode::LifecycleInactive,
-        process: persisted.process,
-        evidence_unavailable_reason: persisted.evidence_unavailable_reason,
+        process: active.process,
+        evidence_unavailable_reason: active.evidence_unavailable_reason,
     });
     let expected_run_version = latest_run_event_version(transaction, &terminal.run_id)?
         .ok_or_else(|| StoreError::MissingRun {
@@ -5089,6 +5575,47 @@ fn refresh_managed_dashboard_projection(
             "reason": reason,
         }),
     };
+    let stuck_notification = match &projection.stuck_notification {
+        CoreStuckNotification::Inactive => json!({ "status": "inactive" }),
+        CoreStuckNotification::NotDue {
+            occurrence_id,
+            due_at_monotonic_ms,
+        } => json!({
+            "status": "not_due",
+            "occurrence_id": occurrence_id,
+            "due_at_monotonic_ms": due_at_monotonic_ms,
+        }),
+        CoreStuckNotification::Suppressed {
+            occurrence_id,
+            until_monotonic_ms,
+        } => json!({
+            "status": "suppressed",
+            "occurrence_id": occurrence_id,
+            "until_monotonic_ms": until_monotonic_ms,
+        }),
+        CoreStuckNotification::Due {
+            occurrence_id,
+            due_at_monotonic_ms,
+        } => json!({
+            "status": "due",
+            "occurrence_id": occurrence_id,
+            "due_at_monotonic_ms": due_at_monotonic_ms,
+        }),
+        CoreStuckNotification::Delivered {
+            occurrence_id,
+            platform_id,
+        } => json!({
+            "status": "delivered",
+            "occurrence_id": occurrence_id,
+            "platform_id": platform_id,
+        }),
+    };
+    let stuck_reset = projection.stuck_reset.as_ref().map(|reset| json!({
+        "occurrence_id": reset.occurrence_id,
+        "progress_event_id": reset.progress_event_id,
+        "reset_monotonic_ms": reset.reset_monotonic_ms,
+        "notification_suppressed_until_monotonic_ms": reset.notification_suppressed_until_monotonic_ms,
+    }));
     let snapshot = json!({
         "run_id": projection.run_id,
         "version": projection.version,
@@ -5104,6 +5631,11 @@ fn refresh_managed_dashboard_projection(
         "dashboard_bucket": projection.dashboard_bucket,
         "last_progress_at": projection.last_progress_at,
         "last_liveness_at": projection.last_liveness_at,
+        "stuck": {
+            "occurrence_id": projection.current_stuck_occurrence_id,
+            "notification": stuck_notification,
+            "reset": stuck_reset,
+        },
         "changes": changes,
     })
     .as_object()
@@ -5141,6 +5673,9 @@ fn load_run_event_history(
                             WHEN protocol_version = '1.3'
                              AND event_type IN ('run.possibly_stuck', 'run.stuck_cleared')
                             THEN LENGTH(CAST(source_json AS BLOB))
+                            WHEN protocol_version = '1.4'
+                             AND event_type IN ('run.still_working', 'notification.due', 'notification.delivered')
+                            THEN LENGTH(CAST(source_json AS BLOB))
                             ELSE 0
                         END +
                         LENGTH(CAST(observed_at AS BLOB)) +
@@ -5161,6 +5696,9 @@ fn load_run_event_history(
                     CASE
                         WHEN protocol_version = '1.3'
                          AND event_type IN ('run.possibly_stuck', 'run.stuck_cleared')
+                        THEN source_json
+                        WHEN protocol_version = '1.4'
+                         AND event_type IN ('run.still_working', 'notification.due', 'notification.delivered')
                         THEN source_json
                         ELSE NULL
                     END,
@@ -5390,6 +5928,9 @@ fn validate_snapshot_json(snapshot: &RunSnapshotDraft) -> Result<(), StoreError>
             field: "attention.open_count",
         });
     }
+    if snapshot.snapshot.contains_key("stuck") {
+        validate_stuck_snapshot(&snapshot.snapshot)?;
+    }
     let changes = snapshot
         .snapshot
         .get("changes")
@@ -5441,6 +5982,84 @@ fn validate_snapshot_json(snapshot: &RunSnapshotDraft) -> Result<(), StoreError>
         "last_liveness_at",
         snapshot.last_liveness_at.as_deref(),
     )
+}
+
+fn validate_stuck_snapshot(snapshot: &Map<String, Value>) -> Result<(), StoreError> {
+    let invalid = || StoreError::InvalidRunSnapshot { field: "stuck" };
+    let bounded_snapshot_token = |value: &Value| {
+        value
+            .as_str()
+            .is_some_and(|value| !value.trim().is_empty() && value.len() <= 256)
+    };
+    let stuck = snapshot
+        .get("stuck")
+        .and_then(Value::as_object)
+        .ok_or_else(invalid)?;
+    if stuck.len() != 3
+        || stuck
+            .get("occurrence_id")
+            .is_none_or(|value| !value.is_null() && !bounded_snapshot_token(value))
+    {
+        return Err(invalid());
+    }
+    let notification = stuck
+        .get("notification")
+        .and_then(Value::as_object)
+        .ok_or_else(invalid)?;
+    let safe_time = |field: &str| {
+        notification
+            .get(field)
+            .and_then(Value::as_u64)
+            .is_some_and(|value| value <= MAX_JSON_SAFE_INTEGER)
+    };
+    let occurrence = || {
+        notification
+            .get("occurrence_id")
+            .is_some_and(bounded_snapshot_token)
+    };
+    let notification_valid = match notification.get("status").and_then(Value::as_str) {
+        Some("inactive") => notification.len() == 1,
+        Some("not_due" | "due") => {
+            notification.len() == 3 && occurrence() && safe_time("due_at_monotonic_ms")
+        }
+        Some("suppressed") => {
+            notification.len() == 3 && occurrence() && safe_time("until_monotonic_ms")
+        }
+        Some("delivered") => {
+            notification.len() == 3
+                && occurrence()
+                && notification
+                    .get("platform_id")
+                    .is_some_and(bounded_snapshot_token)
+        }
+        _ => false,
+    };
+    if !notification_valid {
+        return Err(invalid());
+    }
+    match stuck.get("reset") {
+        Some(Value::Null) => Ok(()),
+        Some(Value::Object(reset))
+            if reset.len() == 4
+                && ["occurrence_id", "progress_event_id"]
+                    .iter()
+                    .all(|field| reset.get(*field).is_some_and(bounded_snapshot_token))
+                && [
+                    "reset_monotonic_ms",
+                    "notification_suppressed_until_monotonic_ms",
+                ]
+                .iter()
+                .all(|field| {
+                    reset
+                        .get(*field)
+                        .and_then(Value::as_u64)
+                        .is_some_and(|value| value <= MAX_JSON_SAFE_INTEGER)
+                }) =>
+        {
+            Ok(())
+        }
+        _ => Err(invalid()),
+    }
 }
 
 fn validate_optional_snapshot_field(
@@ -5747,6 +6366,25 @@ fn validate_event(event: &UnsequencedEventEnvelope) -> Result<(), StoreError> {
             field: "stuck_source",
         });
     }
+    if event.protocol_version == EventProtocolVersion::V1_4 {
+        let expected = match event.event_type.as_str() {
+            "run.still_working" => Some((EventSourceKind::Core, "stuck-action/1.0")),
+            "notification.due" => Some((EventSourceKind::Core, "stuck-notification/1.0")),
+            "notification.delivered" => Some((EventSourceKind::Notifier, "stuck-notification/1.0")),
+            _ => None,
+        };
+        if let Some((source_kind, contract_version)) = expected
+            && (!matches!(event.session_id, NullableSessionId::Null)
+                || event.source.kind != source_kind
+                || event.source.provider.is_some()
+                || event.source.contract_version.as_deref() != Some(contract_version)
+                || !event.source.extensions.is_empty())
+        {
+            return Err(StoreError::InvalidEvent {
+                field: "stuck_source",
+            });
+        }
+    }
     Ok(())
 }
 
@@ -5888,6 +6526,7 @@ fn load_event(connection: &Connection, ingest_seq: i64) -> Result<EventEnvelope,
         "1.1" => EventProtocolVersion::V1_1,
         "1.2" => EventProtocolVersion::V1_2,
         "1.3" => EventProtocolVersion::V1_3,
+        "1.4" => EventProtocolVersion::V1_4,
         _ => {
             return Err(StoreError::StoredEventInvalid {
                 ingest_seq: assigned_ingest_seq,
@@ -6429,6 +7068,12 @@ pub enum StoreError {
     InvalidManagedStuckTransition {
         field: &'static str,
     },
+    InvalidManagedStillWorking {
+        field: &'static str,
+    },
+    InvalidManagedStuckNotificationDelivery {
+        field: &'static str,
+    },
     ManagedStuckAssessmentRunLimitExceeded {
         count: usize,
         max: usize,
@@ -6803,6 +7448,13 @@ impl fmt::Display for StoreError {
             Self::InvalidManagedStuckTransition { field } => {
                 write!(formatter, "invalid managed stuck transition field: {field}")
             }
+            Self::InvalidManagedStillWorking { field } => {
+                write!(formatter, "invalid managed Still working field: {field}")
+            }
+            Self::InvalidManagedStuckNotificationDelivery { field } => write!(
+                formatter,
+                "invalid managed stuck notification delivery field: {field}"
+            ),
             Self::ManagedStuckAssessmentRunLimitExceeded { count, max } => write!(
                 formatter,
                 "managed stuck assessment active Run count {count} exceeds {max}"

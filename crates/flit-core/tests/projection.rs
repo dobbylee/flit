@@ -2,7 +2,7 @@ use flit_core::{
     activity::WaitKind,
     projection::{
         CHANGES_UNAVAILABLE_REASON, ChangeAttribution, ChangeSummary, ProjectionError,
-        ProjectionEvent, replay_dashboard_projection,
+        ProjectionEvent, StuckNotificationProjection, replay_dashboard_projection,
     },
 };
 use serde_json::{Map, Value, json};
@@ -153,6 +153,146 @@ fn explicit_stuck_transitions_own_dashboard_and_attention_replay() {
 }
 
 #[test]
+fn still_working_and_notification_receipts_replay_exact_persisted_state() {
+    let base = vec![
+        event(1, "run.created", None, json!({})),
+        event(2, "session.connected", Some("session-1"), json!({})),
+        event(3, "command.started", Some("session-1"), json!({})),
+        stuck_event(4, "occurrence-1", "event-3", 5_000),
+    ];
+    let mut still_working = event(
+        5,
+        "run.still_working",
+        None,
+        json!({
+            "occurrence_id": "occurrence-1",
+            "progress_event_id": "event-3",
+            "reset_monotonic_ms": 140_000,
+            "notification_suppressed_until_monotonic_ms": 740_000,
+            "process": {
+                "status": "alive",
+                "generation": "process-generation-1",
+                "observed_monotonic_ms": 140_000
+            },
+            "evidence_unavailable_reason": "raw_provider_content_not_retained"
+        }),
+    );
+    still_working.protocol_version = "1.4".to_owned();
+    still_working.source_contract_version = Some("stuck-action/1.0".to_owned());
+
+    let reset = replay_dashboard_projection(&[base.clone(), vec![still_working.clone()]].concat())
+        .expect("exact Still working replay");
+    assert_eq!(reset.dashboard_bucket, "Working");
+    assert_eq!(reset.attention_open_count, 0);
+    assert_eq!(reset.current_stuck_occurrence_id, None);
+    assert_eq!(
+        reset.stuck_notification,
+        StuckNotificationProjection::Suppressed {
+            occurrence_id: "occurrence-1".to_owned(),
+            until_monotonic_ms: 740_000,
+        }
+    );
+    let reset_receipt = reset.stuck_reset.expect("persisted reset receipt");
+    assert_eq!(reset_receipt.progress_event_id, "event-3");
+    assert_eq!(reset_receipt.reset_monotonic_ms, 140_000);
+
+    let mut next_occurrence = stuck_event(6, "occurrence-2", "event-3", 5_000);
+    next_occurrence.payload["baseline_monotonic_ms"] = json!(140_000);
+    next_occurrence.payload["stuck_since_monotonic_ms"] = json!(260_000);
+    next_occurrence.payload["process"]["observed_monotonic_ms"] = json!(270_000);
+    let suppressed = replay_dashboard_projection(
+        &[
+            base.clone(),
+            vec![still_working.clone(), next_occurrence.clone()],
+        ]
+        .concat(),
+    )
+    .expect("same-progress occurrence remains suppressed");
+    assert_eq!(
+        suppressed.stuck_notification,
+        StuckNotificationProjection::Suppressed {
+            occurrence_id: "occurrence-2".to_owned(),
+            until_monotonic_ms: 740_000,
+        }
+    );
+
+    let mut due = event(
+        7,
+        "notification.due",
+        None,
+        json!({
+            "occurrence_id": "occurrence-2",
+            "due_at_monotonic_ms": 560_000,
+            "process": {
+                "status": "alive",
+                "generation": "process-generation-1",
+                "observed_monotonic_ms": 740_000
+            },
+            "evidence_unavailable_reason": "raw_provider_content_not_retained"
+        }),
+    );
+    due.protocol_version = "1.4".to_owned();
+    due.source_contract_version = Some("stuck-notification/1.0".to_owned());
+    let due_projection = replay_dashboard_projection(
+        &[
+            base.clone(),
+            vec![still_working.clone(), next_occurrence.clone(), due.clone()],
+        ]
+        .concat(),
+    )
+    .expect("due receipt after suppression boundary");
+    assert_eq!(
+        due_projection.stuck_notification,
+        StuckNotificationProjection::Due {
+            occurrence_id: "occurrence-2".to_owned(),
+            due_at_monotonic_ms: 560_000,
+        }
+    );
+
+    let mut delivered = event(
+        8,
+        "notification.delivered",
+        None,
+        json!({
+            "occurrence_id": "occurrence-2",
+            "platform_id": "notification-occurrence-2"
+        }),
+    );
+    delivered.protocol_version = "1.4".to_owned();
+    delivered.source_kind = "notifier".to_owned();
+    delivered.source_contract_version = Some("stuck-notification/1.0".to_owned());
+    let delivered_projection = replay_dashboard_projection(
+        &[
+            base.clone(),
+            vec![
+                still_working.clone(),
+                next_occurrence.clone(),
+                due.clone(),
+                delivered,
+            ],
+        ]
+        .concat(),
+    )
+    .expect("delivered receipt replay");
+    assert_eq!(
+        delivered_projection.stuck_notification,
+        StuckNotificationProjection::Delivered {
+            occurrence_id: "occurrence-2".to_owned(),
+            platform_id: "notification-occurrence-2".to_owned(),
+        }
+    );
+
+    let mut stale_due = due;
+    stale_due.payload["occurrence_id"] = json!("occurrence-1");
+    assert_eq!(
+        replay_dashboard_projection(
+            &[base, vec![still_working, next_occurrence, stale_due]].concat()
+        ),
+        Err(ProjectionError::Stuck)
+    );
+}
+
+#[test]
 fn every_terminal_lifecycle_atomically_clears_the_active_stuck_occurrence() {
     for terminal in [
         "run.completed",
@@ -176,6 +316,124 @@ fn every_terminal_lifecycle_atomically_clears_the_active_stuck_occurrence() {
 }
 
 #[test]
+fn late_stuck_occurrence_requires_an_explicit_due_receipt_before_delivery() {
+    let mut late = stuck_event(3, "occurrence-late", "event-2", 5_000);
+    late.payload["process"]["observed_monotonic_ms"] = json!(500_000);
+    let base = vec![
+        event(1, "run.created", None, json!({})),
+        event(2, "session.connected", Some("session-1"), json!({})),
+        late,
+    ];
+    let projected = replay_dashboard_projection(&base).expect("late occurrence replay");
+    assert_eq!(
+        projected.stuck_notification,
+        StuckNotificationProjection::NotDue {
+            occurrence_id: "occurrence-late".to_owned(),
+            due_at_monotonic_ms: 425_000,
+        }
+    );
+
+    let mut backdated_action = event(
+        4,
+        "run.still_working",
+        None,
+        json!({
+            "occurrence_id": "occurrence-late",
+            "progress_event_id": "event-2",
+            "reset_monotonic_ms": 130_000,
+            "notification_suppressed_until_monotonic_ms": 730_000,
+            "process": {
+                "status": "alive",
+                "generation": "process-generation-1",
+                "observed_monotonic_ms": 130_000
+            },
+            "evidence_unavailable_reason": "raw_provider_content_not_retained"
+        }),
+    );
+    backdated_action.protocol_version = "1.4".to_owned();
+    backdated_action.source_contract_version = Some("stuck-action/1.0".to_owned());
+    assert_eq!(
+        replay_dashboard_projection(&[base.clone(), vec![backdated_action]].concat()),
+        Err(ProjectionError::Stuck)
+    );
+
+    let mut delivered = event(
+        4,
+        "notification.delivered",
+        None,
+        json!({
+            "occurrence_id": "occurrence-late",
+            "platform_id": "notification-occurrence-late"
+        }),
+    );
+    delivered.protocol_version = "1.4".to_owned();
+    delivered.source_kind = "notifier".to_owned();
+    delivered.source_contract_version = Some("stuck-notification/1.0".to_owned());
+    assert_eq!(
+        replay_dashboard_projection(&[base.clone(), vec![delivered.clone()]].concat()),
+        Err(ProjectionError::Stuck)
+    );
+
+    let mut due = event(
+        4,
+        "notification.due",
+        None,
+        json!({
+            "occurrence_id": "occurrence-late",
+            "due_at_monotonic_ms": 425_000,
+            "process": {
+                "status": "alive",
+                "generation": "process-generation-1",
+                "observed_monotonic_ms": 425_000
+            },
+            "evidence_unavailable_reason": "raw_provider_content_not_retained"
+        }),
+    );
+    due.protocol_version = "1.4".to_owned();
+    due.source_contract_version = Some("stuck-notification/1.0".to_owned());
+    assert_eq!(
+        replay_dashboard_projection(&[base.clone(), vec![due.clone()]].concat()),
+        Err(ProjectionError::Stuck)
+    );
+
+    due.payload["process"]["observed_monotonic_ms"] = json!(700_000);
+    let due_projection = replay_dashboard_projection(&[base.clone(), vec![due.clone()]].concat())
+        .expect("later current process receipt establishes due");
+    assert!(matches!(
+        due_projection.stuck_notification,
+        StuckNotificationProjection::Due { .. }
+    ));
+    let mut after_due_backdated_action = event(
+        5,
+        "run.still_working",
+        None,
+        json!({
+            "occurrence_id": "occurrence-late",
+            "progress_event_id": "event-2",
+            "reset_monotonic_ms": 600_000,
+            "notification_suppressed_until_monotonic_ms": 1_200_000,
+            "process": {
+                "status": "alive",
+                "generation": "process-generation-1",
+                "observed_monotonic_ms": 600_000
+            },
+            "evidence_unavailable_reason": "raw_provider_content_not_retained"
+        }),
+    );
+    after_due_backdated_action.protocol_version = "1.4".to_owned();
+    after_due_backdated_action.source_contract_version = Some("stuck-action/1.0".to_owned());
+    assert_eq!(
+        replay_dashboard_projection(
+            &[base.clone(), vec![due.clone(), after_due_backdated_action]].concat()
+        ),
+        Err(ProjectionError::Stuck)
+    );
+    delivered.ingest_seq = 5;
+    replay_dashboard_projection(&[base, vec![due, delivered]].concat())
+        .expect("delivery follows an explicit current due receipt");
+}
+
+#[test]
 fn legacy_stuck_named_events_remain_unknown_and_non_core_v13_is_rejected() {
     let legacy = replay_dashboard_projection(&[
         event(1, "run.created", None, json!({})),
@@ -186,6 +444,25 @@ fn legacy_stuck_named_events_remain_unknown_and_non_core_v13_is_rejected() {
     .expect("legacy event names remain unknown-compatible");
     assert_eq!(legacy.dashboard_bucket, "Working");
     assert_eq!(legacy.attention_open_count, 0);
+
+    for version in ["1.0", "1.1", "1.2", "1.3"] {
+        for name in [
+            "run.still_working",
+            "notification.due",
+            "notification.delivered",
+        ] {
+            let mut lookalike = event(3, name, None, json!({"legacy": true}));
+            lookalike.protocol_version = version.to_owned();
+            let projection = replay_dashboard_projection(&[
+                event(1, "run.created", None, json!({})),
+                event(2, "session.connected", Some("session-1"), json!({})),
+                lookalike,
+            ])
+            .unwrap_or_else(|error| panic!("{version} {name} must remain unknown: {error}"));
+            assert_eq!(projection.dashboard_bucket, "Working");
+            assert_eq!(projection.attention_open_count, 0);
+        }
+    }
 
     let mut provider_owned = stuck_event(3, "occurrence-provider", "event-2", 5_000);
     provider_owned.session_id = Some("session-1".to_owned());
