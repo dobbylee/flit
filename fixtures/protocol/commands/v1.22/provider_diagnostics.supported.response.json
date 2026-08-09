@@ -1,0 +1,26 @@
+{
+  "protocol_version": "1.22",
+  "provider": "codex",
+  "compatibility": "supported",
+  "executable_version": "0.144.6",
+  "capabilities": [
+    {"capability": "launch", "status": "supported"},
+    {"capability": "list_managed", "status": "supported"},
+    {"capability": "resume", "status": "supported"},
+    {"capability": "reconcile", "status": "supported"},
+    {"capability": "structured_activity", "status": "degraded"},
+    {"capability": "permission_detect", "status": "degraded"},
+    {"capability": "permission_respond", "status": "unsupported"},
+    {"capability": "permission_mode_configure", "status": "unsupported"},
+    {"capability": "provider_outcome_observe", "status": "unsupported"},
+    {"capability": "question_detect", "status": "supported"},
+    {"capability": "question_respond", "status": "degraded"},
+    {"capability": "completion_detect", "status": "supported"},
+    {"capability": "history", "status": "unsupported"},
+    {"capability": "open_in_provider", "status": "unsupported"},
+    {"capability": "continue_after_quit", "status": "unsupported"},
+    {"capability": "stop", "status": "supported"}
+  ],
+  "fingerprint_mismatches": [],
+  "unavailable_reason": null
+}

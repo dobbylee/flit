@@ -155,6 +155,7 @@ pub struct DashboardRunSnapshot {
     pub started_at: Option<String>,
     pub ended_at: Option<String>,
     pub attention_open_count: u64,
+    pub active_stuck_occurrence_id: Option<String>,
     pub changes: DashboardChangeSummary,
     pub projection: RunSnapshot,
 }
@@ -5928,8 +5929,25 @@ fn validate_snapshot_json(snapshot: &RunSnapshotDraft) -> Result<(), StoreError>
             field: "attention.open_count",
         });
     }
-    if snapshot.snapshot.contains_key("stuck") {
+    let has_active_occurrence = if snapshot.snapshot.contains_key("stuck") {
         validate_stuck_snapshot(&snapshot.snapshot)?;
+        snapshot.snapshot["stuck"]["occurrence_id"]
+            .as_str()
+            .is_some()
+    } else {
+        false
+    };
+    let permitted = if has_active_occurrence {
+        matches!(snapshot.lifecycle.as_str(), "Starting" | "Running")
+            && matches!(
+                snapshot.dashboard_bucket.as_str(),
+                "PossiblyStuck" | "NeedsAttention"
+            )
+    } else {
+        snapshot.dashboard_bucket != "PossiblyStuck"
+    };
+    if !permitted {
+        return Err(StoreError::InvalidRunSnapshot { field: "stuck" });
     }
     let changes = snapshot
         .snapshot
@@ -6203,6 +6221,13 @@ fn load_dashboard_run_snapshot(
             run_id: projection.run_id.clone(),
             field: "attention.open_count",
         })?;
+    let active_stuck_occurrence_id = projection
+        .snapshot
+        .get("stuck")
+        .and_then(Value::as_object)
+        .and_then(|stuck| stuck.get("occurrence_id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let changes = projection
         .snapshot
         .get("changes")
@@ -6266,6 +6291,7 @@ fn load_dashboard_run_snapshot(
         started_at,
         ended_at,
         attention_open_count,
+        active_stuck_occurrence_id,
         changes,
         projection,
     })

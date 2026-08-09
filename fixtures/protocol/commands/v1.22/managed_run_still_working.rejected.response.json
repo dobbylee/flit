@@ -1,0 +1,8 @@
+{
+  "status": "rejected",
+  "protocol_version": "1.22",
+  "run_id": "run-managed-1",
+  "expected_run_version": 6,
+  "occurrence_id": "stuck-run-managed-1-1",
+  "reason": "run_version_stale"
+}

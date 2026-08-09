@@ -572,6 +572,10 @@ struct NativeHealthTests {
             FlitDashboardReadResponse.self,
             at: "\(fixtureRoot)/dashboard_read.unavailable_changes.response.json"
         )
+        let possiblyStuckDashboardFixture = try decodeFixture(
+            FlitDashboardReadResponse.self,
+            at: "\(fixtureRoot)/dashboard_read.possibly_stuck.response.json"
+        )
         let overflowFixtureData = try Data(
             contentsOf: URL(
                 fileURLWithPath: "\(fixtureRoot)/dashboard_read.initial.response.json"
@@ -622,6 +626,8 @@ struct NativeHealthTests {
             case let .snapshot(resyncFixture) = resyncDashboardFixture,
             case let .snapshot(unavailableSnapshotFixture) =
                 unavailableChangesDashboardFixture,
+            case let .snapshot(possiblyStuckSnapshotFixture) =
+                possiblyStuckDashboardFixture,
             case let .available(attribution, files, insertions, deletions) =
                 initialSnapshotFixture.runs[0].changes,
             case let .unavailable(unavailableReason) =
@@ -635,6 +641,7 @@ struct NativeHealthTests {
             initialSnapshotFixture.reason == .initial
                 && initialSnapshotFixture.runs.count == 1
                 && initialSnapshotFixture.runs[0].attentionOpenCount == 2
+                && initialSnapshotFixture.runs[0].activeStuckOccurrenceId == nil
                 && attribution == .exact
                 && files == 3
                 && insertions == 42
@@ -647,6 +654,56 @@ struct NativeHealthTests {
                 && resyncFixture.reason == .coreInstanceMismatch,
             "generated Dashboard fixtures must preserve snapshot, delta, and resync facts"
         )
+        try require(
+            possiblyStuckSnapshotFixture.runs.count == 1
+                && possiblyStuckSnapshotFixture.runs[0].dashboardBucket == "PossiblyStuck"
+                && possiblyStuckSnapshotFixture.runs[0].activeStuckOccurrenceId
+                    == "occurrence-dashboard-stuck-1",
+            "generated Dashboard contract must preserve the exact active stuck occurrence"
+        )
+        let occurrenceFixtureData = try Data(
+            contentsOf: URL(
+                fileURLWithPath: "\(fixtureRoot)/dashboard_read.possibly_stuck.response.json"
+            )
+        )
+        guard
+            var occurrenceFixtureObject = try JSONSerialization.jsonObject(
+                with: occurrenceFixtureData
+            ) as? [String: Any],
+            var occurrenceRuns = occurrenceFixtureObject["runs"] as? [[String: Any]]
+        else {
+            throw NativeHealthTestFailure.failed(
+                "Possibly Stuck Dashboard fixture must contain one Run"
+            )
+        }
+        occurrenceRuns[0].removeValue(forKey: "active_stuck_occurrence_id")
+        occurrenceFixtureObject["runs"] = occurrenceRuns
+        try requireDecodingFailure(
+            FlitDashboardReadResponse.self,
+            from: try JSONSerialization.data(withJSONObject: occurrenceFixtureObject),
+            "generated Dashboard contract must reject a missing active stuck occurrence field"
+        )
+        for invalidOccurrence in ["", String(repeating: "x", count: 257)] {
+            guard
+                var invalidOccurrenceObject = try JSONSerialization.jsonObject(
+                    with: occurrenceFixtureData
+                ) as? [String: Any],
+                var invalidOccurrenceRuns = invalidOccurrenceObject["runs"]
+                    as? [[String: Any]],
+                !invalidOccurrenceRuns.isEmpty
+            else {
+                throw NativeHealthTestFailure.failed(
+                    "Possibly Stuck Dashboard fixture must retain one Run"
+                )
+            }
+            invalidOccurrenceRuns[0]["active_stuck_occurrence_id"] = invalidOccurrence
+            invalidOccurrenceObject["runs"] = invalidOccurrenceRuns
+            try requireDecodingFailure(
+                FlitDashboardReadResponse.self,
+                from: try JSONSerialization.data(withJSONObject: invalidOccurrenceObject),
+                "generated Dashboard contract must reject empty or oversized occurrence IDs"
+            )
+        }
         try require(
             DashboardSection.allCases.map(\.rawValue)
                 == ["NeedsAttention", "PossiblyStuck", "Working", "Finished"],

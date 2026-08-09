@@ -1508,6 +1508,7 @@ fn dashboard_run_record(
         attention_level: snapshot.projection.attention_level,
         attention_open_count: snapshot.attention_open_count,
         dashboard_bucket: snapshot.projection.dashboard_bucket,
+        active_stuck_occurrence_id: snapshot.active_stuck_occurrence_id,
         last_progress_at: snapshot.projection.last_progress_at,
         last_liveness_at: snapshot.projection.last_liveness_at,
         started_at: snapshot.started_at,
@@ -3806,6 +3807,28 @@ mod tests {
             occurrence_id: "occurrence-still-working-command".to_owned(),
             client_protocol_version: PROTOCOL_VERSION.to_owned(),
         };
+        let dashboard: DashboardReadResponse = serde_json::from_str(
+            &dashboard_read_with(
+                &manager,
+                &serde_json::to_string(&DashboardReadRequest {
+                    expected_core_instance_id: None,
+                    after_cursor: None,
+                    requested_event_limit: MAX_DASHBOARD_DELTA_EVENTS as u32,
+                    client_protocol_version: PROTOCOL_VERSION.to_owned(),
+                })
+                .expect("Dashboard request"),
+            )
+            .expect("Dashboard response"),
+        )
+        .expect("typed Dashboard response");
+        assert!(matches!(
+            dashboard,
+            DashboardReadResponse::Snapshot { runs, .. }
+                if runs.len() == 1
+                    && runs[0].version == version
+                    && runs[0].active_stuck_occurrence_id.as_deref()
+                        == Some("occurrence-still-working-command")
+        ));
         let request_json = serde_json::to_string(&request).expect("Still working request");
 
         let unavailable: ManagedRunStillWorkingResponse = serde_json::from_str(
@@ -4960,6 +4983,7 @@ mod tests {
                 started_at: Some("2026-08-04T00:00:00Z".to_owned()),
                 ended_at: Some("2026-08-04T00:01:00Z".to_owned()),
                 attention_open_count: 0,
+                active_stuck_occurrence_id: None,
                 changes: StoreDashboardChangeSummary::Available {
                     attribution: stored,
                     files: 3,

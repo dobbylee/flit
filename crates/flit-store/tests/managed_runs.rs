@@ -1193,6 +1193,14 @@ fn stuck_transitions_are_exact_atomic_and_same_state_consumes_no_cursor() {
     assert_eq!(stuck.dashboard_bucket, "PossiblyStuck");
     assert_eq!(stuck.attention_level, "Informational");
     assert_eq!(stuck.snapshot["attention"]["open_count"], 1);
+    assert_eq!(
+        store
+            .dashboard_run_snapshots_through(first_event.ingest_seq)
+            .expect("stuck Dashboard snapshot")[0]
+            .active_stuck_occurrence_id
+            .as_deref(),
+        Some("occurrence-stuck-1")
+    );
 
     let mut same_payload = first_payload.clone();
     same_payload.process = StuckProcessReceipt::Alive {
@@ -1281,6 +1289,13 @@ fn stuck_transitions_are_exact_atomic_and_same_state_consumes_no_cursor() {
         .expect("working projection");
     assert_eq!(working.dashboard_bucket, "Working");
     assert_eq!(working.snapshot["attention"]["open_count"], 0);
+    assert_eq!(
+        store
+            .dashboard_run_snapshots_through(first_clear_event.ingest_seq)
+            .expect("cleared Dashboard snapshot")[0]
+            .active_stuck_occurrence_id,
+        None
+    );
 
     let second_payload = PossiblyStuckPayload {
         occurrence_id: "occurrence-stuck-2".to_owned(),
@@ -1352,6 +1367,117 @@ fn stuck_transitions_are_exact_atomic_and_same_state_consumes_no_cursor() {
             version: 8,
         }
     );
+}
+
+#[test]
+fn blocking_attention_preserves_active_stuck_occurrence_until_explicit_clear() {
+    let directory = TestDirectory::new("stuck-blocking-priority");
+    let (mut store, _database, project_path) = trusted_store(&directory);
+    store
+        .create_managed_run_intent(run_intent(
+            "run-stuck-blocking",
+            "event-stuck-blocking-created",
+            "event-stuck-blocking-start-requested",
+        ))
+        .expect("managed Run");
+    store
+        .connect_initial_managed_session(session_connection(
+            "session-stuck-blocking",
+            "run-stuck-blocking",
+            "thread-stuck-blocking",
+            &project_path,
+        ))
+        .expect("managed session");
+    let initial_version = store
+        .run_snapshot("run-stuck-blocking")
+        .expect("running snapshot")
+        .expect("running projection")
+        .version;
+    let stuck_event = match store
+        .append_managed_stuck_transition(ManagedStuckTransition {
+            run_id: "run-stuck-blocking".to_owned(),
+            expected_run_version: initial_version,
+            event_id: "event-stuck-blocking-open".to_owned(),
+            observed_at: "2026-07-24T10:02:10Z".to_owned(),
+            assessment: ManagedStuckAssessment::PossiblyStuck(PossiblyStuckPayload {
+                occurrence_id: "occurrence-stuck-blocking".to_owned(),
+                cause: StuckCauseCode::Unknown,
+                threshold_seconds: 120,
+                progress_event_id: "event-stuck-blocking-created".to_owned(),
+                progress_observed_at: CREATED_AT.to_owned(),
+                progress_monotonic_ms: 5_000,
+                baseline_monotonic_ms: 5_000,
+                stuck_since_monotonic_ms: 125_000,
+                process: StuckProcessReceipt::Alive {
+                    generation: "process-generation-stuck-blocking".to_owned(),
+                    observed_monotonic_ms: 130_000,
+                },
+                evidence_unavailable_reason: "raw_provider_content_not_retained".to_owned(),
+            }),
+        })
+        .expect("open stuck occurrence")
+    {
+        ManagedStuckTransitionOutcome::Appended(event) => event,
+        other => panic!("unexpected stuck transition: {other:?}"),
+    };
+    let permission = match store
+        .append_managed_provider_observation(ManagedProviderObservation {
+            run_id: "run-stuck-blocking".to_owned(),
+            session_id: "session-stuck-blocking".to_owned(),
+            external_session_key: "thread-stuck-blocking".to_owned(),
+            provider_turn_id: "turn-stuck-blocking".to_owned(),
+            contract_version: "codex-app-server/0.145.0".to_owned(),
+            event_id: "event-stuck-blocking-permission".to_owned(),
+            observed_at: "2026-07-24T10:02:11Z".to_owned(),
+            kind: ManagedProviderObservationKind::PermissionRequested {
+                request_id: "request-stuck-blocking".to_owned(),
+                provider_request_id: 73,
+                provider_item_id: "permission-stuck-blocking".to_owned(),
+                provider_started_at_ms: 73,
+            },
+        })
+        .expect("blocking permission")
+    {
+        AppendEventOutcome::Inserted(event) => event,
+        other => panic!("unexpected blocking permission: {other:?}"),
+    };
+    let blocked = store
+        .dashboard_run_snapshots_through(permission.ingest_seq)
+        .expect("blocked Dashboard snapshot");
+    assert_eq!(blocked[0].projection.version, permission.ingest_seq);
+    assert_eq!(blocked[0].projection.dashboard_bucket, "NeedsAttention");
+    assert_eq!(
+        blocked[0].active_stuck_occurrence_id.as_deref(),
+        Some("occurrence-stuck-blocking")
+    );
+
+    let clear_event = match store
+        .append_managed_stuck_transition(ManagedStuckTransition {
+            run_id: "run-stuck-blocking".to_owned(),
+            expected_run_version: permission.ingest_seq,
+            event_id: "event-stuck-blocking-clear".to_owned(),
+            observed_at: "2026-07-24T10:02:12Z".to_owned(),
+            assessment: ManagedStuckAssessment::Clear(StuckClearedPayload {
+                occurrence_id: "occurrence-stuck-blocking".to_owned(),
+                reason: StuckClearReasonCode::BlockingRequestOpen,
+                process: StuckProcessReceipt::Alive {
+                    generation: "process-generation-stuck-blocking".to_owned(),
+                    observed_monotonic_ms: 132_000,
+                },
+                evidence_unavailable_reason: "raw_provider_content_not_retained".to_owned(),
+            }),
+        })
+        .expect("clear blocked stuck occurrence")
+    {
+        ManagedStuckTransitionOutcome::Appended(event) => event,
+        other => panic!("unexpected stuck clear: {other:?}"),
+    };
+    assert!(clear_event.ingest_seq > stuck_event.ingest_seq);
+    let cleared = store
+        .dashboard_run_snapshots_through(clear_event.ingest_seq)
+        .expect("cleared Dashboard snapshot");
+    assert_eq!(cleared[0].projection.dashboard_bucket, "NeedsAttention");
+    assert_eq!(cleared[0].active_stuck_occurrence_id, None);
 }
 
 #[test]

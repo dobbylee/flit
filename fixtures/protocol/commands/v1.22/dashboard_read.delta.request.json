@@ -1,0 +1,6 @@
+{
+  "expected_core_instance_id": "core-instance-1",
+  "after_cursor": 3,
+  "requested_event_limit": 50,
+  "client_protocol_version": "1.22"
+}

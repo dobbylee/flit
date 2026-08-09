@@ -4,7 +4,7 @@ use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: &str = "1.21";
+pub const PROTOCOL_VERSION: &str = "1.22";
 pub const EVENT_PROTOCOL_VERSION: &str = "1.4";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -452,6 +452,8 @@ pub struct DashboardRunRecord {
     pub attention_level: String,
     pub attention_open_count: u64,
     pub dashboard_bucket: String,
+    #[serde(deserialize_with = "deserialize_active_stuck_occurrence_id")]
+    pub active_stuck_occurrence_id: Option<String>,
     pub last_progress_at: Option<String>,
     pub last_liveness_at: Option<String>,
     pub started_at: Option<String>,
@@ -1241,6 +1243,25 @@ where
     }
 }
 
+fn deserialize_active_stuck_occurrence_id<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    if value
+        .as_deref()
+        .is_none_or(|value| !value.trim().is_empty() && value.len() <= 256)
+    {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom(
+            "active stuck occurrence ID must be a non-empty string of at most 256 bytes",
+        ))
+    }
+}
+
 fn deserialize_stuck_threshold<'de, D>(deserializer: D) -> Result<u16, D::Error>
 where
     D: Deserializer<'de>,
@@ -1803,6 +1824,7 @@ struct FlitDashboardRunRecord: Codable, Equatable, Sendable {
     let attentionLevel: String
     let attentionOpenCount: UInt64
     let dashboardBucket: String
+    let activeStuckOccurrenceId: String?
     let lastProgressAt: String?
     let lastLivenessAt: String?
     let startedAt: String?
@@ -1823,12 +1845,81 @@ struct FlitDashboardRunRecord: Codable, Equatable, Sendable {
         case attentionLevel = "attention_level"
         case attentionOpenCount = "attention_open_count"
         case dashboardBucket = "dashboard_bucket"
+        case activeStuckOccurrenceId = "active_stuck_occurrence_id"
         case lastProgressAt = "last_progress_at"
         case lastLivenessAt = "last_liveness_at"
         case startedAt = "started_at"
         case endedAt = "ended_at"
         case changes
         case updatedAt = "updated_at"
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        guard values.contains(.activeStuckOccurrenceId) else {
+            throw DecodingError.keyNotFound(
+                CodingKeys.activeStuckOccurrenceId,
+                DecodingError.Context(
+                    codingPath: values.codingPath,
+                    debugDescription: "Dashboard Run requires active_stuck_occurrence_id"
+                )
+            )
+        }
+        runId = try values.decode(String.self, forKey: .runId)
+        projectId = try values.decode(String.self, forKey: .projectId)
+        projectDisplayName = try values.decode(String.self, forKey: .projectDisplayName)
+        title = try values.decode(String.self, forKey: .title)
+        provider = try values.decode(FlitProviderKind.self, forKey: .provider)
+        version = try values.decode(UInt64.self, forKey: .version)
+        lifecycle = try values.decode(String.self, forKey: .lifecycle)
+        activity = try values.decode(String.self, forKey: .activity)
+        activityConfidence = try values.decode(Double.self, forKey: .activityConfidence)
+        attentionLevel = try values.decode(String.self, forKey: .attentionLevel)
+        attentionOpenCount = try values.decode(UInt64.self, forKey: .attentionOpenCount)
+        dashboardBucket = try values.decode(String.self, forKey: .dashboardBucket)
+        activeStuckOccurrenceId = try values.decodeIfPresent(
+            String.self,
+            forKey: .activeStuckOccurrenceId
+        )
+        if let activeStuckOccurrenceId,
+           activeStuckOccurrenceId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || activeStuckOccurrenceId.utf8.count > 256
+        {
+            throw DecodingError.dataCorruptedError(
+                forKey: .activeStuckOccurrenceId,
+                in: values,
+                debugDescription: "active stuck occurrence ID must be non-empty and bounded"
+            )
+        }
+        lastProgressAt = try values.decodeIfPresent(String.self, forKey: .lastProgressAt)
+        lastLivenessAt = try values.decodeIfPresent(String.self, forKey: .lastLivenessAt)
+        startedAt = try values.decodeIfPresent(String.self, forKey: .startedAt)
+        endedAt = try values.decodeIfPresent(String.self, forKey: .endedAt)
+        changes = try values.decode(FlitDashboardChangeSummary.self, forKey: .changes)
+        updatedAt = try values.decode(String.self, forKey: .updatedAt)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(runId, forKey: .runId)
+        try values.encode(projectId, forKey: .projectId)
+        try values.encode(projectDisplayName, forKey: .projectDisplayName)
+        try values.encode(title, forKey: .title)
+        try values.encode(provider, forKey: .provider)
+        try values.encode(version, forKey: .version)
+        try values.encode(lifecycle, forKey: .lifecycle)
+        try values.encode(activity, forKey: .activity)
+        try values.encode(activityConfidence, forKey: .activityConfidence)
+        try values.encode(attentionLevel, forKey: .attentionLevel)
+        try values.encode(attentionOpenCount, forKey: .attentionOpenCount)
+        try values.encode(dashboardBucket, forKey: .dashboardBucket)
+        try values.encode(activeStuckOccurrenceId, forKey: .activeStuckOccurrenceId)
+        try values.encode(lastProgressAt, forKey: .lastProgressAt)
+        try values.encode(lastLivenessAt, forKey: .lastLivenessAt)
+        try values.encode(startedAt, forKey: .startedAt)
+        try values.encode(endedAt, forKey: .endedAt)
+        try values.encode(changes, forKey: .changes)
+        try values.encode(updatedAt, forKey: .updatedAt)
     }
 }
 

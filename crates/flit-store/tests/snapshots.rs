@@ -482,6 +482,52 @@ fn dashboard_reads_reject_future_reversed_and_unbounded_ranges() {
 }
 
 #[test]
+fn dashboard_snapshot_rejects_stuck_occurrence_and_bucket_drift() {
+    let database = TestDatabase::new("dashboard-stuck-drift");
+    let mut store = database.open();
+    append(&mut store, event(RUN_A, "event-stuck-drift", 1));
+    let mut draft = snapshot(RUN_A, 1, "Running", "Unknown", 0.0);
+    draft.snapshot.insert(
+        "stuck".to_owned(),
+        json!({
+            "occurrence_id": "occurrence-stuck-drift",
+            "notification": { "status": "inactive" },
+            "reset": null
+        }),
+    );
+    assert!(matches!(
+        store.write_run_snapshot(draft),
+        Err(flit_store::StoreError::InvalidRunSnapshot { field: "stuck" })
+    ));
+
+    let mut missing = snapshot(RUN_A, 1, "Running", "Unknown", 0.0);
+    missing.dashboard_bucket = "PossiblyStuck".to_owned();
+    missing.snapshot["dashboard_bucket"] = json!("PossiblyStuck");
+    assert!(matches!(
+        store.write_run_snapshot(missing),
+        Err(flit_store::StoreError::InvalidRunSnapshot { field: "stuck" })
+    ));
+
+    for lifecycle in ["Finished", "Completed", "Failed", "Stopped", "Interrupted"] {
+        let mut terminal = snapshot(RUN_A, 1, lifecycle, "Unknown", 0.0);
+        terminal.dashboard_bucket = "NeedsAttention".to_owned();
+        terminal.snapshot["dashboard_bucket"] = json!("NeedsAttention");
+        terminal.snapshot.insert(
+            "stuck".to_owned(),
+            json!({
+                "occurrence_id": format!("occurrence-terminal-{lifecycle}"),
+                "notification": { "status": "inactive" },
+                "reset": null
+            }),
+        );
+        assert!(matches!(
+            store.write_run_snapshot(terminal),
+            Err(flit_store::StoreError::InvalidRunSnapshot { field: "stuck" })
+        ));
+    }
+}
+
+#[test]
 fn changed_projection_read_ignores_unrelated_corrupt_snapshots() {
     let database = TestDatabase::new("dashboard-changed-projections");
     let mut store = database.open();

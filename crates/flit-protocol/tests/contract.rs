@@ -261,6 +261,7 @@ fn current_dashboard_read_fixtures_round_trip_every_delivery() {
     }
     for name in [
         "dashboard_read.initial.response.json",
+        "dashboard_read.possibly_stuck.response.json",
         "dashboard_read.unavailable_changes.response.json",
         "dashboard_read.delta.response.json",
         "dashboard_read.resync.response.json",
@@ -290,6 +291,21 @@ fn current_dashboard_read_fixtures_round_trip_every_delivery() {
                     ..
                 }
             )
+    ));
+    let possibly_stuck: DashboardReadResponse = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "dashboard_read.possibly_stuck.response.json",
+        )))
+        .expect("Possibly Stuck Dashboard fixture should be readable"),
+    )
+    .expect("Possibly Stuck Dashboard fixture should match Rust types");
+    assert!(matches!(
+        possibly_stuck,
+        DashboardReadResponse::Snapshot { runs, .. }
+            if runs[0].dashboard_bucket == "PossiblyStuck"
+                && runs[0].active_stuck_occurrence_id.as_deref()
+                    == Some("occurrence-dashboard-stuck-1")
     ));
     let mut observed: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(repository_path(&command_fixture(
@@ -337,7 +353,11 @@ fn current_dashboard_read_fixtures_round_trip_every_delivery() {
     unknown_reason["reason"] = serde_json::json!("silently_continue");
     assert!(serde_json::from_value::<DashboardReadResponse>(unknown_reason).is_err());
 
-    for required in ["attention_open_count", "changes"] {
+    for required in [
+        "attention_open_count",
+        "active_stuck_occurrence_id",
+        "changes",
+    ] {
         let mut missing_projection: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(repository_path(&command_fixture(
                 current,
@@ -354,6 +374,19 @@ fn current_dashboard_read_fixtures_round_trip_every_delivery() {
             serde_json::from_value::<DashboardReadResponse>(missing_projection).is_err(),
             "Dashboard Run must require {required}"
         );
+    }
+
+    for invalid_occurrence in [serde_json::json!(""), serde_json::json!("x".repeat(257))] {
+        let mut invalid: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(repository_path(&command_fixture(
+                current,
+                "dashboard_read.initial.response.json",
+            )))
+            .expect("Dashboard projection fixture should be readable"),
+        )
+        .expect("Dashboard projection fixture should be JSON");
+        invalid["runs"][0]["active_stuck_occurrence_id"] = invalid_occurrence;
+        assert!(serde_json::from_value::<DashboardReadResponse>(invalid).is_err());
     }
 
     let unavailable: DashboardReadResponse = serde_json::from_str(

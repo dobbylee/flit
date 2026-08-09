@@ -1,0 +1,12 @@
+{
+  "delivery": "snapshot",
+  "protocol_version": "1.22",
+  "event_schema_version": "1.4",
+  "core_instance_id": "core-instance-2",
+  "reason": "core_instance_mismatch",
+  "requested_after_cursor": 3,
+  "retained_after_cursor": 0,
+  "next_cursor": 4,
+  "has_more": false,
+  "runs": []
+}
