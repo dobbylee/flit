@@ -2067,6 +2067,23 @@ struct NativeHealthTests {
             FlitManagedRunObserveRequest.self,
             at: "\(fixtureRoot)/managed_run_observe.request.json"
         )
+        let stuckAssessmentRequest = try decodeFixture(
+            FlitManagedRunsAssessStuckRequest.self,
+            at: "\(fixtureRoot)/managed_runs_assess_stuck.request.json"
+        )
+        let stuckAssessmentResponse = try decodeFixture(
+            FlitManagedRunsAssessStuckResponse.self,
+            at: "\(fixtureRoot)/managed_runs_assess_stuck.response.json"
+        )
+        try require(
+            stuckAssessmentRequest.clientProtocolVersion == flitClientProtocolVersion
+                && stuckAssessmentResponse.protocolVersion == flitClientProtocolVersion
+                && stuckAssessmentResponse.assessedRuns == 3
+                && stuckAssessmentResponse.transitionsAppended == 1
+                && stuckAssessmentResponse.unchangedRuns == 2
+                && stuckAssessmentResponse.unavailableRuns == 1,
+            "generated stuck assessment contract must preserve bounded aggregate counts"
+        )
         for (name, expectedStatus) in [
             (
                 "managed_run_observe.permission_requested.response.json",

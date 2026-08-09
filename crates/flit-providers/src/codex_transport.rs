@@ -19,7 +19,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::{
     CapabilityStatus, CodexCompatibilityProbe, CodexCompatibilityProbeError, CodexContractError,
@@ -56,6 +58,65 @@ const INBOUND_FRAME_QUEUE_CAPACITY: usize = 16;
 const RECEIVE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const IO_POLL_INTERVAL: Duration = Duration::from_millis(5);
 static NEXT_STAGED_EXECUTABLE: AtomicU64 = AtomicU64::new(1);
+static NEXT_PROCESS_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Debug)]
+pub struct CodexProcessProbe {
+    pid: Pid,
+    generation: String,
+    generation_active: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodexProcessHealth {
+    Alive,
+    Exited,
+    Unavailable,
+}
+
+impl CodexProcessProbe {
+    #[must_use]
+    pub fn generation(&self) -> &str {
+        &self.generation
+    }
+
+    #[must_use]
+    pub fn observe(&self) -> CodexProcessHealth {
+        if !self.generation_active.load(Ordering::Acquire) {
+            return CodexProcessHealth::Unavailable;
+        }
+        let observed = match waitid(
+            WaitId::Pid(self.pid),
+            WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT | WaitIdOptions::EXITED,
+        ) {
+            Ok(None) => CodexProcessHealth::Alive,
+            Ok(Some(_)) => CodexProcessHealth::Exited,
+            Err(_) => CodexProcessHealth::Unavailable,
+        };
+        if self.generation_active.load(Ordering::Acquire) {
+            observed
+        } else {
+            CodexProcessHealth::Unavailable
+        }
+    }
+
+    fn invalidate(&self) {
+        self.generation_active.store(false, Ordering::Release);
+    }
+
+    fn for_child(child: &Child) -> Self {
+        let sequence = NEXT_PROCESS_GENERATION.fetch_add(1, Ordering::Relaxed);
+        let mut digest = Sha256::new();
+        digest.update(std::process::id().to_le_bytes());
+        digest.update(child.id().to_le_bytes());
+        digest.update(sequence.to_le_bytes());
+        Self {
+            pid: Pid::from_child(child),
+            generation: format!("codex-{:x}", digest.finalize()),
+            generation_active: Arc::new(AtomicBool::new(true)),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodexManagedThreads {
@@ -106,6 +167,7 @@ impl Drop for StagedExecutable {
 
 pub struct CodexAppServer {
     child: Option<Child>,
+    process_probe: CodexProcessProbe,
     stdin: Option<ChildStdin>,
     inbound: Option<Receiver<InboundFrame>>,
     stdout_thread: Option<JoinHandle<()>>,
@@ -127,6 +189,11 @@ pub struct CodexAppServer {
 }
 
 impl CodexAppServer {
+    #[must_use]
+    pub fn process_probe(&self) -> CodexProcessProbe {
+        self.process_probe.clone()
+    }
+
     pub fn connect_at(path: impl AsRef<Path>) -> Result<Self, CodexAppServerError> {
         let probe =
             probe_codex_compatibility_at(path).map_err(CodexAppServerError::CompatibilityProbe)?;
@@ -782,8 +849,10 @@ impl CodexAppServer {
             }
         };
 
+        let process_probe = CodexProcessProbe::for_child(&child);
         let mut server = Self {
             child: Some(child),
+            process_probe,
             stdin: Some(stdin),
             inbound: Some(receiver),
             stdout_thread: Some(stdout_thread),
@@ -1185,6 +1254,7 @@ impl CodexAppServer {
     }
 
     fn terminate_owned(&mut self) -> Result<(), CodexAppServerError> {
+        self.process_probe.invalidate();
         self.io_cancelled.store(true, Ordering::Release);
         self.stdin.take();
         self.inbound.take();
@@ -1703,6 +1773,58 @@ mod tests {
     struct TestDirectory(PathBuf);
 
     struct UmaskGuard(Mode);
+
+    #[test]
+    fn exact_child_probe_distinguishes_alive_and_exit_without_reaping() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("probe child");
+        let probe = CodexProcessProbe::for_child(&child);
+        assert_eq!(probe.observe(), CodexProcessHealth::Alive);
+
+        child.kill().expect("terminate probe child");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while probe.observe() == CodexProcessHealth::Alive && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(probe.observe(), CodexProcessHealth::Exited);
+        child.wait().expect("probe must not reap child");
+        assert_eq!(probe.observe(), CodexProcessHealth::Unavailable);
+    }
+
+    #[test]
+    fn invalidated_generation_cannot_report_a_still_live_pid() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("probe child");
+        let retained = CodexProcessProbe::for_child(&child);
+        let detached = retained.clone();
+        retained.invalidate();
+        assert_eq!(detached.observe(), CodexProcessHealth::Unavailable);
+        child.kill().expect("terminate probe child");
+        child.wait().expect("reap probe child");
+    }
+
+    #[test]
+    fn process_generation_is_opaque_and_unique_per_child() {
+        let mut first = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("first child");
+        let mut second = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("second child");
+        let first_probe = CodexProcessProbe::for_child(&first);
+        let second_probe = CodexProcessProbe::for_child(&second);
+        assert_ne!(first_probe.generation(), second_probe.generation());
+        assert!(first_probe.generation().starts_with("codex-"));
+        assert_eq!(first_probe.generation().len(), "codex-".len() + 64);
+        first.wait().expect("first child wait");
+        second.wait().expect("second child wait");
+    }
 
     impl TestDirectory {
         fn new(label: &str) -> Self {

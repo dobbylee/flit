@@ -493,13 +493,46 @@ impl Store {
         &mut self,
         transition: ManagedStuckTransition,
     ) -> Result<ManagedStuckTransitionOutcome, StoreError> {
-        managed_runs::validate_stuck_transition(&transition)
-            .map_err(|field| StoreError::InvalidManagedStuckTransition { field })?;
+        self.append_managed_stuck_transitions(vec![transition])?
+            .pop()
+            .ok_or(StoreError::InvalidManagedStuckTransition {
+                field: "transitions",
+            })
+    }
+
+    pub fn append_managed_stuck_transitions(
+        &mut self,
+        transitions: Vec<ManagedStuckTransition>,
+    ) -> Result<Vec<ManagedStuckTransitionOutcome>, StoreError> {
+        if transitions.len() > MAX_MANAGED_STUCK_ASSESSMENT_RUNS {
+            return Err(StoreError::ManagedStuckAssessmentRunLimitExceeded {
+                count: transitions.len(),
+                max: MAX_MANAGED_STUCK_ASSESSMENT_RUNS,
+            });
+        }
+        for transition in &transitions {
+            managed_runs::validate_stuck_transition(transition)
+                .map_err(|field| StoreError::InvalidManagedStuckTransition { field })?;
+        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(StoreError::Sqlite)?;
-        let current_version = latest_run_event_version(&transaction, &transition.run_id)?
+        let outcomes = transitions
+            .into_iter()
+            .map(|transition| {
+                Self::append_managed_stuck_transition_in_transaction(&transaction, transition)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(outcomes)
+    }
+
+    fn append_managed_stuck_transition_in_transaction(
+        transaction: &Transaction<'_>,
+        transition: ManagedStuckTransition,
+    ) -> Result<ManagedStuckTransitionOutcome, StoreError> {
+        let current_version = latest_run_event_version(transaction, &transition.run_id)?
             .ok_or_else(|| StoreError::MissingRun {
                 run_id: transition.run_id.clone(),
             })?;
@@ -510,9 +543,9 @@ impl Store {
                 current: current_version,
             });
         }
-        validate_managed_stuck_authority(&transaction, &transition)?;
+        validate_managed_stuck_authority(transaction, &transition)?;
 
-        let active = load_active_stuck_transition(&transaction, &transition.run_id)?;
+        let active = load_active_stuck_transition(transaction, &transition.run_id)?;
         let desired_payload = managed_stuck_payload(&transition.assessment)?;
         match (&transition.assessment, active) {
             (ManagedStuckAssessment::PossiblyStuck(desired), Some(current))
@@ -524,14 +557,12 @@ impl Store {
                         occurrence_id: current.occurrence_id,
                     });
                 }
-                transaction.commit().map_err(StoreError::Sqlite)?;
                 return Ok(ManagedStuckTransitionOutcome::Unchanged {
                     run_id: transition.run_id,
                     version: current_version,
                 });
             }
             (ManagedStuckAssessment::Clear(_), None) => {
-                transaction.commit().map_err(StoreError::Sqlite)?;
                 return Ok(ManagedStuckTransitionOutcome::Unchanged {
                     run_id: transition.run_id,
                     version: current_version,
@@ -549,9 +580,9 @@ impl Store {
             _ => {}
         }
 
-        let stream_seq = next_managed_run_core_stream_seq(&transaction, &transition.run_id)?;
+        let stream_seq = next_managed_run_core_stream_seq(transaction, &transition.run_id)?;
         let event = managed_stuck_transition_event(&transition, stream_seq, desired_payload);
-        let mut outcomes = append_event_batch_in_transaction(&transaction, vec![event])?;
+        let mut outcomes = append_event_batch_in_transaction(transaction, vec![event])?;
         let outcome = outcomes
             .pop()
             .expect("one stuck transition must produce one append outcome");
@@ -564,7 +595,6 @@ impl Store {
                 },
             });
         };
-        transaction.commit().map_err(StoreError::Sqlite)?;
         Ok(ManagedStuckTransitionOutcome::Appended(Box::new(event)))
     }
 
@@ -4807,6 +4837,12 @@ fn append_event_batch_in_transaction(
 
         validate_event_session(transaction, &event)?;
         validate_event_evidence(transaction, &event)?;
+        if terminal_event_transitions_to_terminal(transaction, &event)?
+            && let Some(clear) = terminal_lifecycle_stuck_clear_event(transaction, &event)?
+        {
+            let clear_outcomes = append_event_batch_in_transaction(transaction, vec![clear])?;
+            debug_assert_eq!(clear_outcomes.len(), 1);
+        }
         let source_json = serde_json::to_string(&event.source).map_err(StoreError::Json)?;
         let payload_json = serde_json::to_string(&event.payload).map_err(StoreError::Json)?;
         let extensions_json = serde_json::to_string(&event.extensions).map_err(StoreError::Json)?;
@@ -4864,6 +4900,131 @@ fn append_event_batch_in_transaction(
         refresh_managed_dashboard_projection(transaction, run_id)?;
     }
     Ok(outcomes)
+}
+
+fn terminal_event_transitions_to_terminal(
+    transaction: &Transaction<'_>,
+    terminal: &UnsequencedEventEnvelope,
+) -> Result<bool, StoreError> {
+    let allowed_lifecycles = match terminal.event_type.as_str() {
+        "run.completed" | "run.interrupted" => ["Running", "Running"],
+        "run.failed" | "run.stopped" => ["Starting", "Running"],
+        _ => return Ok(false),
+    };
+    if load_active_stuck_transition(transaction, &terminal.run_id)?.is_none() {
+        return Ok(false);
+    }
+    let events = load_run_event_history(transaction, &terminal.run_id)?;
+    let projection =
+        replay_dashboard_projection(&events).map_err(|source| StoreError::DashboardProjection {
+            run_id: terminal.run_id.clone(),
+            source,
+        })?;
+    Ok(allowed_lifecycles.contains(&projection.lifecycle.as_str())
+        && terminal_rows_match(transaction, terminal)?)
+}
+
+fn terminal_rows_match(
+    transaction: &Transaction<'_>,
+    terminal: &UnsequencedEventEnvelope,
+) -> Result<bool, StoreError> {
+    let run_ended_at = transaction
+        .query_row(
+            "SELECT ended_at FROM runs WHERE id = ?1",
+            [&terminal.run_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(StoreError::Sqlite)?;
+    if run_ended_at.flatten().as_deref() != Some(terminal.observed_at.as_str()) {
+        return Ok(false);
+    }
+    let NullableSessionId::Id(session_id) = &terminal.session_id else {
+        return Ok(true);
+    };
+    let expected_reason = match terminal.event_type.as_str() {
+        "run.completed" => "completed",
+        "run.interrupted" => "interrupted",
+        "run.failed" => "failed",
+        "run.stopped" => "stopped",
+        _ => return Ok(false),
+    };
+    let session_terminal = transaction
+        .query_row(
+            "SELECT ended_at, end_reason FROM agent_sessions WHERE id = ?1 AND run_id = ?2",
+            params![session_id, terminal.run_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(StoreError::Sqlite)?;
+    Ok(matches!(
+        session_terminal,
+        Some((Some(ended_at), Some(end_reason)))
+            if ended_at == terminal.observed_at && end_reason == expected_reason
+    ))
+}
+
+fn terminal_lifecycle_stuck_clear_event(
+    transaction: &Transaction<'_>,
+    terminal: &UnsequencedEventEnvelope,
+) -> Result<Option<UnsequencedEventEnvelope>, StoreError> {
+    if !matches!(
+        terminal.event_type.as_str(),
+        "run.completed" | "run.failed" | "run.stopped" | "run.interrupted"
+    ) {
+        return Ok(None);
+    }
+    let Some(active) = load_active_stuck_transition(transaction, &terminal.run_id)? else {
+        return Ok(None);
+    };
+    let persisted = serde_json::from_value::<flit_protocol::PossiblyStuckPayload>(Value::Object(
+        active.payload,
+    ))
+    .map_err(|_| StoreError::StoredManagedStuckTransitionInvalid {
+        run_id: terminal.run_id.clone(),
+    })?;
+    let assessment = ManagedStuckAssessment::Clear(flit_protocol::StuckClearedPayload {
+        occurrence_id: active.occurrence_id.clone(),
+        reason: flit_protocol::StuckClearReasonCode::LifecycleInactive,
+        process: persisted.process,
+        evidence_unavailable_reason: persisted.evidence_unavailable_reason,
+    });
+    let expected_run_version = latest_run_event_version(transaction, &terminal.run_id)?
+        .ok_or_else(|| StoreError::MissingRun {
+            run_id: terminal.run_id.clone(),
+        })?;
+    let event_id =
+        terminal_lifecycle_stuck_clear_event_id(&terminal.event_id, &active.occurrence_id);
+    let transition = ManagedStuckTransition {
+        run_id: terminal.run_id.clone(),
+        expected_run_version,
+        event_id,
+        observed_at: terminal.observed_at.clone(),
+        assessment,
+    };
+    managed_runs::validate_stuck_transition(&transition)
+        .map_err(|field| StoreError::InvalidManagedStuckTransition { field })?;
+    let stream_seq = next_managed_run_core_stream_seq(transaction, &terminal.run_id)?;
+    let payload = managed_stuck_payload(&transition.assessment)?;
+    Ok(Some(managed_stuck_transition_event(
+        &transition,
+        stream_seq,
+        payload,
+    )))
+}
+
+fn terminal_lifecycle_stuck_clear_event_id(terminal_event_id: &str, occurrence_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(terminal_event_id.len().to_be_bytes());
+    digest.update(terminal_event_id.as_bytes());
+    digest.update(occurrence_id.len().to_be_bytes());
+    digest.update(occurrence_id.as_bytes());
+    format!("stuck-terminal-clear-{:x}", digest.finalize())
 }
 
 fn rebuild_managed_dashboard_projections(connection: &mut Connection) -> Result<(), StoreError> {

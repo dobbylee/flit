@@ -6,7 +6,8 @@ use flit_protocol::{
     GitObservationRequest, GitObservationResponse, MAX_JSON_SAFE_INTEGER, ManagedRunObserveRequest,
     ManagedRunObserveResponse, ManagedRunOpenInProviderRequest, ManagedRunPermissionRespondRequest,
     ManagedRunPermissionRespondResponse, ManagedRunStartRequest, ManagedRunStartResponse,
-    PROTOCOL_VERSION, PossiblyStuckPayload, ProjectInspectionRequest, ProjectInspectionResponse,
+    ManagedRunsAssessStuckRequest, ManagedRunsAssessStuckResponse, PROTOCOL_VERSION,
+    PossiblyStuckPayload, ProjectInspectionRequest, ProjectInspectionResponse,
     ProjectRegistrationRequest, ProjectRegistrationResponse, ProjectTrustRequest,
     ProjectTrustResponse, ProjectsListRequest, ProjectsListResponse, ProviderCompatibility,
     ProviderDiagnosticsRequest, ProviderDiagnosticsResponse, ProviderExecutionAfterQuit,
@@ -924,6 +925,26 @@ fn current_managed_run_observe_fixtures_round_trip_every_shape() {
 }
 
 #[test]
+fn current_managed_stuck_assessment_fixtures_round_trip_without_native_facts() {
+    let manifest = read_command_compatibility_manifest();
+    let current = &manifest.current;
+    assert_fixture_round_trip::<ManagedRunsAssessStuckRequest>(&command_fixture(
+        current,
+        "managed_runs_assess_stuck.request.json",
+    ));
+    assert_fixture_round_trip::<ManagedRunsAssessStuckResponse>(&command_fixture(
+        current,
+        "managed_runs_assess_stuck.response.json",
+    ));
+    assert!(
+        serde_json::from_str::<ManagedRunsAssessStuckRequest>(
+            r#"{"client_protocol_version":"1.20","observed_at":"fabricated"}"#,
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn current_managed_permission_response_fixtures_round_trip_every_shape() {
     let manifest = read_command_compatibility_manifest();
     let current = &manifest.current;
@@ -1121,6 +1142,8 @@ fn generated_swift_project_contract_is_current_and_required_fields_fail_closed()
         "FlitManagedRunStartRequest",
         "FlitManagedRunStartResponse",
         "FlitManagedRunObserveRequest",
+        "FlitManagedRunsAssessStuckRequest",
+        "FlitManagedRunsAssessStuckResponse",
         "FlitManagedRunObservationStatus",
         "FlitManagedRunProviderDecision",
         "FlitManagedRunProviderTerminalOutcome",

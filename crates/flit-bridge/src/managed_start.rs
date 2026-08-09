@@ -13,9 +13,10 @@ use flit_protocol::{
 };
 use flit_providers::{
     CapabilityStatus, CodexAppServer, CodexAppServerError, CodexContractError,
-    CodexManagedThreadId, CodexManualStartedThread, CodexProviderAutoStartedThread,
-    CodexStartedTurn, CodexTurnObservation, CodexTurnTerminalOutcome, ProviderCapability,
-    ProviderCompatibility, ProviderFingerprint, classify_codex,
+    CodexManagedThreadId, CodexManualStartedThread, CodexProcessProbe,
+    CodexProviderAutoStartedThread, CodexStartedTurn, CodexTurnObservation,
+    CodexTurnTerminalOutcome, ProviderCapability, ProviderCompatibility, ProviderFingerprint,
+    classify_codex,
 };
 use flit_store::{
     AppendEventOutcome, InitialManagedSessionConnection, ManagedGitChangeAttribution,
@@ -49,6 +50,9 @@ pub(crate) trait ManagedCodexConnector {
 
 pub(crate) trait ManagedCodexRuntime: Send {
     fn validated_profile(&self) -> Option<&ProviderFingerprint>;
+    fn process_probe(&self) -> Option<CodexProcessProbe> {
+        None
+    }
     fn start_manual(
         &mut self,
         cwd: &Path,
@@ -93,6 +97,10 @@ impl ManagedCodexConnector for ProductionCodexConnector {
 impl ManagedCodexRuntime for CodexAppServer {
     fn validated_profile(&self) -> Option<&ProviderFingerprint> {
         self.validated_profile()
+    }
+
+    fn process_probe(&self) -> Option<CodexProcessProbe> {
+        Some(CodexAppServer::process_probe(self))
     }
 
     fn start_manual(
@@ -177,6 +185,10 @@ pub(crate) struct RetainedPermission {
 }
 
 impl RetainedManagedRun {
+    pub(crate) fn process_probe(&self) -> Option<CodexProcessProbe> {
+        self.provider.process_probe()
+    }
+
     pub(crate) fn cached_permission(&self) -> Option<ManagedRunObserveResponse> {
         self.active_permission
             .as_ref()

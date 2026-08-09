@@ -347,6 +347,203 @@ impl TestDirectory {
 }
 
 #[test]
+fn stuck_transition_batches_roll_back_all_runs_on_late_stale_cas() {
+    let directory = TestDirectory::new("stuck-transition-batch-rollback");
+    let (mut store, _database, project_path) = trusted_store(&directory);
+    for suffix in ["a", "b"] {
+        store
+            .create_managed_run_intent(run_intent(
+                &format!("run-stuck-batch-{suffix}"),
+                &format!("event-stuck-batch-{suffix}-created"),
+                &format!("event-stuck-batch-{suffix}-start-requested"),
+            ))
+            .expect("managed Run");
+        store
+            .connect_initial_managed_session(session_connection(
+                &format!("session-stuck-batch-{suffix}"),
+                &format!("run-stuck-batch-{suffix}"),
+                &format!("thread-stuck-batch-{suffix}"),
+                &project_path,
+            ))
+            .expect("managed session");
+    }
+    let version_a = store
+        .run_snapshot("run-stuck-batch-a")
+        .expect("Run A snapshot")
+        .expect("Run A projection")
+        .version;
+    let version_b = store
+        .run_snapshot("run-stuck-batch-b")
+        .expect("Run B snapshot")
+        .expect("Run B projection")
+        .version;
+    let transition = |suffix: &str, expected_run_version: u64| ManagedStuckTransition {
+        run_id: format!("run-stuck-batch-{suffix}"),
+        expected_run_version,
+        event_id: format!("event-stuck-batch-{suffix}-open"),
+        observed_at: "2026-07-24T10:02:10Z".to_owned(),
+        assessment: ManagedStuckAssessment::PossiblyStuck(PossiblyStuckPayload {
+            occurrence_id: format!("occurrence-stuck-batch-{suffix}"),
+            cause: StuckCauseCode::Unknown,
+            threshold_seconds: 120,
+            progress_event_id: format!("event-stuck-batch-{suffix}-created"),
+            progress_observed_at: CREATED_AT.to_owned(),
+            progress_monotonic_ms: 5_000,
+            baseline_monotonic_ms: 5_000,
+            stuck_since_monotonic_ms: 125_000,
+            process: StuckProcessReceipt::Alive {
+                generation: format!("process-generation-stuck-batch-{suffix}"),
+                observed_monotonic_ms: 130_000,
+            },
+            evidence_unavailable_reason: "raw_provider_content_not_retained".to_owned(),
+        }),
+    };
+    assert!(matches!(
+        store.append_managed_stuck_transitions(vec![
+            transition("a", version_a),
+            transition("b", version_b + 1),
+        ]),
+        Err(StoreError::ManagedStuckRunVersionStale { .. })
+    ));
+    for (run_id, expected_version) in [
+        ("run-stuck-batch-a", version_a),
+        ("run-stuck-batch-b", version_b),
+    ] {
+        assert_eq!(
+            store
+                .run_snapshot(run_id)
+                .expect("unchanged snapshot")
+                .expect("unchanged projection")
+                .version,
+            expected_version
+        );
+    }
+}
+
+#[test]
+fn managed_terminal_events_close_active_stuck_replay_in_the_same_transaction() {
+    for (suffix, interrupted) in [("completed", false), ("interrupted", true)] {
+        let directory = TestDirectory::new(&format!("stuck-terminal-{suffix}"));
+        let (mut store, database, project_path) = trusted_store(&directory);
+        let run_id = format!("run-stuck-terminal-{suffix}");
+        let session_id = format!("session-stuck-terminal-{suffix}");
+        let thread_id = format!("thread-stuck-terminal-{suffix}");
+        let created_event_id = format!("event-stuck-terminal-{suffix}-created");
+        store
+            .create_managed_run_intent(run_intent(
+                &run_id,
+                &created_event_id,
+                &format!("event-stuck-terminal-{suffix}-requested"),
+            ))
+            .expect("managed Run");
+        store
+            .connect_initial_managed_session(session_connection(
+                &session_id,
+                &run_id,
+                &thread_id,
+                &project_path,
+            ))
+            .expect("managed session");
+        let version = store
+            .run_snapshot(&run_id)
+            .expect("running snapshot")
+            .expect("running projection")
+            .version;
+        store
+            .append_managed_stuck_transition(ManagedStuckTransition {
+                run_id: run_id.clone(),
+                expected_run_version: version,
+                event_id: format!("event-stuck-terminal-{suffix}-open"),
+                observed_at: "2026-07-24T10:02:10Z".to_owned(),
+                assessment: ManagedStuckAssessment::PossiblyStuck(PossiblyStuckPayload {
+                    occurrence_id: format!("occurrence-stuck-terminal-{suffix}"),
+                    cause: StuckCauseCode::Unknown,
+                    threshold_seconds: 120,
+                    progress_event_id: created_event_id,
+                    progress_observed_at: CREATED_AT.to_owned(),
+                    progress_monotonic_ms: 5_000,
+                    baseline_monotonic_ms: 5_000,
+                    stuck_since_monotonic_ms: 125_000,
+                    process: StuckProcessReceipt::Alive {
+                        generation: format!("process-stuck-terminal-{suffix}"),
+                        observed_monotonic_ms: 130_000,
+                    },
+                    evidence_unavailable_reason: "raw_provider_content_not_retained".to_owned(),
+                }),
+            })
+            .expect("open stuck occurrence");
+        let kind = if interrupted {
+            ManagedProviderObservationKind::TurnInterrupted {
+                changes: ManagedGitChangeSummary::Unavailable {
+                    reason: "git_terminal_observation_unavailable".to_owned(),
+                },
+                change_set: None,
+            }
+        } else {
+            ManagedProviderObservationKind::TurnCompleted {
+                changes: ManagedGitChangeSummary::Unavailable {
+                    reason: "git_terminal_observation_unavailable".to_owned(),
+                },
+                change_set: None,
+            }
+        };
+        let terminal_observation = ManagedProviderObservation {
+            run_id: run_id.clone(),
+            session_id,
+            external_session_key: thread_id,
+            provider_turn_id: format!("turn-stuck-terminal-{suffix}"),
+            contract_version: "codex-app-server/0.145.0".to_owned(),
+            event_id: format!("event-stuck-terminal-{suffix}-terminal"),
+            observed_at: ENDED_AT.to_owned(),
+            kind,
+        };
+        let terminal_outcome = store
+            .append_managed_provider_observation(terminal_observation.clone())
+            .expect("terminal event must close stuck replay");
+        let terminal_event = match terminal_outcome {
+            AppendEventOutcome::Inserted(event) => event,
+            other => panic!("new terminal must insert: {other:?}"),
+        };
+        let projection = store
+            .run_snapshot(&run_id)
+            .expect("terminal snapshot")
+            .expect("terminal projection");
+        assert_ne!(projection.dashboard_bucket, "PossiblyStuck");
+        let history = store
+            .run_events_through(&run_id, 0, terminal_event.ingest_seq, 20)
+            .expect("terminal history");
+        let clear = &history.events[history.events.len() - 2];
+        assert_eq!(clear.event_type, "run.stuck_cleared");
+        assert_eq!(clear.payload["reason"], "lifecycle_inactive");
+        assert_eq!(
+            clear.payload["occurrence_id"],
+            format!("occurrence-stuck-terminal-{suffix}")
+        );
+        assert_eq!(history.events.last(), Some(&terminal_event));
+        let terminal_cursor = store.latest_ingest_seq().expect("terminal cursor");
+        assert_eq!(
+            store
+                .append_managed_provider_observation(terminal_observation)
+                .expect("exact terminal retry"),
+            AppendEventOutcome::Duplicate(terminal_event.clone())
+        );
+        assert_eq!(
+            store.latest_ingest_seq().expect("duplicate cursor"),
+            terminal_cursor
+        );
+        assert!(
+            store
+                .managed_stuck_assessment_contexts()
+                .expect("terminal assessment contexts")
+                .iter()
+                .all(|context| context.run_id != run_id)
+        );
+        drop(store);
+        Store::open(&database, CREATED_AT).expect("terminal stuck replay reopens");
+    }
+}
+
+#[test]
 fn stuck_transitions_are_exact_atomic_and_same_state_consumes_no_cursor() {
     let directory = TestDirectory::new("stuck-transitions");
     let (mut store, _database, project_path) = trusted_store(&directory);

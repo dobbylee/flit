@@ -68,6 +68,27 @@ fn stuck_event(
     event
 }
 
+fn stuck_clear_event(ingest_seq: u64, occurrence_id: &str) -> ProjectionEvent {
+    let mut event = event(
+        ingest_seq,
+        "run.stuck_cleared",
+        None,
+        json!({
+            "occurrence_id": occurrence_id,
+            "reason": "lifecycle_inactive",
+            "process": {
+                "status": "alive",
+                "generation": "process-generation-1",
+                "observed_monotonic_ms": 135_000
+            },
+            "evidence_unavailable_reason": "raw_provider_content_not_retained"
+        }),
+    );
+    event.protocol_version = "1.3".to_owned();
+    event.source_contract_version = Some("stuck-transition/1.0".to_owned());
+    event
+}
+
 #[test]
 fn explicit_stuck_transitions_own_dashboard_and_attention_replay() {
     let base = vec![
@@ -129,6 +150,29 @@ fn explicit_stuck_transitions_own_dashboard_and_attention_replay() {
         ]),
         Err(ProjectionError::Stuck)
     );
+}
+
+#[test]
+fn every_terminal_lifecycle_atomically_clears_the_active_stuck_occurrence() {
+    for terminal in [
+        "run.completed",
+        "run.interrupted",
+        "run.failed",
+        "run.stopped",
+    ] {
+        let terminal_session =
+            matches!(terminal, "run.completed" | "run.interrupted").then_some("session-1");
+        let projection = replay_dashboard_projection(&[
+            event(1, "run.created", None, json!({})),
+            event(2, "session.connected", Some("session-1"), json!({})),
+            stuck_event(3, "occurrence-terminal", "event-2", 5_000),
+            stuck_clear_event(4, "occurrence-terminal"),
+            event(5, terminal, terminal_session, json!({})),
+        ])
+        .unwrap_or_else(|error| panic!("{terminal} must clear stuck replay: {error}"));
+        assert_ne!(projection.dashboard_bucket, "PossiblyStuck", "{terminal}");
+        assert_eq!(projection.current_stuck_occurrence_id, None, "{terminal}");
+    }
 }
 
 #[test]

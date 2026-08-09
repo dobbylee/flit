@@ -4,7 +4,7 @@ use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: &str = "1.19";
+pub const PROTOCOL_VERSION: &str = "1.20";
 pub const EVENT_PROTOCOL_VERSION: &str = "1.3";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -907,6 +907,21 @@ pub struct ManagedRunObserveRequest {
     pub run_id: String,
     pub observed_at: String,
     pub client_protocol_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRunsAssessStuckRequest {
+    pub client_protocol_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ManagedRunsAssessStuckResponse {
+    pub protocol_version: String,
+    pub assessed_runs: u32,
+    pub transitions_appended: u32,
+    pub unchanged_runs: u32,
+    pub unavailable_runs: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2560,6 +2575,30 @@ struct FlitManagedRunObserveRequest: Codable, Equatable, Sendable {
         case runId = "run_id"
         case observedAt = "observed_at"
         case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+struct FlitManagedRunsAssessStuckRequest: Codable, Equatable, Sendable {
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+struct FlitManagedRunsAssessStuckResponse: Codable, Equatable, Sendable {
+    let protocolVersion: String
+    let assessedRuns: UInt32
+    let transitionsAppended: UInt32
+    let unchangedRuns: UInt32
+    let unavailableRuns: UInt32
+
+    private enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case assessedRuns = "assessed_runs"
+        case transitionsAppended = "transitions_appended"
+        case unchangedRuns = "unchanged_runs"
+        case unavailableRuns = "unavailable_runs"
     }
 }
 

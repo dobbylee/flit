@@ -8,7 +8,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use flit_git::{
@@ -25,20 +25,20 @@ use flit_protocol::{
     GitNotWorktreeReason, GitObservationResponse, GitObservationUnavailableReason, HealthStatus,
     ManagedRunObserveRequest, ManagedRunObserveResponse, ManagedRunOpenInProviderRequest,
     ManagedRunPermissionRespondRequest, ManagedRunPermissionRespondResponse,
-    ManagedRunStartRequest, PROTOCOL_VERSION, ProjectInspectionResponse,
-    ProjectListCursor as ProjectListCursorResponse, ProjectRecord, ProjectRegistrationResponse,
-    ProjectRegistrationStatus, ProjectTrustResponse, ProjectTrustStatus, ProjectsListResponse,
-    ProviderCapability as ProtocolProviderCapability, ProviderCapabilityEntry,
-    ProviderCompatibility as ProtocolProviderCompatibility, ProviderDiagnosticsResponse,
-    ProviderExecutionAfterQuit, ProviderKind as ProtocolProviderKind, ProviderUnavailableReason,
-    QuitImpactReason, QuitImpactResponse, QuitImpactRun, RunChangeExternalOpenDisabledReason,
-    RunChangeExternalOpenRequest, RunChangeExternalOpenResponse, RunChangeHead,
-    RunChangesReadRequest, RunChangesReadResponse, RunChangesUnavailableReason,
-    RunDetailReadRequest, RunDetailReadResponse, RunEvidenceRecord, RunFileChangeRecord,
-    RunFileChangeStatus, RunFileProjectScope, SystemHealthResponse,
+    ManagedRunStartRequest, ManagedRunsAssessStuckRequest, PROTOCOL_VERSION,
+    ProjectInspectionResponse, ProjectListCursor as ProjectListCursorResponse, ProjectRecord,
+    ProjectRegistrationResponse, ProjectRegistrationStatus, ProjectTrustResponse,
+    ProjectTrustStatus, ProjectsListResponse, ProviderCapability as ProtocolProviderCapability,
+    ProviderCapabilityEntry, ProviderCompatibility as ProtocolProviderCompatibility,
+    ProviderDiagnosticsResponse, ProviderExecutionAfterQuit, ProviderKind as ProtocolProviderKind,
+    ProviderUnavailableReason, QuitImpactReason, QuitImpactResponse, QuitImpactRun,
+    RunChangeExternalOpenDisabledReason, RunChangeExternalOpenRequest,
+    RunChangeExternalOpenResponse, RunChangeHead, RunChangesReadRequest, RunChangesReadResponse,
+    RunChangesUnavailableReason, RunDetailReadRequest, RunDetailReadResponse, RunEvidenceRecord,
+    RunFileChangeRecord, RunFileChangeStatus, RunFileProjectScope, SystemHealthResponse,
 };
 use flit_providers::{
-    CapabilityStatus, CodexCompatibilityProbe, CodexCompatibilityProbeError,
+    CapabilityStatus, CodexCompatibilityProbe, CodexCompatibilityProbeError, CodexProcessProbe,
     ExecutableInspectionError, FingerprintAxis, MAX_CODEX_COMMAND_STARTS_PER_TURN,
     ProviderCapability, ProviderCapabilitySnapshot, ProviderCompatibility,
     probe_codex_compatibility_on_path,
@@ -83,6 +83,7 @@ mod external_open;
 mod managed_start;
 #[cfg(test)]
 mod phase2_journey;
+mod stuck_assessment;
 
 const DATABASE_FILE_NAME: &str = "flit.sqlite3";
 const LOCK_FILE_NAME: &str = "core.lock";
@@ -168,11 +169,18 @@ struct FoundationCore {
     core_instance_id: String,
     // Rust drops fields in declaration order, so stop providers and close SQLite before the guard.
     managed_runtimes: BTreeMap<String, managed_start::RetainedManagedRun>,
+    stuck_assessment: Box<StuckAssessmentState>,
     managed_observations_in_flight: BTreeSet<String>,
     startup_recovery_sessions: Option<Vec<ManagedSession>>,
     store: Store,
     provider_health: HealthStatus,
     _guard: File,
+}
+
+struct StuckAssessmentState {
+    process_probes: BTreeMap<String, CodexProcessProbe>,
+    progress_baselines: BTreeMap<String, stuck_assessment::ProgressBaseline>,
+    clock_origin: Instant,
 }
 
 enum CoreState {
@@ -370,6 +378,11 @@ impl FoundationCore {
             core_instance_id,
             canonical_data_directory,
             managed_runtimes: BTreeMap::new(),
+            stuck_assessment: Box::new(StuckAssessmentState {
+                process_probes: BTreeMap::new(),
+                progress_baselines: BTreeMap::new(),
+                clock_origin: Instant::now(),
+            }),
             managed_observations_in_flight: BTreeSet::new(),
             startup_recovery_sessions: Some(startup_recovery_sessions),
             store,
@@ -2438,6 +2451,58 @@ fn managed_start_bridge_error_json(error: BridgeError) -> Result<String, BridgeE
     }
 }
 
+#[uniffi::export]
+pub fn managed_runs_assess_stuck_json(request_json: String) -> Result<String, BridgeError> {
+    protect(|| managed_runs_assess_stuck_with(&CORE, request_json))
+}
+
+fn managed_runs_assess_stuck_with(
+    core_manager: &CoreManager,
+    request_json: String,
+) -> Result<String, BridgeError> {
+    if request_json.len() > MAX_MANAGED_RUN_REQUEST_BYTES {
+        return project_json(&CommandError::for_code(CommandErrorCode::InvalidRunRequest));
+    }
+    let request = match serde_json::from_str::<ManagedRunsAssessStuckRequest>(&request_json) {
+        Ok(request) => request,
+        Err(_) => {
+            return project_json(&CommandError::for_code(CommandErrorCode::InvalidRunRequest));
+        }
+    };
+    if request.client_protocol_version != PROTOCOL_VERSION {
+        return project_json(&CommandError::protocol_mismatch());
+    }
+    let assessed = core_manager.with_ready_core(|core| {
+        let elapsed = core.stuck_assessment.clock_origin.elapsed().as_millis();
+        let now_monotonic_ms = u64::try_from(elapsed)
+            .unwrap_or(flit_protocol::MAX_JSON_SAFE_INTEGER)
+            .min(flit_protocol::MAX_JSON_SAFE_INTEGER);
+        let observed_at = core
+            .store
+            .current_utc_timestamp()
+            .map_err(|_| BridgeError::StorageFailure)?;
+        stuck_assessment::assess_managed_runs(
+            &mut core.store,
+            &mut core.stuck_assessment.progress_baselines,
+            &mut core.stuck_assessment.process_probes,
+            now_monotonic_ms,
+            &observed_at,
+        )
+        .map_err(|_| BridgeError::StorageFailure)
+    });
+    match assessed {
+        Ok(response) => bounded_json(
+            &response,
+            MAX_PROJECT_RESPONSE_BYTES,
+            BridgeError::ManagedRunResponseTooLarge,
+        ),
+        Err(BridgeError::StorageFailure) => project_json(&CommandError::for_code(
+            CommandErrorCode::StorageUnavailable,
+        )),
+        Err(error) => Err(error),
+    }
+}
+
 fn start_managed_run_in_core(
     core: &mut FoundationCore,
     connector: &dyn managed_start::ManagedCodexConnector,
@@ -2464,6 +2529,15 @@ fn start_managed_run_in_core(
         request,
     ) {
         Ok(response) => {
+            if let Some(probe) = core
+                .managed_runtimes
+                .get(&response.run_id)
+                .and_then(managed_start::RetainedManagedRun::process_probe)
+            {
+                core.stuck_assessment
+                    .process_probes
+                    .insert(response.run_id.clone(), probe);
+            }
             core.provider_health = HealthStatus::Ready;
             bounded_json(
                 &response,
@@ -3366,6 +3440,94 @@ mod tests {
 
     fn fixture(name: &str) -> serde_json::Value {
         fixture_at(PROTOCOL_VERSION, name)
+    }
+
+    #[test]
+    fn managed_stuck_assessment_command_accepts_only_protocol_version_and_is_quiet_when_empty() {
+        let (_directory, manager, _) = managed_start_core("stuck-assessment-command");
+        let request = serde_json::to_string(&ManagedRunsAssessStuckRequest {
+            client_protocol_version: PROTOCOL_VERSION.to_owned(),
+        })
+        .expect("assessment request");
+        let expected = flit_protocol::ManagedRunsAssessStuckResponse {
+            protocol_version: PROTOCOL_VERSION.to_owned(),
+            assessed_runs: 0,
+            transitions_appended: 0,
+            unchanged_runs: 0,
+            unavailable_runs: 0,
+        };
+        for _ in 0..2 {
+            let actual: flit_protocol::ManagedRunsAssessStuckResponse = serde_json::from_str(
+                &managed_runs_assess_stuck_with(&manager, request.clone())
+                    .expect("assessment response"),
+            )
+            .expect("typed assessment response");
+            assert_eq!(actual, expected);
+        }
+        let rejected: CommandError = serde_json::from_str(
+            &managed_runs_assess_stuck_with(
+                &manager,
+                format!(
+                    r#"{{"client_protocol_version":"{PROTOCOL_VERSION}","observed_at":"native-fact"}}"#
+                ),
+            )
+            .expect("invalid request response"),
+        )
+        .expect("command error");
+        assert_eq!(
+            rejected,
+            CommandError::for_code(CommandErrorCode::InvalidRunRequest)
+        );
+
+        manager
+            .with_ready_core(|core| {
+                core.store
+                    .create_managed_run_intent(ManagedRunIntent {
+                        id: "run-assess-starting".to_owned(),
+                        project_id: "project-observe".to_owned(),
+                        title: "Assess starting Run".to_owned(),
+                        goal: None,
+                        start_request: serde_json::Map::new(),
+                        git_baseline: GitBaselinePayload::Unavailable {
+                            project_id: "project-observe".to_owned(),
+                            reason: GitBaselineUnavailableReason::RunnerUnavailable,
+                        },
+                        git_baseline_observed_at: "2026-08-09T10:00:00Z".to_owned(),
+                        created_at: "2026-08-09T10:00:00Z".to_owned(),
+                        run_created_event_id: "event-assess-starting-created".to_owned(),
+                        git_baseline_event_id: "event-assess-starting-baseline".to_owned(),
+                        start_requested_event_id: "event-assess-starting-requested".to_owned(),
+                    })
+                    .expect("starting Run");
+                Ok(())
+            })
+            .expect("seed starting Run");
+        let baseline: flit_protocol::ManagedRunsAssessStuckResponse = serde_json::from_str(
+            &managed_runs_assess_stuck_with(&manager, request.clone()).expect("baseline response"),
+        )
+        .expect("baseline assessment");
+        assert_eq!(baseline.assessed_runs, 1);
+        assert_eq!(baseline.transitions_appended, 0);
+        assert_eq!(baseline.unchanged_runs, 1);
+        assert_eq!(baseline.unavailable_runs, 1);
+        let unchanged: flit_protocol::ManagedRunsAssessStuckResponse = serde_json::from_str(
+            &managed_runs_assess_stuck_with(&manager, request).expect("unchanged response"),
+        )
+        .expect("unchanged assessment");
+        assert_eq!(unchanged.transitions_appended, 0);
+        assert_eq!(unchanged.unchanged_runs, 1);
+        assert_eq!(unchanged.unavailable_runs, 1);
+        manager
+            .with_ready_core(|core| {
+                let snapshot = core
+                    .store
+                    .run_snapshot("run-assess-starting")
+                    .expect("starting snapshot")
+                    .expect("starting projection");
+                assert_ne!(snapshot.dashboard_bucket, "PossiblyStuck");
+                Ok(())
+            })
+            .expect("read starting Run");
     }
 
     fn observation_request_json() -> String {
