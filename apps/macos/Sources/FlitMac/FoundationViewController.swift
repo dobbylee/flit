@@ -37,6 +37,24 @@ private final class RunEvidenceButton: NSButton {
     }
 }
 
+private final class RunChangeExternalOpenButton: NSButton {
+    let runId: String
+    let runVersion: UInt64
+    let changeId: String
+
+    init(runId: String, runVersion: UInt64, changeId: String) {
+        self.runId = runId
+        self.runVersion = runVersion
+        self.changeId = changeId
+        super.init(frame: .zero)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
+}
+
 private func dashboardChangesCopy(_ changes: FlitDashboardChangeSummary) -> String {
     switch changes {
     case let .available(attribution, files, insertions, deletions):
@@ -59,6 +77,7 @@ final class FoundationViewController: NSViewController {
     private let dashboardClient: DashboardClient
     private let runDetailClient: RunDetailClient
     private let runChangesClient: RunChangesClient
+    private let runChangeExternalOpenClient: RunChangeExternalOpenClient
     private var state: FoundationState = .checking
     private var dashboardState = DashboardPresentationState()
     private var statusHost: NSHostingView<FoundationStatusBadge>?
@@ -74,6 +93,9 @@ final class FoundationViewController: NSViewController {
     private var activeRunChanges: RunChangesPresentationState?
     private var activeRunChangesFirstPageFailure = false
     private var activeRunChangesPageFailure = false
+    private var activeRunChangeOpenResults:
+        [String: RunChangeExternalOpenPresentationResult] = [:]
+    private var activeRunChangeOpenFailures: Set<String> = []
     private var expandedRunEvidenceIds: Set<String> = []
     private var runEvidenceButtonsByCursor: [UInt64: NSButton] = [:]
 
@@ -81,12 +103,15 @@ final class FoundationViewController: NSViewController {
         client: SystemHealthClient,
         dashboardClient: DashboardClient = DashboardClient(),
         runDetailClient: RunDetailClient = RunDetailClient(),
-        runChangesClient: RunChangesClient = RunChangesClient()
+        runChangesClient: RunChangesClient = RunChangesClient(),
+        runChangeExternalOpenClient: RunChangeExternalOpenClient =
+            RunChangeExternalOpenClient()
     ) {
         self.client = client
         self.dashboardClient = dashboardClient
         self.runDetailClient = runDetailClient
         self.runChangesClient = runChangesClient
+        self.runChangeExternalOpenClient = runChangeExternalOpenClient
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -362,6 +387,8 @@ final class FoundationViewController: NSViewController {
         activeRunDetailPageFailure = false
         activeRunChangesFirstPageFailure = false
         activeRunChangesPageFailure = false
+        activeRunChangeOpenResults = [:]
+        activeRunChangeOpenFailures = []
         expandedRunEvidenceIds = []
         do {
             let completionSummary = try runCompletionSummary(for: sender.run)
@@ -406,6 +433,8 @@ final class FoundationViewController: NSViewController {
             activeRunChanges = nil
             activeRunChangesFirstPageFailure = false
             activeRunChangesPageFailure = false
+            activeRunChangeOpenResults = [:]
+            activeRunChangeOpenFailures = []
             renderRunDetailFailure()
         }
     }
@@ -419,6 +448,8 @@ final class FoundationViewController: NSViewController {
         activeRunChanges = nil
         activeRunChangesFirstPageFailure = false
         activeRunChangesPageFailure = false
+        activeRunChangeOpenResults = [:]
+        activeRunChangeOpenFailures = []
         expandedRunEvidenceIds = []
         renderDashboard()
     }
@@ -490,6 +521,46 @@ final class FoundationViewController: NSViewController {
             runTitle: runTitle,
             pageFailure: activeRunDetailPageFailure
         )
+    }
+
+    @objc private func openRunChangeExternally(_ sender: RunChangeExternalOpenButton) {
+        guard
+            let detail = activeRunDetail,
+            let runTitle = activeRunTitle,
+            detail.runId == sender.runId,
+            detail.runVersion == sender.runVersion,
+            let changes = activeRunChanges,
+            changes.runId == sender.runId,
+            changes.runVersion == sender.runVersion,
+            changes.changes.contains(where: {
+                $0.changeId == sender.changeId
+                    && $0.status != .deleted
+                    && $0.projectScope == .insideProject
+            })
+        else {
+            return
+        }
+        let visibleOrigin = dashboardScroll?.contentView.bounds.origin
+        do {
+            activeRunChangeOpenResults[sender.changeId] = try runChangeExternalOpenClient.open(
+                runId: sender.runId,
+                expectedRunVersion: sender.runVersion,
+                changeId: sender.changeId
+            )
+            activeRunChangeOpenFailures.remove(sender.changeId)
+        } catch {
+            activeRunChangeOpenResults.removeValue(forKey: sender.changeId)
+            activeRunChangeOpenFailures.insert(sender.changeId)
+        }
+        renderRunDetail(
+            detail,
+            runTitle: runTitle,
+            pageFailure: activeRunDetailPageFailure
+        )
+        if let visibleOrigin, let dashboardScroll {
+            dashboardScroll.contentView.scroll(to: visibleOrigin)
+            dashboardScroll.reflectScrolledClipView(dashboardScroll.contentView)
+        }
     }
 
     @objc private func changeRunDetailFilter(_ sender: NSPopUpButton) {
@@ -777,8 +848,14 @@ final class FoundationViewController: NSViewController {
                 identify(empty, as: "flit.runChanges.noChanges")
                 stack.addArrangedSubview(empty)
             } else {
-                changes.changes.forEach {
-                    stack.addArrangedSubview(runChangeRowView($0))
+                changes.changes.forEach { change in
+                    stack.addArrangedSubview(
+                        runChangeRowView(
+                            change,
+                            runId: changes.runId ?? "",
+                            runVersion: changes.runVersion ?? 0
+                        )
+                    )
                 }
             }
             if changes.hasMore {
@@ -805,7 +882,11 @@ final class FoundationViewController: NSViewController {
         return stack
     }
 
-    private func runChangeRowView(_ change: RunChangeRow) -> NSView {
+    private func runChangeRowView(
+        _ change: RunChangeRow,
+        runId: String,
+        runVersion: UInt64
+    ) -> NSView {
         let stack = NSStackView()
         identify(stack, as: "flit.runChanges.row.\(change.changeId)")
         stack.orientation = .vertical
@@ -845,7 +926,75 @@ final class FoundationViewController: NSViewController {
         )
         identify(factsLabel, as: "flit.runChanges.facts.\(change.changeId)")
         stack.addArrangedSubview(factsLabel)
+        let staticDisabledReason: FlitRunChangeExternalOpenDisabledReason? =
+            if change.status == .deleted {
+                .deletedChange
+            } else if change.projectScope == .outsideProject {
+                .outsideProject
+            } else {
+                nil
+            }
+        let result = activeRunChangeOpenResults[change.changeId]
+        let disabledReason: FlitRunChangeExternalOpenDisabledReason? =
+            switch result {
+            case let .disabled(reason): reason
+            case .opened, .none: staticDisabledReason
+            }
+        let open = RunChangeExternalOpenButton(
+            runId: runId,
+            runVersion: runVersion,
+            changeId: change.changeId
+        )
+        open.title = FoundationCopy.text(.runChangesOpenExternally)
+        open.bezelStyle = .inline
+        open.target = self
+        open.action = #selector(openRunChangeExternally(_:))
+        open.isEnabled = disabledReason == nil && runVersion > 0 && !runId.isEmpty
+        identify(open, as: "flit.runChanges.open.\(change.changeId)")
+        stack.addArrangedSubview(open)
+        let resultCopy: String? = if activeRunChangeOpenFailures.contains(change.changeId) {
+            FoundationCopy.text(.runChangesOpenFailed)
+        } else if let disabledReason {
+            FoundationCopy.format(
+                .runChangesOpenUnavailable,
+                runChangeExternalOpenDisabledReasonCopy(disabledReason)
+            )
+        } else if result == .opened {
+            FoundationCopy.text(.runChangesOpenedExternally)
+        } else {
+            nil
+        }
+        if let resultCopy {
+            let resultLabel = label(
+                resultCopy,
+                size: 11,
+                weight: .regular,
+                color: disabledReason == nil ? .secondaryLabelColor : .systemOrange
+            )
+            identify(resultLabel, as: "flit.runChanges.openResult.\(change.changeId)")
+            stack.addArrangedSubview(resultLabel)
+        }
         return stack
+    }
+
+    private func runChangeExternalOpenDisabledReasonCopy(
+        _ reason: FlitRunChangeExternalOpenDisabledReason
+    ) -> String {
+        let key: FoundationCopyKey
+        switch reason {
+        case .changeSetNotAvailable: key = .runChangesOpenChangeSetUnavailable
+        case .changeNotFound: key = .runChangesOpenChangeNotFound
+        case .deletedChange: key = .runChangesOpenDeleted
+        case .outsideProject: key = .runChangesOpenOutsideProject
+        case .projectIdentityMismatch: key = .runChangesOpenProjectChanged
+        case .repositoryIdentityMismatch: key = .runChangesOpenRepositoryChanged
+        case .targetUnavailable: key = .runChangesOpenTargetUnavailable
+        case .symlinkEscape: key = .runChangesOpenSymlinkEscape
+        case .targetNotFile: key = .runChangesOpenTargetNotFile
+        case .targetIdentityDrift: key = .runChangesOpenTargetChanged
+        case .openFailed: key = .runChangesOpenHandlerFailed
+        }
+        return FoundationCopy.text(key)
     }
 
     private func runChangeHeadCopy(_ head: RunChangeHeadPresentation) -> String {

@@ -11,9 +11,10 @@ use flit_protocol::{
     ProjectTrustResponse, ProjectsListRequest, ProjectsListResponse, ProviderCompatibility,
     ProviderDiagnosticsRequest, ProviderDiagnosticsResponse, ProviderExecutionAfterQuit,
     ProviderUnavailableReason, QuitImpactReason, QuitImpactRequest, QuitImpactResponse,
-    RunChangesReadRequest, RunChangesReadResponse, RunDetailReadRequest, RunDetailReadResponse,
-    RunEvidenceCategory, SystemHealthRequest, SystemHealthResponse, event_schema_id,
-    event_schema_relative_path, generated_swift_command_contract,
+    RunChangeExternalOpenRequest, RunChangeExternalOpenResponse, RunChangesReadRequest,
+    RunChangesReadResponse, RunDetailReadRequest, RunDetailReadResponse, RunEvidenceCategory,
+    SystemHealthRequest, SystemHealthResponse, event_schema_id, event_schema_relative_path,
+    generated_swift_command_contract,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -464,6 +465,16 @@ fn current_run_detail_and_provider_open_fixtures_are_exact_and_path_free() {
         current,
         "managed_run_open_in_provider.request.json",
     ));
+    assert_fixture_round_trip::<RunChangeExternalOpenRequest>(&command_fixture(
+        current,
+        "run_change_external_open.request.json",
+    ));
+    for name in [
+        "run_change_external_open.opened.response.json",
+        "run_change_external_open.disabled.response.json",
+    ] {
+        assert_fixture_round_trip::<RunChangeExternalOpenResponse>(&command_fixture(current, name));
+    }
     assert_fixture_round_trip::<Vec<CommandError>>(&command_fixture(
         current,
         "run_detail_and_provider_open_errors.json",
@@ -527,6 +538,25 @@ fn current_run_detail_and_provider_open_fixtures_are_exact_and_path_free() {
             !changes.contains(forbidden),
             "Run Changes must not expose {forbidden}"
         );
+    }
+    for name in [
+        "run_change_external_open.opened.response.json",
+        "run_change_external_open.disabled.response.json",
+    ] {
+        let response = fs::read_to_string(repository_path(&command_fixture(current, name)))
+            .expect("external-open response should be readable");
+        for forbidden in [
+            "path",
+            "repository_root",
+            "filesystem_id",
+            "git_directory",
+            "common_directory",
+        ] {
+            assert!(
+                !response.contains(forbidden),
+                "external-open response must not expose {forbidden}"
+            );
+        }
     }
 }
 
@@ -1076,6 +1106,9 @@ fn generated_swift_project_contract_is_current_and_required_fields_fail_closed()
         "FlitRunChangesUnavailableReason",
         "FlitRunChangesReadResponse",
         "FlitManagedRunOpenInProviderRequest",
+        "FlitRunChangeExternalOpenRequest",
+        "FlitRunChangeExternalOpenDisabledReason",
+        "FlitRunChangeExternalOpenResponse",
         "FlitCommandError",
         "FlitProviderDiagnosticsRequest",
         "FlitProviderDiagnosticsResponse",

@@ -4,7 +4,7 @@ use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: &str = "1.18";
+pub const PROTOCOL_VERSION: &str = "1.19";
 pub const EVENT_PROTOCOL_VERSION: &str = "1.2";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -684,6 +684,48 @@ pub struct ManagedRunOpenInProviderRequest {
     pub run_id: String,
     pub expected_run_version: u64,
     pub client_protocol_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RunChangeExternalOpenRequest {
+    pub run_id: String,
+    pub expected_run_version: u64,
+    pub change_id: String,
+    pub client_protocol_version: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunChangeExternalOpenDisabledReason {
+    ChangeSetNotAvailable,
+    ChangeNotFound,
+    DeletedChange,
+    OutsideProject,
+    ProjectIdentityMismatch,
+    RepositoryIdentityMismatch,
+    TargetUnavailable,
+    SymlinkEscape,
+    TargetNotFile,
+    TargetIdentityDrift,
+    OpenFailed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RunChangeExternalOpenResponse {
+    Opened {
+        protocol_version: String,
+        run_id: String,
+        run_version: u64,
+        change_id: String,
+    },
+    Disabled {
+        protocol_version: String,
+        run_id: String,
+        run_version: u64,
+        change_id: String,
+        reason: RunChangeExternalOpenDisabledReason,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2059,6 +2101,101 @@ struct FlitManagedRunOpenInProviderRequest: Codable, Equatable, Sendable {
         case runId = "run_id"
         case expectedRunVersion = "expected_run_version"
         case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+struct FlitRunChangeExternalOpenRequest: Codable, Equatable, Sendable {
+    let runId: String
+    let expectedRunVersion: UInt64
+    let changeId: String
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case runId = "run_id"
+        case expectedRunVersion = "expected_run_version"
+        case changeId = "change_id"
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+enum FlitRunChangeExternalOpenDisabledReason: String, Codable, Sendable {
+    case changeSetNotAvailable = "change_set_not_available"
+    case changeNotFound = "change_not_found"
+    case deletedChange = "deleted_change"
+    case outsideProject = "outside_project"
+    case projectIdentityMismatch = "project_identity_mismatch"
+    case repositoryIdentityMismatch = "repository_identity_mismatch"
+    case targetUnavailable = "target_unavailable"
+    case symlinkEscape = "symlink_escape"
+    case targetNotFile = "target_not_file"
+    case targetIdentityDrift = "target_identity_drift"
+    case openFailed = "open_failed"
+}
+
+enum FlitRunChangeExternalOpenStatus: String, Codable, Sendable {
+    case opened
+    case disabled
+}
+
+struct FlitRunChangeExternalOpenOpenedResponse: Codable, Equatable, Sendable {
+    let status: FlitRunChangeExternalOpenStatus
+    let protocolVersion: String
+    let runId: String
+    let runVersion: UInt64
+    let changeId: String
+
+    private enum CodingKeys: String, CodingKey {
+        case status
+        case protocolVersion = "protocol_version"
+        case runId = "run_id"
+        case runVersion = "run_version"
+        case changeId = "change_id"
+    }
+}
+
+struct FlitRunChangeExternalOpenDisabledResponse: Codable, Equatable, Sendable {
+    let status: FlitRunChangeExternalOpenStatus
+    let protocolVersion: String
+    let runId: String
+    let runVersion: UInt64
+    let changeId: String
+    let reason: FlitRunChangeExternalOpenDisabledReason
+
+    private enum CodingKeys: String, CodingKey {
+        case status
+        case protocolVersion = "protocol_version"
+        case runId = "run_id"
+        case runVersion = "run_version"
+        case changeId = "change_id"
+        case reason
+    }
+}
+
+enum FlitRunChangeExternalOpenResponse: Codable, Equatable, Sendable {
+    case opened(FlitRunChangeExternalOpenOpenedResponse)
+    case disabled(FlitRunChangeExternalOpenDisabledResponse)
+
+    private enum CodingKeys: String, CodingKey {
+        case status
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(FlitRunChangeExternalOpenStatus.self, forKey: .status) {
+        case .opened:
+            self = .opened(try FlitRunChangeExternalOpenOpenedResponse(from: decoder))
+        case .disabled:
+            self = .disabled(try FlitRunChangeExternalOpenDisabledResponse(from: decoder))
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        switch self {
+        case let .opened(response):
+            try response.encode(to: encoder)
+        case let .disabled(response):
+            try response.encode(to: encoder)
+        }
     }
 }
 

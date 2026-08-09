@@ -746,6 +746,18 @@ struct NativeHealthTests {
             FlitRunChangesReadResponse.self,
             at: "\(fixtureRoot)/run_changes_read.unavailable.response.json"
         )
+        let externalOpenRequest = try decodeFixture(
+            FlitRunChangeExternalOpenRequest.self,
+            at: "\(fixtureRoot)/run_change_external_open.request.json"
+        )
+        let externalOpenOpenedFixture = try decodeFixture(
+            FlitRunChangeExternalOpenResponse.self,
+            at: "\(fixtureRoot)/run_change_external_open.opened.response.json"
+        )
+        let externalOpenDisabledFixture = try decodeFixture(
+            FlitRunChangeExternalOpenResponse.self,
+            at: "\(fixtureRoot)/run_change_external_open.disabled.response.json"
+        )
         try require(
             runChangesRequest.runId == "run-changes-1"
                 && runChangesRequest.expectedRunVersion == 5
@@ -757,6 +769,135 @@ struct NativeHealthTests {
             throw NativeHealthTestFailure.failed(
                 "generated Run Changes fixture must remain available"
             )
+        }
+        try require(
+            externalOpenRequest.runId == "run-changes-1"
+                && externalOpenRequest.expectedRunVersion == 5
+                && externalOpenRequest.changeId == String(repeating: "a", count: 32)
+                && externalOpenRequest.clientProtocolVersion == flitClientProtocolVersion,
+            "generated external-open request must contain only exact Run/version/change identity"
+        )
+        let externalOpenClient = RunChangeExternalOpenClient(
+            fixtureLoader: { request in
+                guard request == externalOpenRequest else {
+                    throw NativeHealthTestFailure.failed(
+                        "external-open client must submit the exact generated request"
+                    )
+                }
+                return externalOpenOpenedFixture
+            }
+        )
+        let externalOpenResult = try externalOpenClient.open(
+            runId: externalOpenRequest.runId,
+            expectedRunVersion: externalOpenRequest.expectedRunVersion,
+            changeId: externalOpenRequest.changeId
+        )
+        try require(
+            externalOpenResult == .opened,
+            "native external-open client must accept an exact opened response"
+        )
+        guard case let .disabled(disabledFixture) = externalOpenDisabledFixture else {
+            throw NativeHealthTestFailure.failed(
+                "generated external-open disabled fixture must remain disabled"
+            )
+        }
+        try require(
+            disabledFixture.reason == .targetIdentityDrift,
+            "generated external-open disabled reason must remain typed"
+        )
+        let disabledExternalOpenClient = RunChangeExternalOpenClient(
+            fixtureLoader: { _ in externalOpenDisabledFixture }
+        )
+        let disabledExternalOpenResult = try disabledExternalOpenClient.open(
+            runId: externalOpenRequest.runId,
+            expectedRunVersion: externalOpenRequest.expectedRunVersion,
+            changeId: externalOpenRequest.changeId
+        )
+        try require(
+            disabledExternalOpenResult == .disabled(.targetIdentityDrift),
+            "native external-open client must preserve a typed disabled response"
+        )
+        let invalidExternalOpenResponses: [
+            (FlitRunChangeExternalOpenResponse, RunChangeExternalOpenPresentationError)
+        ] = [
+            (
+                .opened(
+                    FlitRunChangeExternalOpenOpenedResponse(
+                        status: .opened,
+                        protocolVersion: "9.9",
+                        runId: externalOpenRequest.runId,
+                        runVersion: externalOpenRequest.expectedRunVersion,
+                        changeId: externalOpenRequest.changeId
+                    )
+                ),
+                .contractMismatch
+            ),
+            (
+                .opened(
+                    FlitRunChangeExternalOpenOpenedResponse(
+                        status: .opened,
+                        protocolVersion: flitClientProtocolVersion,
+                        runId: "another-run",
+                        runVersion: externalOpenRequest.expectedRunVersion,
+                        changeId: externalOpenRequest.changeId
+                    )
+                ),
+                .runIdentityMismatch
+            ),
+            (
+                .opened(
+                    FlitRunChangeExternalOpenOpenedResponse(
+                        status: .opened,
+                        protocolVersion: flitClientProtocolVersion,
+                        runId: externalOpenRequest.runId,
+                        runVersion: externalOpenRequest.expectedRunVersion + 1,
+                        changeId: externalOpenRequest.changeId
+                    )
+                ),
+                .runVersionMismatch
+            ),
+            (
+                .opened(
+                    FlitRunChangeExternalOpenOpenedResponse(
+                        status: .opened,
+                        protocolVersion: flitClientProtocolVersion,
+                        runId: externalOpenRequest.runId,
+                        runVersion: externalOpenRequest.expectedRunVersion,
+                        changeId: String(repeating: "b", count: 32)
+                    )
+                ),
+                .changeIdentityMismatch
+            ),
+            (
+                .opened(
+                    FlitRunChangeExternalOpenOpenedResponse(
+                        status: .disabled,
+                        protocolVersion: flitClientProtocolVersion,
+                        runId: externalOpenRequest.runId,
+                        runVersion: externalOpenRequest.expectedRunVersion,
+                        changeId: externalOpenRequest.changeId
+                    )
+                ),
+                .statusMismatch
+            ),
+        ]
+        for (response, expectedError) in invalidExternalOpenResponses {
+            let invalidClient = RunChangeExternalOpenClient(fixtureLoader: { _ in response })
+            do {
+                _ = try invalidClient.open(
+                    runId: externalOpenRequest.runId,
+                    expectedRunVersion: externalOpenRequest.expectedRunVersion,
+                    changeId: externalOpenRequest.changeId
+                )
+                throw NativeHealthTestFailure.failed(
+                    "native external-open client must reject mismatched response authority"
+                )
+            } catch let error as RunChangeExternalOpenPresentationError {
+                try require(
+                    error == expectedError,
+                    "native external-open client must report the exact mismatch"
+                )
+            }
         }
         var runChangesPresentation = RunChangesPresentationState()
         try runChangesPresentation.apply(
@@ -2407,6 +2548,29 @@ struct NativeHealthTests {
                     }
                     return detailRunChangesFixture
                 }
+            ),
+            runChangeExternalOpenClient: RunChangeExternalOpenClient(
+                fixtureLoader: { request in
+                    guard
+                        request.runId == "run-dashboard-1",
+                        request.expectedRunVersion == 3,
+                        request.changeId == String(repeating: "a", count: 32),
+                        request.clientProtocolVersion == flitClientProtocolVersion
+                    else {
+                        throw NativeHealthTestFailure.failed(
+                            "Changes open action must submit only the exact accepted row identity"
+                        )
+                    }
+                    return .opened(
+                        FlitRunChangeExternalOpenOpenedResponse(
+                            status: .opened,
+                            protocolVersion: flitClientProtocolVersion,
+                            runId: request.runId,
+                            runVersion: request.expectedRunVersion,
+                            changeId: request.changeId
+                        )
+                    )
+                }
             )
         )
         _ = detailController.view
@@ -2492,6 +2656,48 @@ struct NativeHealthTests {
                     "Added · Layers: Committed · Text · +1 −0 · Outside Project"
                 ),
             "native Changes must visibly preserve attribution, HEAD, and display-only file facts"
+        )
+        guard
+            let insideOpen = detailViews.first(where: {
+                $0.accessibilityIdentifier()
+                    == "flit.runChanges.open.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }) as? NSButton,
+            let outsideOpen = detailViews.first(where: {
+                $0.accessibilityIdentifier()
+                    == "flit.runChanges.open.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }) as? NSButton
+        else {
+            throw NativeHealthTestFailure.failed(
+                "every Changes row must expose a stable external-open control"
+            )
+        }
+        try require(
+            insideOpen.isEnabled
+                && insideOpen.title == FoundationCopy.text(.runChangesOpenExternally)
+                && !outsideOpen.isEnabled
+                && detailInitialCopy.contains(
+                    FoundationCopy.format(
+                        .runChangesOpenUnavailable,
+                        FoundationCopy.text(.runChangesOpenOutsideProject)
+                    )
+                ),
+            "native Changes must enable only eligible rows and explain static disabled scope"
+        )
+        insideOpen.performClick(nil)
+        let openedChangeViews = descendants(of: detailController.view)
+        try require(
+            openedChangeViews.contains(where: {
+                $0.accessibilityIdentifier()
+                    == "flit.runChanges.openResult.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    && ($0 as? NSTextField)?.stringValue
+                        == FoundationCopy.text(.runChangesOpenedExternally)
+            })
+                && openedChangeViews.contains(where: {
+                    $0.accessibilityIdentifier()
+                        == "flit.runChanges.open.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        && ($0 as? NSButton)?.isEnabled == true
+                }),
+            "an exact external-open result must remain associated with its row"
         )
         try require(
             initialCategoryFilter.itemTitles == [

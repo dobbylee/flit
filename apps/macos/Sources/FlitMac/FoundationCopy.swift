@@ -89,6 +89,21 @@ enum FoundationCopyKey: String {
     case runChangesLineCountsUnavailable = "runChanges.lineCountsUnavailable"
     case runChangesLoadMore = "runChanges.loadMore"
     case runChangesNoChanges = "runChanges.noChanges"
+    case runChangesOpenChangeNotFound = "runChanges.open.changeNotFound"
+    case runChangesOpenChangeSetUnavailable = "runChanges.open.changeSetUnavailable"
+    case runChangesOpenDeleted = "runChanges.open.deleted"
+    case runChangesOpenExternally = "runChanges.open.externally"
+    case runChangesOpenFailed = "runChanges.open.failed"
+    case runChangesOpenHandlerFailed = "runChanges.open.handlerFailed"
+    case runChangesOpenedExternally = "runChanges.openedExternally"
+    case runChangesOpenOutsideProject = "runChanges.open.outsideProject"
+    case runChangesOpenProjectChanged = "runChanges.open.projectChanged"
+    case runChangesOpenRepositoryChanged = "runChanges.open.repositoryChanged"
+    case runChangesOpenSymlinkEscape = "runChanges.open.symlinkEscape"
+    case runChangesOpenTargetChanged = "runChanges.open.targetChanged"
+    case runChangesOpenTargetNotFile = "runChanges.open.targetNotFile"
+    case runChangesOpenTargetUnavailable = "runChanges.open.targetUnavailable"
+    case runChangesOpenUnavailable = "runChanges.open.unavailable"
     case runChangesPageUnavailable = "runChanges.pageUnavailable"
     case runChangesScopeInside = "runChanges.scope.inside"
     case runChangesScopeOutside = "runChanges.scope.outside"
@@ -219,6 +234,21 @@ enum FoundationCopy {
         .runChangesLineCountsUnavailable: "Line counts unavailable",
         .runChangesLoadMore: "Load more changes",
         .runChangesNoChanges: "No file changes are available",
+        .runChangesOpenChangeNotFound: "The stored change no longer exists",
+        .runChangesOpenChangeSetUnavailable: "The terminal change set is unavailable",
+        .runChangesOpenDeleted: "Deleted files cannot be opened",
+        .runChangesOpenExternally: "Open externally",
+        .runChangesOpenFailed: "The external-open request could not be completed",
+        .runChangesOpenHandlerFailed: "The default application could not open the file",
+        .runChangesOpenedExternally: "Opened with the default application",
+        .runChangesOpenOutsideProject: "Files outside the Project cannot be opened",
+        .runChangesOpenProjectChanged: "The Project identity changed",
+        .runChangesOpenRepositoryChanged: "The repository identity changed",
+        .runChangesOpenSymlinkEscape: "The current file target escapes its stored boundary",
+        .runChangesOpenTargetChanged: "The file identity changed during validation",
+        .runChangesOpenTargetNotFile: "The current target is not a file",
+        .runChangesOpenTargetUnavailable: "The current file target is unavailable",
+        .runChangesOpenUnavailable: "Open unavailable: %@",
         .runChangesPageUnavailable: "More changes could not be loaded",
         .runChangesScopeInside: "Inside Project",
         .runChangesScopeOutside: "Outside Project",

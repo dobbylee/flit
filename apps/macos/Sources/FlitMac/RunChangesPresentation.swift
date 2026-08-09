@@ -10,6 +10,19 @@ enum RunChangesPresentationError: Error, Equatable {
     case duplicateChange
 }
 
+enum RunChangeExternalOpenPresentationError: Error, Equatable {
+    case contractMismatch
+    case runIdentityMismatch
+    case runVersionMismatch
+    case changeIdentityMismatch
+    case statusMismatch
+}
+
+enum RunChangeExternalOpenPresentationResult: Equatable, Sendable {
+    case opened
+    case disabled(FlitRunChangeExternalOpenDisabledReason)
+}
+
 enum RunChangeHeadPresentation: Equatable, Sendable {
     case available(String)
     case unavailable
@@ -336,4 +349,101 @@ struct RunChangesClient: Sendable {
             afterCursor: nil
         )
     }
+}
+
+struct RunChangeExternalOpenClient: Sendable {
+    private let fixtureLoader:
+        (@Sendable (FlitRunChangeExternalOpenRequest) throws
+            -> FlitRunChangeExternalOpenResponse)?
+
+    init(
+        fixtureLoader:
+            (@Sendable (FlitRunChangeExternalOpenRequest) throws
+                -> FlitRunChangeExternalOpenResponse)? = nil
+    ) {
+        self.fixtureLoader = fixtureLoader
+    }
+
+    func open(
+        runId: String,
+        expectedRunVersion: UInt64,
+        changeId: String
+    ) throws -> RunChangeExternalOpenPresentationResult {
+        let request = FlitRunChangeExternalOpenRequest(
+            runId: runId,
+            expectedRunVersion: expectedRunVersion,
+            changeId: changeId,
+            clientProtocolVersion: flitClientProtocolVersion
+        )
+        let response: FlitRunChangeExternalOpenResponse
+        if let fixtureLoader {
+            response = try fixtureLoader(request)
+        } else {
+            let requestData = try JSONEncoder().encode(request)
+            let rendered = try runChangeExternalOpenJson(
+                requestJson: String(decoding: requestData, as: UTF8.self)
+            )
+            response = try JSONDecoder().decode(
+                FlitRunChangeExternalOpenResponse.self,
+                from: Data(rendered.utf8)
+            )
+        }
+        return try validatedExternalOpenResponse(
+            response,
+            requestedRunId: runId,
+            expectedRunVersion: expectedRunVersion,
+            requestedChangeId: changeId
+        )
+    }
+}
+
+private func validatedExternalOpenResponse(
+    _ response: FlitRunChangeExternalOpenResponse,
+    requestedRunId: String,
+    expectedRunVersion: UInt64,
+    requestedChangeId: String
+) throws -> RunChangeExternalOpenPresentationResult {
+    guard validOpaqueChangeId(requestedChangeId) else {
+        throw RunChangeExternalOpenPresentationError.changeIdentityMismatch
+    }
+    let protocolVersion: String
+    let runId: String
+    let runVersion: UInt64
+    let changeId: String
+    let status: FlitRunChangeExternalOpenStatus
+    let result: RunChangeExternalOpenPresentationResult
+    switch response {
+    case let .opened(opened):
+        protocolVersion = opened.protocolVersion
+        runId = opened.runId
+        runVersion = opened.runVersion
+        changeId = opened.changeId
+        status = opened.status
+        result = .opened
+    case let .disabled(disabled):
+        protocolVersion = disabled.protocolVersion
+        runId = disabled.runId
+        runVersion = disabled.runVersion
+        changeId = disabled.changeId
+        status = disabled.status
+        result = .disabled(disabled.reason)
+    }
+    guard protocolVersion == flitClientProtocolVersion else {
+        throw RunChangeExternalOpenPresentationError.contractMismatch
+    }
+    guard runId == requestedRunId else {
+        throw RunChangeExternalOpenPresentationError.runIdentityMismatch
+    }
+    guard runVersion == expectedRunVersion else {
+        throw RunChangeExternalOpenPresentationError.runVersionMismatch
+    }
+    guard changeId == requestedChangeId, validOpaqueChangeId(changeId) else {
+        throw RunChangeExternalOpenPresentationError.changeIdentityMismatch
+    }
+    guard
+        status == (result == .opened ? .opened : .disabled)
+    else {
+        throw RunChangeExternalOpenPresentationError.statusMismatch
+    }
+    return result
 }

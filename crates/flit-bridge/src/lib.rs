@@ -31,10 +31,11 @@ use flit_protocol::{
     ProviderCapability as ProtocolProviderCapability, ProviderCapabilityEntry,
     ProviderCompatibility as ProtocolProviderCompatibility, ProviderDiagnosticsResponse,
     ProviderExecutionAfterQuit, ProviderKind as ProtocolProviderKind, ProviderUnavailableReason,
-    QuitImpactReason, QuitImpactResponse, QuitImpactRun, RunChangeHead, RunChangesReadRequest,
-    RunChangesReadResponse, RunChangesUnavailableReason, RunDetailReadRequest,
-    RunDetailReadResponse, RunEvidenceRecord, RunFileChangeRecord, RunFileChangeStatus,
-    RunFileProjectScope, SystemHealthResponse,
+    QuitImpactReason, QuitImpactResponse, QuitImpactRun, RunChangeExternalOpenDisabledReason,
+    RunChangeExternalOpenRequest, RunChangeExternalOpenResponse, RunChangeHead,
+    RunChangesReadRequest, RunChangesReadResponse, RunChangesUnavailableReason,
+    RunDetailReadRequest, RunDetailReadResponse, RunEvidenceRecord, RunFileChangeRecord,
+    RunFileChangeStatus, RunFileProjectScope, SystemHealthResponse,
 };
 use flit_providers::{
     CapabilityStatus, CodexCompatibilityProbe, CodexCompatibilityProbeError,
@@ -48,6 +49,8 @@ use flit_store::{
     DashboardRunSnapshot as StoreDashboardRunSnapshot, MAX_DASHBOARD_DELTA_EVENTS,
     MAX_LIVE_MANAGED_SESSIONS, MAX_MANAGED_GIT_CHANGE_PAGE_SIZE, MAX_PROJECT_PAGE_SIZE,
     MAX_RUN_DETAIL_EVENTS, ManagedGitChangeAttribution as StoreManagedGitChangeAttribution,
+    ManagedGitChangeSetMetadata as StoreManagedGitChangeSetMetadata,
+    ManagedGitFileChange as StoreManagedGitFileChange,
     ManagedGitFileStatus as StoreManagedGitFileStatus,
     ManagedGitProjectScope as StoreManagedGitProjectScope, ManagedPermissionDecision,
     ManagedPermissionDeliveryUnknownReason, ManagedPermissionResponseAttemptOutcome,
@@ -67,11 +70,16 @@ use crate::codex_recovery::{
     CodexRecoveryAttempt, ExactCodexRecoveryConnector, observe_codex_sessions,
     persist_codex_recovery_observations, unknown_codex_recovery_observations,
 };
+use crate::external_open::{
+    ExternalOpenAuthority, ExternalOpenGuardError, ExternalOpenTarget,
+    inspect_external_open_target, open_with_default_application,
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 pub mod codex_recovery;
+mod external_open;
 mod managed_start;
 #[cfg(test)]
 mod phase2_journey;
@@ -1960,6 +1968,289 @@ pub fn run_changes_read_json(request_json: String) -> Result<String, BridgeError
     protect(|| run_changes_read_with(&CORE, &request_json))
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ExternalOpenAuthorityState {
+    Available(Box<ExternalOpenAuthority>),
+    Disabled(RunChangeExternalOpenDisabledReason),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExternalOpenAuthorityRead {
+    run_version: u64,
+    state: ExternalOpenAuthorityState,
+}
+
+fn load_external_open_authority(
+    core_manager: &CoreManager,
+    run_id: &str,
+    expected_run_version: u64,
+    change_id: &str,
+) -> Result<ExternalOpenAuthorityRead, BridgeError> {
+    core_manager.with_ready_core(|core| {
+        let context =
+            core.store
+                .managed_run_detail_context(run_id)
+                .map_err(|error| match error {
+                    StoreError::MissingRun { .. } => BridgeError::RunNotFound,
+                    _ => BridgeError::StorageFailure,
+                })?;
+        if context.run_version != expected_run_version {
+            return Err(BridgeError::RunVersionStale);
+        }
+        let run = core
+            .store
+            .managed_run(run_id)
+            .map_err(|_| BridgeError::StorageFailure)?
+            .ok_or(BridgeError::RunNotFound)?;
+        let Some(project) = core
+            .store
+            .project(&run.project_id)
+            .map_err(|_| BridgeError::StorageFailure)?
+        else {
+            return Ok(ExternalOpenAuthorityRead {
+                run_version: context.run_version,
+                state: ExternalOpenAuthorityState::Disabled(
+                    RunChangeExternalOpenDisabledReason::ProjectIdentityMismatch,
+                ),
+            });
+        };
+        let Some(project_filesystem_id) = project.filesystem_id.clone() else {
+            return Ok(ExternalOpenAuthorityRead {
+                run_version: context.run_version,
+                state: ExternalOpenAuthorityState::Disabled(
+                    RunChangeExternalOpenDisabledReason::ProjectIdentityMismatch,
+                ),
+            });
+        };
+        if !project.trusted {
+            return Ok(ExternalOpenAuthorityRead {
+                run_version: context.run_version,
+                state: ExternalOpenAuthorityState::Disabled(
+                    RunChangeExternalOpenDisabledReason::ProjectIdentityMismatch,
+                ),
+            });
+        }
+        let Some(metadata) = core
+            .store
+            .managed_git_change_set_metadata(run_id)
+            .map_err(|_| BridgeError::StorageFailure)?
+        else {
+            return Ok(ExternalOpenAuthorityRead {
+                run_version: context.run_version,
+                state: ExternalOpenAuthorityState::Disabled(
+                    RunChangeExternalOpenDisabledReason::ChangeSetNotAvailable,
+                ),
+            });
+        };
+        let Some(change) = core
+            .store
+            .managed_git_file_change(run_id, change_id)
+            .map_err(|_| BridgeError::StorageFailure)?
+        else {
+            return Ok(ExternalOpenAuthorityRead {
+                run_version: context.run_version,
+                state: ExternalOpenAuthorityState::Disabled(
+                    RunChangeExternalOpenDisabledReason::ChangeNotFound,
+                ),
+            });
+        };
+        Ok(ExternalOpenAuthorityRead {
+            run_version: context.run_version,
+            state: ExternalOpenAuthorityState::Available(Box::new(external_open_authority(
+                project,
+                project_filesystem_id,
+                metadata,
+                change,
+            ))),
+        })
+    })
+}
+
+fn external_open_authority(
+    project: Project,
+    project_filesystem_id: String,
+    metadata: StoreManagedGitChangeSetMetadata,
+    change: StoreManagedGitFileChange,
+) -> ExternalOpenAuthority {
+    ExternalOpenAuthority {
+        project_path: project.canonical_path,
+        project_filesystem_id,
+        repository_identity: metadata.repository_identity,
+        raw_path: change.raw_path,
+        status: change.status,
+        project_scope: change.project_scope,
+    }
+}
+
+fn external_open_disabled_reason(
+    error: ExternalOpenGuardError,
+) -> RunChangeExternalOpenDisabledReason {
+    match error {
+        ExternalOpenGuardError::DeletedChange => RunChangeExternalOpenDisabledReason::DeletedChange,
+        ExternalOpenGuardError::OutsideProject => {
+            RunChangeExternalOpenDisabledReason::OutsideProject
+        }
+        ExternalOpenGuardError::ProjectIdentityMismatch => {
+            RunChangeExternalOpenDisabledReason::ProjectIdentityMismatch
+        }
+        ExternalOpenGuardError::RepositoryIdentityMismatch => {
+            RunChangeExternalOpenDisabledReason::RepositoryIdentityMismatch
+        }
+        ExternalOpenGuardError::TargetUnavailable => {
+            RunChangeExternalOpenDisabledReason::TargetUnavailable
+        }
+        ExternalOpenGuardError::SymlinkEscape => RunChangeExternalOpenDisabledReason::SymlinkEscape,
+        ExternalOpenGuardError::TargetNotFile => RunChangeExternalOpenDisabledReason::TargetNotFile,
+    }
+}
+
+fn external_open_response(
+    request: &RunChangeExternalOpenRequest,
+    run_version: u64,
+    reason: Option<RunChangeExternalOpenDisabledReason>,
+) -> RunChangeExternalOpenResponse {
+    match reason {
+        Some(reason) => RunChangeExternalOpenResponse::Disabled {
+            protocol_version: PROTOCOL_VERSION.to_owned(),
+            run_id: request.run_id.clone(),
+            run_version,
+            change_id: request.change_id.clone(),
+            reason,
+        },
+        None => RunChangeExternalOpenResponse::Opened {
+            protocol_version: PROTOCOL_VERSION.to_owned(),
+            run_id: request.run_id.clone(),
+            run_version,
+            change_id: request.change_id.clone(),
+        },
+    }
+}
+
+fn valid_external_open_change_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn run_change_external_open_with<Inspect, Open>(
+    core_manager: &CoreManager,
+    request_json: &str,
+    mut inspect: Inspect,
+    open: Open,
+) -> Result<String, BridgeError>
+where
+    Inspect: FnMut(&ExternalOpenAuthority) -> Result<ExternalOpenTarget, ExternalOpenGuardError>,
+    Open: FnOnce(&Path) -> Result<(), ()>,
+{
+    if request_json.len() > MAX_MANAGED_RUN_REQUEST_BYTES {
+        return run_command_json(|| -> Result<RunChangeExternalOpenResponse, _> {
+            Err(BridgeError::InvalidRunRequest)
+        });
+    }
+    let request = serde_json::from_str::<RunChangeExternalOpenRequest>(request_json)
+        .map_err(|_| BridgeError::InvalidRunRequest);
+    run_command_json(|| -> Result<RunChangeExternalOpenResponse, BridgeError> {
+        let request = request?;
+        if request.client_protocol_version != PROTOCOL_VERSION {
+            return Err(BridgeError::ProtocolMismatch);
+        }
+        if request.run_id.trim().is_empty()
+            || request.run_id.len() > MAX_PROJECT_ID_BYTES
+            || request.run_id.contains('\0')
+            || request.expected_run_version == 0
+            || request.expected_run_version > flit_protocol::MAX_JSON_SAFE_INTEGER
+            || !valid_external_open_change_id(&request.change_id)
+        {
+            return Err(BridgeError::InvalidRunRequest);
+        }
+
+        let first = load_external_open_authority(
+            core_manager,
+            &request.run_id,
+            request.expected_run_version,
+            &request.change_id,
+        )?;
+        let first_authority = match first.state {
+            ExternalOpenAuthorityState::Available(authority) => authority,
+            ExternalOpenAuthorityState::Disabled(reason) => {
+                return Ok(external_open_response(
+                    &request,
+                    first.run_version,
+                    Some(reason),
+                ));
+            }
+        };
+        let first_target = match inspect(&first_authority) {
+            Ok(target) => target,
+            Err(error) => {
+                return Ok(external_open_response(
+                    &request,
+                    first.run_version,
+                    Some(external_open_disabled_reason(error)),
+                ));
+            }
+        };
+
+        let second = load_external_open_authority(
+            core_manager,
+            &request.run_id,
+            request.expected_run_version,
+            &request.change_id,
+        )?;
+        let second_authority = match second.state {
+            ExternalOpenAuthorityState::Available(authority) => authority,
+            ExternalOpenAuthorityState::Disabled(_) => {
+                return Ok(external_open_response(
+                    &request,
+                    second.run_version,
+                    Some(RunChangeExternalOpenDisabledReason::TargetIdentityDrift),
+                ));
+            }
+        };
+        if second_authority != first_authority {
+            return Ok(external_open_response(
+                &request,
+                second.run_version,
+                Some(RunChangeExternalOpenDisabledReason::TargetIdentityDrift),
+            ));
+        }
+        let second_target = match inspect(&second_authority) {
+            Ok(target) => target,
+            Err(error) => {
+                return Ok(external_open_response(
+                    &request,
+                    second.run_version,
+                    Some(external_open_disabled_reason(error)),
+                ));
+            }
+        };
+        if second_target != first_target {
+            return Ok(external_open_response(
+                &request,
+                second.run_version,
+                Some(RunChangeExternalOpenDisabledReason::TargetIdentityDrift),
+            ));
+        }
+        let reason = open(second_target.canonical_path())
+            .err()
+            .map(|()| RunChangeExternalOpenDisabledReason::OpenFailed);
+        Ok(external_open_response(&request, second.run_version, reason))
+    })
+}
+
+#[uniffi::export]
+pub fn run_change_external_open_json(request_json: String) -> Result<String, BridgeError> {
+    protect(|| {
+        run_change_external_open_with(
+            &CORE,
+            &request_json,
+            inspect_external_open_target,
+            open_with_default_application,
+        )
+    })
+}
+
 fn managed_run_open_in_provider_with(
     core_manager: &CoreManager,
     request_json: &str,
@@ -2908,6 +3199,12 @@ mod tests {
         time::Duration,
     };
 
+    #[cfg(unix)]
+    use std::{
+        ffi::OsString,
+        os::unix::{ffi::OsStringExt, fs::MetadataExt},
+    };
+
     use flit_protocol::{
         EventProtocolVersion, ManagedRunOpenInProviderRequest, ManagedRunPermissionDecision,
         ManagedRunPermissionMode, ManagedRunPermissionRespondRequest,
@@ -3164,6 +3461,17 @@ mod tests {
         let project_identity = ProjectDirectoryInspection::inspect(project)
             .expect("Project identity")
             .identity;
+        let git_directory_path = project.join(".git");
+        fs::create_dir_all(&git_directory_path).expect("Git directory");
+        let git_directory_metadata = fs::metadata(&git_directory_path).expect("Git directory");
+        #[cfg(unix)]
+        let git_directory_filesystem_id = format!(
+            "unix:{}:{}",
+            git_directory_metadata.dev(),
+            git_directory_metadata.ino()
+        );
+        #[cfg(not(unix))]
+        let git_directory_filesystem_id = "unsupported".to_owned();
         let root = project
             .to_str()
             .expect("UTF-8 test Project")
@@ -3181,9 +3489,9 @@ mod tests {
                 repository_root: root,
                 repository_root_filesystem_id: project_identity.filesystem_id,
                 git_directory: git_directory.clone(),
-                git_directory_filesystem_id: "unix:11:12".to_owned(),
+                git_directory_filesystem_id: git_directory_filesystem_id.clone(),
                 common_directory: git_directory,
-                common_directory_filesystem_id: "unix:11:12".to_owned(),
+                common_directory_filesystem_id: git_directory_filesystem_id,
             },
             files: 1,
             insertions: Some(2),
@@ -5435,6 +5743,138 @@ mod tests {
             command_error(&missing_cursor).code,
             CommandErrorCode::InvalidRunRequest
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_change_external_open_revalidates_exact_authority_and_calls_opener_once() {
+        let (_directory, manager, _response, project) =
+            observation_core_with_baseline("run-change-external-open", true);
+        let mut change_set = exact_bridge_change_set(&project);
+        change_set.changes[0].raw_path = b"inside.txt".to_vec();
+        change_set.changes[0].display_path = "inside.txt".to_owned();
+        let change_id = change_set.changes[0].change_id.clone();
+        let target = project.join(OsString::from_vec(change_set.changes[0].raw_path.clone()));
+        fs::write(&target, b"first identity").expect("external-open target");
+        let run_version = manager
+            .with_ready_core(|core| {
+                let outcome = core
+                    .store
+                    .append_managed_provider_observation(ManagedProviderObservation {
+                        run_id: "run-observe".to_owned(),
+                        session_id: "session-observe".to_owned(),
+                        external_session_key: "thread-observe".to_owned(),
+                        provider_turn_id: "turn-observe".to_owned(),
+                        contract_version: "codex-app-server/0.145.0".to_owned(),
+                        event_id: "event-run-change-external-open-terminal".to_owned(),
+                        observed_at: "2026-07-27T12:00:02Z".to_owned(),
+                        kind: ManagedProviderObservationKind::TurnCompleted {
+                            changes: ManagedGitChangeSummary::Exact {
+                                files: 1,
+                                insertions: 2,
+                                deletions: 1,
+                            },
+                            change_set: Some(Box::new(change_set)),
+                        },
+                    })
+                    .expect("terminal external-open change set");
+                Ok(appended_event(&outcome).ingest_seq)
+            })
+            .expect("seed external-open change set");
+        let request = |change_id: String, expected_run_version: u64| {
+            serde_json::to_string(&RunChangeExternalOpenRequest {
+                run_id: "run-observe".to_owned(),
+                expected_run_version,
+                change_id,
+                client_protocol_version: PROTOCOL_VERSION.to_owned(),
+            })
+            .expect("external-open request")
+        };
+
+        let open_calls = AtomicUsize::new(0);
+        let canonical_target = fs::canonicalize(&target).expect("canonical external-open target");
+        let opened = run_change_external_open_with(
+            &manager,
+            &request(change_id.clone(), run_version),
+            inspect_external_open_target,
+            |path| {
+                open_calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(path, canonical_target);
+                Ok(())
+            },
+        )
+        .expect("external-open response");
+        assert_eq!(open_calls.load(Ordering::SeqCst), 1);
+        assert!(!opened.contains("raw_path"));
+        assert!(!opened.contains("filesystem_id"));
+        assert!(!opened.contains("inside.txt"));
+        assert!(matches!(
+            serde_json::from_str::<RunChangeExternalOpenResponse>(&opened)
+                .expect("opened response JSON"),
+            RunChangeExternalOpenResponse::Opened {
+                run_version: opened_version,
+                ref change_id,
+                ..
+            } if opened_version == run_version
+                && change_id == "0123456789abcdef0123456789abcdef"
+        ));
+
+        let stale = run_change_external_open_with(
+            &manager,
+            &request(change_id.clone(), run_version - 1),
+            |_| -> Result<ExternalOpenTarget, ExternalOpenGuardError> {
+                panic!("stale request must not inspect the filesystem")
+            },
+            |_| -> Result<(), ()> { panic!("stale request must not call the opener") },
+        )
+        .expect("typed stale external-open response");
+        assert_eq!(
+            command_error(&stale).code,
+            CommandErrorCode::RunVersionStale
+        );
+
+        let missing = run_change_external_open_with(
+            &manager,
+            &request("f".repeat(32), run_version),
+            |_| -> Result<ExternalOpenTarget, ExternalOpenGuardError> {
+                panic!("missing change must not inspect the filesystem")
+            },
+            |_| -> Result<(), ()> { panic!("missing change must not call the opener") },
+        )
+        .expect("typed missing external-open response");
+        assert!(matches!(
+            serde_json::from_str::<RunChangeExternalOpenResponse>(&missing)
+                .expect("missing response JSON"),
+            RunChangeExternalOpenResponse::Disabled {
+                reason: RunChangeExternalOpenDisabledReason::ChangeNotFound,
+                ..
+            }
+        ));
+
+        let inspection_count = AtomicUsize::new(0);
+        let replacement = project.join("replacement.txt");
+        let drifted = run_change_external_open_with(
+            &manager,
+            &request(change_id, run_version),
+            |authority| {
+                if inspection_count.fetch_add(1, Ordering::SeqCst) == 1 {
+                    fs::write(&replacement, b"second identity").expect("replacement target");
+                    fs::rename(&replacement, &target).expect("replace target identity");
+                }
+                inspect_external_open_target(authority)
+            },
+            |_| -> Result<(), ()> { panic!("identity drift must not call the opener") },
+        )
+        .expect("typed drift external-open response");
+        assert_eq!(inspection_count.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            serde_json::from_str::<RunChangeExternalOpenResponse>(&drifted)
+                .expect("drift response JSON"),
+            RunChangeExternalOpenResponse::Disabled {
+                reason: RunChangeExternalOpenDisabledReason::TargetIdentityDrift,
+                ..
+            }
+        ));
     }
 
     #[test]
