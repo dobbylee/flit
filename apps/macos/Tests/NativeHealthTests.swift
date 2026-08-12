@@ -230,6 +230,66 @@ private func dashboardDeltaResponse(
     )
 }
 
+private func stuckAttentionResponse(
+    runId: String,
+    runVersion: UInt64,
+    occurrenceId: String
+) -> FlitRunActiveAttentionReadResponse {
+    FlitRunActiveAttentionReadResponse(
+        protocolVersion: flitClientProtocolVersion,
+        eventSchemaVersion: flitEventSchemaVersion,
+        runId: runId,
+        runVersion: runVersion,
+        openCount: 1,
+        item: .item(
+            FlitRunActiveAttentionItem(
+                attentionId: "stuck:\(occurrenceId)",
+                attentionVersion: runVersion,
+                category: .stuck,
+                severity: .informational,
+                blocking: false,
+                status: .open,
+                sourceEventId: "event-\(occurrenceId)",
+                sourceEventType: "run.possibly_stuck",
+                sourceObservedAt: "2026-08-09T00:02:00.000Z",
+                contentUnavailableReason: "raw_provider_content_not_retained",
+                action: .stillWorking(occurrenceId: occurrenceId)
+            )
+        )
+    )
+}
+
+private func permissionAttentionResponse(
+    runId: String,
+    runVersion: UInt64
+) -> FlitRunActiveAttentionReadResponse {
+    FlitRunActiveAttentionReadResponse(
+        protocolVersion: flitClientProtocolVersion,
+        eventSchemaVersion: flitEventSchemaVersion,
+        runId: runId,
+        runVersion: runVersion,
+        openCount: 1,
+        item: .item(
+            FlitRunActiveAttentionItem(
+                attentionId: "request:permission-native",
+                attentionVersion: runVersion,
+                category: .permission,
+                severity: .actionRequired,
+                blocking: true,
+                status: .open,
+                sourceEventId: "event-permission-native",
+                sourceEventType: "permission.requested",
+                sourceObservedAt: "2026-08-12T10:00:00.000Z",
+                contentUnavailableReason: "raw_provider_content_not_retained",
+                action: .permissionResponse(
+                    requestId: "permission-native",
+                    requestVersion: runVersion
+                )
+            )
+        )
+    )
+}
+
 @MainActor
 private final class ManualDashboardCadence: DashboardCadenceScheduling {
     private var tick: (@MainActor @Sendable () -> Void)?
@@ -2976,6 +3036,231 @@ struct NativeHealthTests {
                 ),
             "fixture-backed Run card must render exact Unknown, attention, and unavailable facts"
         )
+        let permissionDashboardFixture = try changingDashboard(initialDashboardFixture) { object in
+            guard var runs = object["runs"] as? [[String: Any]], !runs.isEmpty else {
+                throw NativeHealthTestFailure.failed(
+                    "permission Dashboard fixture must contain one Run"
+                )
+            }
+            runs[0]["attention_level"] = "ActionRequired"
+            runs[0]["attention_open_count"] = 1
+            runs[0]["dashboard_bucket"] = "NeedsAttention"
+            object["runs"] = runs
+        }
+        var permissionAttentionLoads = 0
+        let permissionController = FoundationViewController(
+            client: client,
+            dashboardClient: DashboardClient(
+                fixtureLoader: { permissionDashboardFixture }
+            ),
+            activeAttentionClient: ActiveAttentionClient(
+                fixtureLoader: { request in
+                    permissionAttentionLoads += 1
+                    guard
+                        request.runId == "run-dashboard-1",
+                        request.expectedRunVersion == 3,
+                        request.clientProtocolVersion == flitClientProtocolVersion
+                    else {
+                        throw NativeHealthTestFailure.failed(
+                            "permission detail must bind the exact visible Run/version"
+                        )
+                    }
+                    return permissionAttentionResponse(
+                        runId: request.runId,
+                        runVersion: request.expectedRunVersion
+                    )
+                }
+            )
+        )
+        _ = permissionController.view
+        let permissionViews = descendants(of: permissionController.view)
+        let permissionCopy = permissionViews.compactMap {
+            ($0 as? NSTextField)?.stringValue
+        }
+        let deny = permissionViews.first(where: {
+            $0.accessibilityIdentifier()
+                == "flit.attention.permission.deny.run-dashboard-1"
+        }) as? NSButton
+        let allowOnce = permissionViews.first(where: {
+            $0.accessibilityIdentifier()
+                == "flit.attention.permission.allowOnce.run-dashboard-1"
+        }) as? NSButton
+        try require(
+            permissionAttentionLoads == 1
+                && permissionViews.contains(where: {
+                    $0.accessibilityIdentifier()
+                        == "flit.attention.card.run-dashboard-1"
+                })
+                && permissionViews.contains(where: {
+                    $0.accessibilityIdentifier()
+                        == "flit.attention.evidence.run-dashboard-1"
+                })
+                && deny?.isEnabled == false
+                && allowOnce?.isEnabled == false
+                && permissionCopy.contains(
+                    FoundationCopy.format(
+                        .attentionCardFacts,
+                        FoundationCopy.text(.attentionCategoryPermission),
+                        FoundationCopy.text(.attentionSeverityActionRequired),
+                        FoundationCopy.text(.attentionStatusOpen)
+                    )
+                )
+                && permissionCopy.contains(
+                    FoundationCopy.text(.attentionPermissionDetailsRequired)
+                )
+                && !permissionCopy.contains(where: {
+                    $0.contains("permission-native")
+                }),
+            "permission attention must show bounded facts while exact response controls remain disabled without required scope"
+        )
+        guard case let .snapshot(permissionSnapshot) = permissionDashboardFixture,
+            let permissionRun = permissionSnapshot.runs.first
+        else {
+            throw NativeHealthTestFailure.failed(
+                "permission presentation fixture must retain one Run"
+            )
+        }
+        let exactPermissionAttention = permissionAttentionResponse(
+            runId: permissionRun.runId,
+            runVersion: permissionRun.version
+        )
+        let countDriftAttention = FlitRunActiveAttentionReadResponse(
+            protocolVersion: exactPermissionAttention.protocolVersion,
+            eventSchemaVersion: exactPermissionAttention.eventSchemaVersion,
+            runId: exactPermissionAttention.runId,
+            runVersion: exactPermissionAttention.runVersion,
+            openCount: 2,
+            item: exactPermissionAttention.item
+        )
+        do {
+            _ = try activeAttentionCard(from: countDriftAttention, for: permissionRun)
+            throw NativeHealthTestFailure.failed(
+                "active-attention count drift must fail closed"
+            )
+        } catch let error as ActiveAttentionPresentationError {
+            try require(
+                error == .identityMismatch,
+                "active-attention count drift must retain a typed identity failure"
+            )
+        }
+        guard
+            let stuckRun = possiblyStuckSnapshotFixture.runs.first
+        else {
+            throw NativeHealthTestFailure.failed(
+                "stuck presentation fixture must retain one Run"
+            )
+        }
+        do {
+            _ = try activeAttentionCard(
+                from: stuckAttentionResponse(
+                    runId: stuckRun.runId,
+                    runVersion: stuckRun.version,
+                    occurrenceId: "occurrence-other"
+                ),
+                for: stuckRun
+            )
+            throw NativeHealthTestFailure.failed(
+                "stale stuck action identity must fail closed"
+            )
+        } catch let error as ActiveAttentionPresentationError {
+            try require(
+                error == .invalidItem,
+                "stale stuck action identity must retain a typed item failure"
+            )
+        }
+        let versionedPermissionDashboardFixture = try changingDashboard(
+            deltaDashboardFixture
+        ) { object in
+            guard var runs = object["runs"] as? [[String: Any]], !runs.isEmpty else {
+                throw NativeHealthTestFailure.failed(
+                    "versioned permission fixture must contain one Run"
+                )
+            }
+            runs[0]["attention_level"] = "ActionRequired"
+            runs[0]["attention_open_count"] = 1
+            runs[0]["dashboard_bucket"] = "NeedsAttention"
+            runs[0]["active_stuck_occurrence_id"] = NSNull()
+            object["runs"] = runs
+        }
+        var unavailableAttentionLoads = 0
+        var unavailableDashboardLoads = 0
+        let unavailableAttentionCadence = ManualDashboardCadence()
+        let unavailableAttentionController = FoundationViewController(
+            client: client,
+            dashboardClient: DashboardClient(
+                requestLoader: { request in
+                    unavailableDashboardLoads += 1
+                    switch unavailableDashboardLoads {
+                    case 1:
+                        return permissionDashboardFixture
+                    case 2, 3:
+                        return try dashboardDeltaResponse(
+                            coreInstanceId: "core-instance-1",
+                            requestedAfterCursor: 3,
+                            nextCursor: 3,
+                            hasMore: false
+                        )
+                    case 4:
+                        return versionedPermissionDashboardFixture
+                    default:
+                        throw NativeHealthTestFailure.failed(
+                            "unavailable attention test exceeded its bounded reads"
+                        )
+                    }
+                }
+            ),
+            activeAttentionClient: ActiveAttentionClient(
+                fixtureLoader: { _ in
+                    unavailableAttentionLoads += 1
+                    throw NativeHealthTestFailure.failed("attention unavailable")
+                }
+            ),
+            stuckAssessmentClient: StuckAssessmentClient(
+                fixtureLoader: { _ in
+                    FlitManagedRunsAssessStuckResponse(
+                        protocolVersion: flitClientProtocolVersion,
+                        assessedRuns: 0,
+                        transitionsAppended: 0,
+                        unchangedRuns: 0,
+                        unavailableRuns: 0
+                    )
+                }
+            ),
+            dashboardCadence: unavailableAttentionCadence
+        )
+        _ = unavailableAttentionController.view
+        unavailableAttentionCadence.fire()
+        unavailableAttentionCadence.fire()
+        try require(
+            unavailableAttentionLoads == 1,
+            "unchanged failed attention detail must be cached by exact Run scope"
+        )
+        unavailableAttentionCadence.fire()
+        let unavailableAttentionViews = descendants(
+            of: unavailableAttentionController.view
+        )
+        try require(
+            unavailableAttentionLoads == 2
+                && unavailableAttentionViews.contains(where: {
+                $0.accessibilityIdentifier()
+                    == "flit.attention.unavailable.run-dashboard-1"
+            })
+                && !unavailableAttentionViews.contains(where: {
+                    $0.accessibilityIdentifier().hasPrefix("flit.attention.permission.")
+                }),
+            "failed attention detail must retry once on a new Run version without inventing an action"
+        )
+        unavailableAttentionController.stopMonitoring()
+        try require(
+            [
+                FlitRunActiveAttentionCategory.permission,
+                .permissionAudit, .question, .risk, .failure, .stuck, .system, .completion,
+            ].map(FoundationCopy.attentionCategory) == [
+                "Permission", "Permission audit", "Question", "Risk", "Failure",
+                "Possibly stuck", "System", "Completion",
+            ],
+            "every active-attention category must retain distinct stable native copy"
+        )
         let stuckAssessmentFixture = try decodeFixture(
             FlitManagedRunsAssessStuckResponse.self,
             at: "\(fixtureRoot)/managed_runs_assess_stuck.response.json"
@@ -3092,6 +3377,18 @@ struct NativeHealthTests {
         var monitoringOperations: [String] = []
         var dashboardLoadStep = 0
         var assessmentCallCount = 0
+        var stuckAttentionLoadCount = 0
+        let monitoringInitialDashboardFixture = try changingDashboard(
+            initialDashboardFixture
+        ) { object in
+            guard var runs = object["runs"] as? [[String: Any]], !runs.isEmpty else {
+                throw NativeHealthTestFailure.failed(
+                    "monitoring Dashboard fixture must contain one Run"
+                )
+            }
+            runs[0]["attention_open_count"] = 0
+            object["runs"] = runs
+        }
         let manualCadence = ManualDashboardCadence()
         let monitoringController = FoundationViewController(
             client: client,
@@ -3109,7 +3406,7 @@ struct NativeHealthTests {
                                 "monitoring must start from one exact Dashboard snapshot"
                             )
                         }
-                        return initialDashboardFixture
+                        return monitoringInitialDashboardFixture
                     case 2:
                         monitoringOperations.append("dashboard.delta.3")
                         guard
@@ -3139,6 +3436,23 @@ struct NativeHealthTests {
                             "monitoring fixture received an unbounded read"
                         )
                     }
+                }
+            ),
+            activeAttentionClient: ActiveAttentionClient(
+                fixtureLoader: { request in
+                    stuckAttentionLoadCount += 1
+                    guard request.runId == "run-dashboard-1",
+                        request.expectedRunVersion == 4
+                    else {
+                        throw NativeHealthTestFailure.failed(
+                            "active attention must follow the exact visible stuck Run"
+                        )
+                    }
+                    return stuckAttentionResponse(
+                        runId: request.runId,
+                        runVersion: request.expectedRunVersion,
+                        occurrenceId: "occurrence-dashboard-action"
+                    )
                 }
             ),
             stuckAssessmentClient: StuckAssessmentClient(
@@ -3210,6 +3524,7 @@ struct NativeHealthTests {
         let convergedActionViews = descendants(of: monitoringController.view)
         try require(
             assessmentCallCount == 2
+                && stuckAttentionLoadCount == 1
                 && !convergedActionViews.contains(where: {
                     $0.accessibilityIdentifier() == "flit.dashboard.monitoringUnavailable"
                 })
@@ -3265,6 +3580,15 @@ struct NativeHealthTests {
         let rejectedActionController = FoundationViewController(
             client: client,
             dashboardClient: noChangeStuckDashboardClient,
+            activeAttentionClient: ActiveAttentionClient(
+                fixtureLoader: { request in
+                    stuckAttentionResponse(
+                        runId: request.runId,
+                        runVersion: request.expectedRunVersion,
+                        occurrenceId: "occurrence-dashboard-stuck-1"
+                    )
+                }
+            ),
             stillWorkingClient: StillWorkingClient(
                 fixtureLoader: { _ in rejectedStillWorkingResponse }
             )
@@ -3290,6 +3614,15 @@ struct NativeHealthTests {
         let unavailableActionController = FoundationViewController(
             client: client,
             dashboardClient: noChangeStuckDashboardClient,
+            activeAttentionClient: ActiveAttentionClient(
+                fixtureLoader: { request in
+                    stuckAttentionResponse(
+                        runId: request.runId,
+                        runVersion: request.expectedRunVersion,
+                        occurrenceId: "occurrence-dashboard-stuck-1"
+                    )
+                }
+            ),
             stillWorkingClient: StillWorkingClient(
                 fixtureLoader: { _ in
                     throw NativeHealthTestFailure.failed("action unavailable")
@@ -4192,6 +4525,10 @@ struct NativeHealthTests {
             let attentionCard = overflowViews.first(where: {
                 $0.accessibilityIdentifier()
                     == "flit.dashboard.run.\(overflowFirstRunId)"
+            }),
+            let attentionDetail = overflowViews.first(where: {
+                $0.accessibilityIdentifier()
+                    == "flit.attention.card.\(overflowFirstRunId)"
             })
         else {
             throw NativeHealthTestFailure.failed(
@@ -4205,8 +4542,11 @@ struct NativeHealthTests {
             )
                 && initialVisibleRect.intersects(
                     attentionCard.convert(attentionCard.bounds, to: overflowDocument)
+                )
+                && initialVisibleRect.intersects(
+                    attentionDetail.convert(attentionDetail.bounds, to: overflowDocument)
                 ),
-            "overflow Dashboard must open on Needs Attention content"
+            "overflow Dashboard must open on its highest-priority attention detail"
         )
         let layoutWindow = NSWindow(contentViewController: controller)
         layoutWindow.minSize = NSSize(width: 720, height: 560)

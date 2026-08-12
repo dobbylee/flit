@@ -97,6 +97,27 @@ private struct StillWorkingPresentation {
     let result: StillWorkingPresentationResult
 }
 
+private enum CachedActiveAttentionState {
+    case card(ActiveAttentionCardPresentation)
+    case empty
+    case unavailable
+}
+
+private struct CachedActiveAttention {
+    let runVersion: UInt64
+    let attentionOpenCount: UInt64
+    let attentionLevel: String
+    let activeStuckOccurrenceId: String?
+    let state: CachedActiveAttentionState
+
+    func matches(_ run: FlitDashboardRunRecord) -> Bool {
+        runVersion == run.version
+            && attentionOpenCount == run.attentionOpenCount
+            && attentionLevel == run.attentionLevel
+            && activeStuckOccurrenceId == run.activeStuckOccurrenceId
+    }
+}
+
 private func dashboardChangesCopy(_ changes: FlitDashboardChangeSummary) -> String {
     switch changes {
     case let .available(attribution, files, insertions, deletions):
@@ -117,6 +138,7 @@ private func dashboardChangesCopy(_ changes: FlitDashboardChangeSummary) -> Stri
 final class FoundationViewController: NSViewController {
     private let client: SystemHealthClient
     private let dashboardClient: DashboardClient
+    private let activeAttentionClient: ActiveAttentionClient
     private let stuckAssessmentClient: StuckAssessmentClient
     private let stillWorkingClient: StillWorkingClient
     private let dashboardCadence: any DashboardCadenceScheduling
@@ -135,6 +157,7 @@ final class FoundationViewController: NSViewController {
     private var monitoringTickInFlight = false
     private var monitoringFailure = false
     private var lastStillWorkingPresentation: StillWorkingPresentation?
+    private var activeAttentionCache: [String: CachedActiveAttention] = [:]
     private var activeRunDetail: RunDetailPresentationState?
     private var activeRunTitle: String?
     private var activeRunCompletionSummary: RunCompletionSummary?
@@ -152,6 +175,7 @@ final class FoundationViewController: NSViewController {
     init(
         client: SystemHealthClient,
         dashboardClient: DashboardClient = DashboardClient(),
+        activeAttentionClient: ActiveAttentionClient = ActiveAttentionClient(),
         stuckAssessmentClient: StuckAssessmentClient = StuckAssessmentClient(),
         stillWorkingClient: StillWorkingClient = StillWorkingClient(),
         dashboardCadence: any DashboardCadenceScheduling =
@@ -163,6 +187,7 @@ final class FoundationViewController: NSViewController {
     ) {
         self.client = client
         self.dashboardClient = dashboardClient
+        self.activeAttentionClient = activeAttentionClient
         self.stuckAssessmentClient = stuckAssessmentClient
         self.stillWorkingClient = stillWorkingClient
         self.dashboardCadence = dashboardCadence
@@ -374,6 +399,9 @@ final class FoundationViewController: NSViewController {
 
     private func renderDashboard() {
         guard let dashboardStack else { return }
+        activeAttentionCache = activeAttentionCache.filter { runId, cached in
+            dashboardState.runsById[runId].map(cached.matches) ?? false
+        }
         dashboardStack.arrangedSubviews.forEach { view in
             dashboardStack.removeArrangedSubview(view)
             view.removeFromSuperview()
@@ -456,6 +484,16 @@ final class FoundationViewController: NSViewController {
                 color: .secondaryLabelColor
             )
         )
+        if run.attentionOpenCount > 0 {
+            card.addArrangedSubview(
+                activeAttentionCardView(
+                    activeAttentionState(for: run),
+                    run: run
+                )
+            )
+        } else {
+            activeAttentionCache.removeValue(forKey: run.runId)
+        }
         let activity = run.activity == "Unknown"
             ? FoundationCopy.text(.dashboardActivityUnknown)
             : FoundationCopy.format(
@@ -483,7 +521,108 @@ final class FoundationViewController: NSViewController {
                 color: .secondaryLabelColor
             )
         )
-        if let occurrenceId = run.activeStuckOccurrenceId {
+        let detail = RunDetailButton(run: run)
+        detail.title = FoundationCopy.text(.dashboardViewActivity)
+        detail.bezelStyle = .inline
+        detail.target = self
+        detail.action = #selector(showRunDetail(_:))
+        identify(detail, as: "flit.dashboard.runDetail.\(run.runId)")
+        card.addArrangedSubview(detail)
+        return card
+    }
+
+    private func activeAttentionState(
+        for run: FlitDashboardRunRecord
+    ) -> CachedActiveAttentionState {
+        if let cached = activeAttentionCache[run.runId], cached.matches(run) {
+            return cached.state
+        }
+        let state: CachedActiveAttentionState
+        do {
+            if let card = try activeAttentionClient.load(for: run) {
+                state = .card(card)
+            } else {
+                state = .empty
+            }
+        } catch {
+            state = .unavailable
+        }
+        activeAttentionCache[run.runId] = CachedActiveAttention(
+            runVersion: run.version,
+            attentionOpenCount: run.attentionOpenCount,
+            attentionLevel: run.attentionLevel,
+            activeStuckOccurrenceId: run.activeStuckOccurrenceId,
+            state: state
+        )
+        return state
+    }
+
+    private func activeAttentionCardView(
+        _ state: CachedActiveAttentionState,
+        run: FlitDashboardRunRecord
+    ) -> NSView {
+        let stack = NSStackView()
+        identify(stack, as: "flit.attention.card.\(run.runId)")
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 2
+        stack.edgeInsets = NSEdgeInsets(top: 6, left: 8, bottom: 6, right: 8)
+        stack.wantsLayer = true
+        stack.layer?.cornerRadius = 6
+        stack.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        let title = label(
+            FoundationCopy.text(.attentionCardTitle),
+            size: 12,
+            weight: .semibold
+        )
+        identify(title, as: "flit.attention.title.\(run.runId)")
+        stack.addArrangedSubview(title)
+        guard case let .card(card) = state else {
+            let unavailable = label(
+                FoundationCopy.text(.attentionDetailsUnavailable),
+                size: 11,
+                weight: .regular,
+                color: .systemOrange
+            )
+            identify(unavailable, as: "flit.attention.unavailable.\(run.runId)")
+            stack.addArrangedSubview(unavailable)
+            return stack
+        }
+        let facts = label(
+            FoundationCopy.format(
+                .attentionCardFacts,
+                FoundationCopy.attentionCategory(card.category),
+                FoundationCopy.attentionSeverity(card.severity),
+                FoundationCopy.attentionStatus(card.status)
+            ),
+            size: 11,
+            weight: .regular
+        )
+        identify(facts, as: "flit.attention.facts.\(run.runId)")
+        stack.addArrangedSubview(facts)
+        let evidence = label(
+            FoundationCopy.format(
+                .attentionCardEvidence,
+                card.sourceEventType,
+                card.sourceObservedAt
+            ),
+            size: 11,
+            weight: .regular,
+            color: .secondaryLabelColor
+        )
+        evidence.maximumNumberOfLines = 2
+        identify(evidence, as: "flit.attention.evidence.\(run.runId)")
+        stack.addArrangedSubview(evidence)
+        let content = label(
+            FoundationCopy.text(.attentionContentUnavailable),
+            size: 11,
+            weight: .regular,
+            color: .secondaryLabelColor
+        )
+        identify(content, as: "flit.attention.contentUnavailable.\(run.runId)")
+        stack.addArrangedSubview(content)
+        switch card.action {
+        case let .stillWorking(occurrenceId):
             let identity = StillWorkingActionIdentity(
                 runId: run.runId,
                 runVersion: run.version,
@@ -499,16 +638,43 @@ final class FoundationViewController: NSViewController {
                     && lastStillWorkingPresentation?.result == .applied
             )
             identify(stillWorking, as: "flit.dashboard.stillWorking.\(run.runId)")
-            card.addArrangedSubview(stillWorking)
+            stack.addArrangedSubview(stillWorking)
+        case .permissionDetailsUnavailable:
+            let controls = NSStackView()
+            controls.orientation = .horizontal
+            controls.alignment = .centerY
+            controls.spacing = 6
+            for (key, identifier) in [
+                (FoundationCopyKey.attentionPermissionDeny, "deny"),
+                (FoundationCopyKey.attentionPermissionAllowOnce, "allowOnce"),
+            ] {
+                let button = NSButton(title: FoundationCopy.text(key), target: nil, action: nil)
+                button.bezelStyle = .inline
+                button.isEnabled = false
+                identify(button, as: "flit.attention.permission.\(identifier).\(run.runId)")
+                controls.addArrangedSubview(button)
+            }
+            stack.addArrangedSubview(controls)
+            let reason = label(
+                FoundationCopy.text(.attentionPermissionDetailsRequired),
+                size: 11,
+                weight: .regular,
+                color: .systemOrange
+            )
+            reason.maximumNumberOfLines = 3
+            identify(reason, as: "flit.attention.permission.reason.\(run.runId)")
+            stack.addArrangedSubview(reason)
+        case .unavailable:
+            let unavailable = label(
+                FoundationCopy.text(.attentionActionUnavailable),
+                size: 11,
+                weight: .regular,
+                color: .secondaryLabelColor
+            )
+            identify(unavailable, as: "flit.attention.actionUnavailable.\(run.runId)")
+            stack.addArrangedSubview(unavailable)
         }
-        let detail = RunDetailButton(run: run)
-        detail.title = FoundationCopy.text(.dashboardViewActivity)
-        detail.bezelStyle = .inline
-        detail.target = self
-        detail.action = #selector(showRunDetail(_:))
-        identify(detail, as: "flit.dashboard.runDetail.\(run.runId)")
-        card.addArrangedSubview(detail)
-        return card
+        return stack
     }
 
     @objc private func confirmStillWorking(_ sender: StillWorkingButton) {

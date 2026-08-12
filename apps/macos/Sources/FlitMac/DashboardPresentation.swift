@@ -28,6 +28,165 @@ enum DashboardPresentationError: Error, Equatable {
     case unknownSection
 }
 
+enum ActiveAttentionPresentationError: Error, Equatable {
+    case contractMismatch
+    case identityMismatch
+    case invalidItem
+}
+
+enum ActiveAttentionPresentationAction: Equatable, Sendable {
+    case stillWorking(occurrenceId: String)
+    case permissionDetailsUnavailable
+    case unavailable
+}
+
+struct ActiveAttentionCardPresentation: Equatable, Sendable {
+    let attentionId: String
+    let category: FlitRunActiveAttentionCategory
+    let severity: FlitRunActiveAttentionSeverity
+    let status: FlitRunActiveAttentionStatus
+    let blocking: Bool
+    let sourceEventType: String
+    let sourceObservedAt: String
+    let contentUnavailableReason: String
+    let action: ActiveAttentionPresentationAction
+}
+
+func activeAttentionCard(
+    from response: FlitRunActiveAttentionReadResponse,
+    for run: FlitDashboardRunRecord
+) throws -> ActiveAttentionCardPresentation? {
+    guard
+        response.protocolVersion == flitClientProtocolVersion,
+        response.eventSchemaVersion == flitEventSchemaVersion
+    else {
+        throw ActiveAttentionPresentationError.contractMismatch
+    }
+    guard
+        response.runId == run.runId,
+        response.runVersion == run.version,
+        response.openCount == run.attentionOpenCount
+    else {
+        throw ActiveAttentionPresentationError.identityMismatch
+    }
+    switch response.item {
+    case .null:
+        guard response.openCount == 0, run.attentionLevel == "None" else {
+            throw ActiveAttentionPresentationError.invalidItem
+        }
+        return nil
+    case let .item(item):
+        guard
+            response.openCount > 0,
+            item.attentionVersion > 0,
+            item.attentionVersion <= run.version,
+            boundedAttentionToken(item.attentionId, maximumBytes: 256),
+            boundedAttentionToken(item.sourceEventId, maximumBytes: 256),
+            boundedAttentionToken(item.sourceEventType, maximumBytes: 256),
+            boundedAttentionToken(item.sourceObservedAt, maximumBytes: 256),
+            boundedAttentionToken(item.contentUnavailableReason, maximumBytes: 4 * 1_024),
+            run.attentionLevel == attentionSeverityCoreName(item.severity)
+        else {
+            throw ActiveAttentionPresentationError.invalidItem
+        }
+        let action: ActiveAttentionPresentationAction
+        switch item.action {
+        case let .permissionResponse(requestId, requestVersion):
+            guard
+                item.category == .permission,
+                item.status == .open,
+                item.blocking,
+                requestVersion == item.attentionVersion,
+                boundedAttentionToken(requestId, maximumBytes: 256)
+            else {
+                throw ActiveAttentionPresentationError.invalidItem
+            }
+            // The current provider contract omits the command, cwd, affected paths, and raw
+            // request text required by the permission-card safety contract. Preserve the exact
+            // identity without presenting an approval control until those facts are available.
+            action = .permissionDetailsUnavailable
+        case let .stillWorking(occurrenceId):
+            guard
+                item.category == .stuck,
+                item.status == .open,
+                boundedAttentionToken(occurrenceId, maximumBytes: 256),
+                run.activeStuckOccurrenceId == occurrenceId
+            else {
+                throw ActiveAttentionPresentationError.invalidItem
+            }
+            action = .stillWorking(occurrenceId: occurrenceId)
+        case let .unavailable(reason):
+            guard boundedAttentionToken(reason, maximumBytes: 4 * 1_024) else {
+                throw ActiveAttentionPresentationError.invalidItem
+            }
+            action = .unavailable
+        }
+        return ActiveAttentionCardPresentation(
+            attentionId: item.attentionId,
+            category: item.category,
+            severity: item.severity,
+            status: item.status,
+            blocking: item.blocking,
+            sourceEventType: item.sourceEventType,
+            sourceObservedAt: item.sourceObservedAt,
+            contentUnavailableReason: item.contentUnavailableReason,
+            action: action
+        )
+    }
+}
+
+private func boundedAttentionToken(_ value: String, maximumBytes: Int) -> Bool {
+    !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        && value.utf8.count <= maximumBytes
+        && !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+}
+
+private func attentionSeverityCoreName(
+    _ severity: FlitRunActiveAttentionSeverity
+) -> String {
+    switch severity {
+    case .informational: "Informational"
+    case .actionRequired: "ActionRequired"
+    case .critical: "Critical"
+    }
+}
+
+@MainActor
+struct ActiveAttentionClient {
+    private let fixtureLoader:
+        ((FlitRunActiveAttentionReadRequest) throws
+            -> FlitRunActiveAttentionReadResponse)?
+
+    init(
+        fixtureLoader: ((FlitRunActiveAttentionReadRequest) throws
+            -> FlitRunActiveAttentionReadResponse)? = nil
+    ) {
+        self.fixtureLoader = fixtureLoader
+    }
+
+    func load(for run: FlitDashboardRunRecord) throws -> ActiveAttentionCardPresentation? {
+        let request = FlitRunActiveAttentionReadRequest(
+            runId: run.runId,
+            expectedRunVersion: run.version,
+            clientProtocolVersion: flitClientProtocolVersion
+        )
+        let response: FlitRunActiveAttentionReadResponse
+        if let fixtureLoader {
+            response = try fixtureLoader(request)
+        } else {
+            let requestData = try JSONEncoder().encode(request)
+            let rendered = try runActiveAttentionReadJson(
+                requestJson: String(decoding: requestData, as: UTF8.self)
+            )
+            response = try JSONDecoder().decode(
+                FlitRunActiveAttentionReadResponse.self,
+                from: Data(rendered.utf8)
+            )
+        }
+        return try activeAttentionCard(from: response, for: run)
+    }
+}
+
 struct DashboardPresentationState: Sendable {
     private static let maximumDeltaEvents = 50
 

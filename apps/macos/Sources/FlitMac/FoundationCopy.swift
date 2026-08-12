@@ -1,6 +1,29 @@
 import Foundation
 
 enum FoundationCopyKey: String {
+    case attentionActionUnavailable = "attention.action.unavailable"
+    case attentionCardEvidence = "attention.card.evidence"
+    case attentionCardFacts = "attention.card.facts"
+    case attentionCardTitle = "attention.card.title"
+    case attentionCategoryCompletion = "attention.category.completion"
+    case attentionCategoryFailure = "attention.category.failure"
+    case attentionCategoryPermission = "attention.category.permission"
+    case attentionCategoryPermissionAudit = "attention.category.permissionAudit"
+    case attentionCategoryQuestion = "attention.category.question"
+    case attentionCategoryRisk = "attention.category.risk"
+    case attentionCategoryStuck = "attention.category.stuck"
+    case attentionCategorySystem = "attention.category.system"
+    case attentionContentUnavailable = "attention.content.unavailable"
+    case attentionDetailsUnavailable = "attention.details.unavailable"
+    case attentionPermissionDetailsRequired = "attention.permission.detailsRequired"
+    case attentionPermissionAllowOnce = "attention.permission.allowOnce"
+    case attentionPermissionDeny = "attention.permission.deny"
+    case attentionSeverityActionRequired = "attention.severity.actionRequired"
+    case attentionSeverityCritical = "attention.severity.critical"
+    case attentionSeverityInformational = "attention.severity.informational"
+    case attentionStatusDeliveryUnknown = "attention.status.deliveryUnknown"
+    case attentionStatusOpen = "attention.status.open"
+    case attentionStatusResponsePending = "attention.status.responsePending"
     case dashboardActivity = "dashboard.activity"
     case dashboardActivityUnknown = "dashboard.activity.unknown"
     case dashboardAttention = "dashboard.attention"
@@ -134,6 +157,30 @@ enum FoundationCopyKey: String {
 
 enum FoundationCopy {
     private static let values: [FoundationCopyKey: String] = [
+        .attentionActionUnavailable: "No action is available for this attention",
+        .attentionCardEvidence: "Evidence: %@ · %@",
+        .attentionCardFacts: "%@ · %@ · %@",
+        .attentionCardTitle: "Highest-priority attention",
+        .attentionCategoryCompletion: "Completion",
+        .attentionCategoryFailure: "Failure",
+        .attentionCategoryPermission: "Permission",
+        .attentionCategoryPermissionAudit: "Permission audit",
+        .attentionCategoryQuestion: "Question",
+        .attentionCategoryRisk: "Risk",
+        .attentionCategoryStuck: "Possibly stuck",
+        .attentionCategorySystem: "System",
+        .attentionContentUnavailable: "Details unavailable: provider content was not retained",
+        .attentionDetailsUnavailable: "Attention details unavailable",
+        .attentionPermissionDetailsRequired:
+            "Response unavailable until the command, cwd, affected paths, and provider request text can be shown",
+        .attentionPermissionAllowOnce: "Allow once",
+        .attentionPermissionDeny: "Deny",
+        .attentionSeverityActionRequired: "Action required",
+        .attentionSeverityCritical: "Critical",
+        .attentionSeverityInformational: "Informational",
+        .attentionStatusDeliveryUnknown: "Delivery could not be confirmed",
+        .attentionStatusOpen: "Open",
+        .attentionStatusResponsePending: "Sending response",
         .dashboardActivity: "Activity: %@ · %d%% confidence",
         .dashboardActivityUnknown: "Activity: Unknown",
         .dashboardAttention: "Attention: %@ · %llu open",
@@ -302,6 +349,41 @@ enum FoundationCopy {
         case .unsupported: key = .runDetailOpenInProviderUnsupported
         case .unknown: key = .runDetailOpenInProviderUnknown
         case .unavailable: key = .runDetailOpenInProviderUnavailable
+        }
+        return text(key)
+    }
+
+    static func attentionCategory(_ category: FlitRunActiveAttentionCategory) -> String {
+        let key: FoundationCopyKey
+        switch category {
+        case .permission: key = .attentionCategoryPermission
+        case .permissionAudit: key = .attentionCategoryPermissionAudit
+        case .question: key = .attentionCategoryQuestion
+        case .risk: key = .attentionCategoryRisk
+        case .failure: key = .attentionCategoryFailure
+        case .stuck: key = .attentionCategoryStuck
+        case .system: key = .attentionCategorySystem
+        case .completion: key = .attentionCategoryCompletion
+        }
+        return text(key)
+    }
+
+    static func attentionSeverity(_ severity: FlitRunActiveAttentionSeverity) -> String {
+        let key: FoundationCopyKey
+        switch severity {
+        case .informational: key = .attentionSeverityInformational
+        case .actionRequired: key = .attentionSeverityActionRequired
+        case .critical: key = .attentionSeverityCritical
+        }
+        return text(key)
+    }
+
+    static func attentionStatus(_ status: FlitRunActiveAttentionStatus) -> String {
+        let key: FoundationCopyKey
+        switch status {
+        case .open: key = .attentionStatusOpen
+        case .responsePending: key = .attentionStatusResponsePending
+        case .deliveryUnknown: key = .attentionStatusDeliveryUnknown
         }
         return text(key)
     }
