@@ -4,7 +4,7 @@ use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: &str = "1.22";
+pub const PROTOCOL_VERSION: &str = "1.23";
 pub const EVENT_PROTOCOL_VERSION: &str = "1.4";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -604,6 +604,92 @@ pub struct RunDetailReadResponse {
     pub history_status: CapabilityStatus,
     pub open_in_provider_status: CapabilityStatus,
     pub events: Vec<RunEvidenceRecord>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunActiveAttentionReadRequest {
+    pub run_id: String,
+    pub expected_run_version: u64,
+    pub client_protocol_version: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunActiveAttentionCategory {
+    Permission,
+    PermissionAudit,
+    Question,
+    Risk,
+    Failure,
+    Stuck,
+    System,
+    Completion,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunActiveAttentionSeverity {
+    Informational,
+    ActionRequired,
+    Critical,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunActiveAttentionStatus {
+    Open,
+    ResponsePending,
+    DeliveryUnknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RunActiveAttentionAction {
+    PermissionResponse {
+        request_id: String,
+        request_version: u64,
+    },
+    StillWorking {
+        occurrence_id: String,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunActiveAttentionItem {
+    pub attention_id: String,
+    pub attention_version: u64,
+    pub category: RunActiveAttentionCategory,
+    pub severity: RunActiveAttentionSeverity,
+    pub blocking: bool,
+    pub status: RunActiveAttentionStatus,
+    pub source_event_id: String,
+    pub source_event_type: String,
+    pub source_observed_at: String,
+    pub content_unavailable_reason: String,
+    pub action: RunActiveAttentionAction,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum RunActiveAttentionSlot {
+    Item(RunActiveAttentionItem),
+    Null,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunActiveAttentionReadResponse {
+    pub protocol_version: String,
+    pub event_schema_version: String,
+    pub run_id: String,
+    pub run_version: u64,
+    pub open_count: u64,
+    pub item: RunActiveAttentionSlot,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2192,6 +2278,164 @@ struct FlitRunDetailReadResponse: Codable, Equatable, Sendable {
         case historyStatus = "history_status"
         case openInProviderStatus = "open_in_provider_status"
         case events
+    }
+}
+
+struct FlitRunActiveAttentionReadRequest: Codable, Equatable, Sendable {
+    let runId: String
+    let expectedRunVersion: UInt64
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case runId = "run_id"
+        case expectedRunVersion = "expected_run_version"
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+enum FlitRunActiveAttentionCategory: String, Codable, Sendable {
+    case permission
+    case permissionAudit = "permission_audit"
+    case question
+    case risk
+    case failure
+    case stuck
+    case system
+    case completion
+}
+
+enum FlitRunActiveAttentionSeverity: String, Codable, Sendable {
+    case informational
+    case actionRequired = "action_required"
+    case critical
+}
+
+enum FlitRunActiveAttentionStatus: String, Codable, Sendable {
+    case open
+    case responsePending = "response_pending"
+    case deliveryUnknown = "delivery_unknown"
+}
+
+enum FlitRunActiveAttentionAction: Codable, Equatable, Sendable {
+    case permissionResponse(requestId: String, requestVersion: UInt64)
+    case stillWorking(occurrenceId: String)
+    case unavailable(reason: String)
+
+    private enum CodingKeys: String, CodingKey {
+        case kind
+        case requestId = "request_id"
+        case requestVersion = "request_version"
+        case occurrenceId = "occurrence_id"
+        case reason
+    }
+
+    private enum Kind: String, Codable {
+        case permissionResponse = "permission_response"
+        case stillWorking = "still_working"
+        case unavailable
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(Kind.self, forKey: .kind) {
+        case .permissionResponse:
+            self = .permissionResponse(
+                requestId: try container.decode(String.self, forKey: .requestId),
+                requestVersion: try container.decode(UInt64.self, forKey: .requestVersion)
+            )
+        case .stillWorking:
+            self = .stillWorking(
+                occurrenceId: try container.decode(String.self, forKey: .occurrenceId)
+            )
+        case .unavailable:
+            self = .unavailable(reason: try container.decode(String.self, forKey: .reason))
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case let .permissionResponse(requestId, requestVersion):
+            try container.encode(Kind.permissionResponse, forKey: .kind)
+            try container.encode(requestId, forKey: .requestId)
+            try container.encode(requestVersion, forKey: .requestVersion)
+        case let .stillWorking(occurrenceId):
+            try container.encode(Kind.stillWorking, forKey: .kind)
+            try container.encode(occurrenceId, forKey: .occurrenceId)
+        case let .unavailable(reason):
+            try container.encode(Kind.unavailable, forKey: .kind)
+            try container.encode(reason, forKey: .reason)
+        }
+    }
+}
+
+struct FlitRunActiveAttentionItem: Codable, Equatable, Sendable {
+    let attentionId: String
+    let attentionVersion: UInt64
+    let category: FlitRunActiveAttentionCategory
+    let severity: FlitRunActiveAttentionSeverity
+    let blocking: Bool
+    let status: FlitRunActiveAttentionStatus
+    let sourceEventId: String
+    let sourceEventType: String
+    let sourceObservedAt: String
+    let contentUnavailableReason: String
+    let action: FlitRunActiveAttentionAction
+
+    private enum CodingKeys: String, CodingKey {
+        case attentionId = "attention_id"
+        case attentionVersion = "attention_version"
+        case category
+        case severity
+        case blocking
+        case status
+        case sourceEventId = "source_event_id"
+        case sourceEventType = "source_event_type"
+        case sourceObservedAt = "source_observed_at"
+        case contentUnavailableReason = "content_unavailable_reason"
+        case action
+    }
+}
+
+enum FlitRunActiveAttentionSlot: Codable, Equatable, Sendable {
+    case item(FlitRunActiveAttentionItem)
+    case null
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() {
+            self = .null
+        } else {
+            self = .item(try container.decode(FlitRunActiveAttentionItem.self))
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case let .item(item):
+            try container.encode(item)
+        case .null:
+            try container.encodeNil()
+        }
+    }
+}
+
+struct FlitRunActiveAttentionReadResponse: Codable, Equatable, Sendable {
+    let protocolVersion: String
+    let eventSchemaVersion: String
+    let runId: String
+    let runVersion: UInt64
+    let openCount: UInt64
+    let item: FlitRunActiveAttentionSlot
+
+    private enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case eventSchemaVersion = "event_schema_version"
+        case runId = "run_id"
+        case runVersion = "run_version"
+        case openCount = "open_count"
+        case item
     }
 }
 

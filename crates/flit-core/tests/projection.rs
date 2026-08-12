@@ -1,8 +1,8 @@
 use flit_core::{
     activity::WaitKind,
     projection::{
-        CHANGES_UNAVAILABLE_REASON, ChangeAttribution, ChangeSummary, ProjectionError,
-        ProjectionEvent, StuckNotificationProjection, replay_dashboard_projection,
+        ActiveAttentionAction, CHANGES_UNAVAILABLE_REASON, ChangeAttribution, ChangeSummary,
+        ProjectionError, ProjectionEvent, StuckNotificationProjection, replay_dashboard_projection,
     },
 };
 use serde_json::{Map, Value, json};
@@ -102,6 +102,18 @@ fn explicit_stuck_transitions_own_dashboard_and_attention_replay() {
     assert_eq!(stuck.dashboard_bucket, "PossiblyStuck");
     assert_eq!(stuck.attention_level, "Informational");
     assert_eq!(stuck.attention_open_count, 1);
+    let primary = stuck
+        .primary_attention
+        .as_ref()
+        .expect("stuck primary attention");
+    assert_eq!(primary.category, "stuck");
+    assert_eq!(primary.source_event_id, "event-4");
+    assert_eq!(
+        primary.action,
+        ActiveAttentionAction::StillWorking {
+            occurrence_id: "occurrence-1".to_owned(),
+        }
+    );
     assert_eq!(
         stuck.current_stuck_occurrence_id.as_deref(),
         Some("occurrence-1")
@@ -652,6 +664,24 @@ fn managed_history_replays_lifecycle_activity_attention_and_unavailable_changes(
         ),
     ];
 
+    let open = replay_dashboard_projection(&events[..5]).expect("open permission projection");
+    let primary = open
+        .primary_attention
+        .as_ref()
+        .expect("open permission primary attention");
+    assert_eq!(primary.attention_version, 5);
+    assert_eq!(
+        primary.content_unavailable_reason,
+        "raw_provider_content_not_retained"
+    );
+    assert_eq!(
+        primary.action,
+        ActiveAttentionAction::PermissionResponse {
+            request_id: "request-1".to_owned(),
+            request_version: 5,
+        }
+    );
+
     let unknown = replay_dashboard_projection(&events).expect("delivery-unknown projection");
     assert_eq!(unknown.lifecycle, "Running");
     assert_eq!(unknown.activity, "Waiting");
@@ -660,6 +690,21 @@ fn managed_history_replays_lifecycle_activity_attention_and_unavailable_changes(
     assert!(unknown.has_active_blocking_request);
     assert_eq!(unknown.attention_level, "ActionRequired");
     assert_eq!(unknown.attention_open_count, 1);
+    let primary = unknown
+        .primary_attention
+        .as_ref()
+        .expect("delivery-unknown primary attention");
+    assert_eq!(primary.category, "permission");
+    assert_eq!(primary.severity, "ActionRequired");
+    assert_eq!(primary.status, "delivery_unknown");
+    assert_eq!(primary.source_event_id, "event-5");
+    assert_eq!(primary.source_event_type, "permission.requested");
+    assert_eq!(
+        primary.action,
+        ActiveAttentionAction::Unavailable {
+            reason: "delivery_unknown_non_retry".to_owned(),
+        }
+    );
     assert_eq!(unknown.dashboard_bucket, "NeedsAttention");
     assert_eq!(
         unknown.changes,
@@ -682,6 +727,7 @@ fn managed_history_replays_lifecycle_activity_attention_and_unavailable_changes(
     let resolved = replay_dashboard_projection(&events).expect("resolved projection");
     assert_eq!(resolved.attention_level, "None");
     assert_eq!(resolved.attention_open_count, 0);
+    assert!(resolved.primary_attention.is_none());
     assert!(!resolved.has_active_blocking_request);
     assert_eq!(resolved.dashboard_bucket, "Working");
 
@@ -697,7 +743,58 @@ fn managed_history_replays_lifecycle_activity_attention_and_unavailable_changes(
     assert_eq!(finished.activity, "Unknown");
     assert_eq!(finished.attention_level, "Informational");
     assert_eq!(finished.attention_open_count, 1);
+    assert_eq!(
+        finished
+            .primary_attention
+            .as_ref()
+            .expect("completion attention")
+            .action,
+        ActiveAttentionAction::Unavailable {
+            reason: "attention_action_not_implemented".to_owned(),
+        }
+    );
     assert_eq!(finished.dashboard_bucket, "Finished");
+}
+
+#[test]
+fn recovery_gap_revokes_the_open_permission_action_authority() {
+    let mut gap = event(
+        6,
+        "diagnostic.sequence_gap",
+        Some("session-1"),
+        json!({
+            "gap_reason": "provider_notifications_unavailable_after_restart",
+            "evidence_unavailable_reason": "raw_provider_content_not_retained"
+        }),
+    );
+    gap.source_kind = "recovery".to_owned();
+    let projection = replay_dashboard_projection(&[
+        event(1, "run.created", None, json!({})),
+        event(2, "session.connected", Some("session-1"), json!({})),
+        event(
+            5,
+            "permission.requested",
+            Some("session-1"),
+            json!({
+                "blocking": true,
+                "request_id": "request-1",
+                "evidence_unavailable_reason": "raw_provider_content_not_retained"
+            }),
+        ),
+        gap,
+    ])
+    .expect("recovery-gap projection");
+
+    let primary = projection
+        .primary_attention
+        .expect("open permission remains visible");
+    assert_eq!(primary.status, "open");
+    assert_eq!(
+        primary.action,
+        ActiveAttentionAction::Unavailable {
+            reason: "provider_request_authority_lost".to_owned(),
+        }
+    );
 }
 
 #[test]
@@ -723,6 +820,15 @@ fn provider_auto_outcome_is_informational_without_a_flit_response_attempt() {
     assert_eq!(projection.lifecycle, "Running");
     assert_eq!(projection.attention_level, "Informational");
     assert_eq!(projection.attention_open_count, 1);
+    let primary = projection
+        .primary_attention
+        .as_ref()
+        .expect("provider audit attention");
+    assert_eq!(primary.category, "permission_audit");
+    assert!(matches!(
+        primary.action,
+        ActiveAttentionAction::Unavailable { .. }
+    ));
     assert_eq!(projection.dashboard_bucket, "Working");
 }
 

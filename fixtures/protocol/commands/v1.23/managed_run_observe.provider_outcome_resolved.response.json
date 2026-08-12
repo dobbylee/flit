@@ -1,0 +1,17 @@
+{
+  "status": "provider_outcome_resolved",
+  "protocol_version": "1.23",
+  "run_id": "run-managed-auto-1",
+  "session_id": "session-managed-auto-1",
+  "provider_thread_id": "codex-thread-auto-1",
+  "provider_turn_id": "codex-turn-auto-1",
+  "provider_item_id": "codex-file-change-1",
+  "provider_decision_id": "codex-review-1",
+  "request_id": "request-provider-auto-1",
+  "request_version": 5,
+  "request_event_id": "event-provider-auto-request-1",
+  "provider_decision": "allowed",
+  "terminal_outcome": "request_resolved",
+  "event_id": "event-provider-auto-resolved-1",
+  "event_version": 6
+}

@@ -355,6 +355,32 @@ fn dashboard_snapshot_and_global_delta_share_one_fixed_cursor_order() {
         .and_then(serde_json::Value::as_object_mut)
         .expect("attention object")
         .insert("open_count".to_owned(), json!(2));
+    run_a_snapshot.attention_level = "ActionRequired".to_owned();
+    let attention = run_a_snapshot
+        .snapshot
+        .get_mut("attention")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("attention object");
+    attention.insert("level".to_owned(), json!("ActionRequired"));
+    attention.insert(
+        "primary".to_owned(),
+        json!({
+            "attention_id": "synthetic-failure-attention",
+            "attention_version": third,
+            "category": "failure",
+            "severity": "ActionRequired",
+            "blocking": false,
+            "status": "open",
+            "source_event_id": "event-a-2",
+            "source_event_type": "run.failed",
+            "source_observed_at": APPLIED_AT,
+            "content_unavailable_reason": "event_evidence_not_hydrated",
+            "action": {
+                "kind": "unavailable",
+                "reason": "attention_action_not_implemented"
+            }
+        }),
+    );
     run_a_snapshot.snapshot.insert(
         "changes".to_owned(),
         json!({
@@ -857,7 +883,8 @@ fn snapshot(
         },
         "attention": {
             "level": "None",
-            "open_count": 0
+            "open_count": 0,
+            "primary": null
         },
         "dashboard_bucket": "Working",
         "last_progress_at": last_progress_at,

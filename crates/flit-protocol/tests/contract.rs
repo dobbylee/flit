@@ -12,12 +12,13 @@ use flit_protocol::{
     ProjectRegistrationResponse, ProjectTrustRequest, ProjectTrustResponse, ProjectsListRequest,
     ProjectsListResponse, ProviderCompatibility, ProviderDiagnosticsRequest,
     ProviderDiagnosticsResponse, ProviderExecutionAfterQuit, ProviderUnavailableReason,
-    QuitImpactReason, QuitImpactRequest, QuitImpactResponse, RunChangeExternalOpenRequest,
-    RunChangeExternalOpenResponse, RunChangesReadRequest, RunChangesReadResponse,
-    RunDetailReadRequest, RunDetailReadResponse, RunEvidenceCategory, StillWorkingPayload,
-    StuckClearedPayload, StuckNotificationDeliveredPayload, StuckNotificationDuePayload,
-    StuckProcessReceipt, SystemHealthRequest, SystemHealthResponse, event_schema_id,
-    event_schema_relative_path, generated_swift_command_contract,
+    QuitImpactReason, QuitImpactRequest, QuitImpactResponse, RunActiveAttentionAction,
+    RunActiveAttentionReadRequest, RunActiveAttentionReadResponse, RunActiveAttentionSlot,
+    RunChangeExternalOpenRequest, RunChangeExternalOpenResponse, RunChangesReadRequest,
+    RunChangesReadResponse, RunDetailReadRequest, RunDetailReadResponse, RunEvidenceCategory,
+    StillWorkingPayload, StuckClearedPayload, StuckNotificationDeliveredPayload,
+    StuckNotificationDuePayload, StuckProcessReceipt, SystemHealthRequest, SystemHealthResponse,
+    event_schema_id, event_schema_relative_path, generated_swift_command_contract,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -131,6 +132,8 @@ fn fixtures_are_bound_to_the_current_protocol_version() {
         "dashboard_read.resync.response.json",
         "dashboard_read.unavailable_changes.response.json",
         "run_detail_read.response.json",
+        "run_active_attention_read.permission.response.json",
+        "run_active_attention_read.empty.response.json",
     ] {
         let fixture: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(repository_path(&command_fixture(&manifest.current, name)))
@@ -608,6 +611,79 @@ fn current_run_detail_and_provider_open_fixtures_are_exact_and_path_free() {
             );
         }
     }
+}
+
+#[test]
+fn current_active_attention_read_is_required_bounded_exact_and_content_safe() {
+    let manifest = read_command_compatibility_manifest();
+    let current = &manifest.current;
+    assert_fixture_round_trip::<RunActiveAttentionReadRequest>(&command_fixture(
+        current,
+        "run_active_attention_read.request.json",
+    ));
+    for name in [
+        "run_active_attention_read.permission.response.json",
+        "run_active_attention_read.empty.response.json",
+    ] {
+        assert_fixture_round_trip::<RunActiveAttentionReadResponse>(&command_fixture(
+            current, name,
+        ));
+    }
+    let permission: RunActiveAttentionReadResponse = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "run_active_attention_read.permission.response.json",
+        )))
+        .expect("active permission fixture should be readable"),
+    )
+    .expect("active permission fixture should match Rust types");
+    assert!(matches!(
+        permission.item,
+        RunActiveAttentionSlot::Item(ref item)
+            if matches!(
+                item.action,
+                RunActiveAttentionAction::PermissionResponse {
+                    request_version: 1842,
+                    ..
+                }
+            )
+    ));
+    let rendered = serde_json::to_string(&permission).expect("attention response JSON");
+    for forbidden in [
+        "canonical_path",
+        "provider_thread_id",
+        "provider_request_id",
+        "raw_payload",
+        "cwd",
+        "secret command",
+    ] {
+        assert!(!rendered.contains(forbidden));
+    }
+
+    let mut missing_item = serde_json::to_value(&permission).expect("attention response value");
+    missing_item
+        .as_object_mut()
+        .expect("attention response object")
+        .remove("item");
+    assert!(serde_json::from_value::<RunActiveAttentionReadResponse>(missing_item).is_err());
+    let mut unknown_action = serde_json::to_value(&permission).expect("attention response value");
+    unknown_action["item"]["action"]["kind"] = serde_json::json!("retry_anyway");
+    assert!(serde_json::from_value::<RunActiveAttentionReadResponse>(unknown_action).is_err());
+    let mut extra_action_fact =
+        serde_json::to_value(&permission).expect("attention response value");
+    extra_action_fact["item"]["action"]["path"] = serde_json::json!("/private/secret");
+    assert!(serde_json::from_value::<RunActiveAttentionReadResponse>(extra_action_fact).is_err());
+
+    let empty: RunActiveAttentionReadResponse = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "run_active_attention_read.empty.response.json",
+        )))
+        .expect("empty attention fixture should be readable"),
+    )
+    .expect("empty attention fixture should match Rust types");
+    assert!(matches!(empty.item, RunActiveAttentionSlot::Null));
+    assert_eq!(empty.open_count, 0);
 }
 
 #[test]
@@ -1190,6 +1266,14 @@ fn generated_swift_project_contract_is_current_and_required_fields_fail_closed()
         "FlitRunEvidenceCategory",
         "FlitRunEvidenceRecord",
         "FlitRunDetailReadResponse",
+        "FlitRunActiveAttentionReadRequest",
+        "FlitRunActiveAttentionCategory",
+        "FlitRunActiveAttentionSeverity",
+        "FlitRunActiveAttentionStatus",
+        "FlitRunActiveAttentionAction",
+        "FlitRunActiveAttentionItem",
+        "FlitRunActiveAttentionSlot",
+        "FlitRunActiveAttentionReadResponse",
         "FlitRunChangesReadRequest",
         "FlitRunChangeHead",
         "FlitRunFileChangeStatus",

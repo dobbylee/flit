@@ -18,8 +18,9 @@ use crate::{
         SignalSource, TimestampMs, WaitKind,
     },
     attention::{
-        AttentionCategory, AttentionDedupeKey, AttentionEvent, AttentionEvidence,
-        AttentionItemDraft, AttentionItemId, AttentionProjection, AttentionSeverity, SourceEventId,
+        AttentionCategory, AttentionDedupeKey, AttentionEvent, AttentionEvidence, AttentionItem,
+        AttentionItemDraft, AttentionItemId, AttentionProjection, AttentionSeverity,
+        AttentionStatus, SourceEventId,
     },
     dashboard::{DashboardBucket, dashboard_bucket},
     lifecycle::{LifecycleEvent, LifecycleProjection, RunLifecycle, SessionId},
@@ -117,6 +118,7 @@ pub struct DashboardProjection {
     pub has_active_blocking_request: bool,
     pub attention_level: String,
     pub attention_open_count: u64,
+    pub primary_attention: Option<ActiveAttentionProjection>,
     pub dashboard_bucket: String,
     pub last_progress_at: Option<String>,
     pub last_progress_event_id: String,
@@ -129,8 +131,41 @@ pub struct DashboardProjection {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ActiveAttentionAction {
+    PermissionResponse {
+        request_id: String,
+        request_version: u64,
+    },
+    StillWorking {
+        occurrence_id: String,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveAttentionProjection {
+    pub attention_id: String,
+    pub attention_version: u64,
+    pub category: String,
+    pub severity: String,
+    pub blocking: bool,
+    pub status: String,
+    pub source_event_id: String,
+    pub source_event_type: String,
+    pub source_observed_at: String,
+    pub content_unavailable_reason: String,
+    pub action: ActiveAttentionAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum PermissionReplayState {
     ManualOpen {
+        request_version: u64,
+        session_id: String,
+    },
+    ManualAuthorityLost {
         request_version: u64,
     },
     ManualPending {
@@ -271,6 +306,17 @@ pub fn replay_dashboard_projection(
         .highest_active_severity()
         .map_or("None", attention_severity_name)
         .to_owned();
+    let primary_attention = active_attention
+        .first()
+        .map(|item| {
+            primary_attention_projection(
+                item,
+                events,
+                &permission_requests,
+                stuck_occurrence_id.as_deref(),
+            )
+        })
+        .transpose()?;
     let last = events.last().expect("non-empty event history");
 
     Ok(DashboardProjection {
@@ -285,6 +331,7 @@ pub fn replay_dashboard_projection(
         has_active_blocking_request: attention.has_active_blocking_request(),
         attention_level,
         attention_open_count,
+        primary_attention,
         dashboard_bucket: bucket_name(dashboard_bucket(&lifecycle, &attention, &stuck_assessment))
             .to_owned(),
         last_progress_at,
@@ -295,6 +342,96 @@ pub fn replay_dashboard_projection(
         stuck_reset,
         changes,
         updated_at: last.observed_at.clone(),
+    })
+}
+
+fn primary_attention_projection(
+    item: &AttentionItem,
+    events: &[ProjectionEvent],
+    permission_requests: &BTreeMap<String, PermissionReplayState>,
+    stuck_occurrence_id: Option<&str>,
+) -> Result<ActiveAttentionProjection, ProjectionError> {
+    let source = events
+        .iter()
+        .find(|event| event.event_id == item.source_event_id().as_str())
+        .ok_or(ProjectionError::Attention)?;
+    let content_unavailable_reason = source
+        .payload
+        .get("evidence_unavailable_reason")
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.trim().is_empty())
+        .unwrap_or("event_evidence_not_hydrated")
+        .to_owned();
+    let action = match item.category() {
+        AttentionCategory::Permission => {
+            let matching = permission_requests.iter().find(|(request_id, _)| {
+                request_item_id(request_id).is_ok_and(|candidate| candidate == *item.item_id())
+            });
+            match matching {
+                Some((
+                    request_id,
+                    PermissionReplayState::ManualOpen {
+                        request_version, ..
+                    },
+                )) if item.status() == AttentionStatus::Open => {
+                    ActiveAttentionAction::PermissionResponse {
+                        request_id: request_id.clone(),
+                        request_version: *request_version,
+                    }
+                }
+                Some((_, PermissionReplayState::ManualAuthorityLost { .. }))
+                    if item.status() == AttentionStatus::Open =>
+                {
+                    ActiveAttentionAction::Unavailable {
+                        reason: "provider_request_authority_lost".to_owned(),
+                    }
+                }
+                Some((_, PermissionReplayState::ManualPending { .. }))
+                    if item.status() == AttentionStatus::ResponsePending =>
+                {
+                    ActiveAttentionAction::Unavailable {
+                        reason: "response_pending".to_owned(),
+                    }
+                }
+                Some((_, PermissionReplayState::ManualDeliveryUnknown { .. }))
+                    if item.status() == AttentionStatus::DeliveryUnknown =>
+                {
+                    ActiveAttentionAction::Unavailable {
+                        reason: "delivery_unknown_non_retry".to_owned(),
+                    }
+                }
+                _ => return Err(ProjectionError::Permission),
+            }
+        }
+        AttentionCategory::Stuck => {
+            let occurrence_id = stuck_occurrence_id.ok_or(ProjectionError::Stuck)?;
+            ActiveAttentionAction::StillWorking {
+                occurrence_id: occurrence_id.to_owned(),
+            }
+        }
+        AttentionCategory::Question => ActiveAttentionAction::Unavailable {
+            reason: "question_response_not_implemented".to_owned(),
+        },
+        AttentionCategory::Failure
+        | AttentionCategory::Risk
+        | AttentionCategory::System
+        | AttentionCategory::Completion
+        | AttentionCategory::PermissionAudit => ActiveAttentionAction::Unavailable {
+            reason: "attention_action_not_implemented".to_owned(),
+        },
+    };
+    Ok(ActiveAttentionProjection {
+        attention_id: item.item_id().as_str().to_owned(),
+        attention_version: item.version(),
+        category: attention_category_name(item.category()).to_owned(),
+        severity: attention_severity_name(item.severity()).to_owned(),
+        blocking: item.blocking(),
+        status: attention_status_name(item.status()).to_owned(),
+        source_event_id: item.source_event_id().as_str().to_owned(),
+        source_event_type: source.event_type.clone(),
+        source_observed_at: source.observed_at.clone(),
+        content_unavailable_reason,
+        action,
     })
 }
 
@@ -981,6 +1118,27 @@ fn attention_events(
     let evidence = attention_evidence(event)?;
     let mut events = Vec::new();
 
+    if permission_authority_is_lost(event) {
+        let lost_session = event.session_id.as_deref();
+        for state in permission_requests.values_mut() {
+            if matches!(
+                state,
+                PermissionReplayState::ManualOpen { session_id, .. }
+                    if Some(session_id.as_str()) == lost_session
+            ) {
+                let PermissionReplayState::ManualOpen {
+                    request_version, ..
+                } = state
+                else {
+                    unreachable!("matched Manual open request")
+                };
+                *state = PermissionReplayState::ManualAuthorityLost {
+                    request_version: *request_version,
+                };
+            }
+        }
+    }
+
     match event.event_type.as_str() {
         "permission.requested" if permission_request_is_blocking(event)? => {
             let request_id = payload_string(event, "request_id")?;
@@ -989,6 +1147,7 @@ fn attention_events(
                     request_id.to_owned(),
                     PermissionReplayState::ManualOpen {
                         request_version: event.ingest_seq,
+                        session_id: session_id(event)?,
                     },
                 )
                 .is_some()
@@ -1043,6 +1202,7 @@ fn attention_events(
                 permission_requests.get(request_id),
                 Some(PermissionReplayState::ManualOpen {
                     request_version: current,
+                    ..
                 }) if *current == request_version
             ) {
                 permission_requests.insert(
@@ -1213,6 +1373,18 @@ fn attention_events(
     Ok(events)
 }
 
+fn permission_authority_is_lost(event: &ProjectionEvent) -> bool {
+    let terminal = matches!(
+        event.event_type.as_str(),
+        "run.completed" | "run.failed" | "run.interrupted" | "run.stopped"
+    );
+    let exact_recovery_gap = event.event_type == "diagnostic.sequence_gap"
+        && event.source_kind == "recovery"
+        && event.payload.get("gap_reason").and_then(Value::as_str)
+            == Some("provider_notifications_unavailable_after_restart");
+    event.session_id.is_some() && (terminal || exact_recovery_gap)
+}
+
 fn attention_evidence(event: &ProjectionEvent) -> Result<AttentionEvidence, ProjectionError> {
     let reason = event
         .payload
@@ -1319,6 +1491,30 @@ const fn attention_severity_name(severity: AttentionSeverity) -> &'static str {
         AttentionSeverity::Informational => "Informational",
         AttentionSeverity::ActionRequired => "ActionRequired",
         AttentionSeverity::Critical => "Critical",
+    }
+}
+
+const fn attention_category_name(category: AttentionCategory) -> &'static str {
+    match category {
+        AttentionCategory::Permission => "permission",
+        AttentionCategory::PermissionAudit => "permission_audit",
+        AttentionCategory::Question => "question",
+        AttentionCategory::Risk => "risk",
+        AttentionCategory::Failure => "failure",
+        AttentionCategory::Stuck => "stuck",
+        AttentionCategory::System => "system",
+        AttentionCategory::Completion => "completion",
+    }
+}
+
+const fn attention_status_name(status: AttentionStatus) -> &'static str {
+    match status {
+        AttentionStatus::Open => "open",
+        AttentionStatus::ResponsePending => "response_pending",
+        AttentionStatus::DeliveryUnknown => "delivery_unknown",
+        AttentionStatus::Resolved => "resolved",
+        AttentionStatus::Acknowledged => "acknowledged",
+        AttentionStatus::Expired => "expired",
     }
 }
 

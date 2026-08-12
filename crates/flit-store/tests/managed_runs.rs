@@ -31,7 +31,8 @@ use flit_store::{
     ManagedStillWorkingRejectedReason, ManagedStuckActivity, ManagedStuckAssessment,
     ManagedStuckLifecycle, ManagedStuckNotificationDelivery, ManagedStuckTransition,
     ManagedStuckTransitionOutcome, ManagedStuckWaitKind, ManagedTurnTerminalOutcome,
-    ProjectDirectoryInspection, ProjectRegistration, ProjectTrustConfirmation, Store, StoreError,
+    ProjectDirectoryInspection, ProjectRegistration, ProjectTrustConfirmation,
+    RunActiveAttentionAction, Store, StoreError,
 };
 use rusqlite::{Connection, params};
 use serde_json::{Map, Value, json};
@@ -1890,6 +1891,12 @@ fn managed_events_atomically_advance_truthful_dashboard_projection_and_reopen() 
     assert_eq!(starting.lifecycle, "Starting");
     assert_eq!(starting.activity, "Unknown");
     assert_eq!(starting.dashboard_bucket, "Working");
+    let empty_attention = store
+        .managed_run_active_attention_context("run-1")
+        .expect("empty active attention");
+    assert_eq!(empty_attention.run_version, starting.version);
+    assert_eq!(empty_attention.open_count, 0);
+    assert!(empty_attention.item.is_none());
     assert_eq!(
         starting.snapshot["changes"],
         json!({
@@ -1943,6 +1950,26 @@ fn managed_events_atomically_advance_truthful_dashboard_projection_and_reopen() 
     assert_eq!(waiting.attention_level, "ActionRequired");
     assert_eq!(waiting.dashboard_bucket, "NeedsAttention");
     assert_eq!(waiting.snapshot["attention"]["open_count"], 1);
+    let active_attention = store
+        .managed_run_active_attention_context("run-1")
+        .expect("active permission attention");
+    assert_eq!(active_attention.run_version, request.ingest_seq);
+    assert_eq!(active_attention.open_count, 1);
+    let active_item = active_attention.item.expect("primary active permission");
+    assert_eq!(active_item.category, "permission");
+    assert_eq!(active_item.source_event_id, request.event_id);
+    assert_eq!(active_item.source_event_type, "permission.requested");
+    assert_eq!(
+        active_item.content_unavailable_reason,
+        "raw_provider_content_not_retained"
+    );
+    assert_eq!(
+        active_item.action,
+        RunActiveAttentionAction::PermissionResponse {
+            request_id: "request-permission".to_owned(),
+            request_version: request.ingest_seq,
+        }
+    );
 
     let attempt = permission_attempt(
         &request,
@@ -1971,6 +1998,12 @@ fn managed_events_atomically_advance_truthful_dashboard_projection_and_reopen() 
     assert_eq!(projection.version, resolved_event.ingest_seq);
     assert_eq!(projection.attention_level, "None");
     assert_eq!(projection.dashboard_bucket, "Working");
+    let resolved_attention = store
+        .managed_run_active_attention_context("run-1")
+        .expect("resolved active attention");
+    assert_eq!(resolved_attention.run_version, resolved_event.ingest_seq);
+    assert_eq!(resolved_attention.open_count, 0);
+    assert!(resolved_attention.item.is_none());
 
     let dashboard = store
         .dashboard_run_snapshots_through(resolved_event.ingest_seq)
@@ -1991,6 +2024,180 @@ fn managed_events_atomically_advance_truthful_dashboard_projection_and_reopen() 
             .expect("reopened projection"),
         projection
     );
+    assert_eq!(
+        reopened
+            .managed_run_active_attention_context("run-1")
+            .expect("reopened active attention"),
+        resolved_attention
+    );
+}
+
+#[test]
+fn active_attention_read_fails_closed_on_stored_action_identity_drift() {
+    let directory = TestDirectory::new("active-attention-corruption");
+    let (mut store, database, project_path) = trusted_store(&directory);
+    let request = open_permission_request(&mut store, &project_path);
+    let connection = Connection::open(database).expect("snapshot corruption connection");
+    let snapshot_json: String = connection
+        .query_row(
+            "SELECT snapshot_json FROM run_snapshots WHERE run_id = 'run-1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("stored snapshot JSON");
+    let mut snapshot: Value = serde_json::from_str(&snapshot_json).expect("snapshot value");
+    snapshot["attention"]["primary"]["action"]["request_version"] = json!(request.ingest_seq - 1);
+    connection
+        .execute(
+            "UPDATE run_snapshots SET snapshot_json = ?1 WHERE run_id = 'run-1'",
+            [serde_json::to_string(&snapshot).expect("corrupt snapshot JSON")],
+        )
+        .expect("corrupt active attention identity");
+    assert!(matches!(
+        store.managed_run_active_attention_context("run-1"),
+        Err(StoreError::StoredRunSnapshotInvalid { .. })
+    ));
+}
+
+#[test]
+fn active_attention_read_fails_closed_on_stored_request_id_drift() {
+    let directory = TestDirectory::new("active-attention-request-id-corruption");
+    let (mut store, database, project_path) = trusted_store(&directory);
+    open_permission_request(&mut store, &project_path);
+    let connection = Connection::open(database).expect("snapshot corruption connection");
+    let snapshot_json: String = connection
+        .query_row(
+            "SELECT snapshot_json FROM run_snapshots WHERE run_id = 'run-1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("stored snapshot JSON");
+    let mut snapshot: Value = serde_json::from_str(&snapshot_json).expect("snapshot value");
+    snapshot["attention"]["primary"]["action"]["request_id"] = json!("request-other");
+    connection
+        .execute(
+            "UPDATE run_snapshots SET snapshot_json = ?1 WHERE run_id = 'run-1'",
+            [serde_json::to_string(&snapshot).expect("corrupt snapshot JSON")],
+        )
+        .expect("corrupt active attention request identity");
+    assert!(matches!(
+        store.managed_run_active_attention_context("run-1"),
+        Err(StoreError::StoredRunSnapshotInvalid { .. })
+    ));
+}
+
+#[test]
+fn active_attention_read_fails_closed_on_stored_open_count_drift() {
+    let directory = TestDirectory::new("active-attention-count-corruption");
+    let (mut store, database, project_path) = trusted_store(&directory);
+    open_permission_request(&mut store, &project_path);
+    let connection = Connection::open(database).expect("snapshot corruption connection");
+    let snapshot_json: String = connection
+        .query_row(
+            "SELECT snapshot_json FROM run_snapshots WHERE run_id = 'run-1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("stored snapshot JSON");
+    let mut snapshot: Value = serde_json::from_str(&snapshot_json).expect("snapshot value");
+    snapshot["attention"]["open_count"] = json!(2);
+    connection
+        .execute(
+            "UPDATE run_snapshots SET snapshot_json = ?1 WHERE run_id = 'run-1'",
+            [serde_json::to_string(&snapshot).expect("corrupt snapshot JSON")],
+        )
+        .expect("corrupt active attention count");
+    assert!(matches!(
+        store.managed_run_active_attention_context("run-1"),
+        Err(StoreError::StoredRunSnapshotInvalid { .. })
+    ));
+}
+
+#[test]
+fn active_attention_read_fails_closed_on_stored_unavailable_reason_drift() {
+    let directory = TestDirectory::new("active-attention-reason-corruption");
+    let (mut store, database, project_path) = trusted_store(&directory);
+    let request = open_permission_request(&mut store, &project_path);
+    let attempt = permission_attempt(
+        &request,
+        "attempt-attention-reason",
+        ManagedPermissionDecision::Deny,
+    );
+    store
+        .submit_managed_permission_response(attempt.clone())
+        .expect("submit response");
+    store
+        .finish_managed_permission_response(permission_result(
+            &attempt,
+            "event-attention-reason-unknown",
+            ManagedPermissionResponseResultKind::DeliveryUnknown(
+                ManagedPermissionDeliveryUnknownReason::ProviderOutcomeAmbiguous,
+            ),
+        ))
+        .expect("finish delivery unknown");
+    let connection = Connection::open(database).expect("snapshot corruption connection");
+    let snapshot_json: String = connection
+        .query_row(
+            "SELECT snapshot_json FROM run_snapshots WHERE run_id = 'run-1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("stored snapshot JSON");
+    let mut snapshot: Value = serde_json::from_str(&snapshot_json).expect("snapshot value");
+    snapshot["attention"]["primary"]["action"]["reason"] = json!("/private/secret");
+    connection
+        .execute(
+            "UPDATE run_snapshots SET snapshot_json = ?1 WHERE run_id = 'run-1'",
+            [serde_json::to_string(&snapshot).expect("corrupt snapshot JSON")],
+        )
+        .expect("corrupt unavailable action reason");
+    assert!(matches!(
+        store.managed_run_active_attention_context("run-1"),
+        Err(StoreError::StoredRunSnapshotInvalid { .. })
+    ));
+}
+
+#[test]
+fn reopen_rebuilds_the_exact_previous_active_attention_snapshot_shape() {
+    let directory = TestDirectory::new("active-attention-upgrade");
+    let (mut store, database, project_path) = trusted_store(&directory);
+    let request = open_permission_request(&mut store, &project_path);
+    drop(store);
+    let connection = Connection::open(&database).expect("legacy snapshot connection");
+    let snapshot_json: String = connection
+        .query_row(
+            "SELECT snapshot_json FROM run_snapshots WHERE run_id = 'run-1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("stored snapshot JSON");
+    let mut snapshot: Value = serde_json::from_str(&snapshot_json).expect("snapshot value");
+    snapshot["attention"]
+        .as_object_mut()
+        .expect("attention object")
+        .remove("primary")
+        .expect("current primary field");
+    connection
+        .execute(
+            "UPDATE run_snapshots SET snapshot_json = ?1 WHERE run_id = 'run-1'",
+            [serde_json::to_string(&snapshot).expect("legacy snapshot JSON")],
+        )
+        .expect("write exact previous snapshot shape");
+    drop(connection);
+
+    let reopened = Store::open(&database, CREATED_AT).expect("upgrade exact legacy snapshot");
+    let attention = reopened
+        .managed_run_active_attention_context("run-1")
+        .expect("rebuilt active attention");
+    assert_eq!(attention.run_version, request.ingest_seq);
+    assert_eq!(attention.open_count, 1);
+    assert!(matches!(
+        attention.item.expect("rebuilt primary attention").action,
+        RunActiveAttentionAction::PermissionResponse {
+            request_version,
+            ..
+        } if request_version == request.ingest_seq
+    ));
 }
 
 #[test]

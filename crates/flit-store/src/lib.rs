@@ -8,9 +8,9 @@ use std::{
 
 use flit_core::activity::WaitKind as CoreWaitKind;
 use flit_core::projection::{
-    ChangeAttribution as CoreChangeAttribution, ChangeSummary as CoreChangeSummary,
-    ProjectionError, ProjectionEvent, StuckNotificationProjection as CoreStuckNotification,
-    replay_dashboard_projection,
+    ActiveAttentionAction as CoreActiveAttentionAction, ChangeAttribution as CoreChangeAttribution,
+    ChangeSummary as CoreChangeSummary, DashboardProjection, ProjectionError, ProjectionEvent,
+    StuckNotificationProjection as CoreStuckNotification, replay_dashboard_projection,
 };
 use flit_protocol::{
     EventEnvelope, EventProtocolVersion, EventSource, EventSourceKind, GitBaselinePayload, GitHead,
@@ -391,6 +391,42 @@ pub struct ManagedRunDetailContext {
     pub run_version: u64,
     pub history_status: String,
     pub open_in_provider_status: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RunActiveAttentionAction {
+    PermissionResponse {
+        request_id: String,
+        request_version: u64,
+    },
+    StillWorking {
+        occurrence_id: String,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunActiveAttentionItem {
+    pub attention_id: String,
+    pub attention_version: u64,
+    pub category: String,
+    pub severity: String,
+    pub blocking: bool,
+    pub status: String,
+    pub source_event_id: String,
+    pub source_event_type: String,
+    pub source_observed_at: String,
+    pub content_unavailable_reason: String,
+    pub action: RunActiveAttentionAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedRunActiveAttentionContext {
+    pub run_version: u64,
+    pub open_count: u64,
+    pub item: Option<RunActiveAttentionItem>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2490,6 +2526,39 @@ impl Store {
             history_status: stored_capability_status(&session, "history")?,
             open_in_provider_status: stored_capability_status(&session, "open_in_provider")?,
         })
+    }
+
+    pub fn managed_run_active_attention_context(
+        &self,
+        run_id: &str,
+    ) -> Result<ManagedRunActiveAttentionContext, StoreError> {
+        if run_id.trim().is_empty() {
+            return Err(StoreError::InvalidRunDetailRequest { field: "run_id" });
+        }
+        let snapshot =
+            load_run_snapshot(&self.connection, run_id)?.ok_or_else(|| StoreError::MissingRun {
+                run_id: run_id.to_owned(),
+            })?;
+        let context = active_attention_context(&snapshot).map_err(|_| {
+            StoreError::StoredRunSnapshotInvalid {
+                run_id: run_id.to_owned(),
+                field: "attention.primary",
+            }
+        })?;
+        let events = load_run_event_history(&self.connection, run_id)?;
+        let projection = replay_dashboard_projection(&events).map_err(|_| {
+            StoreError::StoredRunSnapshotInvalid {
+                run_id: run_id.to_owned(),
+                field: "attention.primary",
+            }
+        })?;
+        if context != active_attention_context_from_projection(&projection) {
+            return Err(StoreError::StoredRunSnapshotInvalid {
+                run_id: run_id.to_owned(),
+                field: "attention.primary",
+            });
+        }
+        Ok(context)
     }
 
     pub fn managed_session(&self, session_id: &str) -> Result<Option<ManagedSession>, StoreError> {
@@ -5628,6 +5697,39 @@ fn refresh_managed_dashboard_projection(
         "attention": {
             "level": projection.attention_level,
             "open_count": projection.attention_open_count,
+            "primary": projection.primary_attention.as_ref().map(|item| {
+                let action = match &item.action {
+                    CoreActiveAttentionAction::PermissionResponse {
+                        request_id,
+                        request_version,
+                    } => json!({
+                        "kind": "permission_response",
+                        "request_id": request_id,
+                        "request_version": *request_version,
+                    }),
+                    CoreActiveAttentionAction::StillWorking { occurrence_id } => json!({
+                        "kind": "still_working",
+                        "occurrence_id": occurrence_id,
+                    }),
+                    CoreActiveAttentionAction::Unavailable { reason } => json!({
+                        "kind": "unavailable",
+                        "reason": reason,
+                    }),
+                };
+                json!({
+                    "attention_id": item.attention_id,
+                    "attention_version": item.attention_version,
+                    "category": item.category,
+                    "severity": item.severity,
+                    "blocking": item.blocking,
+                    "status": item.status,
+                    "source_event_id": item.source_event_id,
+                    "source_event_type": item.source_event_type,
+                    "source_observed_at": item.source_observed_at,
+                    "content_unavailable_reason": item.content_unavailable_reason,
+                    "action": action,
+                })
+            }),
         },
         "dashboard_bucket": projection.dashboard_bucket,
         "last_progress_at": projection.last_progress_at,
@@ -5655,7 +5757,83 @@ fn refresh_managed_dashboard_projection(
         snapshot,
         updated_at: projection.updated_at,
     };
+    if let Some(upgraded) = replace_exact_legacy_active_attention_snapshot(connection, &draft)? {
+        return Ok(Some(upgraded));
+    }
     write_run_snapshot_on(connection, draft).map(Some)
+}
+
+fn replace_exact_legacy_active_attention_snapshot(
+    connection: &Connection,
+    draft: &RunSnapshotDraft,
+) -> Result<Option<WriteRunSnapshotOutcome>, StoreError> {
+    let stored = connection
+        .query_row(
+            "SELECT version, lifecycle, activity, activity_confidence, attention_level, dashboard_bucket, last_progress_at, last_liveness_at, snapshot_json, updated_at FROM run_snapshots WHERE run_id = ?1",
+            [&draft.run_id],
+            |row| {
+                Ok(StoredRunSnapshot {
+                    version: row.get(0)?,
+                    lifecycle: row.get(1)?,
+                    activity: row.get(2)?,
+                    activity_confidence: row.get(3)?,
+                    attention_level: row.get(4)?,
+                    dashboard_bucket: row.get(5)?,
+                    last_progress_at: row.get(6)?,
+                    last_liveness_at: row.get(7)?,
+                    snapshot_json: row.get(8)?,
+                    updated_at: row.get(9)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(StoreError::Sqlite)?;
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    let exact_scalar_match = u64::try_from(stored.version).ok() == Some(draft.version)
+        && stored.lifecycle == draft.lifecycle
+        && stored.activity == draft.activity
+        && stored.activity_confidence == draft.activity_confidence
+        && stored.attention_level == draft.attention_level
+        && stored.dashboard_bucket == draft.dashboard_bucket
+        && stored.last_progress_at == draft.last_progress_at
+        && stored.last_liveness_at == draft.last_liveness_at
+        && stored.updated_at == draft.updated_at;
+    if !exact_scalar_match {
+        return Ok(None);
+    }
+    let mut exact_legacy = draft.snapshot.clone();
+    let removed = exact_legacy
+        .get_mut("attention")
+        .and_then(Value::as_object_mut)
+        .and_then(|attention| attention.remove("primary"));
+    if removed.is_none() {
+        return Ok(None);
+    }
+    let stored_snapshot = serde_json::from_str::<Map<String, Value>>(&stored.snapshot_json)
+        .map_err(|source| StoreError::StoredRunSnapshotJson {
+            run_id: draft.run_id.clone(),
+            source,
+        })?;
+    if stored_snapshot != exact_legacy {
+        return Ok(None);
+    }
+    let snapshot_json = serde_json::to_string(&draft.snapshot).map_err(StoreError::Json)?;
+    let changed = connection
+        .execute(
+            "UPDATE run_snapshots SET snapshot_json = ?2 WHERE run_id = ?1 AND version = ?3 AND snapshot_json = ?4",
+            params![draft.run_id, snapshot_json, draft.version as i64, stored.snapshot_json],
+        )
+        .map_err(StoreError::Sqlite)?;
+    if changed != 1 {
+        return Err(StoreError::RunSnapshotConcurrentChange {
+            run_id: draft.run_id.clone(),
+        });
+    }
+    Ok(Some(WriteRunSnapshotOutcome::Replaced(RunSnapshot::from(
+        draft.clone(),
+    ))))
 }
 
 fn load_run_event_history(
@@ -5671,6 +5849,9 @@ fn load_run_event_history(
                         LENGTH(CAST(run_id AS BLOB)) +
                         COALESCE(LENGTH(CAST(session_id AS BLOB)), 0) +
                         CASE
+                            WHEN protocol_version = '1.2'
+                             AND event_type = 'diagnostic.sequence_gap'
+                            THEN LENGTH(CAST(source_json AS BLOB))
                             WHEN protocol_version = '1.3'
                              AND event_type IN ('run.possibly_stuck', 'run.stuck_cleared')
                             THEN LENGTH(CAST(source_json AS BLOB))
@@ -5695,6 +5876,9 @@ fn load_run_event_history(
         .prepare(
             "SELECT ingest_seq, protocol_version, event_id, session_id,
                     CASE
+                        WHEN protocol_version = '1.2'
+                         AND event_type = 'diagnostic.sequence_gap'
+                        THEN source_json
                         WHEN protocol_version = '1.3'
                          AND event_type IN ('run.possibly_stuck', 'run.stuck_cleared')
                         THEN source_json
@@ -5929,6 +6113,18 @@ fn validate_snapshot_json(snapshot: &RunSnapshotDraft) -> Result<(), StoreError>
             field: "attention.open_count",
         });
     }
+    let active_attention =
+        active_attention_context_from_snapshot(snapshot.version, &snapshot.snapshot)?;
+    if active_attention
+        .item
+        .as_ref()
+        .map(|item| item.severity.as_str())
+        != (active_attention.open_count > 0).then_some(snapshot.attention_level.as_str())
+    {
+        return Err(StoreError::InvalidRunSnapshot {
+            field: "attention.primary",
+        });
+    }
     let has_active_occurrence = if snapshot.snapshot.contains_key("stuck") {
         validate_stuck_snapshot(&snapshot.snapshot)?;
         snapshot.snapshot["stuck"]["occurrence_id"]
@@ -6000,6 +6196,197 @@ fn validate_snapshot_json(snapshot: &RunSnapshotDraft) -> Result<(), StoreError>
         "last_liveness_at",
         snapshot.last_liveness_at.as_deref(),
     )
+}
+
+fn active_attention_context(
+    snapshot: &RunSnapshot,
+) -> Result<ManagedRunActiveAttentionContext, StoreError> {
+    active_attention_context_from_snapshot(snapshot.version, &snapshot.snapshot)
+}
+
+fn active_attention_context_from_projection(
+    projection: &DashboardProjection,
+) -> ManagedRunActiveAttentionContext {
+    let item = projection.primary_attention.as_ref().map(|item| {
+        let action = match &item.action {
+            CoreActiveAttentionAction::PermissionResponse {
+                request_id,
+                request_version,
+            } => RunActiveAttentionAction::PermissionResponse {
+                request_id: request_id.clone(),
+                request_version: *request_version,
+            },
+            CoreActiveAttentionAction::StillWorking { occurrence_id } => {
+                RunActiveAttentionAction::StillWorking {
+                    occurrence_id: occurrence_id.clone(),
+                }
+            }
+            CoreActiveAttentionAction::Unavailable { reason } => {
+                RunActiveAttentionAction::Unavailable {
+                    reason: reason.clone(),
+                }
+            }
+        };
+        RunActiveAttentionItem {
+            attention_id: item.attention_id.clone(),
+            attention_version: item.attention_version,
+            category: item.category.clone(),
+            severity: item.severity.clone(),
+            blocking: item.blocking,
+            status: item.status.clone(),
+            source_event_id: item.source_event_id.clone(),
+            source_event_type: item.source_event_type.clone(),
+            source_observed_at: item.source_observed_at.clone(),
+            content_unavailable_reason: item.content_unavailable_reason.clone(),
+            action,
+        }
+    });
+    ManagedRunActiveAttentionContext {
+        run_version: projection.version,
+        open_count: projection.attention_open_count,
+        item,
+    }
+}
+
+fn active_attention_context_from_snapshot(
+    run_version: u64,
+    snapshot: &Map<String, Value>,
+) -> Result<ManagedRunActiveAttentionContext, StoreError> {
+    let invalid = || StoreError::InvalidRunSnapshot {
+        field: "attention.primary",
+    };
+    let attention = snapshot
+        .get("attention")
+        .and_then(Value::as_object)
+        .ok_or_else(invalid)?;
+    if attention.len() != 3 {
+        return Err(invalid());
+    }
+    let open_count = attention
+        .get("open_count")
+        .and_then(Value::as_u64)
+        .filter(|count| *count <= MAX_JSON_SAFE_INTEGER)
+        .ok_or_else(invalid)?;
+    let item = match attention.get("primary") {
+        Some(Value::Null) if open_count == 0 => None,
+        Some(Value::Object(item)) if open_count > 0 && item.len() == 11 => {
+            let token = |field: &'static str| {
+                item.get(field)
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty() && value.len() <= 4 * 1024)
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(invalid)
+            };
+            let category = token("category")?;
+            if !matches!(
+                category.as_str(),
+                "permission"
+                    | "permission_audit"
+                    | "question"
+                    | "risk"
+                    | "failure"
+                    | "stuck"
+                    | "system"
+                    | "completion"
+            ) {
+                return Err(invalid());
+            }
+            let severity = token("severity")?;
+            if !matches!(
+                severity.as_str(),
+                "Informational" | "ActionRequired" | "Critical"
+            ) {
+                return Err(invalid());
+            }
+            let status = token("status")?;
+            if !matches!(
+                status.as_str(),
+                "open" | "response_pending" | "delivery_unknown"
+            ) {
+                return Err(invalid());
+            }
+            let attention_version = item
+                .get("attention_version")
+                .and_then(Value::as_u64)
+                .filter(|value| {
+                    *value > 0 && *value <= run_version && *value <= MAX_JSON_SAFE_INTEGER
+                })
+                .ok_or_else(invalid)?;
+            let action = item
+                .get("action")
+                .and_then(Value::as_object)
+                .ok_or_else(invalid)?;
+            let action = match action.get("kind").and_then(Value::as_str) {
+                Some("permission_response") if action.len() == 3 => {
+                    let request_id = action
+                        .get("request_id")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty() && value.len() <= 256)
+                        .ok_or_else(invalid)?
+                        .to_owned();
+                    let request_version = action
+                        .get("request_version")
+                        .and_then(Value::as_u64)
+                        .filter(|value| *value > 0 && *value <= MAX_JSON_SAFE_INTEGER)
+                        .ok_or_else(invalid)?;
+                    if category != "permission"
+                        || status != "open"
+                        || request_version != attention_version
+                    {
+                        return Err(invalid());
+                    }
+                    RunActiveAttentionAction::PermissionResponse {
+                        request_id,
+                        request_version,
+                    }
+                }
+                Some("still_working") if action.len() == 2 => {
+                    let occurrence_id = action
+                        .get("occurrence_id")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty() && value.len() <= 256)
+                        .ok_or_else(invalid)?
+                        .to_owned();
+                    if category != "stuck" || status != "open" {
+                        return Err(invalid());
+                    }
+                    RunActiveAttentionAction::StillWorking { occurrence_id }
+                }
+                Some("unavailable") if action.len() == 2 => {
+                    let reason = action
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty() && value.len() <= 4 * 1024)
+                        .ok_or_else(invalid)?
+                        .to_owned();
+                    RunActiveAttentionAction::Unavailable { reason }
+                }
+                _ => return Err(invalid()),
+            };
+            Some(RunActiveAttentionItem {
+                attention_id: token("attention_id")?,
+                attention_version,
+                category,
+                severity,
+                blocking: item
+                    .get("blocking")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(invalid)?,
+                status,
+                source_event_id: token("source_event_id")?,
+                source_event_type: token("source_event_type")?,
+                source_observed_at: token("source_observed_at")?,
+                content_unavailable_reason: token("content_unavailable_reason")?,
+                action,
+            })
+        }
+        _ => return Err(invalid()),
+    };
+    Ok(ManagedRunActiveAttentionContext {
+        run_version,
+        open_count,
+        item,
+    })
 }
 
 fn validate_stuck_snapshot(snapshot: &Map<String, Value>) -> Result<(), StoreError> {

@@ -33,6 +33,12 @@ use flit_protocol::{
     ProviderCapabilityEntry, ProviderCompatibility as ProtocolProviderCompatibility,
     ProviderDiagnosticsResponse, ProviderExecutionAfterQuit, ProviderKind as ProtocolProviderKind,
     ProviderUnavailableReason, QuitImpactReason, QuitImpactResponse, QuitImpactRun,
+    RunActiveAttentionAction as ProtocolRunActiveAttentionAction,
+    RunActiveAttentionCategory as ProtocolRunActiveAttentionCategory,
+    RunActiveAttentionItem as ProtocolRunActiveAttentionItem, RunActiveAttentionReadRequest,
+    RunActiveAttentionReadResponse,
+    RunActiveAttentionSeverity as ProtocolRunActiveAttentionSeverity, RunActiveAttentionSlot,
+    RunActiveAttentionStatus as ProtocolRunActiveAttentionStatus,
     RunChangeExternalOpenDisabledReason, RunChangeExternalOpenRequest,
     RunChangeExternalOpenResponse, RunChangeHead, RunChangesReadRequest, RunChangesReadResponse,
     RunChangesUnavailableReason, RunDetailReadRequest, RunDetailReadResponse, RunEvidenceRecord,
@@ -59,7 +65,9 @@ use flit_store::{
     ManagedStillWorkingAction, ManagedStillWorkingOutcome,
     ManagedStillWorkingRejectedReason as StoreStillWorkingRejectedReason, Project,
     ProjectDirectoryInspection, ProjectListCursor as StoreProjectListCursor, ProjectRegistration,
-    ProjectRegistrationOutcome, ProjectTrustConfirmation, ProjectTrustOutcome, Store, StoreError,
+    ProjectRegistrationOutcome, ProjectTrustConfirmation, ProjectTrustOutcome,
+    RunActiveAttentionAction as StoreRunActiveAttentionAction,
+    RunActiveAttentionItem as StoreRunActiveAttentionItem, Store, StoreError,
 };
 #[cfg(test)]
 use flit_store::{
@@ -1861,6 +1869,118 @@ fn run_detail_read_with(
 #[uniffi::export]
 pub fn run_detail_read_json(request_json: String) -> Result<String, BridgeError> {
     protect(|| run_detail_read_with(&CORE, &request_json))
+}
+
+fn active_attention_item(
+    item: StoreRunActiveAttentionItem,
+) -> Result<ProtocolRunActiveAttentionItem, BridgeError> {
+    let category = match item.category.as_str() {
+        "permission" => ProtocolRunActiveAttentionCategory::Permission,
+        "permission_audit" => ProtocolRunActiveAttentionCategory::PermissionAudit,
+        "question" => ProtocolRunActiveAttentionCategory::Question,
+        "risk" => ProtocolRunActiveAttentionCategory::Risk,
+        "failure" => ProtocolRunActiveAttentionCategory::Failure,
+        "stuck" => ProtocolRunActiveAttentionCategory::Stuck,
+        "system" => ProtocolRunActiveAttentionCategory::System,
+        "completion" => ProtocolRunActiveAttentionCategory::Completion,
+        _ => return Err(BridgeError::StorageFailure),
+    };
+    let severity = match item.severity.as_str() {
+        "Informational" => ProtocolRunActiveAttentionSeverity::Informational,
+        "ActionRequired" => ProtocolRunActiveAttentionSeverity::ActionRequired,
+        "Critical" => ProtocolRunActiveAttentionSeverity::Critical,
+        _ => return Err(BridgeError::StorageFailure),
+    };
+    let status = match item.status.as_str() {
+        "open" => ProtocolRunActiveAttentionStatus::Open,
+        "response_pending" => ProtocolRunActiveAttentionStatus::ResponsePending,
+        "delivery_unknown" => ProtocolRunActiveAttentionStatus::DeliveryUnknown,
+        _ => return Err(BridgeError::StorageFailure),
+    };
+    let action = match item.action {
+        StoreRunActiveAttentionAction::PermissionResponse {
+            request_id,
+            request_version,
+        } => ProtocolRunActiveAttentionAction::PermissionResponse {
+            request_id,
+            request_version,
+        },
+        StoreRunActiveAttentionAction::StillWorking { occurrence_id } => {
+            ProtocolRunActiveAttentionAction::StillWorking { occurrence_id }
+        }
+        StoreRunActiveAttentionAction::Unavailable { reason } => {
+            ProtocolRunActiveAttentionAction::Unavailable { reason }
+        }
+    };
+    Ok(ProtocolRunActiveAttentionItem {
+        attention_id: item.attention_id,
+        attention_version: item.attention_version,
+        category,
+        severity,
+        blocking: item.blocking,
+        status,
+        source_event_id: item.source_event_id,
+        source_event_type: item.source_event_type,
+        source_observed_at: item.source_observed_at,
+        content_unavailable_reason: item.content_unavailable_reason,
+        action,
+    })
+}
+
+fn run_active_attention_read_with(
+    core_manager: &CoreManager,
+    request_json: &str,
+) -> Result<String, BridgeError> {
+    if request_json.len() > MAX_MANAGED_RUN_REQUEST_BYTES {
+        return run_command_json(|| -> Result<RunActiveAttentionReadResponse, _> {
+            Err(BridgeError::InvalidRunRequest)
+        });
+    }
+    let request = serde_json::from_str::<RunActiveAttentionReadRequest>(request_json)
+        .map_err(|_| BridgeError::InvalidRunRequest);
+    run_command_json(|| {
+        let request = request?;
+        if request.client_protocol_version != PROTOCOL_VERSION {
+            return Err(BridgeError::ProtocolMismatch);
+        }
+        if request.run_id.trim().is_empty()
+            || request.run_id.len() > MAX_PROJECT_ID_BYTES
+            || request.run_id.contains('\0')
+            || request.expected_run_version == 0
+            || request.expected_run_version > flit_protocol::MAX_JSON_SAFE_INTEGER
+        {
+            return Err(BridgeError::InvalidRunRequest);
+        }
+        core_manager.with_ready_core(|core| {
+            let context = core
+                .store
+                .managed_run_active_attention_context(&request.run_id)
+                .map_err(|error| match error {
+                    StoreError::MissingRun { .. } => BridgeError::RunNotFound,
+                    _ => BridgeError::StorageFailure,
+                })?;
+            if context.run_version != request.expected_run_version {
+                return Err(BridgeError::RunVersionStale);
+            }
+            let item = match context.item {
+                Some(item) => RunActiveAttentionSlot::Item(active_attention_item(item)?),
+                None => RunActiveAttentionSlot::Null,
+            };
+            Ok(RunActiveAttentionReadResponse {
+                protocol_version: PROTOCOL_VERSION.to_owned(),
+                event_schema_version: EVENT_PROTOCOL_VERSION.to_owned(),
+                run_id: request.run_id,
+                run_version: context.run_version,
+                open_count: context.open_count,
+                item,
+            })
+        })
+    })
+}
+
+#[uniffi::export]
+pub fn run_active_attention_read_json(request_json: String) -> Result<String, BridgeError> {
+    protect(|| run_active_attention_read_with(&CORE, &request_json))
 }
 
 fn run_change_head(oid: Option<String>) -> RunChangeHead {
@@ -5344,6 +5464,122 @@ mod tests {
     }
 
     #[test]
+    fn active_attention_read_is_exact_content_safe_and_read_only() {
+        let (_directory, manager, _) = observation_core("active-attention-read");
+        let initial = manager
+            .with_ready_core(|core| {
+                core.store
+                    .managed_run_active_attention_context("run-observe")
+                    .map_err(|_| BridgeError::StorageFailure)
+            })
+            .expect("initial active attention context");
+        let empty_json = run_active_attention_read_with(
+            &manager,
+            &serde_json::to_string(&RunActiveAttentionReadRequest {
+                run_id: "run-observe".to_owned(),
+                expected_run_version: initial.run_version,
+                client_protocol_version: PROTOCOL_VERSION.to_owned(),
+            })
+            .expect("empty active attention request"),
+        )
+        .expect("empty active attention response");
+        let empty: RunActiveAttentionReadResponse =
+            serde_json::from_str(&empty_json).expect("empty active attention JSON");
+        assert_eq!(empty.open_count, 0);
+        assert!(matches!(empty.item, RunActiveAttentionSlot::Null));
+
+        let permission = open_permission(&manager);
+        let ManagedRunObserveResponse::PermissionRequested {
+            request_id,
+            request_version,
+            ..
+        } = permission
+        else {
+            panic!("expected permission request");
+        };
+        let cursor = manager
+            .with_ready_core(|core| {
+                core.store
+                    .latest_ingest_seq()
+                    .map_err(|_| BridgeError::StorageFailure)
+            })
+            .expect("attention cursor");
+        let response_json = run_active_attention_read_with(
+            &manager,
+            &serde_json::to_string(&RunActiveAttentionReadRequest {
+                run_id: "run-observe".to_owned(),
+                expected_run_version: request_version,
+                client_protocol_version: PROTOCOL_VERSION.to_owned(),
+            })
+            .expect("active attention request"),
+        )
+        .expect("active attention response");
+        for forbidden in [
+            "/private/tmp",
+            "provider_thread_id",
+            "provider_request_id",
+            "raw_payload",
+            "secret command",
+        ] {
+            assert!(!response_json.contains(forbidden));
+        }
+        let response: RunActiveAttentionReadResponse =
+            serde_json::from_str(&response_json).expect("active attention JSON");
+        assert_eq!(response.run_version, request_version);
+        assert_eq!(response.open_count, 1);
+        assert!(matches!(
+            response.item,
+            RunActiveAttentionSlot::Item(item)
+                if item.source_event_type == "permission.requested"
+                    && item.content_unavailable_reason == "raw_provider_content_not_retained"
+                    && matches!(
+                        item.action,
+                        ProtocolRunActiveAttentionAction::PermissionResponse {
+                            request_id: ref actual_request_id,
+                            request_version: actual_request_version,
+                        } if actual_request_id == &request_id
+                            && actual_request_version == request_version
+                    )
+        ));
+
+        for invalid in [
+            "{}".to_owned(),
+            serde_json::to_string(&RunActiveAttentionReadRequest {
+                run_id: "run-observe".to_owned(),
+                expected_run_version: request_version - 1,
+                client_protocol_version: PROTOCOL_VERSION.to_owned(),
+            })
+            .expect("stale attention request"),
+            serde_json::to_string(&RunActiveAttentionReadRequest {
+                run_id: "run-observe".to_owned(),
+                expected_run_version: request_version,
+                client_protocol_version: "0.0".to_owned(),
+            })
+            .expect("mismatched attention request"),
+        ] {
+            let response = run_active_attention_read_with(&manager, &invalid)
+                .expect("typed active attention error");
+            assert!(matches!(
+                command_error(&response).code,
+                CommandErrorCode::InvalidRunRequest
+                    | CommandErrorCode::RunVersionStale
+                    | CommandErrorCode::ProtocolMismatch
+            ));
+        }
+        manager
+            .with_ready_core(|core| {
+                assert_eq!(
+                    core.store
+                        .latest_ingest_seq()
+                        .map_err(|_| BridgeError::StorageFailure)?,
+                    cursor
+                );
+                Ok(())
+            })
+            .expect("active attention read has no side effect");
+    }
+
+    #[test]
     fn dashboard_resync_priority_and_response_byte_cap_are_explicit() {
         assert_eq!(
             dashboard_resync_reason("stale", "current", 9, 8, 7),
@@ -6032,6 +6268,79 @@ mod tests {
                 Ok(())
             })
             .expect("restart Store state");
+    }
+
+    #[test]
+    fn restarted_core_exposes_an_open_permission_without_stale_action_authority() {
+        let (directory, manager, _) = observation_core("open-permission-restart");
+        let permission = open_permission(&manager);
+        let request =
+            permission_response_request(&permission, ManagedRunPermissionDecision::AllowOnce);
+        drop(manager);
+
+        let restarted = CoreManager::default();
+        restarted
+            .initialize(directory.0.to_str().expect("UTF-8 restart path"))
+            .expect("restart Core");
+        let context = restarted
+            .with_ready_core(|core| {
+                let cursor = core
+                    .store
+                    .latest_ingest_seq()
+                    .map_err(|_| BridgeError::StorageFailure)?;
+                let events = core
+                    .store
+                    .run_events_through("run-observe", 0, cursor, 10)
+                    .map_err(|_| BridgeError::StorageFailure)?;
+                assert_eq!(
+                    events.events.last().map(|event| event.event_type.as_str()),
+                    Some("diagnostic.sequence_gap"),
+                    "unexpected restart events: {events:?}"
+                );
+                core.store
+                    .managed_run_active_attention_context("run-observe")
+                    .map_err(|_| BridgeError::StorageFailure)
+            })
+            .expect("restarted active attention context");
+        let response_json = run_active_attention_read_with(
+            &restarted,
+            &serde_json::to_string(&RunActiveAttentionReadRequest {
+                run_id: "run-observe".to_owned(),
+                expected_run_version: context.run_version,
+                client_protocol_version: PROTOCOL_VERSION.to_owned(),
+            })
+            .expect("restarted active attention request"),
+        )
+        .expect("restarted active attention response");
+        let response: RunActiveAttentionReadResponse =
+            serde_json::from_str(&response_json).expect("restarted active attention JSON");
+        assert!(
+            matches!(
+                response.item,
+                RunActiveAttentionSlot::Item(ref item)
+                    if item.status == flit_protocol::RunActiveAttentionStatus::Open
+                        && item.action == ProtocolRunActiveAttentionAction::Unavailable {
+                            reason: "provider_request_authority_lost".to_owned(),
+                        }
+            ),
+            "unexpected restarted attention: {response:?}"
+        );
+
+        let calls = AtomicUsize::new(0);
+        let command = managed_run_permission_respond_with(
+            &restarted,
+            serde_json::to_string(&request).expect("stale restart request"),
+            |_runtime, _decision| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(())
+            },
+        )
+        .expect("stale restart response");
+        assert_eq!(
+            command_error(&command),
+            CommandError::for_code(CommandErrorCode::ManagedRunNotActive)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
