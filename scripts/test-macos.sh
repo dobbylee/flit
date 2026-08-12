@@ -134,6 +134,7 @@ esac
     "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/FoundationCopy.swift" \
     "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/SystemHealthClient.swift" \
     "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/DashboardPresentation.swift" \
+    "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/NotificationDelivery.swift" \
     "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/RunDetailPresentation.swift" \
     "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/RunChangesPresentation.swift" \
     "$REPOSITORY_ROOT/apps/macos/Sources/FlitMac/FoundationStatusBadge.swift" \
@@ -142,6 +143,7 @@ esac
     "$REPOSITORY_ROOT/target/$host_target/release/libflit_bridge.a" \
     -framework AppKit \
     -framework SwiftUI \
+    -framework UserNotifications \
     -o "$TEST_EXECUTABLE"
 
 "$TEST_EXECUTABLE" "$REPOSITORY_ROOT"

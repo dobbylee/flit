@@ -141,6 +141,7 @@ final class FoundationViewController: NSViewController {
     private let activeAttentionClient: ActiveAttentionClient
     private let stuckAssessmentClient: StuckAssessmentClient
     private let stillWorkingClient: StillWorkingClient
+    private let stuckNotificationCoordinator: StuckNotificationCoordinator
     private let dashboardCadence: any DashboardCadenceScheduling
     private let runDetailClient: RunDetailClient
     private let runChangesClient: RunChangesClient
@@ -178,6 +179,8 @@ final class FoundationViewController: NSViewController {
         activeAttentionClient: ActiveAttentionClient = ActiveAttentionClient(),
         stuckAssessmentClient: StuckAssessmentClient = StuckAssessmentClient(),
         stillWorkingClient: StillWorkingClient = StillWorkingClient(),
+        stuckNotificationCoordinator: StuckNotificationCoordinator =
+            StuckNotificationCoordinatorFactory.makeDefault(),
         dashboardCadence: any DashboardCadenceScheduling =
             DashboardCadenceFactory.makeDefault(),
         runDetailClient: RunDetailClient = RunDetailClient(),
@@ -190,6 +193,7 @@ final class FoundationViewController: NSViewController {
         self.activeAttentionClient = activeAttentionClient
         self.stuckAssessmentClient = stuckAssessmentClient
         self.stillWorkingClient = stillWorkingClient
+        self.stuckNotificationCoordinator = stuckNotificationCoordinator
         self.dashboardCadence = dashboardCadence
         self.runDetailClient = runDetailClient
         self.runChangesClient = runChangesClient
@@ -379,6 +383,7 @@ final class FoundationViewController: NSViewController {
     func stopMonitoring() {
         dashboardCadence.stop()
         monitoringStarted = false
+        stuckNotificationCoordinator.stop()
     }
 
     private func performMonitoringTick() {
@@ -388,6 +393,9 @@ final class FoundationViewController: NSViewController {
         do {
             try stuckAssessmentClient.assess()
             dashboardState = try dashboardClient.convergedState(from: dashboardState)
+            try stuckNotificationCoordinator.reconcile(
+                projectNamesByRunId: dashboardState.runsById.mapValues(\.projectDisplayName)
+            )
             monitoringFailure = false
         } catch {
             monitoringFailure = true

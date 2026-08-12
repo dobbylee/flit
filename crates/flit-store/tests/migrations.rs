@@ -8,6 +8,7 @@ use std::{
 use flit_store::{
     ConnectionPolicy, Store, StoreError, initial_migration_checksum,
     project_filesystem_identity_migration_checksum, run_git_changes_migration_checksum,
+    stuck_notification_delivery_claims_migration_checksum,
 };
 use rusqlite::{Connection, params};
 
@@ -44,7 +45,7 @@ impl Drop for TestDatabase {
 fn fresh_database_applies_full_initial_schema_and_reopens() {
     let database = TestDatabase::new("fresh");
     let store = Store::open(database.path(), APPLIED_AT).expect("fresh store opens");
-    assert_eq!(store.schema_version().expect("schema version"), 3);
+    assert_eq!(store.schema_version().expect("schema version"), 4);
     assert_eq!(store.quick_check().expect("quick check"), "ok");
     assert_eq!(
         store.connection_policy().expect("connection policy"),
@@ -61,7 +62,7 @@ fn fresh_database_applies_full_initial_schema_and_reopens() {
 
     let reopened = Store::open(database.path(), "different-time-is-not-reapplied")
         .expect("existing store reopens");
-    assert_eq!(reopened.schema_version().expect("schema version"), 3);
+    assert_eq!(reopened.schema_version().expect("schema version"), 4);
 
     let connection = Connection::open(database.path()).expect("inspect database");
     let stored: (String, String, String) = connection
@@ -94,6 +95,19 @@ fn fresh_database_applies_full_initial_schema_and_reopens() {
     assert_eq!(third.0, "run_git_changes");
     assert_eq!(third.1, run_git_changes_migration_checksum());
     assert_eq!(third.2, APPLIED_AT);
+    let fourth: (String, String, String) = connection
+        .query_row(
+            "SELECT name, checksum, applied_at FROM schema_migrations WHERE version = 4",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("fourth migration row");
+    assert_eq!(fourth.0, "stuck_notification_delivery_claims");
+    assert_eq!(
+        fourth.1,
+        stuck_notification_delivery_claims_migration_checksum()
+    );
+    assert_eq!(fourth.2, APPLIED_AT);
 
     let names = schema_names(&connection);
     for required in [
@@ -109,6 +123,7 @@ fn fresh_database_applies_full_initial_schema_and_reopens() {
         "run_snapshots",
         "run_git_change_sets",
         "run_git_file_changes",
+        "stuck_notification_delivery_claims",
         "runs",
         "schema_migrations",
         "one_live_session_per_run",
@@ -259,6 +274,102 @@ fn version_one_schema_drift_is_rejected_before_pending_migrations_change_the_dat
 }
 
 #[test]
+fn version_three_database_with_a_run_upgrades_and_preserves_delivery_claims() {
+    let database = TestDatabase::new("version-three-run-upgrade");
+    let connection = Connection::open(database.path()).expect("version three database");
+    connection
+        .execute_batch(include_str!("../migrations/0001_initial.sql"))
+        .expect("version one schema");
+    connection
+        .execute_batch(include_str!(
+            "../migrations/0002_project_filesystem_identity.sql"
+        ))
+        .expect("version two schema");
+    connection
+        .execute_batch(include_str!("../migrations/0003_run_git_changes.sql"))
+        .expect("version three schema");
+    for (version, name, checksum) in [
+        (1_i64, "initial", initial_migration_checksum()),
+        (
+            2_i64,
+            "project_filesystem_identity",
+            project_filesystem_identity_migration_checksum(),
+        ),
+        (
+            3_i64,
+            "run_git_changes",
+            run_git_changes_migration_checksum(),
+        ),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO schema_migrations(version, name, checksum, applied_at) VALUES(?1, ?2, ?3, ?4)",
+                params![version, name, checksum, APPLIED_AT],
+            )
+            .expect("version three migration registry");
+    }
+    connection
+        .execute(
+            "INSERT INTO projects(
+                id, display_name, canonical_path, filesystem_id, trusted,
+                notification_policy_json, created_at, updated_at
+             ) VALUES('project-upgrade', 'Upgrade', '/private/tmp/flit-upgrade', 'unix:1:2', 1, '{}', ?1, ?1)",
+            [APPLIED_AT],
+        )
+        .expect("version three Project");
+    connection
+        .execute(
+            "INSERT INTO runs(
+                id, project_id, title, provider_kind, start_request_json, created_at
+             ) VALUES('run-upgrade', 'project-upgrade', 'Upgrade Run', 'codex', '{}', ?1)",
+            [APPLIED_AT],
+        )
+        .expect("version three Run");
+    drop(connection);
+
+    let store = Store::open(database.path(), APPLIED_AT).expect("upgrade version three Store");
+    assert_eq!(store.schema_version().expect("upgraded schema version"), 4);
+    drop(store);
+
+    let connection = Connection::open(database.path()).expect("seed upgraded claim");
+    connection
+        .execute(
+            "INSERT INTO stuck_notification_delivery_claims(
+                run_id, run_version, occurrence_id, platform_id, claimed_at
+             ) VALUES('run-upgrade', 7, 'occurrence-upgrade', 'occurrence-upgrade', ?1)",
+            [APPLIED_AT],
+        )
+        .expect("outstanding delivery claim");
+    drop(connection);
+
+    let reopened = Store::open(database.path(), "2026-07-24T00:00:00.000Z")
+        .expect("schema four Store reopens with outstanding claim");
+    assert_eq!(
+        reopened.schema_version().expect("reopened schema version"),
+        4
+    );
+    drop(reopened);
+    let connection = Connection::open(database.path()).expect("inspect preserved claim");
+    let retained: (i64, String, String) = connection
+        .query_row(
+            "SELECT run_version, occurrence_id, platform_id
+             FROM stuck_notification_delivery_claims
+             WHERE run_id = 'run-upgrade'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("preserved outstanding claim");
+    assert_eq!(
+        retained,
+        (
+            7,
+            "occurrence-upgrade".to_owned(),
+            "occurrence-upgrade".to_owned(),
+        )
+    );
+}
+
+#[test]
 fn malformed_legacy_filesystem_identity_blocks_the_identity_index_migration() {
     let database = TestDatabase::new("invalid-filesystem-identity");
     let connection = Connection::open(database.path()).expect("version one database");
@@ -345,13 +456,13 @@ fn unknown_newer_migration_and_schema_drift_are_rejected() {
     connection
         .execute(
             "INSERT INTO schema_migrations(version, name, checksum, applied_at) VALUES(?1, ?2, ?3, ?4)",
-            params![4_i64, "future", "future", APPLIED_AT],
+            params![5_i64, "future", "future", APPLIED_AT],
         )
         .expect("future migration row");
     drop(connection);
     assert!(matches!(
         Store::open(newer.path(), APPLIED_AT),
-        Err(StoreError::UnsupportedMigration { version: 4 })
+        Err(StoreError::UnsupportedMigration { version: 5 })
     ));
 
     let drift = TestDatabase::new("drift");

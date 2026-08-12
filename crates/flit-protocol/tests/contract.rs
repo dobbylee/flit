@@ -7,7 +7,11 @@ use flit_protocol::{
     ManagedRunObserveResponse, ManagedRunOpenInProviderRequest, ManagedRunPermissionRespondRequest,
     ManagedRunPermissionRespondResponse, ManagedRunStartRequest, ManagedRunStartResponse,
     ManagedRunStillWorkingRequest, ManagedRunStillWorkingResponse, ManagedRunsAssessStuckRequest,
-    ManagedRunsAssessStuckResponse, PROTOCOL_VERSION, PossiblyStuckPayload,
+    ManagedRunsAssessStuckResponse, ManagedStuckNotificationDeliveredRequest,
+    ManagedStuckNotificationDeliveredResponse, ManagedStuckNotificationDeliveryClaimRequest,
+    ManagedStuckNotificationDeliveryClaimResponse, ManagedStuckNotificationDeliveryFailedRequest,
+    ManagedStuckNotificationDeliveryFailedResponse, ManagedStuckNotificationsDueReadRequest,
+    ManagedStuckNotificationsDueReadResponse, PROTOCOL_VERSION, PossiblyStuckPayload,
     ProjectInspectionRequest, ProjectInspectionResponse, ProjectRegistrationRequest,
     ProjectRegistrationResponse, ProjectTrustRequest, ProjectTrustResponse, ProjectsListRequest,
     ProjectsListResponse, ProviderCompatibility, ProviderDiagnosticsRequest,
@@ -1092,6 +1096,75 @@ fn current_still_working_fixtures_are_exact_cas_without_native_facts() {
 }
 
 #[test]
+fn current_stuck_notification_fixtures_are_bounded_exact_and_platform_owned() {
+    let manifest = read_command_compatibility_manifest();
+    let current = &manifest.current;
+    assert_fixture_round_trip::<ManagedStuckNotificationsDueReadRequest>(&command_fixture(
+        current,
+        "managed_stuck_notifications_due_read.request.json",
+    ));
+    assert_fixture_round_trip::<ManagedStuckNotificationsDueReadResponse>(&command_fixture(
+        current,
+        "managed_stuck_notifications_due_read.response.json",
+    ));
+    assert_fixture_round_trip::<ManagedStuckNotificationDeliveryClaimRequest>(&command_fixture(
+        current,
+        "managed_stuck_notification_delivery_claim.request.json",
+    ));
+    assert_fixture_round_trip::<ManagedStuckNotificationDeliveryClaimResponse>(&command_fixture(
+        current,
+        "managed_stuck_notification_delivery_claim.response.json",
+    ));
+    assert_fixture_round_trip::<ManagedStuckNotificationDeliveryFailedRequest>(&command_fixture(
+        current,
+        "managed_stuck_notification_delivery_failed.request.json",
+    ));
+    assert_fixture_round_trip::<ManagedStuckNotificationDeliveryFailedResponse>(&command_fixture(
+        current,
+        "managed_stuck_notification_delivery_failed.response.json",
+    ));
+    assert_fixture_round_trip::<ManagedStuckNotificationDeliveredRequest>(&command_fixture(
+        current,
+        "managed_stuck_notification_delivered.request.json",
+    ));
+    for name in [
+        "managed_stuck_notification_delivered.delivered.response.json",
+        "managed_stuck_notification_delivered.rejected.response.json",
+    ] {
+        assert_fixture_round_trip::<ManagedStuckNotificationDeliveredResponse>(&command_fixture(
+            current, name,
+        ));
+    }
+
+    let mut fabricated_due: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "managed_stuck_notifications_due_read.request.json",
+        )))
+        .expect("due read fixture should be readable"),
+    )
+    .expect("due read fixture should be JSON");
+    fabricated_due["run_id"] = serde_json::json!("native-selected-run");
+    assert!(
+        serde_json::from_value::<ManagedStuckNotificationsDueReadRequest>(fabricated_due).is_err()
+    );
+
+    let mut fabricated_delivery: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "managed_stuck_notification_delivered.request.json",
+        )))
+        .expect("delivery fixture should be readable"),
+    )
+    .expect("delivery fixture should be JSON");
+    fabricated_delivery["observed_at"] = serde_json::json!("native-time");
+    assert!(
+        serde_json::from_value::<ManagedStuckNotificationDeliveredRequest>(fabricated_delivery)
+            .is_err()
+    );
+}
+
+#[test]
 fn current_managed_permission_response_fixtures_round_trip_every_shape() {
     let manifest = read_command_compatibility_manifest();
     let current = &manifest.current;
@@ -1262,6 +1335,14 @@ fn generated_swift_project_contract_is_current_and_required_fields_fail_closed()
         "FlitDashboardChangeSummary",
         "FlitDashboardEventRecord",
         "FlitDashboardReadResponse",
+        "FlitManagedStuckNotificationsDueReadRequest",
+        "FlitManagedStuckNotificationsDueReadResponse",
+        "FlitManagedStuckNotificationDeliveryClaimRequest",
+        "FlitManagedStuckNotificationDeliveryClaimResponse",
+        "FlitManagedStuckNotificationDeliveryFailedRequest",
+        "FlitManagedStuckNotificationDeliveryFailedResponse",
+        "FlitManagedStuckNotificationDeliveredRequest",
+        "FlitManagedStuckNotificationDeliveredResponse",
         "FlitRunDetailReadRequest",
         "FlitRunEvidenceCategory",
         "FlitRunEvidenceRecord",

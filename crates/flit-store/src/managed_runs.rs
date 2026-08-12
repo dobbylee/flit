@@ -115,6 +115,44 @@ pub struct ManagedStuckNotificationDelivery {
     pub platform_id: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedStuckNotificationDueContext {
+    pub run_id: String,
+    pub run_version: u64,
+    pub occurrence_id: String,
+    pub platform_id: String,
+    pub delivery_claimed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedStuckNotificationDeliveryClaim {
+    pub run_id: String,
+    pub expected_run_version: u64,
+    pub occurrence_id: String,
+    pub platform_id: String,
+    pub claimed_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ManagedStuckNotificationDeliveryClaimOutcome {
+    Claimed,
+    AlreadyClaimed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedStuckNotificationDeliveryFailure {
+    pub run_id: String,
+    pub expected_run_version: u64,
+    pub occurrence_id: String,
+    pub platform_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ManagedStuckNotificationDeliveryFailureOutcome {
+    Released,
+    AlreadyReleased,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManagedStuckLifecycle {
     Starting,
@@ -977,6 +1015,38 @@ pub(crate) fn validate_stuck_notification_delivery(
     validate_timestamp(&delivery.observed_at).map_err(|()| "observed_at")?;
     if delivery.expected_run_version == 0
         || delivery.expected_run_version > flit_protocol::MAX_JSON_SAFE_INTEGER
+        || delivery.platform_id != delivery.occurrence_id
+    {
+        return Err("expected_run_version");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_stuck_notification_delivery_claim(
+    claim: &ManagedStuckNotificationDeliveryClaim,
+) -> Result<(), &'static str> {
+    validate_id(&claim.run_id).map_err(|()| "run_id")?;
+    validate_id(&claim.occurrence_id).map_err(|()| "occurrence_id")?;
+    validate_id(&claim.platform_id).map_err(|()| "platform_id")?;
+    validate_timestamp(&claim.claimed_at).map_err(|()| "claimed_at")?;
+    if claim.expected_run_version == 0
+        || claim.expected_run_version > flit_protocol::MAX_JSON_SAFE_INTEGER
+        || claim.platform_id != claim.occurrence_id
+    {
+        return Err("expected_run_version");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_stuck_notification_delivery_failure(
+    failure: &ManagedStuckNotificationDeliveryFailure,
+) -> Result<(), &'static str> {
+    validate_id(&failure.run_id).map_err(|()| "run_id")?;
+    validate_id(&failure.occurrence_id).map_err(|()| "occurrence_id")?;
+    validate_id(&failure.platform_id).map_err(|()| "platform_id")?;
+    if failure.expected_run_version == 0
+        || failure.expected_run_version > flit_protocol::MAX_JSON_SAFE_INTEGER
+        || failure.platform_id != failure.occurrence_id
     {
         return Err("expected_run_version");
     }

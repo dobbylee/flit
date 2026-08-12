@@ -1,0 +1,37 @@
+{
+  "delivery": "snapshot",
+  "protocol_version": "1.24",
+  "event_schema_version": "1.4",
+  "core_instance_id": "core-instance-1",
+  "reason": "initial",
+  "requested_after_cursor": null,
+  "retained_after_cursor": 0,
+  "next_cursor": 4,
+  "has_more": false,
+  "runs": [
+    {
+      "run_id": "run-dashboard-stuck",
+      "project_id": "project-dashboard-1",
+      "project_display_name": "Dashboard Project",
+      "title": "Preserve exact stuck identity",
+      "provider": "codex",
+      "version": 4,
+      "lifecycle": "Running",
+      "activity": "Unknown",
+      "activity_confidence": 0.0,
+      "attention_level": "Informational",
+      "attention_open_count": 1,
+      "dashboard_bucket": "PossiblyStuck",
+      "active_stuck_occurrence_id": "occurrence-dashboard-stuck-1",
+      "last_progress_at": "2026-08-09T00:00:00.000Z",
+      "last_liveness_at": "2026-08-09T00:02:00.000Z",
+      "started_at": "2026-08-09T00:00:00.000Z",
+      "ended_at": null,
+      "changes": {
+        "availability": "unavailable",
+        "reason": "git_observation_not_configured"
+      },
+      "updated_at": "2026-08-09T00:02:00.000Z"
+    }
+  ]
+}

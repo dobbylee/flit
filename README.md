@@ -14,7 +14,8 @@ The current macOS application includes:
 - a Store-backed Dashboard and bounded Run Activity view with Core-owned lifecycle, activity, attention, evidence category, completion summary, and capability status;
 - content-free Git baseline observation through a verified no-child-exec helper, exact or `Observed during run` terminal change attribution, bounded path-free Changes rows, and Core-guarded external file opening;
 - deterministic Core-owned Possibly Stuck transitions using monotonic elapsed time and generation-bound process evidence, plus an exact Run-version/occurrence `Still working` action; and
-- a retained macOS monitoring cadence that assesses active Runs and atomically converges bounded Dashboard pages while the app remains open or in the menu bar.
+- a retained macOS monitoring cadence that assesses active Runs and atomically converges bounded Dashboard pages while the app remains open or in the menu bar; and
+- exact Possibly Stuck notification delivery through UserNotifications, with a durable Core receipt only after the same platform identifier appears in the delivered list.
 
 Every supported conclusion is backed by structured evidence. When exact Git facts, provider history, raw provider content, or another capability is unavailable, the application preserves an explicit unavailable reason instead of inventing a result.
 
@@ -23,7 +24,7 @@ Every supported conclusion is backed by structured evidence. When exact Git fact
 - Flit does not provide a generic PTY, embedded terminal, terminal replay, worktree orchestration, editor, browser, or built-in diff.
 - Raw provider content and secrets are not retained by default. The current native evidence surface exposes structured event locators and truthful raw-content availability.
 - Exact file-change counts require the verified Git observation boundary; unsupported or uncertain repository states remain unavailable.
-- Native OS notification delivery, project and quiet-hours notification settings, and the complete permission/question action-queue presentation are not yet complete.
+- Notification settings, project overrides, quiet hours, permission education UI, and the complete permission/question action-queue presentation are not yet complete.
 - The build script produces an ad-hoc signed development app, not a notarized distribution artifact.
 
 ## Build and validate

@@ -4,7 +4,7 @@ use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: &str = "1.23";
+pub const PROTOCOL_VERSION: &str = "1.24";
 pub const EVENT_PROTOCOL_VERSION: &str = "1.4";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -1010,6 +1010,112 @@ pub struct ManagedRunsAssessStuckResponse {
     pub transitions_appended: u32,
     pub unchanged_runs: u32,
     pub unavailable_runs: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedStuckNotificationsDueReadRequest {
+    pub client_protocol_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedStuckNotificationDueRecord {
+    pub run_id: String,
+    pub run_version: u64,
+    pub occurrence_id: String,
+    pub platform_id: String,
+    pub delivery_claimed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedStuckNotificationsDueReadResponse {
+    pub protocol_version: String,
+    pub event_schema_version: String,
+    pub notifications: Vec<ManagedStuckNotificationDueRecord>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedStuckNotificationDeliveryClaimRequest {
+    pub run_id: String,
+    pub expected_run_version: u64,
+    pub occurrence_id: String,
+    pub client_protocol_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedStuckNotificationDeliveryClaimResponse {
+    pub protocol_version: String,
+    pub run_id: String,
+    pub run_version: u64,
+    pub occurrence_id: String,
+    pub platform_id: String,
+    pub already_claimed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedStuckNotificationDeliveryFailedRequest {
+    pub run_id: String,
+    pub expected_run_version: u64,
+    pub occurrence_id: String,
+    pub platform_id: String,
+    pub client_protocol_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedStuckNotificationDeliveryFailedResponse {
+    pub protocol_version: String,
+    pub run_id: String,
+    pub run_version: u64,
+    pub occurrence_id: String,
+    pub platform_id: String,
+    pub released: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedStuckNotificationDeliveredRequest {
+    pub run_id: String,
+    pub expected_run_version: u64,
+    pub occurrence_id: String,
+    pub platform_id: String,
+    pub client_protocol_version: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedStuckNotificationDeliveredRejectedReason {
+    RunVersionStale,
+    OccurrenceMismatch,
+    NotDue,
+    AlreadyDelivered,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ManagedStuckNotificationDeliveredResponse {
+    Delivered {
+        protocol_version: String,
+        run_id: String,
+        previous_version: u64,
+        event_id: String,
+        event_version: u64,
+        occurrence_id: String,
+        platform_id: String,
+    },
+    Rejected {
+        protocol_version: String,
+        run_id: String,
+        expected_run_version: u64,
+        occurrence_id: String,
+        platform_id: String,
+        reason: ManagedStuckNotificationDeliveredRejectedReason,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3005,6 +3111,224 @@ struct FlitManagedRunsAssessStuckResponse: Codable, Equatable, Sendable {
         case transitionsAppended = "transitions_appended"
         case unchangedRuns = "unchanged_runs"
         case unavailableRuns = "unavailable_runs"
+    }
+}
+
+struct FlitManagedStuckNotificationsDueReadRequest: Codable, Equatable, Sendable {
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+struct FlitManagedStuckNotificationDueRecord: Codable, Equatable, Sendable {
+    let runId: String
+    let runVersion: UInt64
+    let occurrenceId: String
+    let platformId: String
+    let deliveryClaimed: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case runId = "run_id"
+        case runVersion = "run_version"
+        case occurrenceId = "occurrence_id"
+        case platformId = "platform_id"
+        case deliveryClaimed = "delivery_claimed"
+    }
+}
+
+struct FlitManagedStuckNotificationDeliveryClaimRequest: Codable, Equatable, Sendable {
+    let runId: String
+    let expectedRunVersion: UInt64
+    let occurrenceId: String
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case runId = "run_id"
+        case expectedRunVersion = "expected_run_version"
+        case occurrenceId = "occurrence_id"
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+struct FlitManagedStuckNotificationDeliveryClaimResponse: Codable, Equatable, Sendable {
+    let protocolVersion: String
+    let runId: String
+    let runVersion: UInt64
+    let occurrenceId: String
+    let platformId: String
+    let alreadyClaimed: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case runId = "run_id"
+        case runVersion = "run_version"
+        case occurrenceId = "occurrence_id"
+        case platformId = "platform_id"
+        case alreadyClaimed = "already_claimed"
+    }
+}
+
+struct FlitManagedStuckNotificationDeliveryFailedRequest: Codable, Equatable, Sendable {
+    let runId: String
+    let expectedRunVersion: UInt64
+    let occurrenceId: String
+    let platformId: String
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case runId = "run_id"
+        case expectedRunVersion = "expected_run_version"
+        case occurrenceId = "occurrence_id"
+        case platformId = "platform_id"
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+struct FlitManagedStuckNotificationDeliveryFailedResponse: Codable, Equatable, Sendable {
+    let protocolVersion: String
+    let runId: String
+    let runVersion: UInt64
+    let occurrenceId: String
+    let platformId: String
+    let released: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case runId = "run_id"
+        case runVersion = "run_version"
+        case occurrenceId = "occurrence_id"
+        case platformId = "platform_id"
+        case released
+    }
+}
+
+struct FlitManagedStuckNotificationsDueReadResponse: Codable, Equatable, Sendable {
+    let protocolVersion: String
+    let eventSchemaVersion: String
+    let notifications: [FlitManagedStuckNotificationDueRecord]
+
+    private enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case eventSchemaVersion = "event_schema_version"
+        case notifications
+    }
+}
+
+struct FlitManagedStuckNotificationDeliveredRequest: Codable, Equatable, Sendable {
+    let runId: String
+    let expectedRunVersion: UInt64
+    let occurrenceId: String
+    let platformId: String
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case runId = "run_id"
+        case expectedRunVersion = "expected_run_version"
+        case occurrenceId = "occurrence_id"
+        case platformId = "platform_id"
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+enum FlitManagedStuckNotificationDeliveredStatus: String, Codable, Sendable {
+    case delivered
+    case rejected
+}
+
+enum FlitManagedStuckNotificationDeliveredRejectedReason: String, Codable, Sendable {
+    case runVersionStale = "run_version_stale"
+    case occurrenceMismatch = "occurrence_mismatch"
+    case notDue = "not_due"
+    case alreadyDelivered = "already_delivered"
+}
+
+struct FlitManagedStuckNotificationDeliveredResponse: Codable, Equatable, Sendable {
+    let status: FlitManagedStuckNotificationDeliveredStatus
+    let protocolVersion: String
+    let runId: String
+    let occurrenceId: String
+    let platformId: String
+    let previousVersion: UInt64?
+    let eventId: String?
+    let eventVersion: UInt64?
+    let expectedRunVersion: UInt64?
+    let reason: FlitManagedStuckNotificationDeliveredRejectedReason?
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case status
+        case protocolVersion = "protocol_version"
+        case runId = "run_id"
+        case occurrenceId = "occurrence_id"
+        case platformId = "platform_id"
+        case previousVersion = "previous_version"
+        case eventId = "event_id"
+        case eventVersion = "event_version"
+        case expectedRunVersion = "expected_run_version"
+        case reason
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        status = try values.decode(
+            FlitManagedStuckNotificationDeliveredStatus.self,
+            forKey: .status
+        )
+        protocolVersion = try values.decode(String.self, forKey: .protocolVersion)
+        runId = try values.decode(String.self, forKey: .runId)
+        occurrenceId = try values.decode(String.self, forKey: .occurrenceId)
+        platformId = try values.decode(String.self, forKey: .platformId)
+        switch status {
+        case .delivered:
+            previousVersion = try values.decode(UInt64.self, forKey: .previousVersion)
+            eventId = try values.decode(String.self, forKey: .eventId)
+            eventVersion = try values.decode(UInt64.self, forKey: .eventVersion)
+            expectedRunVersion = nil
+            reason = nil
+            for key in [CodingKeys.expectedRunVersion, .reason] where values.contains(key) {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: values,
+                    debugDescription: "delivered notification response must not contain rejection fields"
+                )
+            }
+        case .rejected:
+            expectedRunVersion = try values.decode(UInt64.self, forKey: .expectedRunVersion)
+            reason = try values.decode(
+                FlitManagedStuckNotificationDeliveredRejectedReason.self,
+                forKey: .reason
+            )
+            previousVersion = nil
+            eventId = nil
+            eventVersion = nil
+            for key in [CodingKeys.previousVersion, .eventId, .eventVersion]
+            where values.contains(key) {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: values,
+                    debugDescription: "rejected notification response must not contain delivery fields"
+                )
+            }
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(status, forKey: .status)
+        try values.encode(protocolVersion, forKey: .protocolVersion)
+        try values.encode(runId, forKey: .runId)
+        try values.encode(occurrenceId, forKey: .occurrenceId)
+        try values.encode(platformId, forKey: .platformId)
+        switch status {
+        case .delivered:
+            try values.encode(previousVersion, forKey: .previousVersion)
+            try values.encode(eventId, forKey: .eventId)
+            try values.encode(eventVersion, forKey: .eventVersion)
+        case .rejected:
+            try values.encode(expectedRunVersion, forKey: .expectedRunVersion)
+            try values.encode(reason, forKey: .reason)
+        }
     }
 }
 

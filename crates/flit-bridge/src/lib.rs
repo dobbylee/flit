@@ -26,9 +26,14 @@ use flit_protocol::{
     ManagedRunObserveRequest, ManagedRunObserveResponse, ManagedRunOpenInProviderRequest,
     ManagedRunPermissionRespondRequest, ManagedRunPermissionRespondResponse,
     ManagedRunStartRequest, ManagedRunStillWorkingRejectedReason, ManagedRunStillWorkingRequest,
-    ManagedRunStillWorkingResponse, ManagedRunsAssessStuckRequest, PROTOCOL_VERSION,
-    ProjectInspectionResponse, ProjectListCursor as ProjectListCursorResponse, ProjectRecord,
-    ProjectRegistrationResponse, ProjectRegistrationStatus, ProjectTrustResponse,
+    ManagedRunStillWorkingResponse, ManagedRunsAssessStuckRequest,
+    ManagedStuckNotificationDeliveredRejectedReason, ManagedStuckNotificationDeliveredRequest,
+    ManagedStuckNotificationDeliveredResponse, ManagedStuckNotificationDeliveryClaimRequest,
+    ManagedStuckNotificationDeliveryClaimResponse, ManagedStuckNotificationDeliveryFailedRequest,
+    ManagedStuckNotificationDeliveryFailedResponse, ManagedStuckNotificationDueRecord,
+    ManagedStuckNotificationsDueReadRequest, ManagedStuckNotificationsDueReadResponse,
+    PROTOCOL_VERSION, ProjectInspectionResponse, ProjectListCursor as ProjectListCursorResponse,
+    ProjectRecord, ProjectRegistrationResponse, ProjectRegistrationStatus, ProjectTrustResponse,
     ProjectTrustStatus, ProjectsListResponse, ProviderCapability as ProtocolProviderCapability,
     ProviderCapabilityEntry, ProviderCompatibility as ProtocolProviderCompatibility,
     ProviderDiagnosticsResponse, ProviderExecutionAfterQuit, ProviderKind as ProtocolProviderKind,
@@ -63,7 +68,10 @@ use flit_store::{
     ManagedPermissionDeliveryUnknownReason, ManagedPermissionResponseAttemptOutcome,
     ManagedPermissionResponseResult, ManagedPermissionResponseResultKind, ManagedSession,
     ManagedStillWorkingAction, ManagedStillWorkingOutcome,
-    ManagedStillWorkingRejectedReason as StoreStillWorkingRejectedReason, Project,
+    ManagedStillWorkingRejectedReason as StoreStillWorkingRejectedReason,
+    ManagedStuckNotificationDelivery, ManagedStuckNotificationDeliveryClaim,
+    ManagedStuckNotificationDeliveryClaimOutcome, ManagedStuckNotificationDeliveryFailure,
+    ManagedStuckNotificationDeliveryFailureOutcome, ManagedStuckNotificationState, Project,
     ProjectDirectoryInspection, ProjectListCursor as StoreProjectListCursor, ProjectRegistration,
     ProjectRegistrationOutcome, ProjectTrustConfirmation, ProjectTrustOutcome,
     RunActiveAttentionAction as StoreRunActiveAttentionAction,
@@ -2628,6 +2636,389 @@ fn managed_runs_assess_stuck_with(
 }
 
 #[uniffi::export]
+pub fn managed_stuck_notifications_due_read_json(
+    request_json: String,
+) -> Result<String, BridgeError> {
+    protect(|| managed_stuck_notifications_due_read_with(&CORE, request_json))
+}
+
+fn managed_stuck_notifications_due_read_with(
+    core_manager: &CoreManager,
+    request_json: String,
+) -> Result<String, BridgeError> {
+    if request_json.len() > MAX_MANAGED_RUN_REQUEST_BYTES {
+        return project_json(&CommandError::for_code(CommandErrorCode::InvalidRunRequest));
+    }
+    let request =
+        match serde_json::from_str::<ManagedStuckNotificationsDueReadRequest>(&request_json) {
+            Ok(request) => request,
+            Err(_) => {
+                return project_json(&CommandError::for_code(CommandErrorCode::InvalidRunRequest));
+            }
+        };
+    if request.client_protocol_version != PROTOCOL_VERSION {
+        return project_json(&CommandError::protocol_mismatch());
+    }
+    let response = core_manager.with_ready_core(|core| {
+        let notifications = core
+            .store
+            .managed_stuck_notification_due_contexts()
+            .map_err(|_| BridgeError::StorageFailure)?
+            .into_iter()
+            .map(|context| ManagedStuckNotificationDueRecord {
+                run_id: context.run_id,
+                run_version: context.run_version,
+                occurrence_id: context.occurrence_id,
+                platform_id: context.platform_id,
+                delivery_claimed: context.delivery_claimed,
+            })
+            .collect();
+        Ok(ManagedStuckNotificationsDueReadResponse {
+            protocol_version: PROTOCOL_VERSION.to_owned(),
+            event_schema_version: EVENT_PROTOCOL_VERSION.to_owned(),
+            notifications,
+        })
+    });
+    match response {
+        Ok(response) => bounded_json(
+            &response,
+            MAX_PROJECT_RESPONSE_BYTES,
+            BridgeError::ManagedRunResponseTooLarge,
+        ),
+        Err(BridgeError::StorageFailure) => project_json(&CommandError::for_code(
+            CommandErrorCode::StorageUnavailable,
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+#[uniffi::export]
+pub fn managed_stuck_notification_delivery_claim_json(
+    request_json: String,
+) -> Result<String, BridgeError> {
+    protect(|| managed_stuck_notification_delivery_claim_with(&CORE, request_json))
+}
+
+fn managed_stuck_notification_delivery_claim_with(
+    core_manager: &CoreManager,
+    request_json: String,
+) -> Result<String, BridgeError> {
+    if request_json.len() > MAX_MANAGED_RUN_REQUEST_BYTES {
+        return project_json(&CommandError::for_code(CommandErrorCode::InvalidRunRequest));
+    }
+    let request =
+        match serde_json::from_str::<ManagedStuckNotificationDeliveryClaimRequest>(&request_json) {
+            Ok(request)
+                if valid_stuck_notification_token(&request.run_id)
+                    && valid_stuck_notification_token(&request.occurrence_id)
+                    && request.expected_run_version > 0
+                    && request.expected_run_version <= flit_protocol::MAX_JSON_SAFE_INTEGER =>
+            {
+                request
+            }
+            _ => {
+                return project_json(&CommandError::for_code(CommandErrorCode::InvalidRunRequest));
+            }
+        };
+    if request.client_protocol_version != PROTOCOL_VERSION {
+        return project_json(&CommandError::protocol_mismatch());
+    }
+    let response = core_manager.with_ready_core(|core| {
+        let claimed_at = core
+            .store
+            .current_utc_timestamp()
+            .map_err(|_| BridgeError::StorageFailure)?;
+        let outcome = core
+            .store
+            .claim_managed_stuck_notification_delivery(ManagedStuckNotificationDeliveryClaim {
+                run_id: request.run_id.clone(),
+                expected_run_version: request.expected_run_version,
+                occurrence_id: request.occurrence_id.clone(),
+                platform_id: request.occurrence_id.clone(),
+                claimed_at,
+            })
+            .map_err(|error| match error {
+                StoreError::MissingRun { .. } => BridgeError::RunNotFound,
+                _ => BridgeError::StorageFailure,
+            })?;
+        Ok(ManagedStuckNotificationDeliveryClaimResponse {
+            protocol_version: PROTOCOL_VERSION.to_owned(),
+            run_id: request.run_id,
+            run_version: request.expected_run_version,
+            occurrence_id: request.occurrence_id.clone(),
+            platform_id: request.occurrence_id,
+            already_claimed: matches!(
+                outcome,
+                ManagedStuckNotificationDeliveryClaimOutcome::AlreadyClaimed
+            ),
+        })
+    });
+    managed_stuck_notification_command_response(response)
+}
+
+#[uniffi::export]
+pub fn managed_stuck_notification_delivery_failed_json(
+    request_json: String,
+) -> Result<String, BridgeError> {
+    protect(|| managed_stuck_notification_delivery_failed_with(&CORE, request_json))
+}
+
+fn managed_stuck_notification_delivery_failed_with(
+    core_manager: &CoreManager,
+    request_json: String,
+) -> Result<String, BridgeError> {
+    if request_json.len() > MAX_MANAGED_RUN_REQUEST_BYTES {
+        return project_json(&CommandError::for_code(CommandErrorCode::InvalidRunRequest));
+    }
+    let request = match serde_json::from_str::<ManagedStuckNotificationDeliveryFailedRequest>(
+        &request_json,
+    ) {
+        Ok(request)
+            if valid_stuck_notification_token(&request.run_id)
+                && valid_stuck_notification_token(&request.occurrence_id)
+                && valid_stuck_notification_token(&request.platform_id)
+                && request.platform_id == request.occurrence_id
+                && request.expected_run_version > 0
+                && request.expected_run_version <= flit_protocol::MAX_JSON_SAFE_INTEGER =>
+        {
+            request
+        }
+        _ => {
+            return project_json(&CommandError::for_code(CommandErrorCode::InvalidRunRequest));
+        }
+    };
+    if request.client_protocol_version != PROTOCOL_VERSION {
+        return project_json(&CommandError::protocol_mismatch());
+    }
+    let response = core_manager.with_ready_core(|core| {
+        let outcome = core
+            .store
+            .release_managed_stuck_notification_delivery(ManagedStuckNotificationDeliveryFailure {
+                run_id: request.run_id.clone(),
+                expected_run_version: request.expected_run_version,
+                occurrence_id: request.occurrence_id.clone(),
+                platform_id: request.platform_id.clone(),
+            })
+            .map_err(|error| match error {
+                StoreError::MissingRun { .. } => BridgeError::RunNotFound,
+                _ => BridgeError::StorageFailure,
+            })?;
+        Ok(ManagedStuckNotificationDeliveryFailedResponse {
+            protocol_version: PROTOCOL_VERSION.to_owned(),
+            run_id: request.run_id,
+            run_version: request.expected_run_version,
+            occurrence_id: request.occurrence_id,
+            platform_id: request.platform_id,
+            released: matches!(
+                outcome,
+                ManagedStuckNotificationDeliveryFailureOutcome::Released
+            ),
+        })
+    });
+    managed_stuck_notification_command_response(response)
+}
+
+fn managed_stuck_notification_command_response<T: serde::Serialize>(
+    response: Result<T, BridgeError>,
+) -> Result<String, BridgeError> {
+    match response {
+        Ok(response) => bounded_json(
+            &response,
+            MAX_PROJECT_RESPONSE_BYTES,
+            BridgeError::ManagedRunResponseTooLarge,
+        ),
+        Err(BridgeError::RunNotFound) => {
+            project_json(&CommandError::for_code(CommandErrorCode::RunNotFound))
+        }
+        Err(BridgeError::StorageFailure) => project_json(&CommandError::for_code(
+            CommandErrorCode::StorageUnavailable,
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+#[uniffi::export]
+pub fn managed_stuck_notification_delivered_json(
+    request_json: String,
+) -> Result<String, BridgeError> {
+    protect(|| managed_stuck_notification_delivered_with(&CORE, request_json))
+}
+
+fn managed_stuck_notification_delivered_with(
+    core_manager: &CoreManager,
+    request_json: String,
+) -> Result<String, BridgeError> {
+    if request_json.len() > MAX_MANAGED_RUN_REQUEST_BYTES {
+        return project_json(&CommandError::for_code(CommandErrorCode::InvalidRunRequest));
+    }
+    let request =
+        match serde_json::from_str::<ManagedStuckNotificationDeliveredRequest>(&request_json) {
+            Ok(request)
+                if valid_stuck_notification_token(&request.run_id)
+                    && valid_stuck_notification_token(&request.occurrence_id)
+                    && valid_stuck_notification_token(&request.platform_id)
+                    && request.platform_id == request.occurrence_id
+                    && request.expected_run_version > 0
+                    && request.expected_run_version <= flit_protocol::MAX_JSON_SAFE_INTEGER =>
+            {
+                request
+            }
+            _ => {
+                return project_json(&CommandError::for_code(CommandErrorCode::InvalidRunRequest));
+            }
+        };
+    if request.client_protocol_version != PROTOCOL_VERSION {
+        return project_json(&CommandError::protocol_mismatch());
+    }
+    let response = core_manager.with_ready_core(|core| {
+        let event_id = stuck_notification_delivered_event_id(&request);
+        if let Some(event) = core
+            .store
+            .managed_stuck_notification_delivery_receipt(
+                &request.run_id,
+                &event_id,
+                &request.occurrence_id,
+                &request.platform_id,
+            )
+            .map_err(|_| BridgeError::StorageFailure)?
+        {
+            return Ok(ManagedStuckNotificationDeliveredResponse::Delivered {
+                protocol_version: PROTOCOL_VERSION.to_owned(),
+                run_id: request.run_id,
+                previous_version: request.expected_run_version,
+                event_id: event.event_id,
+                event_version: event.ingest_seq,
+                occurrence_id: request.occurrence_id,
+                platform_id: request.platform_id,
+            });
+        }
+        let observed_at = core
+            .store
+            .current_utc_timestamp()
+            .map_err(|_| BridgeError::StorageFailure)?;
+        match core.store.append_managed_stuck_notification_delivered(
+            ManagedStuckNotificationDelivery {
+                run_id: request.run_id.clone(),
+                expected_run_version: request.expected_run_version,
+                occurrence_id: request.occurrence_id.clone(),
+                event_id,
+                observed_at,
+                platform_id: request.platform_id.clone(),
+            },
+        ) {
+            Ok(AppendEventOutcome::Inserted(event) | AppendEventOutcome::Duplicate(event)) => {
+                Ok(ManagedStuckNotificationDeliveredResponse::Delivered {
+                    protocol_version: PROTOCOL_VERSION.to_owned(),
+                    run_id: request.run_id,
+                    previous_version: request.expected_run_version,
+                    event_id: event.event_id,
+                    event_version: event.ingest_seq,
+                    occurrence_id: request.occurrence_id,
+                    platform_id: request.platform_id,
+                })
+            }
+            Err(StoreError::MissingRun { .. }) => Err(BridgeError::RunNotFound),
+            Err(StoreError::ManagedStuckRunVersionStale { .. }) => {
+                Ok(stuck_notification_rejected_response(
+                    &request,
+                    ManagedStuckNotificationDeliveredRejectedReason::RunVersionStale,
+                ))
+            }
+            Err(StoreError::ManagedStuckOccurrenceMismatch { .. }) => {
+                let reason = stuck_notification_rejected_reason(&core.store, &request)?;
+                Ok(stuck_notification_rejected_response(&request, reason))
+            }
+            Err(_) => Err(BridgeError::StorageFailure),
+        }
+    });
+    match response {
+        Ok(response) => bounded_json(
+            &response,
+            MAX_PROJECT_RESPONSE_BYTES,
+            BridgeError::ManagedRunResponseTooLarge,
+        ),
+        Err(BridgeError::RunNotFound) => {
+            project_json(&CommandError::for_code(CommandErrorCode::RunNotFound))
+        }
+        Err(BridgeError::StorageFailure) => project_json(&CommandError::for_code(
+            CommandErrorCode::StorageUnavailable,
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+fn valid_stuck_notification_token(value: &str) -> bool {
+    !value.trim().is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+}
+
+fn stuck_notification_rejected_reason(
+    store: &Store,
+    request: &ManagedStuckNotificationDeliveredRequest,
+) -> Result<ManagedStuckNotificationDeliveredRejectedReason, BridgeError> {
+    let contexts = store
+        .managed_stuck_assessment_contexts()
+        .map_err(|_| BridgeError::StorageFailure)?;
+    let Some(context) = contexts
+        .into_iter()
+        .find(|context| context.run_id == request.run_id)
+    else {
+        return Ok(ManagedStuckNotificationDeliveredRejectedReason::OccurrenceMismatch);
+    };
+    if context.active_occurrence_id.as_deref() != Some(request.occurrence_id.as_str()) {
+        return Ok(ManagedStuckNotificationDeliveredRejectedReason::OccurrenceMismatch);
+    }
+    Ok(match context.notification {
+        ManagedStuckNotificationState::Delivered { occurrence_id, .. }
+            if occurrence_id == request.occurrence_id =>
+        {
+            ManagedStuckNotificationDeliveredRejectedReason::AlreadyDelivered
+        }
+        ManagedStuckNotificationState::Due { occurrence_id, .. }
+            if occurrence_id != request.occurrence_id =>
+        {
+            ManagedStuckNotificationDeliveredRejectedReason::OccurrenceMismatch
+        }
+        ManagedStuckNotificationState::Inactive
+        | ManagedStuckNotificationState::NotDue { .. }
+        | ManagedStuckNotificationState::Suppressed { .. }
+        | ManagedStuckNotificationState::Due { .. }
+        | ManagedStuckNotificationState::Delivered { .. } => {
+            ManagedStuckNotificationDeliveredRejectedReason::NotDue
+        }
+    })
+}
+
+fn stuck_notification_rejected_response(
+    request: &ManagedStuckNotificationDeliveredRequest,
+    reason: ManagedStuckNotificationDeliveredRejectedReason,
+) -> ManagedStuckNotificationDeliveredResponse {
+    ManagedStuckNotificationDeliveredResponse::Rejected {
+        protocol_version: PROTOCOL_VERSION.to_owned(),
+        run_id: request.run_id.clone(),
+        expected_run_version: request.expected_run_version,
+        occurrence_id: request.occurrence_id.clone(),
+        platform_id: request.platform_id.clone(),
+        reason,
+    }
+}
+
+fn stuck_notification_delivered_event_id(
+    request: &ManagedStuckNotificationDeliveredRequest,
+) -> String {
+    let mut digest = Sha256::new();
+    for part in [
+        request.run_id.as_str(),
+        &request.expected_run_version.to_string(),
+        request.occurrence_id.as_str(),
+        request.platform_id.as_str(),
+    ] {
+        digest.update(part.len().to_le_bytes());
+        digest.update(part.as_bytes());
+    }
+    format!("stuck-notification-{:x}", digest.finalize())
+}
+
+#[uniffi::export]
 pub fn managed_run_still_working_json(request_json: String) -> Result<String, BridgeError> {
     protect(|| managed_run_still_working_with(&CORE, request_json))
 }
@@ -3872,6 +4263,257 @@ mod tests {
                 Ok(())
             })
             .expect("read starting Run");
+    }
+
+    #[test]
+    fn stuck_notification_commands_read_due_and_record_only_exact_delivery_once() {
+        let (_directory, manager, _response) = observation_core("stuck-notification-command");
+        let due_version = manager
+            .with_ready_core(|core| {
+                let running_version = core
+                    .store
+                    .run_snapshot("run-observe")
+                    .expect("running snapshot")
+                    .expect("running projection")
+                    .version;
+                let opened = core
+                    .store
+                    .append_managed_stuck_transition(ManagedStuckTransition {
+                        run_id: "run-observe".to_owned(),
+                        expected_run_version: running_version,
+                        event_id: "event-notification-command-open".to_owned(),
+                        observed_at: "2026-08-09T10:02:10Z".to_owned(),
+                        assessment: ManagedStuckAssessment::PossiblyStuck(PossiblyStuckPayload {
+                            occurrence_id: "occurrence-notification-command".to_owned(),
+                            cause: StuckCauseCode::Unknown,
+                            threshold_seconds: 120,
+                            progress_event_id: "event-observe-created".to_owned(),
+                            progress_observed_at: "2026-07-27T12:00:00Z".to_owned(),
+                            progress_monotonic_ms: 5_000,
+                            baseline_monotonic_ms: 5_000,
+                            stuck_since_monotonic_ms: 125_000,
+                            process: StuckProcessReceipt::Alive {
+                                generation: "process-notification-command".to_owned(),
+                                observed_monotonic_ms: 130_000,
+                            },
+                            evidence_unavailable_reason: "raw_provider_content_not_retained"
+                                .to_owned(),
+                        }),
+                    })
+                    .expect("open stuck occurrence");
+                let opened_version = match opened {
+                    flit_store::ManagedStuckTransitionOutcome::Appended(event) => event.ingest_seq,
+                    other => panic!("stuck occurrence must append: {other:?}"),
+                };
+                let due = core
+                    .store
+                    .append_managed_stuck_transition(ManagedStuckTransition {
+                        run_id: "run-observe".to_owned(),
+                        expected_run_version: opened_version,
+                        event_id: "event-notification-command-due".to_owned(),
+                        observed_at: "2026-08-09T10:07:10Z".to_owned(),
+                        assessment: ManagedStuckAssessment::NotificationDue(
+                            flit_protocol::StuckNotificationDuePayload {
+                                occurrence_id: "occurrence-notification-command".to_owned(),
+                                due_at_monotonic_ms: 425_000,
+                                process: StuckProcessReceipt::Alive {
+                                    generation: "process-notification-command".to_owned(),
+                                    observed_monotonic_ms: 430_000,
+                                },
+                                evidence_unavailable_reason: "raw_provider_content_not_retained"
+                                    .to_owned(),
+                            },
+                        ),
+                    })
+                    .expect("mark notification due");
+                match due {
+                    flit_store::ManagedStuckTransitionOutcome::Appended(event) => {
+                        Ok(event.ingest_seq)
+                    }
+                    other => panic!("notification due must append: {other:?}"),
+                }
+            })
+            .expect("seed due notification");
+
+        let due_request = serde_json::to_string(&ManagedStuckNotificationsDueReadRequest {
+            client_protocol_version: PROTOCOL_VERSION.to_owned(),
+        })
+        .expect("due read request");
+        let due: ManagedStuckNotificationsDueReadResponse = serde_json::from_str(
+            &managed_stuck_notifications_due_read_with(&manager, due_request.clone())
+                .expect("due read response"),
+        )
+        .expect("typed due read response");
+        assert_eq!(due.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(due.event_schema_version, EVENT_PROTOCOL_VERSION);
+        assert_eq!(
+            due.notifications,
+            vec![ManagedStuckNotificationDueRecord {
+                run_id: "run-observe".to_owned(),
+                run_version: due_version,
+                occurrence_id: "occurrence-notification-command".to_owned(),
+                platform_id: "occurrence-notification-command".to_owned(),
+                delivery_claimed: false,
+            }]
+        );
+        let smuggled_due = format!(
+            r#"{{"client_protocol_version":"{PROTOCOL_VERSION}","run_id":"native-selected"}}"#
+        );
+        assert_eq!(
+            command_error(
+                &managed_stuck_notifications_due_read_with(&manager, smuggled_due)
+                    .expect("invalid due read response")
+            ),
+            CommandError::for_code(CommandErrorCode::InvalidRunRequest)
+        );
+
+        let wrong_occurrence = ManagedStuckNotificationDeliveredRequest {
+            run_id: "run-observe".to_owned(),
+            expected_run_version: due_version,
+            occurrence_id: "occurrence-notification-wrong".to_owned(),
+            platform_id: "occurrence-notification-wrong".to_owned(),
+            client_protocol_version: PROTOCOL_VERSION.to_owned(),
+        };
+        let rejected: ManagedStuckNotificationDeliveredResponse = serde_json::from_str(
+            &managed_stuck_notification_delivered_with(
+                &manager,
+                serde_json::to_string(&wrong_occurrence).expect("wrong receipt request"),
+            )
+            .expect("wrong receipt response"),
+        )
+        .expect("typed wrong receipt response");
+        assert!(matches!(
+            rejected,
+            ManagedStuckNotificationDeliveredResponse::Rejected {
+                reason: ManagedStuckNotificationDeliveredRejectedReason::OccurrenceMismatch,
+                ..
+            }
+        ));
+
+        let claim_request = ManagedStuckNotificationDeliveryClaimRequest {
+            run_id: "run-observe".to_owned(),
+            expected_run_version: due_version,
+            occurrence_id: "occurrence-notification-command".to_owned(),
+            client_protocol_version: PROTOCOL_VERSION.to_owned(),
+        };
+        let claimed: ManagedStuckNotificationDeliveryClaimResponse = serde_json::from_str(
+            &managed_stuck_notification_delivery_claim_with(
+                &manager,
+                serde_json::to_string(&claim_request).expect("claim request"),
+            )
+            .expect("claim response"),
+        )
+        .expect("typed claim response");
+        assert!(!claimed.already_claimed);
+        let claimed_retry: ManagedStuckNotificationDeliveryClaimResponse = serde_json::from_str(
+            &managed_stuck_notification_delivery_claim_with(
+                &manager,
+                serde_json::to_string(&claim_request).expect("claim retry request"),
+            )
+            .expect("claim retry response"),
+        )
+        .expect("typed claim retry response");
+        assert!(claimed_retry.already_claimed);
+
+        let claimed_due: ManagedStuckNotificationsDueReadResponse = serde_json::from_str(
+            &managed_stuck_notifications_due_read_with(&manager, due_request.clone())
+                .expect("claimed due read response"),
+        )
+        .expect("typed claimed due read response");
+        assert!(claimed_due.notifications[0].delivery_claimed);
+
+        let request = ManagedStuckNotificationDeliveredRequest {
+            run_id: "run-observe".to_owned(),
+            expected_run_version: due_version,
+            occurrence_id: "occurrence-notification-command".to_owned(),
+            platform_id: "occurrence-notification-command".to_owned(),
+            client_protocol_version: PROTOCOL_VERSION.to_owned(),
+        };
+        let wrong_platform = ManagedStuckNotificationDeliveredRequest {
+            platform_id: "different-platform-notification".to_owned(),
+            ..request.clone()
+        };
+        let false_receipt_cursor = manager
+            .with_ready_core(|core| {
+                core.store
+                    .latest_ingest_seq()
+                    .map_err(|_| BridgeError::StorageFailure)
+            })
+            .expect("false receipt cursor");
+        assert_eq!(
+            command_error(
+                &managed_stuck_notification_delivered_with(
+                    &manager,
+                    serde_json::to_string(&wrong_platform).expect("wrong platform request")
+                )
+                .expect("wrong platform response")
+            ),
+            CommandError::for_code(CommandErrorCode::InvalidRunRequest)
+        );
+        manager
+            .with_ready_core(|core| {
+                assert_eq!(
+                    core.store.latest_ingest_seq().expect("unchanged cursor"),
+                    false_receipt_cursor
+                );
+                assert_eq!(
+                    core.store
+                        .managed_stuck_notification_due_contexts()
+                        .expect("due remains")
+                        .len(),
+                    1
+                );
+                Ok(())
+            })
+            .expect("verify false receipt no-write");
+        let request_json = serde_json::to_string(&request).expect("receipt request");
+        let delivered: ManagedStuckNotificationDeliveredResponse = serde_json::from_str(
+            &managed_stuck_notification_delivered_with(&manager, request_json.clone())
+                .expect("delivered response"),
+        )
+        .expect("typed delivered response");
+        let delivered_version = match &delivered {
+            ManagedStuckNotificationDeliveredResponse::Delivered {
+                previous_version,
+                event_version,
+                platform_id,
+                ..
+            } => {
+                assert_eq!(*previous_version, due_version);
+                assert_eq!(platform_id, "occurrence-notification-command");
+                *event_version
+            }
+            other => panic!("exact receipt must be delivered: {other:?}"),
+        };
+        let retry: ManagedStuckNotificationDeliveredResponse = serde_json::from_str(
+            &managed_stuck_notification_delivered_with(&manager, request_json)
+                .expect("receipt retry response"),
+        )
+        .expect("typed receipt retry response");
+        assert_eq!(retry, delivered);
+
+        let empty: ManagedStuckNotificationsDueReadResponse = serde_json::from_str(
+            &managed_stuck_notifications_due_read_with(&manager, due_request)
+                .expect("empty due read response"),
+        )
+        .expect("typed empty due read response");
+        assert!(empty.notifications.is_empty());
+
+        let changed_platform = ManagedStuckNotificationDeliveredRequest {
+            expected_run_version: delivered_version,
+            platform_id: "different-platform-notification".to_owned(),
+            ..request
+        };
+        assert_eq!(
+            command_error(
+                &managed_stuck_notification_delivered_with(
+                    &manager,
+                    serde_json::to_string(&changed_platform).expect("changed platform request"),
+                )
+                .expect("changed platform response")
+            ),
+            CommandError::for_code(CommandErrorCode::InvalidRunRequest)
+        );
     }
 
     #[test]

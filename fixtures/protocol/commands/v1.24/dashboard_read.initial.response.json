@@ -1,0 +1,40 @@
+{
+  "delivery": "snapshot",
+  "protocol_version": "1.24",
+  "event_schema_version": "1.4",
+  "core_instance_id": "core-instance-1",
+  "reason": "initial",
+  "requested_after_cursor": null,
+  "retained_after_cursor": 0,
+  "next_cursor": 3,
+  "has_more": false,
+  "runs": [
+    {
+      "run_id": "run-dashboard-1",
+      "project_id": "project-dashboard-1",
+      "project_display_name": "Dashboard Project",
+      "title": "Verify the Dashboard bridge",
+      "provider": "codex",
+      "version": 3,
+      "lifecycle": "Running",
+      "activity": "Testing",
+      "activity_confidence": 1.0,
+      "attention_level": "None",
+      "attention_open_count": 2,
+      "dashboard_bucket": "Working",
+      "active_stuck_occurrence_id": null,
+      "last_progress_at": "2026-07-28T00:00:02.000Z",
+      "last_liveness_at": "2026-07-28T00:00:02.000Z",
+      "started_at": "2026-07-28T00:00:01.000Z",
+      "ended_at": null,
+      "changes": {
+        "availability": "available",
+        "attribution": "exact",
+        "files": 3,
+        "insertions": 42,
+        "deletions": 7
+      },
+      "updated_at": "2026-07-28T00:00:02.000Z"
+    }
+  ]
+}

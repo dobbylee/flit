@@ -53,6 +53,8 @@ enum FoundationCopyKey: String {
     case menuBarTooltip = "lifecycle.menuBar.tooltip"
     case menuOpen = "lifecycle.menu.open"
     case menuQuit = "lifecycle.menu.quit"
+    case notificationStuckBody = "notification.stuck.body"
+    case notificationStuckTitle = "notification.stuck.title"
     case quitActiveRuns = "lifecycle.quit.activeRuns"
     case quitCancel = "lifecycle.quit.cancel"
     case quitConfirm = "lifecycle.quit.confirm"
@@ -216,6 +218,8 @@ enum FoundationCopy {
         .menuBarTooltip: "Open Flit",
         .menuOpen: "Open Flit",
         .menuQuit: "Quit Flit",
+        .notificationStuckBody: "%@ · Possibly stuck",
+        .notificationStuckTitle: "Flit needs your attention",
         .quitActiveRuns: "Active provider Runs:",
         .quitCancel: "Cancel",
         .quitConfirm: "Quit Flit",

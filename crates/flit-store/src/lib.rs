@@ -48,8 +48,11 @@ pub use managed_runs::{
     ManagedSessionTerminationOutcome, ManagedStillWorkingAction, ManagedStillWorkingOutcome,
     ManagedStillWorkingRejectedReason, ManagedStuckActivity, ManagedStuckAssessment,
     ManagedStuckAssessmentContext, ManagedStuckLifecycle, ManagedStuckNotificationDelivery,
-    ManagedStuckNotificationState, ManagedStuckReset, ManagedStuckTransition,
-    ManagedStuckTransitionOutcome, ManagedStuckWaitKind, ManagedTurnTerminalOutcome,
+    ManagedStuckNotificationDeliveryClaim, ManagedStuckNotificationDeliveryClaimOutcome,
+    ManagedStuckNotificationDeliveryFailure, ManagedStuckNotificationDeliveryFailureOutcome,
+    ManagedStuckNotificationDueContext, ManagedStuckNotificationState, ManagedStuckReset,
+    ManagedStuckTransition, ManagedStuckTransitionOutcome, ManagedStuckWaitKind,
+    ManagedTurnTerminalOutcome,
 };
 pub use projects::{
     MAX_PROJECT_PAGE_SIZE, Project, ProjectDirectoryInspection, ProjectIdentity,
@@ -74,6 +77,11 @@ const PROJECT_FILESYSTEM_IDENTITY_MIGRATION_SQL: &str =
 const RUN_GIT_CHANGES_MIGRATION_VERSION: i64 = 3;
 const RUN_GIT_CHANGES_MIGRATION_NAME: &str = "run_git_changes";
 const RUN_GIT_CHANGES_MIGRATION_SQL: &str = include_str!("../migrations/0003_run_git_changes.sql");
+const STUCK_NOTIFICATION_DELIVERY_CLAIMS_MIGRATION_VERSION: i64 = 4;
+const STUCK_NOTIFICATION_DELIVERY_CLAIMS_MIGRATION_NAME: &str =
+    "stuck_notification_delivery_claims";
+const STUCK_NOTIFICATION_DELIVERY_CLAIMS_MIGRATION_SQL: &str =
+    include_str!("../migrations/0004_stuck_notification_delivery_claims.sql");
 const MAX_EVENT_READ_LIMIT: usize = 1_000;
 const MAX_MANAGED_PERMISSION_RESPONSE_EVENTS: usize = 2;
 pub const MAX_EVENT_APPEND_BATCH: usize = 50;
@@ -438,6 +446,138 @@ pub struct ManagedGitChangePage {
 }
 
 impl Store {
+    pub fn managed_stuck_notification_due_contexts(
+        &self,
+    ) -> Result<Vec<ManagedStuckNotificationDueContext>, StoreError> {
+        let mut due = Vec::new();
+        for context in self.managed_stuck_assessment_contexts()? {
+            match context.notification {
+                ManagedStuckNotificationState::Due { occurrence_id, .. } => {
+                    match context.active_occurrence_id {
+                        Some(active_occurrence_id) if active_occurrence_id == occurrence_id => {
+                            let claim = stuck_notification_delivery_claim(
+                                &self.connection,
+                                &context.run_id,
+                            )?;
+                            let matching_claim = claim.filter(|claim| {
+                                claim.occurrence_id == occurrence_id
+                                    && claim.platform_id == occurrence_id
+                            });
+                            due.push(ManagedStuckNotificationDueContext {
+                                run_id: context.run_id,
+                                run_version: matching_claim
+                                    .as_ref()
+                                    .map_or(context.version, |claim| claim.run_version),
+                                platform_id: occurrence_id.clone(),
+                                delivery_claimed: matching_claim.is_some(),
+                                occurrence_id,
+                            });
+                        }
+                        _ => {
+                            return Err(StoreError::ManagedStuckAssessmentContextInvalid {
+                                run_id: context.run_id,
+                                field: "notification_due_occurrence",
+                            });
+                        }
+                    }
+                }
+                ManagedStuckNotificationState::Inactive
+                | ManagedStuckNotificationState::NotDue { .. }
+                | ManagedStuckNotificationState::Suppressed { .. }
+                | ManagedStuckNotificationState::Delivered { .. } => {}
+            }
+        }
+        Ok(due)
+    }
+
+    pub fn claim_managed_stuck_notification_delivery(
+        &mut self,
+        claim: ManagedStuckNotificationDeliveryClaim,
+    ) -> Result<ManagedStuckNotificationDeliveryClaimOutcome, StoreError> {
+        managed_runs::validate_stuck_notification_delivery_claim(&claim)
+            .map_err(|field| StoreError::InvalidManagedStuckNotificationDelivery { field })?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+        validate_current_due_identity(
+            &transaction,
+            &claim.run_id,
+            claim.expected_run_version,
+            &claim.occurrence_id,
+        )?;
+        if let Some(existing) = stuck_notification_delivery_claim(&transaction, &claim.run_id)? {
+            if existing.occurrence_id == claim.occurrence_id
+                && existing.platform_id == claim.platform_id
+            {
+                transaction.commit().map_err(StoreError::Sqlite)?;
+                return Ok(ManagedStuckNotificationDeliveryClaimOutcome::AlreadyClaimed);
+            }
+            transaction
+                .execute(
+                    "DELETE FROM stuck_notification_delivery_claims WHERE run_id = ?1",
+                    [&claim.run_id],
+                )
+                .map_err(StoreError::Sqlite)?;
+        }
+        let claim_run_version = i64::try_from(claim.expected_run_version).map_err(|_| {
+            StoreError::InvalidManagedStuckNotificationDelivery {
+                field: "expected_run_version",
+            }
+        })?;
+        transaction
+            .execute(
+                "INSERT INTO stuck_notification_delivery_claims(
+                    run_id, run_version, occurrence_id, platform_id, claimed_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5)",
+                params![
+                    claim.run_id,
+                    claim_run_version,
+                    claim.occurrence_id,
+                    claim.platform_id,
+                    claim.claimed_at,
+                ],
+            )
+            .map_err(StoreError::Sqlite)?;
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(ManagedStuckNotificationDeliveryClaimOutcome::Claimed)
+    }
+
+    pub fn release_managed_stuck_notification_delivery(
+        &mut self,
+        failure: ManagedStuckNotificationDeliveryFailure,
+    ) -> Result<ManagedStuckNotificationDeliveryFailureOutcome, StoreError> {
+        managed_runs::validate_stuck_notification_delivery_failure(&failure)
+            .map_err(|field| StoreError::InvalidManagedStuckNotificationDelivery { field })?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+        let Some(existing) = stuck_notification_delivery_claim(&transaction, &failure.run_id)?
+        else {
+            transaction.commit().map_err(StoreError::Sqlite)?;
+            return Ok(ManagedStuckNotificationDeliveryFailureOutcome::AlreadyReleased);
+        };
+        if existing.run_version != failure.expected_run_version
+            || existing.occurrence_id != failure.occurrence_id
+            || existing.platform_id != failure.platform_id
+        {
+            return Err(StoreError::ManagedStuckOccurrenceMismatch {
+                run_id: failure.run_id,
+                expected: existing.occurrence_id,
+                received: failure.occurrence_id,
+            });
+        }
+        transaction
+            .execute(
+                "DELETE FROM stuck_notification_delivery_claims WHERE run_id = ?1",
+                [&failure.run_id],
+            )
+            .map_err(StoreError::Sqlite)?;
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(ManagedStuckNotificationDeliveryFailureOutcome::Released)
+    }
+
     pub fn managed_stuck_assessment_contexts(
         &self,
     ) -> Result<Vec<ManagedStuckAssessmentContext>, StoreError> {
@@ -782,33 +922,19 @@ impl Store {
                 event_id: delivery.event_id,
             });
         }
-        let current_version = latest_run_event_version(&transaction, &delivery.run_id)?
-            .ok_or_else(|| StoreError::MissingRun {
-                run_id: delivery.run_id.clone(),
-            })?;
-        if current_version != delivery.expected_run_version {
-            return Err(StoreError::ManagedStuckRunVersionStale {
+        validate_current_due_occurrence(&transaction, &delivery.run_id, &delivery.occurrence_id)?;
+        let Some(claim) = stuck_notification_delivery_claim(&transaction, &delivery.run_id)? else {
+            return Err(StoreError::ManagedStuckNotificationDeliveryUnclaimed {
                 run_id: delivery.run_id,
-                expected: delivery.expected_run_version,
-                current: current_version,
             });
-        }
-        let projection =
-            replay_dashboard_projection(&load_run_event_history(&transaction, &delivery.run_id)?)
-                .map_err(|source| StoreError::DashboardProjection {
-                run_id: delivery.run_id.clone(),
-                source,
-            })?;
-        if !matches!(
-            projection.stuck_notification,
-            CoreStuckNotification::Due { ref occurrence_id, .. }
-                if occurrence_id == &delivery.occurrence_id
-        ) {
+        };
+        if claim.run_version != delivery.expected_run_version
+            || claim.occurrence_id != delivery.occurrence_id
+            || claim.platform_id != delivery.platform_id
+        {
             return Err(StoreError::ManagedStuckOccurrenceMismatch {
                 run_id: delivery.run_id,
-                expected: projection
-                    .current_stuck_occurrence_id
-                    .unwrap_or_else(|| "active_due_occurrence".to_owned()),
+                expected: claim.occurrence_id,
                 received: delivery.occurrence_id,
             });
         }
@@ -820,8 +946,39 @@ impl Store {
         let outcome = outcomes
             .pop()
             .expect("one notification delivery must produce one outcome");
+        transaction
+            .execute(
+                "DELETE FROM stuck_notification_delivery_claims WHERE run_id = ?1",
+                [&delivery.run_id],
+            )
+            .map_err(StoreError::Sqlite)?;
         transaction.commit().map_err(StoreError::Sqlite)?;
         Ok(outcome)
+    }
+
+    pub fn managed_stuck_notification_delivery_receipt(
+        &self,
+        run_id: &str,
+        event_id: &str,
+        occurrence_id: &str,
+        platform_id: &str,
+    ) -> Result<Option<EventEnvelope>, StoreError> {
+        let Some(ingest_seq) = event_ingest_seq(&self.connection, event_id)? else {
+            return Ok(None);
+        };
+        let event = load_event(&self.connection, ingest_seq)?;
+        if is_authoritative_stuck_notification_delivery_receipt(
+            &event,
+            run_id,
+            occurrence_id,
+            platform_id,
+        ) {
+            Ok(Some(event))
+        } else {
+            Err(StoreError::EventIdentityConflict {
+                event_id: event_id.to_owned(),
+            })
+        }
     }
 
     fn append_managed_stuck_transition_in_transaction(
@@ -3374,6 +3531,87 @@ fn latest_run_event_version(
     stored.map(assigned_sequence).transpose()
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StoredStuckNotificationDeliveryClaim {
+    run_version: u64,
+    occurrence_id: String,
+    platform_id: String,
+}
+
+fn stuck_notification_delivery_claim(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<Option<StoredStuckNotificationDeliveryClaim>, StoreError> {
+    connection
+        .query_row(
+            "SELECT run_version, occurrence_id, platform_id
+             FROM stuck_notification_delivery_claims
+             WHERE run_id = ?1",
+            [run_id],
+            |row| {
+                Ok(StoredStuckNotificationDeliveryClaim {
+                    run_version: u64::try_from(row.get::<_, i64>(0)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Integer,
+                            Box::new(error),
+                        )
+                    })?,
+                    occurrence_id: row.get(1)?,
+                    platform_id: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(StoreError::Sqlite)
+}
+
+fn validate_current_due_identity(
+    connection: &Connection,
+    run_id: &str,
+    expected_run_version: u64,
+    occurrence_id: &str,
+) -> Result<(), StoreError> {
+    let current_version =
+        latest_run_event_version(connection, run_id)?.ok_or_else(|| StoreError::MissingRun {
+            run_id: run_id.to_owned(),
+        })?;
+    if current_version != expected_run_version {
+        return Err(StoreError::ManagedStuckRunVersionStale {
+            run_id: run_id.to_owned(),
+            expected: expected_run_version,
+            current: current_version,
+        });
+    }
+    validate_current_due_occurrence(connection, run_id, occurrence_id)
+}
+
+fn validate_current_due_occurrence(
+    connection: &Connection,
+    run_id: &str,
+    occurrence_id: &str,
+) -> Result<(), StoreError> {
+    let projection = replay_dashboard_projection(&load_run_event_history(connection, run_id)?)
+        .map_err(|source| StoreError::DashboardProjection {
+            run_id: run_id.to_owned(),
+            source,
+        })?;
+    if !matches!(
+        projection.stuck_notification,
+        CoreStuckNotification::Due { occurrence_id: ref current, .. }
+            if current == occurrence_id
+    ) {
+        return Err(StoreError::ManagedStuckOccurrenceMismatch {
+            run_id: run_id.to_owned(),
+            expected: projection
+                .current_stuck_occurrence_id
+                .unwrap_or_else(|| "active_due_occurrence".to_owned()),
+            received: occurrence_id.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn next_managed_run_core_stream_seq(
     connection: &Connection,
     run_id: &str,
@@ -3680,6 +3918,37 @@ fn is_authoritative_still_working_receipt(
         event.payload.clone(),
     ))
     .is_ok_and(|payload| payload.occurrence_id == occurrence_id)
+}
+
+fn is_authoritative_stuck_notification_delivery_receipt(
+    event: &EventEnvelope,
+    run_id: &str,
+    occurrence_id: &str,
+    platform_id: &str,
+) -> bool {
+    let unsequenced = UnsequencedEventEnvelope::from(event.clone());
+    if validate_event(&unsequenced).is_err()
+        || event.protocol_version != EventProtocolVersion::V1_4
+        || event.run_id != run_id
+        || event.event_type != "notification.delivered"
+        || !matches!(event.session_id, NullableSessionId::Null)
+        || event.source.kind != EventSourceKind::Notifier
+        || event.source.provider.is_some()
+        || event.source.contract_version.as_deref() != Some("stuck-notification/1.0")
+        || !event.source.extensions.is_empty()
+        || event.confidence != 1.0
+        || event.occurred_at != event.observed_at
+        || !event.extensions.is_empty()
+        || !event.evidence_ids.is_empty()
+    {
+        return false;
+    }
+    serde_json::from_value::<flit_protocol::StuckNotificationDeliveredPayload>(Value::Object(
+        event.payload.clone(),
+    ))
+    .is_ok_and(|payload| {
+        payload.occurrence_id == occurrence_id && payload.platform_id == platform_id
+    })
 }
 
 fn managed_still_working_receipt_matches_action(
@@ -7092,6 +7361,11 @@ pub fn run_git_changes_migration_checksum() -> String {
     migration_checksum(RUN_GIT_CHANGES_MIGRATION_SQL)
 }
 
+#[must_use]
+pub fn stuck_notification_delivery_claims_migration_checksum() -> String {
+    migration_checksum(STUCK_NOTIFICATION_DELIVERY_CLAIMS_MIGRATION_SQL)
+}
+
 fn migration_checksum(sql: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(sql.as_bytes());
@@ -7275,7 +7549,7 @@ struct Migration {
     sql: &'static str,
 }
 
-fn migrations() -> [Migration; 3] {
+fn migrations() -> [Migration; 4] {
     [
         Migration {
             version: INITIAL_MIGRATION_VERSION,
@@ -7291,6 +7565,11 @@ fn migrations() -> [Migration; 3] {
             version: RUN_GIT_CHANGES_MIGRATION_VERSION,
             name: RUN_GIT_CHANGES_MIGRATION_NAME,
             sql: RUN_GIT_CHANGES_MIGRATION_SQL,
+        },
+        Migration {
+            version: STUCK_NOTIFICATION_DELIVERY_CLAIMS_MIGRATION_VERSION,
+            name: STUCK_NOTIFICATION_DELIVERY_CLAIMS_MIGRATION_NAME,
+            sql: STUCK_NOTIFICATION_DELIVERY_CLAIMS_MIGRATION_SQL,
         },
     ]
 }
@@ -7486,6 +7765,9 @@ pub enum StoreError {
     },
     InvalidManagedStuckNotificationDelivery {
         field: &'static str,
+    },
+    ManagedStuckNotificationDeliveryUnclaimed {
+        run_id: String,
     },
     ManagedStuckAssessmentRunLimitExceeded {
         count: usize,
@@ -7867,6 +8149,10 @@ impl fmt::Display for StoreError {
             Self::InvalidManagedStuckNotificationDelivery { field } => write!(
                 formatter,
                 "invalid managed stuck notification delivery field: {field}"
+            ),
+            Self::ManagedStuckNotificationDeliveryUnclaimed { run_id } => write!(
+                formatter,
+                "managed stuck notification delivery was not claimed for Run {run_id}"
             ),
             Self::ManagedStuckAssessmentRunLimitExceeded { count, max } => write!(
                 formatter,

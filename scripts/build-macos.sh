@@ -71,6 +71,7 @@ for index in 0 1; do
         "$static_library" \
         -framework AppKit \
         -framework SwiftUI \
+        -framework UserNotifications \
         -o "$executable"
 done
 

@@ -29,10 +29,12 @@ use flit_store::{
     ManagedSessionReconciliationOutcome, ManagedSessionTermination,
     ManagedSessionTerminationOutcome, ManagedStillWorkingAction, ManagedStillWorkingOutcome,
     ManagedStillWorkingRejectedReason, ManagedStuckActivity, ManagedStuckAssessment,
-    ManagedStuckLifecycle, ManagedStuckNotificationDelivery, ManagedStuckTransition,
-    ManagedStuckTransitionOutcome, ManagedStuckWaitKind, ManagedTurnTerminalOutcome,
-    ProjectDirectoryInspection, ProjectRegistration, ProjectTrustConfirmation,
-    RunActiveAttentionAction, Store, StoreError,
+    ManagedStuckLifecycle, ManagedStuckNotificationDelivery, ManagedStuckNotificationDeliveryClaim,
+    ManagedStuckNotificationDeliveryClaimOutcome, ManagedStuckNotificationDeliveryFailure,
+    ManagedStuckNotificationDeliveryFailureOutcome, ManagedStuckNotificationDueContext,
+    ManagedStuckTransition, ManagedStuckTransitionOutcome, ManagedStuckWaitKind,
+    ManagedTurnTerminalOutcome, ProjectDirectoryInspection, ProjectRegistration,
+    ProjectTrustConfirmation, RunActiveAttentionAction, Store, StoreError,
 };
 use rusqlite::{Connection, params};
 use serde_json::{Map, Value, json};
@@ -711,7 +713,7 @@ fn still_working_is_exact_no_write_cas_and_replays_suppression() {
             occurrence_id: "occurrence-still-working-reset".to_owned(),
             event_id: "event-still-working-delivery-before-due".to_owned(),
             observed_at: "2026-08-09T10:12:19Z".to_owned(),
-            platform_id: "notification-before-due".to_owned(),
+            platform_id: "occurrence-still-working-reset".to_owned(),
         }),
         Err(StoreError::ManagedStuckOccurrenceMismatch { .. })
     ));
@@ -745,6 +747,18 @@ fn still_working_is_exact_no_write_cas_and_replays_suppression() {
         other => panic!("due transition must append: {other:?}"),
     };
     assert_eq!(due_event.event_type, "notification.due");
+    assert_eq!(
+        store
+            .managed_stuck_notification_due_contexts()
+            .expect("due notification contexts"),
+        vec![ManagedStuckNotificationDueContext {
+            run_id: run_id.to_owned(),
+            run_version: due_event.ingest_seq,
+            occurrence_id: "occurrence-still-working-reset".to_owned(),
+            platform_id: "occurrence-still-working-reset".to_owned(),
+            delivery_claimed: false,
+        }]
+    );
     assert_eq!(
         store
             .run_snapshot(run_id)
@@ -804,7 +818,7 @@ fn still_working_is_exact_no_write_cas_and_replays_suppression() {
         occurrence_id: "occurrence-still-working-reset".to_owned(),
         event_id: "event-still-working-notification-collision".to_owned(),
         observed_at: "2026-08-09T10:12:21Z".to_owned(),
-        platform_id: "notification-still-working-reset".to_owned(),
+        platform_id: "occurrence-still-working-reset".to_owned(),
     };
     let collision_cursor = store
         .latest_ingest_seq()
@@ -818,13 +832,95 @@ fn still_working_is_exact_no_write_cas_and_replays_suppression() {
         store.latest_ingest_seq().expect("delivery no-write cursor"),
         collision_cursor
     );
+    let claim = ManagedStuckNotificationDeliveryClaim {
+        run_id: run_id.to_owned(),
+        expected_run_version: delivery_version,
+        occurrence_id: "occurrence-still-working-reset".to_owned(),
+        platform_id: "occurrence-still-working-reset".to_owned(),
+        claimed_at: "2026-08-09T10:12:21Z".to_owned(),
+    };
+    assert_eq!(
+        store
+            .claim_managed_stuck_notification_delivery(claim.clone())
+            .expect("notification delivery claim"),
+        ManagedStuckNotificationDeliveryClaimOutcome::Claimed
+    );
+    assert_eq!(
+        store
+            .claim_managed_stuck_notification_delivery(claim)
+            .expect("notification delivery claim retry"),
+        ManagedStuckNotificationDeliveryClaimOutcome::AlreadyClaimed
+    );
+    let failure = ManagedStuckNotificationDeliveryFailure {
+        run_id: run_id.to_owned(),
+        expected_run_version: delivery_version,
+        occurrence_id: "occurrence-still-working-reset".to_owned(),
+        platform_id: "occurrence-still-working-reset".to_owned(),
+    };
+    assert_eq!(
+        store
+            .release_managed_stuck_notification_delivery(failure.clone())
+            .expect("release failed delivery claim"),
+        ManagedStuckNotificationDeliveryFailureOutcome::Released
+    );
+    assert_eq!(
+        store
+            .release_managed_stuck_notification_delivery(failure)
+            .expect("release failed delivery claim retry"),
+        ManagedStuckNotificationDeliveryFailureOutcome::AlreadyReleased
+    );
+    let claim = ManagedStuckNotificationDeliveryClaim {
+        run_id: run_id.to_owned(),
+        expected_run_version: delivery_version,
+        occurrence_id: "occurrence-still-working-reset".to_owned(),
+        platform_id: "occurrence-still-working-reset".to_owned(),
+        claimed_at: "2026-08-09T10:12:22Z".to_owned(),
+    };
+    assert_eq!(
+        store
+            .claim_managed_stuck_notification_delivery(claim)
+            .expect("reclaim failed delivery"),
+        ManagedStuckNotificationDeliveryClaimOutcome::Claimed
+    );
+    let mut event_after_claim = session_event(
+        "event-still-working-after-delivery-claim",
+        run_id,
+        "session-still-working",
+        4,
+        "notification.delivered",
+    );
+    event_after_claim.protocol_version = EventProtocolVersion::V1_3;
+    event_after_claim.payload = object(json!({
+        "occurrence_id": "occurrence-still-working-reset",
+        "platform_id": "legacy-notification-after-claim",
+    }));
+    let version_after_claim = match store
+        .append_event(event_after_claim)
+        .expect("unrelated event after delivery claim")
+    {
+        AppendEventOutcome::Inserted(event) => event.ingest_seq,
+        other => panic!("event after delivery claim must insert: {other:?}"),
+    };
+    assert!(version_after_claim > delivery_version);
+    assert_eq!(
+        store
+            .managed_stuck_notification_due_contexts()
+            .expect("claimed due notification contexts"),
+        vec![ManagedStuckNotificationDueContext {
+            run_id: run_id.to_owned(),
+            run_version: delivery_version,
+            occurrence_id: "occurrence-still-working-reset".to_owned(),
+            platform_id: "occurrence-still-working-reset".to_owned(),
+            delivery_claimed: true,
+        }]
+    );
     let delivery = ManagedStuckNotificationDelivery {
         run_id: run_id.to_owned(),
         expected_run_version: delivery_version,
         occurrence_id: "occurrence-still-working-reset".to_owned(),
         event_id: "event-still-working-notification-delivered".to_owned(),
         observed_at: "2026-08-09T10:12:21Z".to_owned(),
-        platform_id: "notification-still-working-reset".to_owned(),
+        platform_id: "occurrence-still-working-reset".to_owned(),
     };
     let delivered = store
         .append_managed_stuck_notification_delivered(delivery.clone())
@@ -846,6 +942,12 @@ fn still_working_is_exact_no_write_cas_and_replays_suppression() {
             .expect("delivered projection")
             .snapshot["stuck"]["notification"]["status"],
         "delivered"
+    );
+    assert!(
+        store
+            .managed_stuck_notification_due_contexts()
+            .expect("delivered notification contexts")
+            .is_empty()
     );
     drop(store);
     let reopened = Store::open(&database, CREATED_AT).expect("reopen reset snapshot");
