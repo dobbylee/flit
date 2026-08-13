@@ -25,7 +25,10 @@ use rusqlite::{
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::notification_delivery::local_minute_is_quiet;
+
 mod managed_runs;
+mod notification_delivery;
 mod notification_policy;
 mod projects;
 mod writer;
@@ -54,6 +57,11 @@ pub use managed_runs::{
     ManagedStuckNotificationDueContext, ManagedStuckNotificationState, ManagedStuckReset,
     ManagedStuckTransition, ManagedStuckTransitionOutcome, ManagedStuckWaitKind,
     ManagedTurnTerminalOutcome,
+};
+pub use notification_delivery::{
+    NotificationDeliveryCandidate, NotificationDeliveryClaim, NotificationDeliveryClaimOutcome,
+    NotificationDeliveryFailure, NotificationDeliveryFailureOutcome, NotificationDeliveryReceipt,
+    NotificationDeliveryReceiptOutcome, NotificationDeliveryState, NotificationKind,
 };
 pub use notification_policy::{
     EffectiveNotificationPolicy, GlobalNotificationPolicy, NotificationKindOverrides,
@@ -88,6 +96,10 @@ const STUCK_NOTIFICATION_DELIVERY_CLAIMS_MIGRATION_NAME: &str =
     "stuck_notification_delivery_claims";
 const STUCK_NOTIFICATION_DELIVERY_CLAIMS_MIGRATION_SQL: &str =
     include_str!("../migrations/0004_stuck_notification_delivery_claims.sql");
+const NOTIFICATION_DELIVERIES_MIGRATION_VERSION: i64 = 5;
+const NOTIFICATION_DELIVERIES_MIGRATION_NAME: &str = "notification_deliveries";
+const NOTIFICATION_DELIVERIES_MIGRATION_SQL: &str =
+    include_str!("../migrations/0005_notification_deliveries.sql");
 const MAX_EVENT_READ_LIMIT: usize = 1_000;
 const MAX_MANAGED_PERMISSION_RESPONSE_EVENTS: usize = 2;
 pub const MAX_EVENT_APPEND_BATCH: usize = 50;
@@ -562,6 +574,275 @@ fn validate_notification_policy_timestamp(updated_at: &str) -> Result<(), StoreE
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+struct NotificationSourceCandidate {
+    candidate: NotificationDeliveryCandidate,
+    priority: u8,
+    legacy_claimed_at: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct StoredNotificationDelivery {
+    notification_id: String,
+    run_id: String,
+    project_id: String,
+    kind: NotificationKind,
+    item_id: String,
+    item_version: u64,
+    platform_id: String,
+    state: NotificationDeliveryState,
+    suppression_reason: Option<String>,
+}
+
+fn validate_notification_delivery_token(
+    value: &str,
+    max: usize,
+    field: &'static str,
+) -> Result<(), StoreError> {
+    if value.trim().is_empty() || value.len() > max || value.chars().any(char::is_control) {
+        return Err(StoreError::InvalidNotificationDelivery { field });
+    }
+    Ok(())
+}
+
+fn validate_notification_delivery_timestamp(
+    value: &str,
+    field: &'static str,
+) -> Result<(), StoreError> {
+    validate_notification_delivery_token(value, 64, field)
+}
+
+fn notification_kind_enabled(kinds: NotificationKinds, kind: NotificationKind) -> bool {
+    match kind {
+        NotificationKind::Permission => kinds.permission,
+        NotificationKind::Question => kinds.question,
+        NotificationKind::Failure => kinds.failure,
+        NotificationKind::Stuck => kinds.stuck,
+        NotificationKind::Completion => kinds.completion,
+    }
+}
+
+fn notification_priority(item: &RunActiveAttentionItem) -> u8 {
+    match (item.severity.as_str(), item.blocking) {
+        ("Critical", _) => 0,
+        ("ActionRequired", true) => 1,
+        ("ActionRequired", false) => 2,
+        ("Informational", _) => 3,
+        _ => 4,
+    }
+}
+
+fn notification_source_candidates(
+    connection: &Connection,
+) -> Result<Vec<NotificationSourceCandidate>, StoreError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT snapshots.run_id, runs.project_id
+             FROM run_snapshots AS snapshots
+             JOIN runs ON runs.id = snapshots.run_id
+             JOIN projects ON projects.id = runs.project_id
+             WHERE runs.deleted_at IS NULL AND projects.archived_at IS NULL
+             ORDER BY snapshots.run_id
+             LIMIT ?1",
+        )
+        .map_err(StoreError::Sqlite)?;
+    let run_projects = statement
+        .query_map([MAX_DASHBOARD_SNAPSHOT_RUNS as i64 + 1], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(StoreError::Sqlite)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::Sqlite)?;
+    drop(statement);
+    if run_projects.len() > MAX_DASHBOARD_SNAPSHOT_RUNS {
+        return Err(StoreError::NotificationDeliveryRunLimitExceeded {
+            count: run_projects.len(),
+            max: MAX_DASHBOARD_SNAPSHOT_RUNS,
+        });
+    }
+
+    let mut candidates = Vec::new();
+    for (run_id, project_id) in run_projects {
+        let snapshot = load_run_snapshot(connection, &run_id)?.ok_or_else(|| {
+            StoreError::StoredNotificationDeliveryInvalid {
+                notification_id: run_id.clone(),
+                field: "run_snapshot",
+            }
+        })?;
+        let context = active_attention_context(&snapshot)?;
+        let Some(item) = context.item else {
+            continue;
+        };
+        let Some(kind) = NotificationKind::parse(&item.category) else {
+            continue;
+        };
+        if item.status != "open" {
+            continue;
+        }
+        let mut legacy_claimed_at = None;
+        let item_id = if kind == NotificationKind::Stuck {
+            let RunActiveAttentionAction::StillWorking { occurrence_id } = &item.action else {
+                return Err(StoreError::StoredNotificationDeliveryInvalid {
+                    notification_id: run_id,
+                    field: "stuck_action",
+                });
+            };
+            let stuck = snapshot
+                .snapshot
+                .get("stuck")
+                .and_then(Value::as_object)
+                .ok_or_else(|| StoreError::StoredNotificationDeliveryInvalid {
+                    notification_id: run_id.clone(),
+                    field: "stuck",
+                })?;
+            let notification = stuck
+                .get("notification")
+                .and_then(Value::as_object)
+                .ok_or_else(|| StoreError::StoredNotificationDeliveryInvalid {
+                    notification_id: run_id.clone(),
+                    field: "stuck.notification",
+                })?;
+            let due_occurrence = notification.get("occurrence_id").and_then(Value::as_str);
+            if notification.get("status").and_then(Value::as_str) != Some("due")
+                || stuck.get("occurrence_id").and_then(Value::as_str)
+                    != Some(occurrence_id.as_str())
+                || due_occurrence != Some(occurrence_id.as_str())
+            {
+                continue;
+            }
+            if let Some(claim) = stuck_notification_delivery_claim(connection, &run_id)?
+                && claim.occurrence_id == *occurrence_id
+            {
+                if claim.platform_id != *occurrence_id {
+                    return Err(StoreError::StoredNotificationDeliveryInvalid {
+                        notification_id: run_id,
+                        field: "legacy.platform_id",
+                    });
+                }
+                validate_notification_delivery_token(
+                    &claim.platform_id,
+                    256,
+                    "legacy.platform_id",
+                )?;
+                validate_notification_delivery_timestamp(&claim.claimed_at, "legacy.claimed_at")?;
+                if claim.run_version > context.run_version {
+                    return Err(StoreError::StoredNotificationDeliveryInvalid {
+                        notification_id: run_id,
+                        field: "legacy.run_version",
+                    });
+                }
+                legacy_claimed_at = Some(claim.claimed_at);
+            }
+            occurrence_id.clone()
+        } else {
+            item.attention_id.clone()
+        };
+        let identity = format!("{}\0{}\0{}", run_id, kind.as_str(), item_id);
+        let digest = sha256_hex(identity.as_bytes());
+        let platform_id = if kind == NotificationKind::Stuck {
+            stuck_notification_delivery_claim(connection, &run_id)?
+                .filter(|claim| claim.occurrence_id == item_id)
+                .map_or_else(|| format!("flit-{digest}"), |claim| claim.platform_id)
+        } else {
+            format!("flit-{digest}")
+        };
+        candidates.push(NotificationSourceCandidate {
+            candidate: NotificationDeliveryCandidate {
+                notification_id: format!("notification-{digest}"),
+                run_id,
+                run_version: context.run_version,
+                project_id,
+                kind,
+                item_id,
+                item_version: item.attention_version,
+                platform_id,
+                delivery_claimed: false,
+                catch_up: false,
+            },
+            priority: notification_priority(&item),
+            legacy_claimed_at,
+        });
+    }
+    Ok(candidates)
+}
+
+fn stored_notification_delivery(
+    connection: &Connection,
+    notification_id: &str,
+) -> Result<Option<StoredNotificationDelivery>, StoreError> {
+    let stored = connection
+        .query_row(
+            "SELECT notification_id, run_id, project_id, kind, item_id, item_version,
+                    platform_id, state, suppression_reason
+             FROM notification_deliveries WHERE notification_id = ?1",
+            [notification_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(StoreError::Sqlite)?;
+    let Some((
+        notification_id,
+        run_id,
+        project_id,
+        kind,
+        item_id,
+        item_version,
+        platform_id,
+        state,
+        suppression_reason,
+    )) = stored
+    else {
+        return Ok(None);
+    };
+    let invalid = |field| StoreError::StoredNotificationDeliveryInvalid {
+        notification_id: notification_id.clone(),
+        field,
+    };
+    let kind = NotificationKind::parse(&kind).ok_or_else(|| invalid("kind"))?;
+    let state = NotificationDeliveryState::parse(&state).ok_or_else(|| invalid("state"))?;
+    let item_version = assigned_sequence(item_version).map_err(|_| invalid("item_version"))?;
+    if matches!(suppression_reason.as_deref(), Some(reason) if !matches!(reason, "policy" | "quiet_hours"))
+    {
+        return Err(invalid("suppression_reason"));
+    }
+    Ok(Some(StoredNotificationDelivery {
+        notification_id,
+        run_id,
+        project_id,
+        kind,
+        item_id,
+        item_version,
+        platform_id,
+        state,
+        suppression_reason,
+    }))
+}
+
+fn notification_delivery_matches(
+    stored: &StoredNotificationDelivery,
+    candidate: &NotificationDeliveryCandidate,
+) -> bool {
+    stored.notification_id == candidate.notification_id
+        && stored.run_id == candidate.run_id
+        && stored.project_id == candidate.project_id
+        && stored.kind == candidate.kind
+        && stored.item_id == candidate.item_id
+        && stored.item_version == candidate.item_version
+        && stored.platform_id == candidate.platform_id
+}
+
 impl Store {
     pub fn notification_policy(
         &self,
@@ -683,6 +964,390 @@ impl Store {
         let snapshot = notification_policy_snapshot(&transaction, Some(project_id))?;
         transaction.commit().map_err(StoreError::Sqlite)?;
         Ok(snapshot)
+    }
+
+    pub fn reconcile_notification_deliveries(
+        &mut self,
+        local_minute: u16,
+        evaluated_at: &str,
+    ) -> Result<Vec<NotificationDeliveryCandidate>, StoreError> {
+        if local_minute >= 24 * 60 {
+            return Err(StoreError::InvalidNotificationDelivery {
+                field: "local_minute",
+            });
+        }
+        validate_notification_delivery_timestamp(evaluated_at, "evaluated_at")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+        let sources = notification_source_candidates(&transaction)?;
+        let mut policies = BTreeMap::new();
+        let mut due = Vec::new();
+        let mut catch_up_by_project: BTreeMap<String, NotificationSourceCandidate> =
+            BTreeMap::new();
+
+        let mut claimed_quiet_projects = BTreeSet::new();
+        for mut source in sources {
+            let policy = match policies.get(&source.candidate.project_id) {
+                Some(policy) => policy,
+                None => {
+                    let policy = notification_policy_snapshot(
+                        &transaction,
+                        Some(&source.candidate.project_id),
+                    )?
+                    .effective;
+                    policies.insert(source.candidate.project_id.clone(), policy);
+                    policies
+                        .get(&source.candidate.project_id)
+                        .expect("inserted notification policy")
+                }
+            };
+            let enabled = notification_kind_enabled(policy.kinds, source.candidate.kind);
+            let quiet = local_minute_is_quiet(
+                policy.quiet_hours.enabled,
+                policy.quiet_hours.start_minute,
+                policy.quiet_hours.end_minute,
+                local_minute,
+            );
+            let mut existing =
+                stored_notification_delivery(&transaction, &source.candidate.notification_id)?;
+            if let Some(existing) = &existing {
+                if existing.item_version > source.candidate.item_version {
+                    return Err(StoreError::StoredNotificationDeliveryInvalid {
+                        notification_id: source.candidate.notification_id,
+                        field: "item_version",
+                    });
+                }
+                source.candidate.item_version = existing.item_version;
+            }
+            if let Some(existing) = &existing
+                && !notification_delivery_matches(existing, &source.candidate)
+            {
+                return Err(StoreError::StoredNotificationDeliveryInvalid {
+                    notification_id: source.candidate.notification_id,
+                    field: "identity",
+                });
+            }
+            if existing.is_none()
+                && let Some(claimed_at) = source.legacy_claimed_at.as_deref()
+            {
+                transaction
+                    .execute(
+                        "INSERT INTO notification_deliveries(
+                            notification_id, run_id, project_id, kind, item_id, item_version,
+                            platform_id, state, claimed_at
+                         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'claimed', ?8)",
+                        params![
+                            source.candidate.notification_id,
+                            source.candidate.run_id,
+                            source.candidate.project_id,
+                            source.candidate.kind.as_str(),
+                            source.candidate.item_id,
+                            source.candidate.item_version as i64,
+                            source.candidate.platform_id,
+                            claimed_at,
+                        ],
+                    )
+                    .map_err(StoreError::Sqlite)?;
+                existing =
+                    stored_notification_delivery(&transaction, &source.candidate.notification_id)?;
+            }
+
+            if !enabled || quiet {
+                if existing.is_none() {
+                    transaction
+                        .execute(
+                            "INSERT INTO notification_deliveries(
+                                notification_id, run_id, project_id, kind, item_id, item_version,
+                                platform_id, state, suppression_reason, suppressed_at
+                             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'suppressed', ?8, ?9)",
+                            params![
+                                source.candidate.notification_id,
+                                source.candidate.run_id,
+                                source.candidate.project_id,
+                                source.candidate.kind.as_str(),
+                                source.candidate.item_id,
+                                source.candidate.item_version as i64,
+                                source.candidate.platform_id,
+                                if enabled { "quiet_hours" } else { "policy" },
+                                evaluated_at,
+                            ],
+                        )
+                        .map_err(StoreError::Sqlite)?;
+                }
+                if existing
+                    .as_ref()
+                    .is_some_and(|row| row.state == NotificationDeliveryState::Claimed)
+                {
+                    if existing
+                        .as_ref()
+                        .is_some_and(|row| row.suppression_reason.as_deref() == Some("quiet_hours"))
+                    {
+                        claimed_quiet_projects.insert(source.candidate.project_id.clone());
+                    }
+                    source.candidate.delivery_claimed = true;
+                    due.push(source);
+                }
+                continue;
+            }
+
+            match existing {
+                None => due.push(source),
+                Some(row) if row.state == NotificationDeliveryState::Claimed => {
+                    if row.suppression_reason.as_deref() == Some("quiet_hours") {
+                        claimed_quiet_projects.insert(source.candidate.project_id.clone());
+                    }
+                    source.candidate.delivery_claimed = true;
+                    due.push(source);
+                }
+                Some(row)
+                    if row.state == NotificationDeliveryState::Suppressed
+                        && row.suppression_reason.as_deref() == Some("quiet_hours")
+                        && source.candidate.kind.catches_up() =>
+                {
+                    source.candidate.catch_up = true;
+                    let replace = catch_up_by_project
+                        .get(&source.candidate.project_id)
+                        .is_none_or(|current| {
+                            (source.priority, source.candidate.notification_id.as_str())
+                                < (current.priority, current.candidate.notification_id.as_str())
+                        });
+                    if replace {
+                        catch_up_by_project.insert(source.candidate.project_id.clone(), source);
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+        catch_up_by_project.retain(|project_id, _| !claimed_quiet_projects.contains(project_id));
+        due.extend(catch_up_by_project.into_values());
+        due.sort_by(|left, right| {
+            (
+                left.candidate.project_id.as_str(),
+                left.priority,
+                left.candidate.notification_id.as_str(),
+            )
+                .cmp(&(
+                    right.candidate.project_id.as_str(),
+                    right.priority,
+                    right.candidate.notification_id.as_str(),
+                ))
+        });
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(due.into_iter().map(|source| source.candidate).collect())
+    }
+
+    pub fn claim_notification_delivery(
+        &mut self,
+        claim: NotificationDeliveryClaim,
+    ) -> Result<NotificationDeliveryClaimOutcome, StoreError> {
+        validate_notification_delivery_token(&claim.notification_id, 96, "notification_id")?;
+        validate_notification_delivery_token(&claim.run_id, 256, "run_id")?;
+        validate_notification_delivery_token(&claim.item_id, 256, "item_id")?;
+        validate_notification_delivery_token(&claim.platform_id, 256, "platform_id")?;
+        validate_notification_delivery_timestamp(&claim.claimed_at, "claimed_at")?;
+        if claim.expected_run_version == 0
+            || claim.expected_run_version > MAX_JSON_SAFE_INTEGER
+            || claim.item_version == 0
+            || claim.item_version > MAX_JSON_SAFE_INTEGER
+        {
+            return Err(StoreError::InvalidNotificationDelivery { field: "version" });
+        }
+        let candidate = self
+            .reconcile_notification_deliveries(claim.local_minute, &claim.claimed_at)?
+            .into_iter()
+            .find(|candidate| candidate.notification_id == claim.notification_id)
+            .ok_or_else(|| StoreError::NotificationDeliveryUnavailable {
+                notification_id: claim.notification_id.clone(),
+            })?;
+        if candidate.run_id != claim.run_id
+            || candidate.run_version != claim.expected_run_version
+            || candidate.kind != claim.kind
+            || candidate.item_id != claim.item_id
+            || candidate.item_version != claim.item_version
+            || candidate.platform_id != claim.platform_id
+        {
+            return Err(StoreError::NotificationDeliveryIdentityMismatch {
+                notification_id: claim.notification_id,
+            });
+        }
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+        let current_version = load_run_snapshot(&transaction, &claim.run_id)?
+            .ok_or_else(|| StoreError::NotificationDeliveryUnavailable {
+                notification_id: claim.notification_id.clone(),
+            })?
+            .version;
+        if current_version != claim.expected_run_version {
+            return Err(StoreError::NotificationDeliveryUnavailable {
+                notification_id: claim.notification_id,
+            });
+        }
+        match stored_notification_delivery(&transaction, &candidate.notification_id)? {
+            Some(row) if !notification_delivery_matches(&row, &candidate) => {
+                return Err(StoreError::StoredNotificationDeliveryInvalid {
+                    notification_id: candidate.notification_id,
+                    field: "identity",
+                });
+            }
+            Some(row) if row.state == NotificationDeliveryState::Claimed => {
+                transaction.commit().map_err(StoreError::Sqlite)?;
+                return Ok(NotificationDeliveryClaimOutcome::AlreadyClaimed);
+            }
+            Some(row) if row.state == NotificationDeliveryState::Suppressed => {
+                transaction
+                    .execute(
+                        "UPDATE notification_deliveries
+                         SET state = 'claimed', claimed_at = ?1
+                         WHERE notification_id = ?2 AND state = 'suppressed'",
+                        params![claim.claimed_at, candidate.notification_id],
+                    )
+                    .map_err(StoreError::Sqlite)?;
+            }
+            Some(_) => {
+                return Err(StoreError::NotificationDeliveryUnavailable {
+                    notification_id: candidate.notification_id,
+                });
+            }
+            None => {
+                transaction
+                    .execute(
+                        "INSERT INTO notification_deliveries(
+                            notification_id, run_id, project_id, kind, item_id, item_version,
+                            platform_id, state, claimed_at
+                         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'claimed', ?8)",
+                        params![
+                            candidate.notification_id,
+                            candidate.run_id,
+                            candidate.project_id,
+                            candidate.kind.as_str(),
+                            candidate.item_id,
+                            candidate.item_version as i64,
+                            candidate.platform_id,
+                            claim.claimed_at,
+                        ],
+                    )
+                    .map_err(StoreError::Sqlite)?;
+            }
+        }
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(NotificationDeliveryClaimOutcome::Claimed)
+    }
+
+    pub fn release_notification_delivery(
+        &mut self,
+        failure: NotificationDeliveryFailure,
+    ) -> Result<NotificationDeliveryFailureOutcome, StoreError> {
+        validate_notification_delivery_token(&failure.notification_id, 96, "notification_id")?;
+        validate_notification_delivery_token(&failure.run_id, 256, "run_id")?;
+        validate_notification_delivery_token(&failure.item_id, 256, "item_id")?;
+        validate_notification_delivery_token(&failure.platform_id, 256, "platform_id")?;
+        if failure.item_version == 0 || failure.item_version > MAX_JSON_SAFE_INTEGER {
+            return Err(StoreError::InvalidNotificationDelivery {
+                field: "item_version",
+            });
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+        let Some(row) = stored_notification_delivery(&transaction, &failure.notification_id)?
+        else {
+            transaction.commit().map_err(StoreError::Sqlite)?;
+            return Ok(NotificationDeliveryFailureOutcome::AlreadyReleased);
+        };
+        if row.run_id != failure.run_id
+            || row.kind != failure.kind
+            || row.item_id != failure.item_id
+            || row.item_version != failure.item_version
+            || row.platform_id != failure.platform_id
+        {
+            return Err(StoreError::NotificationDeliveryIdentityMismatch {
+                notification_id: failure.notification_id,
+            });
+        }
+        if row.state != NotificationDeliveryState::Claimed {
+            return Err(StoreError::NotificationDeliveryUnclaimed {
+                notification_id: failure.notification_id,
+            });
+        }
+        if row.suppression_reason.as_deref() == Some("quiet_hours") {
+            transaction
+                .execute(
+                    "UPDATE notification_deliveries
+                     SET state = 'suppressed', claimed_at = NULL
+                     WHERE notification_id = ?1 AND state = 'claimed'",
+                    [&failure.notification_id],
+                )
+                .map_err(StoreError::Sqlite)?;
+        } else {
+            transaction
+                .execute(
+                    "DELETE FROM notification_deliveries
+                     WHERE notification_id = ?1 AND state = 'claimed'",
+                    [&failure.notification_id],
+                )
+                .map_err(StoreError::Sqlite)?;
+        }
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(NotificationDeliveryFailureOutcome::Released)
+    }
+
+    pub fn record_notification_delivery(
+        &mut self,
+        receipt: NotificationDeliveryReceipt,
+    ) -> Result<NotificationDeliveryReceiptOutcome, StoreError> {
+        validate_notification_delivery_token(&receipt.notification_id, 96, "notification_id")?;
+        validate_notification_delivery_token(&receipt.run_id, 256, "run_id")?;
+        validate_notification_delivery_token(&receipt.item_id, 256, "item_id")?;
+        validate_notification_delivery_token(&receipt.platform_id, 256, "platform_id")?;
+        validate_notification_delivery_timestamp(&receipt.delivered_at, "delivered_at")?;
+        if receipt.item_version == 0 || receipt.item_version > MAX_JSON_SAFE_INTEGER {
+            return Err(StoreError::InvalidNotificationDelivery {
+                field: "item_version",
+            });
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+        let row = stored_notification_delivery(&transaction, &receipt.notification_id)?
+            .ok_or_else(|| StoreError::NotificationDeliveryUnclaimed {
+                notification_id: receipt.notification_id.clone(),
+            })?;
+        if row.run_id != receipt.run_id
+            || row.kind != receipt.kind
+            || row.item_id != receipt.item_id
+            || row.item_version != receipt.item_version
+            || row.platform_id != receipt.platform_id
+        {
+            return Err(StoreError::NotificationDeliveryIdentityMismatch {
+                notification_id: receipt.notification_id,
+            });
+        }
+        if row.state == NotificationDeliveryState::Delivered {
+            transaction.commit().map_err(StoreError::Sqlite)?;
+            return Ok(NotificationDeliveryReceiptOutcome::AlreadyDelivered);
+        }
+        if row.state != NotificationDeliveryState::Claimed {
+            return Err(StoreError::NotificationDeliveryUnclaimed {
+                notification_id: receipt.notification_id,
+            });
+        }
+        transaction
+            .execute(
+                "UPDATE notification_deliveries
+                 SET state = 'delivered', delivered_at = ?1
+                 WHERE notification_id = ?2 AND state = 'claimed'",
+                params![receipt.delivered_at, receipt.notification_id],
+            )
+            .map_err(StoreError::Sqlite)?;
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(NotificationDeliveryReceiptOutcome::Delivered)
     }
 
     pub fn managed_stuck_notification_due_contexts(
@@ -3775,6 +4440,7 @@ struct StoredStuckNotificationDeliveryClaim {
     run_version: u64,
     occurrence_id: String,
     platform_id: String,
+    claimed_at: String,
 }
 
 fn stuck_notification_delivery_claim(
@@ -3783,7 +4449,7 @@ fn stuck_notification_delivery_claim(
 ) -> Result<Option<StoredStuckNotificationDeliveryClaim>, StoreError> {
     connection
         .query_row(
-            "SELECT run_version, occurrence_id, platform_id
+            "SELECT run_version, occurrence_id, platform_id, claimed_at
              FROM stuck_notification_delivery_claims
              WHERE run_id = ?1",
             [run_id],
@@ -3798,6 +4464,7 @@ fn stuck_notification_delivery_claim(
                     })?,
                     occurrence_id: row.get(1)?,
                     platform_id: row.get(2)?,
+                    claimed_at: row.get(3)?,
                 })
             },
         )
@@ -7605,6 +8272,11 @@ pub fn stuck_notification_delivery_claims_migration_checksum() -> String {
     migration_checksum(STUCK_NOTIFICATION_DELIVERY_CLAIMS_MIGRATION_SQL)
 }
 
+#[must_use]
+pub fn notification_deliveries_migration_checksum() -> String {
+    migration_checksum(NOTIFICATION_DELIVERIES_MIGRATION_SQL)
+}
+
 fn migration_checksum(sql: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(sql.as_bytes());
@@ -7788,7 +8460,7 @@ struct Migration {
     sql: &'static str,
 }
 
-fn migrations() -> [Migration; 4] {
+fn migrations() -> [Migration; 5] {
     [
         Migration {
             version: INITIAL_MIGRATION_VERSION,
@@ -7809,6 +8481,11 @@ fn migrations() -> [Migration; 4] {
             version: STUCK_NOTIFICATION_DELIVERY_CLAIMS_MIGRATION_VERSION,
             name: STUCK_NOTIFICATION_DELIVERY_CLAIMS_MIGRATION_NAME,
             sql: STUCK_NOTIFICATION_DELIVERY_CLAIMS_MIGRATION_SQL,
+        },
+        Migration {
+            version: NOTIFICATION_DELIVERIES_MIGRATION_VERSION,
+            name: NOTIFICATION_DELIVERIES_MIGRATION_NAME,
+            sql: NOTIFICATION_DELIVERIES_MIGRATION_SQL,
         },
     ]
 }
@@ -7958,6 +8635,26 @@ struct SchemaObject {
 
 #[derive(Debug)]
 pub enum StoreError {
+    InvalidNotificationDelivery {
+        field: &'static str,
+    },
+    NotificationDeliveryRunLimitExceeded {
+        count: usize,
+        max: usize,
+    },
+    NotificationDeliveryUnavailable {
+        notification_id: String,
+    },
+    NotificationDeliveryIdentityMismatch {
+        notification_id: String,
+    },
+    NotificationDeliveryUnclaimed {
+        notification_id: String,
+    },
+    StoredNotificationDeliveryInvalid {
+        notification_id: String,
+        field: &'static str,
+    },
     InvalidNotificationPolicy {
         field: &'static str,
     },
@@ -8337,6 +9034,32 @@ pub enum StoreError {
 impl fmt::Display for StoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidNotificationDelivery { field } => {
+                write!(formatter, "invalid notification delivery field: {field}")
+            }
+            Self::NotificationDeliveryRunLimitExceeded { count, max } => write!(
+                formatter,
+                "notification delivery Run count {count} exceeds {max}"
+            ),
+            Self::NotificationDeliveryUnavailable { notification_id } => write!(
+                formatter,
+                "notification delivery is no longer available: {notification_id}"
+            ),
+            Self::NotificationDeliveryIdentityMismatch { notification_id } => write!(
+                formatter,
+                "notification delivery identity does not match: {notification_id}"
+            ),
+            Self::NotificationDeliveryUnclaimed { notification_id } => write!(
+                formatter,
+                "notification delivery was not claimed: {notification_id}"
+            ),
+            Self::StoredNotificationDeliveryInvalid {
+                notification_id,
+                field,
+            } => write!(
+                formatter,
+                "stored notification delivery {notification_id} has invalid {field}"
+            ),
             Self::InvalidNotificationPolicy { field } => {
                 write!(formatter, "invalid notification policy field: {field}")
             }

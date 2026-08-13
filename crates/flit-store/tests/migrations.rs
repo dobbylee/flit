@@ -7,8 +7,8 @@ use std::{
 
 use flit_store::{
     ConnectionPolicy, Store, StoreError, initial_migration_checksum,
-    project_filesystem_identity_migration_checksum, run_git_changes_migration_checksum,
-    stuck_notification_delivery_claims_migration_checksum,
+    notification_deliveries_migration_checksum, project_filesystem_identity_migration_checksum,
+    run_git_changes_migration_checksum, stuck_notification_delivery_claims_migration_checksum,
 };
 use rusqlite::{Connection, params};
 
@@ -45,7 +45,7 @@ impl Drop for TestDatabase {
 fn fresh_database_applies_full_initial_schema_and_reopens() {
     let database = TestDatabase::new("fresh");
     let store = Store::open(database.path(), APPLIED_AT).expect("fresh store opens");
-    assert_eq!(store.schema_version().expect("schema version"), 4);
+    assert_eq!(store.schema_version().expect("schema version"), 5);
     assert_eq!(store.quick_check().expect("quick check"), "ok");
     assert_eq!(
         store.connection_policy().expect("connection policy"),
@@ -62,7 +62,7 @@ fn fresh_database_applies_full_initial_schema_and_reopens() {
 
     let reopened = Store::open(database.path(), "different-time-is-not-reapplied")
         .expect("existing store reopens");
-    assert_eq!(reopened.schema_version().expect("schema version"), 4);
+    assert_eq!(reopened.schema_version().expect("schema version"), 5);
 
     let connection = Connection::open(database.path()).expect("inspect database");
     let stored: (String, String, String) = connection
@@ -108,6 +108,16 @@ fn fresh_database_applies_full_initial_schema_and_reopens() {
         stuck_notification_delivery_claims_migration_checksum()
     );
     assert_eq!(fourth.2, APPLIED_AT);
+    let fifth: (String, String, String) = connection
+        .query_row(
+            "SELECT name, checksum, applied_at FROM schema_migrations WHERE version = 5",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("fifth migration row");
+    assert_eq!(fifth.0, "notification_deliveries");
+    assert_eq!(fifth.1, notification_deliveries_migration_checksum());
+    assert_eq!(fifth.2, APPLIED_AT);
 
     let names = schema_names(&connection);
     for required in [
@@ -124,6 +134,7 @@ fn fresh_database_applies_full_initial_schema_and_reopens() {
         "run_git_change_sets",
         "run_git_file_changes",
         "stuck_notification_delivery_claims",
+        "notification_deliveries",
         "runs",
         "schema_migrations",
         "one_live_session_per_run",
@@ -133,6 +144,7 @@ fn fresh_database_applies_full_initial_schema_and_reopens() {
         "snapshots_by_bucket_progress",
         "projects_by_filesystem_id",
         "run_git_file_changes_by_path",
+        "notification_deliveries_project_state_idx",
     ] {
         assert!(
             names.iter().any(|name| name == required),
@@ -328,7 +340,7 @@ fn version_three_database_with_a_run_upgrades_and_preserves_delivery_claims() {
     drop(connection);
 
     let store = Store::open(database.path(), APPLIED_AT).expect("upgrade version three Store");
-    assert_eq!(store.schema_version().expect("upgraded schema version"), 4);
+    assert_eq!(store.schema_version().expect("upgraded schema version"), 5);
     drop(store);
 
     let connection = Connection::open(database.path()).expect("seed upgraded claim");
@@ -346,7 +358,7 @@ fn version_three_database_with_a_run_upgrades_and_preserves_delivery_claims() {
         .expect("schema four Store reopens with outstanding claim");
     assert_eq!(
         reopened.schema_version().expect("reopened schema version"),
-        4
+        5
     );
     drop(reopened);
     let connection = Connection::open(database.path()).expect("inspect preserved claim");
@@ -456,13 +468,13 @@ fn unknown_newer_migration_and_schema_drift_are_rejected() {
     connection
         .execute(
             "INSERT INTO schema_migrations(version, name, checksum, applied_at) VALUES(?1, ?2, ?3, ?4)",
-            params![5_i64, "future", "future", APPLIED_AT],
+            params![6_i64, "future", "future", APPLIED_AT],
         )
         .expect("future migration row");
     drop(connection);
     assert!(matches!(
         Store::open(newer.path(), APPLIED_AT),
-        Err(StoreError::UnsupportedMigration { version: 5 })
+        Err(StoreError::UnsupportedMigration { version: 6 })
     ));
 
     let drift = TestDatabase::new("drift");

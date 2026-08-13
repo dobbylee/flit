@@ -604,7 +604,7 @@ fn version_one_database_migrates_while_preserving_projects_and_conflicting_legac
     drop(connection);
 
     let store = workspace.open();
-    assert_eq!(store.schema_version().expect("schema version"), 4);
+    assert_eq!(store.schema_version().expect("schema version"), 5);
     assert!(
         !store
             .project("legacy")
