@@ -17,7 +17,9 @@ use flit_protocol::{
     ManagedRunPermissionMode, ManagedRunPermissionRespondRequest,
     ManagedRunPermissionRespondResponse, ManagedRunProviderDecision,
     ManagedRunProviderTerminalOutcome, ManagedRunStartRequest, ManagedRunStartResponse,
-    ProviderKind,
+    ProviderKind, RunActiveAttentionAction, RunActiveAttentionCategory,
+    RunActiveAttentionReadRequest, RunActiveAttentionReadResponse, RunActiveAttentionSlot,
+    RunActiveAttentionStatus,
 };
 use flit_providers::{
     CodexManagedItemId, CodexManagedScope, CodexManagedThreadId, CodexManagedThreads,
@@ -35,7 +37,7 @@ use serde_json::json;
 use super::{
     BridgeError, CoreManager, InitializationOutcome, PROTOCOL_VERSION, dashboard_read_with,
     managed_run_observe_with, managed_run_permission_respond_with, managed_start,
-    start_managed_run_in_core,
+    run_active_attention_read_with, start_managed_run_in_core,
 };
 use crate::codex_recovery::{
     CodexRecoveryAttempt, CodexRecoveryConnector, CodexRecoveryProvider,
@@ -50,6 +52,8 @@ const RESPONDED_AT: &str = "2026-07-28T00:00:03Z";
 const COMPLETED_AT: &str = "2026-07-28T00:00:04Z";
 const DASHBOARD_SAMPLE_COUNT: usize = 40;
 const DASHBOARD_P95_LIMIT: Duration = Duration::from_millis(500);
+const ATTENTION_RUN_COUNT: usize = 8;
+const ATTENTION_P95_LIMIT: Duration = Duration::from_millis(500);
 const MAX_FAKE_SCENARIO_BYTES: usize = 64 * 1024;
 const EXPECTED_SCENARIO_VERSION: u64 = 1;
 const EXPECTED_DATASET_SEED: u64 = 240_204;
@@ -649,6 +653,166 @@ fn phase2_journey_and_four_run_latency_gate() {
             "threshold_ms": DASHBOARD_P95_LIMIT.as_millis(),
         })
     );
+}
+
+#[test]
+fn phase4_eight_run_structured_request_to_card_latency_gate() {
+    let scenario = attention_burst_scenario();
+    assert_eq!(scenario.runs.len(), ATTENTION_RUN_COUNT);
+    assert_eq!(
+        scenario
+            .runs
+            .iter()
+            .map(|run| run.run_id.as_str())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        ATTENTION_RUN_COUNT,
+        "attention burst Run identities must be unique"
+    );
+
+    let directory = TestDirectory::new();
+    let data_directory = directory.0.join("data");
+    let project_directory = directory.0.join("project");
+    fs::create_dir(&project_directory).expect("attention burst Project");
+    let canonical_project =
+        fs::canonicalize(&project_directory).expect("canonical attention burst Project");
+
+    let manager = CoreManager::default();
+    assert_eq!(
+        manager
+            .initialize(data_directory.to_str().expect("UTF-8 data directory"))
+            .expect("initialize attention burst Core"),
+        InitializationOutcome::Initialized
+    );
+    seed_trusted_project(&manager, &canonical_project);
+
+    let (connector, _) = ScriptedConnector::new(scenario.runs.clone());
+    let starts = start_runs(&manager, &connector, &scenario);
+    assert_eq!(starts.len(), ATTENTION_RUN_COUNT);
+
+    let expected_run_ids = scenario
+        .runs
+        .iter()
+        .map(|run| run.run_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut samples = Vec::with_capacity(ATTENTION_RUN_COUNT);
+    for run in &scenario.runs {
+        let started = Instant::now();
+        let (request_id, request_version) = match observe(&manager, run) {
+            ManagedRunObserveResponse::PermissionRequested {
+                run_id,
+                request_id,
+                request_version,
+                ..
+            } => {
+                assert_eq!(run_id, run.run_id);
+                (request_id, request_version)
+            }
+            response => panic!("expected exact structured permission request, got {response:?}"),
+        };
+
+        let dashboard = read_dashboard(
+            &manager,
+            &DashboardReadRequest {
+                expected_core_instance_id: None,
+                after_cursor: None,
+                requested_event_limit: 50,
+                client_protocol_version: PROTOCOL_VERSION.to_owned(),
+            },
+        );
+        let DashboardReadResponse::Snapshot { runs, has_more, .. } = dashboard else {
+            panic!("attention burst Dashboard must be a snapshot");
+        };
+        assert!(!has_more);
+        assert_eq!(
+            runs.iter()
+                .map(|record| record.run_id.clone())
+                .collect::<BTreeSet<_>>(),
+            expected_run_ids
+        );
+        let record = runs
+            .iter()
+            .find(|record| record.run_id == run.run_id)
+            .expect("requested Run must remain in the Dashboard");
+        assert_eq!(record.attention_level, "ActionRequired");
+        assert_eq!(record.attention_open_count, 1);
+        assert_eq!(record.dashboard_bucket, "NeedsAttention");
+
+        let active: RunActiveAttentionReadResponse = serde_json::from_str(
+            &run_active_attention_read_with(
+                &manager,
+                &serde_json::to_string(&RunActiveAttentionReadRequest {
+                    run_id: run.run_id.clone(),
+                    expected_run_version: record.version,
+                    client_protocol_version: PROTOCOL_VERSION.to_owned(),
+                })
+                .expect("active attention request"),
+            )
+            .expect("active attention response"),
+        )
+        .expect("typed active attention response");
+        assert_eq!(active.run_id, run.run_id);
+        assert_eq!(active.run_version, record.version);
+        assert_eq!(active.open_count, 1);
+        let RunActiveAttentionSlot::Item(item) = active.item else {
+            panic!("structured request must expose one active attention card");
+        };
+        assert_eq!(item.attention_version, request_version);
+        assert_eq!(item.category, RunActiveAttentionCategory::Permission);
+        assert_eq!(item.status, RunActiveAttentionStatus::Open);
+        assert!(item.blocking);
+        assert!(matches!(
+            item.action,
+            RunActiveAttentionAction::PermissionResponse {
+                request_id: action_request_id,
+                request_version: action_request_version,
+            } if action_request_id == request_id && action_request_version == request_version
+        ));
+        samples.push(started.elapsed());
+    }
+
+    samples.sort_unstable();
+    let p95 = samples[(samples.len() * 95).div_ceil(100) - 1];
+    assert!(
+        p95 <= ATTENTION_P95_LIMIT,
+        "eight-Run structured request-to-card p95 {p95:?} exceeds {ATTENTION_P95_LIMIT:?}"
+    );
+    println!(
+        "phase4_attention_latency_receipt={}",
+        json!({
+            "architecture": std::env::consts::ARCH,
+            "build_profile": if cfg!(debug_assertions) { "debug" } else { "release" },
+            "dataset_seed": scenario.dataset_seed,
+            "os": std::env::consts::OS,
+            "p95_us": p95.as_micros(),
+            "run_count": ATTENTION_RUN_COUNT,
+            "sample_count": samples.len(),
+            "threshold_ms": ATTENTION_P95_LIMIT.as_millis(),
+        })
+    );
+}
+
+fn attention_burst_scenario() -> FakeScenario {
+    FakeScenario {
+        scenario_version: EXPECTED_SCENARIO_VERSION,
+        dataset_seed: 240_408,
+        runs: (0..ATTENTION_RUN_COUNT)
+            .map(|index| FakeRun {
+                run_id: format!("run-phase4-attention-{index}"),
+                session_id: format!("session-phase4-attention-{index}"),
+                title: format!("Phase 4 attention Run {index}"),
+                permission_mode: FakePermissionMode::Manual,
+                thread_id: format!("thread-phase4-attention-{index}"),
+                turn_id: format!("turn-phase4-attention-{index}"),
+                observation: FakeObservation::ManualPermission {
+                    command_item_id: format!("command-phase4-attention-{index}"),
+                    permission_item_id: format!("permission-phase4-attention-{index}"),
+                    provider_request_id: 40_000 + index as u64,
+                    started_at_ms: 80_000 + index as u64,
+                },
+            })
+            .collect(),
+    }
 }
 
 fn seed_trusted_project(manager: &CoreManager, project: &Path) {

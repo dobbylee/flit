@@ -13,9 +13,10 @@ The current macOS application includes:
 - guarded local Project registration and trust, exact-profile Codex managed Run start, durable session ownership, restart reconciliation, and explicit `Unknown` degradation when a provider capability cannot be proved;
 - a Store-backed Dashboard and bounded Run Activity view with Core-owned lifecycle, activity, attention, evidence category, completion summary, and capability status;
 - content-free Git baseline observation through a verified no-child-exec helper, exact or `Observed during run` terminal change attribution, bounded path-free Changes rows, and Core-guarded external file opening;
-- deterministic Core-owned Possibly Stuck transitions using monotonic elapsed time and generation-bound process evidence, plus an exact Run-version/occurrence `Still working` action; and
+- deterministic Core-owned Possibly Stuck transitions using monotonic elapsed time and generation-bound process evidence, plus an exact Run-version/occurrence `Still working` action;
+- exact highest-priority attention cards with safe unavailable states and failure-only acknowledgement that never implies the Run was resolved;
 - a retained macOS monitoring cadence that assesses active Runs and atomically converges bounded Dashboard pages while the app remains open or in the menu bar; and
-- exact Possibly Stuck notification delivery through UserNotifications, with a durable Core receipt only after the same platform identifier appears in the delivered list.
+- policy-aware macOS notifications for permission, question, failure, completion, and Possibly Stuck, with global and Project settings, device-local quiet hours, durable claims, and exact delivered receipts.
 
 Every supported conclusion is backed by structured evidence. When exact Git facts, provider history, raw provider content, or another capability is unavailable, the application preserves an explicit unavailable reason instead of inventing a result.
 
@@ -24,7 +25,7 @@ Every supported conclusion is backed by structured evidence. When exact Git fact
 - Flit does not provide a generic PTY, embedded terminal, terminal replay, worktree orchestration, editor, browser, or built-in diff.
 - Raw provider content and secrets are not retained by default. The current native evidence surface exposes structured event locators and truthful raw-content availability.
 - Exact file-change counts require the verified Git observation boundary; unsupported or uncertain repository states remain unavailable.
-- Notification settings, project overrides, quiet hours, permission education UI, and the complete permission/question action-queue presentation are not yet complete.
+- Permission education and complete permission/question response controls are not yet available; unsupported actions remain visibly disabled until the required provider facts and documented delivery capability exist.
 - The build script produces an ad-hoc signed development app, not a notarized distribution artifact.
 
 ## Build and validate
