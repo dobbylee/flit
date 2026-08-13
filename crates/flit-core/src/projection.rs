@@ -220,9 +220,11 @@ pub fn replay_dashboard_projection(
     let mut stuck_reset = None;
     let mut observed_at_by_evidence =
         BTreeMap::from([(first.event_id.clone(), first.observed_at.clone())]);
+    let mut event_type_by_id = BTreeMap::from([(first.event_id.clone(), first.event_type.clone())]);
 
     for event in &events[1..] {
         observed_at_by_evidence.insert(event.event_id.clone(), event.observed_at.clone());
+        event_type_by_id.insert(event.event_id.clone(), event.event_type.clone());
         let lifecycle_event = lifecycle_event(event)?;
         lifecycle
             .apply(event.ingest_seq, lifecycle_event.clone())
@@ -234,8 +236,13 @@ pub fn replay_dashboard_projection(
                 activity_event(event)?,
             )
             .map_err(|_| ProjectionError::Activity)?;
-        let mut attention_events =
-            attention_events(event, &mut permission_requests, &mut provider_decision_ids)?;
+        let mut attention_events = attention_events(
+            event,
+            &attention,
+            &event_type_by_id,
+            &mut permission_requests,
+            &mut provider_decision_ids,
+        )?;
         update_stuck_replay(
             event,
             &mut stuck_assessment,
@@ -1108,6 +1115,8 @@ fn payload_safe_u64(event: &ProjectionEvent, field: &'static str) -> Result<u64,
 
 fn attention_events(
     event: &ProjectionEvent,
+    attention: &AttentionProjection,
+    event_type_by_id: &BTreeMap<String, String>,
     permission_requests: &mut BTreeMap<String, PermissionReplayState>,
     provider_decision_ids: &mut BTreeSet<String>,
 ) -> Result<Vec<AttentionEvent>, ProjectionError> {
@@ -1339,7 +1348,41 @@ fn attention_events(
                 ));
             }
         }
-        "run.completed" | "run.failed" | "run.interrupted" => {
+        "attention.acknowledged" if is_authoritative_attention_acknowledgement(event) => {
+            let attention_id =
+                payload_bounded_token(event, "attention_id", MAX_PERSISTED_STUCK_ID_BYTES)?;
+            let attention_version = payload_safe_u64(event, "attention_version")?;
+            let source_event_id =
+                payload_bounded_token(event, "source_event_id", MAX_PERSISTED_STUCK_ID_BYTES)?;
+            if event.payload.len() != 3 {
+                return Err(ProjectionError::Attention);
+            }
+            let item_id =
+                AttentionItemId::new(attention_id).map_err(|_| ProjectionError::Attention)?;
+            let item = attention.item(&item_id).ok_or(ProjectionError::Attention)?;
+            let source_type = event_type_by_id
+                .get(source_event_id)
+                .map(String::as_str)
+                .ok_or(ProjectionError::Attention)?;
+            if item.version() != attention_version
+                || item.source_event_id().as_str() != source_event_id
+                || item.category() != AttentionCategory::Failure
+                || item.blocking()
+                || item.status() != AttentionStatus::Open
+                || !matches!(
+                    source_type,
+                    "run.failed" | "run.interrupted" | "run.resume_failed"
+                )
+            {
+                return Err(ProjectionError::Attention);
+            }
+            events.push(AttentionEvent::Acknowledged {
+                item_id,
+                observed_at,
+                evidence_id,
+            });
+        }
+        "run.completed" | "run.failed" | "run.interrupted" | "run.resume_failed" => {
             let (category, severity) = match event.event_type.as_str() {
                 "run.completed" => (
                     AttentionCategory::Completion,
@@ -1347,6 +1390,10 @@ fn attention_events(
                 ),
                 "run.failed" => (AttentionCategory::Failure, AttentionSeverity::Critical),
                 "run.interrupted" => (
+                    AttentionCategory::Failure,
+                    AttentionSeverity::ActionRequired,
+                ),
+                "run.resume_failed" => (
                     AttentionCategory::Failure,
                     AttentionSeverity::ActionRequired,
                 ),
@@ -1371,6 +1418,16 @@ fn attention_events(
         _ => {}
     }
     Ok(events)
+}
+
+fn is_authoritative_attention_acknowledgement(event: &ProjectionEvent) -> bool {
+    event.protocol_version == "1.4"
+        && event.event_type == "attention.acknowledged"
+        && event.session_id.is_none()
+        && event.source_kind == "core"
+        && event.source_provider.is_none()
+        && event.source_contract_version.as_deref() == Some("attention-action/1.0")
+        && !event.source_has_extensions
 }
 
 fn permission_authority_is_lost(event: &ProjectionEvent) -> bool {

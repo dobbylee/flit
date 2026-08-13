@@ -1,0 +1,9 @@
+{
+  "status": "rejected",
+  "protocol_version": "1.27",
+  "run_id": "run-1",
+  "expected_run_version": 6,
+  "attention_id": "lifecycle:event-run-failed",
+  "attention_version": 6,
+  "reason": "run_version_stale"
+}

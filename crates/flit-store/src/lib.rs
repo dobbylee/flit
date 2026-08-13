@@ -38,17 +38,18 @@ pub use managed_runs::{
     MAX_LIVE_MANAGED_SESSIONS, MAX_MANAGED_GIT_CHANGE_ENTRIES, MAX_MANAGED_GIT_DISPLAY_PATH_BYTES,
     MAX_MANAGED_GIT_PATH_BYTES, MAX_MANAGED_METADATA_JSON_BYTES, MAX_MANAGED_METADATA_JSON_DEPTH,
     MAX_MANAGED_METADATA_JSON_VALUES, MAX_MANAGED_STUCK_ASSESSMENT_RUNS,
-    ManagedGitChangeAttribution, ManagedGitChangeSet, ManagedGitChangeSetMetadata,
-    ManagedGitChangeSummary, ManagedGitFileChange, ManagedGitFileStatus, ManagedGitProjectScope,
-    ManagedGitRepositoryIdentity, ManagedPermissionDecision,
-    ManagedPermissionDeliveryUnknownReason, ManagedPermissionResolutionKind,
-    ManagedPermissionResponseAttempt, ManagedPermissionResponseAttemptOutcome,
-    ManagedPermissionResponseResult, ManagedPermissionResponseResultKind, ManagedProviderDecision,
-    ManagedProviderObservation, ManagedProviderObservationKind, ManagedProviderOutcome,
-    ManagedProviderOutcomeCommit, ManagedProviderTerminalOutcome, ManagedReconciliationState,
-    ManagedRun, ManagedRunIntent, ManagedRunIntentOutcome, ManagedRunStartFailure,
-    ManagedRunStartFailureOutcome, ManagedSession, ManagedSessionReconciliation,
-    ManagedSessionReconciliationOutcome, ManagedSessionTermination,
+    ManagedAttentionAcknowledgeAction, ManagedAttentionAcknowledgeOutcome,
+    ManagedAttentionAcknowledgeRejectedReason, ManagedGitChangeAttribution, ManagedGitChangeSet,
+    ManagedGitChangeSetMetadata, ManagedGitChangeSummary, ManagedGitFileChange,
+    ManagedGitFileStatus, ManagedGitProjectScope, ManagedGitRepositoryIdentity,
+    ManagedPermissionDecision, ManagedPermissionDeliveryUnknownReason,
+    ManagedPermissionResolutionKind, ManagedPermissionResponseAttempt,
+    ManagedPermissionResponseAttemptOutcome, ManagedPermissionResponseResult,
+    ManagedPermissionResponseResultKind, ManagedProviderDecision, ManagedProviderObservation,
+    ManagedProviderObservationKind, ManagedProviderOutcome, ManagedProviderOutcomeCommit,
+    ManagedProviderTerminalOutcome, ManagedReconciliationState, ManagedRun, ManagedRunIntent,
+    ManagedRunIntentOutcome, ManagedRunStartFailure, ManagedRunStartFailureOutcome, ManagedSession,
+    ManagedSessionReconciliation, ManagedSessionReconciliationOutcome, ManagedSessionTermination,
     ManagedSessionTerminationOutcome, ManagedStillWorkingAction, ManagedStillWorkingOutcome,
     ManagedStillWorkingRejectedReason, ManagedStuckActivity, ManagedStuckAssessment,
     ManagedStuckAssessmentContext, ManagedStuckLifecycle, ManagedStuckNotificationDelivery,
@@ -1856,6 +1857,96 @@ impl Store {
             run_id,
             occurrence_id,
         ))
+    }
+
+    pub fn acknowledge_managed_attention(
+        &mut self,
+        action: ManagedAttentionAcknowledgeAction,
+    ) -> Result<ManagedAttentionAcknowledgeOutcome, StoreError> {
+        managed_runs::validate_attention_acknowledge_action(&action)
+            .map_err(|field| StoreError::InvalidManagedAttentionAcknowledge { field })?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+        if let Some(ingest_seq) = event_ingest_seq(&transaction, &action.event_id)? {
+            let existing = load_event(&transaction, ingest_seq)?;
+            if managed_attention_acknowledgement_matches_action(&transaction, &existing, &action)? {
+                transaction.commit().map_err(StoreError::Sqlite)?;
+                return Ok(managed_attention_acknowledge_rejected(
+                    action,
+                    ManagedAttentionAcknowledgeRejectedReason::AlreadyApplied,
+                ));
+            }
+            return Err(StoreError::EventIdentityConflict {
+                event_id: action.event_id,
+            });
+        }
+        let Some(current_version) = latest_run_event_version(&transaction, &action.run_id)? else {
+            return Err(StoreError::MissingRun {
+                run_id: action.run_id,
+            });
+        };
+        if current_version != action.expected_run_version {
+            transaction.commit().map_err(StoreError::Sqlite)?;
+            return Ok(managed_attention_acknowledge_rejected(
+                action,
+                ManagedAttentionAcknowledgeRejectedReason::RunVersionStale,
+            ));
+        }
+        let snapshot = load_run_snapshot(&transaction, &action.run_id)?.ok_or_else(|| {
+            StoreError::MissingRun {
+                run_id: action.run_id.clone(),
+            }
+        })?;
+        let context = active_attention_context(&snapshot)?;
+        let Some(item) = context.item else {
+            transaction.commit().map_err(StoreError::Sqlite)?;
+            return Ok(managed_attention_acknowledge_rejected(
+                action,
+                ManagedAttentionAcknowledgeRejectedReason::AttentionMismatch,
+            ));
+        };
+        if item.attention_id != action.attention_id
+            || item.attention_version != action.attention_version
+        {
+            transaction.commit().map_err(StoreError::Sqlite)?;
+            return Ok(managed_attention_acknowledge_rejected(
+                action,
+                ManagedAttentionAcknowledgeRejectedReason::AttentionMismatch,
+            ));
+        }
+        if item.category != "failure"
+            || item.blocking
+            || item.status != "open"
+            || !matches!(
+                item.source_event_type.as_str(),
+                "run.failed" | "run.interrupted" | "run.resume_failed"
+            )
+        {
+            transaction.commit().map_err(StoreError::Sqlite)?;
+            return Ok(managed_attention_acknowledge_rejected(
+                action,
+                ManagedAttentionAcknowledgeRejectedReason::NotAcknowledgeable,
+            ));
+        }
+        let event = managed_attention_acknowledged_event(
+            &action,
+            &item.source_event_id,
+            next_managed_run_core_stream_seq(&transaction, &action.run_id)?,
+        );
+        let mut outcomes = append_event_batch_in_transaction(&transaction, vec![event])?;
+        let event = match outcomes
+            .pop()
+            .expect("one attention acknowledgement must produce one append outcome")
+        {
+            AppendEventOutcome::Inserted(event) => event,
+            AppendEventOutcome::Duplicate(_) => {
+                unreachable!("attention acknowledgement duplicates are handled before append")
+            }
+        };
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(ManagedAttentionAcknowledgeOutcome::Applied(Box::new(event)))
     }
 
     pub fn append_managed_stuck_notification_delivered(
@@ -4934,6 +5025,98 @@ fn managed_still_working_receipt_matches_action(
         && payload.evidence_unavailable_reason == action.evidence_unavailable_reason
 }
 
+fn managed_attention_acknowledgement_matches_action(
+    connection: &Connection,
+    event: &EventEnvelope,
+    action: &ManagedAttentionAcknowledgeAction,
+) -> Result<bool, StoreError> {
+    if event.event_id != action.event_id
+        || event.protocol_version != EventProtocolVersion::V1_4
+        || event.run_id != action.run_id
+        || event.session_id != NullableSessionId::Null
+        || event.event_type != "attention.acknowledged"
+        || event.source.kind != EventSourceKind::Core
+        || event.source.provider.is_some()
+        || event.source.contract_version.as_deref() != Some("attention-action/1.0")
+        || !event.source.extensions.is_empty()
+        || !event.extensions.is_empty()
+        || !event.evidence_ids.is_empty()
+    {
+        return Ok(false);
+    }
+    let Ok(payload) = serde_json::from_value::<flit_protocol::AttentionAcknowledgedPayload>(
+        Value::Object(event.payload.clone()),
+    ) else {
+        return Ok(false);
+    };
+    let Some(expected_source_event_id) = action.attention_id.strip_prefix("lifecycle:") else {
+        return Ok(false);
+    };
+    if payload.attention_id != action.attention_id
+        || payload.attention_version != action.attention_version
+        || payload.source_event_id != expected_source_event_id
+    {
+        return Ok(false);
+    }
+    let Some(source) = load_event_by_id(connection, &payload.source_event_id)? else {
+        return Ok(false);
+    };
+    Ok(source.run_id == action.run_id
+        && matches!(
+            source.event_type.as_str(),
+            "run.failed" | "run.interrupted" | "run.resume_failed"
+        ))
+}
+
+fn managed_attention_acknowledge_rejected(
+    action: ManagedAttentionAcknowledgeAction,
+    reason: ManagedAttentionAcknowledgeRejectedReason,
+) -> ManagedAttentionAcknowledgeOutcome {
+    ManagedAttentionAcknowledgeOutcome::Rejected {
+        run_id: action.run_id,
+        expected_run_version: action.expected_run_version,
+        attention_id: action.attention_id,
+        attention_version: action.attention_version,
+        reason,
+    }
+}
+
+fn managed_attention_acknowledged_event(
+    action: &ManagedAttentionAcknowledgeAction,
+    source_event_id: &str,
+    stream_seq: u64,
+) -> UnsequencedEventEnvelope {
+    let payload = flit_protocol::AttentionAcknowledgedPayload {
+        attention_id: action.attention_id.clone(),
+        attention_version: action.attention_version,
+        source_event_id: source_event_id.to_owned(),
+    };
+    UnsequencedEventEnvelope {
+        protocol_version: EventProtocolVersion::V1_4,
+        event_id: action.event_id.clone(),
+        run_id: action.run_id.clone(),
+        session_id: NullableSessionId::Null,
+        stream_seq,
+        occurred_at: action.observed_at.clone(),
+        observed_at: action.observed_at.clone(),
+        event_type: "attention.acknowledged".to_owned(),
+        source: EventSource {
+            kind: EventSourceKind::Core,
+            provider: None,
+            contract_version: Some("attention-action/1.0".to_owned()),
+            extensions: BTreeMap::new(),
+        },
+        confidence: 1.0,
+        evidence_ids: Vec::new(),
+        payload: serde_json::to_value(payload)
+            .expect("attention acknowledgement payload serializes")
+            .as_object()
+            .expect("attention acknowledgement payload is an object")
+            .clone(),
+        extensions: BTreeMap::new(),
+    }
+}
+
 fn managed_still_working_event(
     action: &ManagedStillWorkingAction,
     payload: flit_protocol::StillWorkingPayload,
@@ -7085,7 +7268,7 @@ fn load_run_event_history(
                              AND event_type IN ('run.possibly_stuck', 'run.stuck_cleared')
                             THEN LENGTH(CAST(source_json AS BLOB))
                             WHEN protocol_version = '1.4'
-                             AND event_type IN ('run.still_working', 'notification.due', 'notification.delivered')
+                             AND event_type IN ('run.still_working', 'notification.due', 'notification.delivered', 'attention.acknowledged')
                             THEN LENGTH(CAST(source_json AS BLOB))
                             ELSE 0
                         END +
@@ -7112,7 +7295,7 @@ fn load_run_event_history(
                          AND event_type IN ('run.possibly_stuck', 'run.stuck_cleared')
                         THEN source_json
                         WHEN protocol_version = '1.4'
-                         AND event_type IN ('run.still_working', 'notification.due', 'notification.delivered')
+                         AND event_type IN ('run.still_working', 'notification.due', 'notification.delivered', 'attention.acknowledged')
                         THEN source_json
                         ELSE NULL
                     END,
@@ -8013,6 +8196,7 @@ fn validate_event(event: &UnsequencedEventEnvelope) -> Result<(), StoreError> {
             "run.still_working" => Some((EventSourceKind::Core, "stuck-action/1.0")),
             "notification.due" => Some((EventSourceKind::Core, "stuck-notification/1.0")),
             "notification.delivered" => Some((EventSourceKind::Notifier, "stuck-notification/1.0")),
+            "attention.acknowledged" => Some((EventSourceKind::Core, "attention-action/1.0")),
             _ => None,
         };
         if let Some((source_kind, contract_version)) = expected
@@ -8767,6 +8951,9 @@ pub enum StoreError {
     InvalidManagedStillWorking {
         field: &'static str,
     },
+    InvalidManagedAttentionAcknowledge {
+        field: &'static str,
+    },
     InvalidManagedStuckNotificationDelivery {
         field: &'static str,
     },
@@ -9193,6 +9380,12 @@ impl fmt::Display for StoreError {
             }
             Self::InvalidManagedStillWorking { field } => {
                 write!(formatter, "invalid managed Still working field: {field}")
+            }
+            Self::InvalidManagedAttentionAcknowledge { field } => {
+                write!(
+                    formatter,
+                    "invalid managed attention acknowledgement field: {field}"
+                )
             }
             Self::InvalidManagedStuckNotificationDelivery { field } => write!(
                 formatter,

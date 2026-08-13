@@ -1,0 +1,6 @@
+{
+  "expected_core_instance_id": null,
+  "after_cursor": null,
+  "requested_event_limit": 50,
+  "client_protocol_version": "1.27"
+}

@@ -4,7 +4,7 @@ use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: &str = "1.26";
+pub const PROTOCOL_VERSION: &str = "1.27";
 pub const EVENT_PROTOCOL_VERSION: &str = "1.4";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -795,6 +795,47 @@ pub struct RunActiveAttentionReadResponse {
     pub run_version: u64,
     pub open_count: u64,
     pub item: RunActiveAttentionSlot,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionAcknowledgeRequest {
+    pub run_id: String,
+    pub expected_run_version: u64,
+    pub attention_id: String,
+    pub attention_version: u64,
+    pub client_protocol_version: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionAcknowledgeRejectedReason {
+    RunVersionStale,
+    AttentionMismatch,
+    NotAcknowledgeable,
+    AlreadyApplied,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AttentionAcknowledgeResponse {
+    Applied {
+        protocol_version: String,
+        run_id: String,
+        previous_version: u64,
+        event_id: String,
+        event_version: u64,
+        attention_id: String,
+        attention_version: u64,
+    },
+    Rejected {
+        protocol_version: String,
+        run_id: String,
+        expected_run_version: u64,
+        attention_id: String,
+        attention_version: u64,
+        reason: AttentionAcknowledgeRejectedReason,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1626,6 +1667,15 @@ pub struct StillWorkingPayload {
     pub notification_suppressed_until_monotonic_ms: u64,
     pub process: StuckProcessReceipt,
     pub evidence_unavailable_reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionAcknowledgedPayload {
+    pub attention_id: String,
+    #[serde(deserialize_with = "deserialize_json_safe_u64")]
+    pub attention_version: u64,
+    pub source_event_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2899,6 +2949,119 @@ struct FlitRunActiveAttentionReadResponse: Codable, Equatable, Sendable {
         case runVersion = "run_version"
         case openCount = "open_count"
         case item
+    }
+}
+
+struct FlitAttentionAcknowledgeRequest: Codable, Equatable, Sendable {
+    let runId: String
+    let expectedRunVersion: UInt64
+    let attentionId: String
+    let attentionVersion: UInt64
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case runId = "run_id"
+        case expectedRunVersion = "expected_run_version"
+        case attentionId = "attention_id"
+        case attentionVersion = "attention_version"
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+enum FlitAttentionAcknowledgeStatus: String, Codable, Sendable {
+    case applied
+    case rejected
+}
+
+enum FlitAttentionAcknowledgeRejectedReason: String, Codable, Sendable {
+    case runVersionStale = "run_version_stale"
+    case attentionMismatch = "attention_mismatch"
+    case notAcknowledgeable = "not_acknowledgeable"
+    case alreadyApplied = "already_applied"
+}
+
+struct FlitAttentionAcknowledgeResponse: Codable, Equatable, Sendable {
+    let status: FlitAttentionAcknowledgeStatus
+    let protocolVersion: String
+    let runId: String
+    let attentionId: String
+    let attentionVersion: UInt64
+    let previousVersion: UInt64?
+    let eventId: String?
+    let eventVersion: UInt64?
+    let expectedRunVersion: UInt64?
+    let reason: FlitAttentionAcknowledgeRejectedReason?
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case status
+        case protocolVersion = "protocol_version"
+        case runId = "run_id"
+        case attentionId = "attention_id"
+        case attentionVersion = "attention_version"
+        case previousVersion = "previous_version"
+        case eventId = "event_id"
+        case eventVersion = "event_version"
+        case expectedRunVersion = "expected_run_version"
+        case reason
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        status = try values.decode(FlitAttentionAcknowledgeStatus.self, forKey: .status)
+        protocolVersion = try values.decode(String.self, forKey: .protocolVersion)
+        runId = try values.decode(String.self, forKey: .runId)
+        attentionId = try values.decode(String.self, forKey: .attentionId)
+        attentionVersion = try values.decode(UInt64.self, forKey: .attentionVersion)
+        switch status {
+        case .applied:
+            previousVersion = try values.decode(UInt64.self, forKey: .previousVersion)
+            eventId = try values.decode(String.self, forKey: .eventId)
+            eventVersion = try values.decode(UInt64.self, forKey: .eventVersion)
+            expectedRunVersion = nil
+            reason = nil
+            for key in [CodingKeys.expectedRunVersion, .reason] where values.contains(key) {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: values,
+                    debugDescription: "applied acknowledgement must not contain rejection fields"
+                )
+            }
+        case .rejected:
+            previousVersion = nil
+            eventId = nil
+            eventVersion = nil
+            expectedRunVersion = try values.decode(UInt64.self, forKey: .expectedRunVersion)
+            reason = try values.decode(
+                FlitAttentionAcknowledgeRejectedReason.self,
+                forKey: .reason
+            )
+            for key in [CodingKeys.previousVersion, .eventId, .eventVersion]
+            where values.contains(key) {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: values,
+                    debugDescription: "rejected acknowledgement must not contain applied fields"
+                )
+            }
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(status, forKey: .status)
+        try values.encode(protocolVersion, forKey: .protocolVersion)
+        try values.encode(runId, forKey: .runId)
+        try values.encode(attentionId, forKey: .attentionId)
+        try values.encode(attentionVersion, forKey: .attentionVersion)
+        switch status {
+        case .applied:
+            try values.encode(previousVersion, forKey: .previousVersion)
+            try values.encode(eventId, forKey: .eventId)
+            try values.encode(eventVersion, forKey: .eventVersion)
+        case .rejected:
+            try values.encode(expectedRunVersion, forKey: .expectedRunVersion)
+            try values.encode(reason, forKey: .reason)
+        }
     }
 }
 

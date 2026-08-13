@@ -16,8 +16,10 @@ use flit_store::{
     AppendEventOutcome, DashboardChangeSummary, InitialManagedSessionConnection,
     InitialManagedSessionOutcome, MAX_DASHBOARD_PROJECTION_SOURCE_BYTES, MAX_LIVE_MANAGED_SESSIONS,
     MAX_MANAGED_GIT_CHANGE_PAGE_SIZE, MAX_MANAGED_GIT_CHANGE_PAGE_SOURCE_BYTES,
-    MAX_MANAGED_STUCK_ASSESSMENT_RUNS, ManagedGitChangeAttribution, ManagedGitChangeSet,
-    ManagedGitChangeSummary, ManagedGitFileChange, ManagedGitFileStatus, ManagedGitProjectScope,
+    MAX_MANAGED_STUCK_ASSESSMENT_RUNS, ManagedAttentionAcknowledgeAction,
+    ManagedAttentionAcknowledgeOutcome, ManagedAttentionAcknowledgeRejectedReason,
+    ManagedGitChangeAttribution, ManagedGitChangeSet, ManagedGitChangeSummary,
+    ManagedGitFileChange, ManagedGitFileStatus, ManagedGitProjectScope,
     ManagedGitRepositoryIdentity, ManagedPermissionDecision,
     ManagedPermissionDeliveryUnknownReason, ManagedPermissionResolutionKind,
     ManagedPermissionResponseAttempt, ManagedPermissionResponseAttemptOutcome,
@@ -2571,6 +2573,145 @@ fn managed_start_failure_is_terminal_idempotent_and_reopens_without_a_session() 
         )),
         Err(StoreError::ManagedRunTerminalConflict { .. })
     ));
+}
+
+#[test]
+fn exact_failure_acknowledgement_is_failure_only_retry_safe_and_reopens() {
+    let directory = TestDirectory::new("attention-acknowledge");
+    let (mut store, database, project_path) = trusted_store(&directory);
+    store
+        .create_managed_run_intent(run_intent(
+            "run-ack-failed",
+            "event-ack-failed-created",
+            "event-ack-failed-requested",
+        ))
+        .expect("create failed Run");
+    store
+        .fail_managed_run_start(start_failure("run-ack-failed", "event-ack-failed-terminal"))
+        .expect("fail Run");
+    let context = store
+        .managed_run_active_attention_context("run-ack-failed")
+        .expect("failure attention context");
+    let item = context.item.expect("failure attention item");
+    assert_eq!(item.category, "failure");
+    assert_eq!(item.source_event_type, "run.failed");
+    let action = ManagedAttentionAcknowledgeAction {
+        run_id: "run-ack-failed".to_owned(),
+        expected_run_version: context.run_version,
+        attention_id: item.attention_id.clone(),
+        attention_version: item.attention_version,
+        event_id: "event-ack-failed-acknowledged".to_owned(),
+        observed_at: "2026-07-24T10:06:00Z".to_owned(),
+    };
+    let cursor = store.latest_ingest_seq().expect("pre-ack cursor");
+    let mut wrong = action.clone();
+    wrong.attention_id = "lifecycle:event-other".to_owned();
+    assert!(matches!(
+        store
+            .acknowledge_managed_attention(wrong)
+            .expect("wrong attention rejection"),
+        ManagedAttentionAcknowledgeOutcome::Rejected {
+            reason: ManagedAttentionAcknowledgeRejectedReason::AttentionMismatch,
+            ..
+        }
+    ));
+    assert_eq!(store.latest_ingest_seq().expect("rejected cursor"), cursor);
+
+    let applied = store
+        .acknowledge_managed_attention(action.clone())
+        .expect("acknowledge failure");
+    let event = match applied {
+        ManagedAttentionAcknowledgeOutcome::Applied(event) => event,
+        other => panic!("unexpected acknowledgement outcome: {other:?}"),
+    };
+    assert_eq!(event.ingest_seq, cursor + 1);
+    assert_eq!(event.event_type, "attention.acknowledged");
+    assert_eq!(event.payload["attention_id"], item.attention_id);
+    assert_eq!(event.payload["attention_version"], item.attention_version);
+    assert_eq!(event.payload["source_event_id"], item.source_event_id);
+    let snapshot = store
+        .run_snapshot("run-ack-failed")
+        .expect("acknowledged snapshot")
+        .expect("acknowledged Run");
+    assert_eq!(snapshot.snapshot["attention"]["open_count"], 0);
+    assert_eq!(snapshot.snapshot["dashboard_bucket"], "Finished");
+    let mut retry_action = action.clone();
+    retry_action.observed_at = "2026-07-24T10:06:30Z".to_owned();
+    assert!(matches!(
+        store
+            .acknowledge_managed_attention(retry_action)
+            .expect("exact retry"),
+        ManagedAttentionAcknowledgeOutcome::Rejected {
+            reason: ManagedAttentionAcknowledgeRejectedReason::AlreadyApplied,
+            ..
+        }
+    ));
+    assert_eq!(
+        store.latest_ingest_seq().expect("retry cursor"),
+        event.ingest_seq
+    );
+
+    store
+        .create_managed_run_intent(run_intent(
+            "run-ack-completed",
+            "event-ack-completed-created",
+            "event-ack-completed-requested",
+        ))
+        .expect("create completion Run");
+    store
+        .connect_initial_managed_session(session_connection(
+            "session-ack-completed",
+            "run-ack-completed",
+            "thread-ack-completed",
+            &project_path,
+        ))
+        .expect("connect completion session");
+    store
+        .terminate_managed_session(session_termination(
+            "run-ack-completed",
+            "session-ack-completed",
+            "thread-ack-completed",
+            "turn-ack-completed",
+            "event-ack-completed-terminal",
+            2,
+            ManagedTurnTerminalOutcome::Completed,
+        ))
+        .expect("complete Run");
+    let completion = store
+        .managed_run_active_attention_context("run-ack-completed")
+        .expect("completion attention");
+    let completion_item = completion.item.expect("completion item");
+    let completion_cursor = store.latest_ingest_seq().expect("completion cursor");
+    assert!(matches!(
+        store
+            .acknowledge_managed_attention(ManagedAttentionAcknowledgeAction {
+                run_id: "run-ack-completed".to_owned(),
+                expected_run_version: completion.run_version,
+                attention_id: completion_item.attention_id,
+                attention_version: completion_item.attention_version,
+                event_id: "event-ack-completed-acknowledged".to_owned(),
+                observed_at: "2026-07-24T10:06:01Z".to_owned(),
+            })
+            .expect("completion rejection"),
+        ManagedAttentionAcknowledgeOutcome::Rejected {
+            reason: ManagedAttentionAcknowledgeRejectedReason::NotAcknowledgeable,
+            ..
+        }
+    ));
+    assert_eq!(
+        store
+            .latest_ingest_seq()
+            .expect("completion rejection cursor"),
+        completion_cursor
+    );
+
+    drop(store);
+    let reopened = Store::open(&database, CREATED_AT).expect("reopen acknowledged Store");
+    let reopened_context = reopened
+        .managed_run_active_attention_context("run-ack-failed")
+        .expect("reopened attention");
+    assert_eq!(reopened_context.open_count, 0);
+    assert!(reopened_context.item.is_none());
 }
 
 #[test]

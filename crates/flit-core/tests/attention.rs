@@ -542,10 +542,24 @@ fn acknowledgement_preserves_evidence_and_only_closes_open_non_blocking_items() 
             )),
         )
         .expect("blocking risk must open");
+    projection
+        .apply(
+            4,
+            AttentionEvent::Opened(draft(
+                "completion",
+                "completion:run",
+                AttentionCategory::Completion,
+                AttentionSeverity::Informational,
+                false,
+                12,
+                "completion-evidence",
+            )),
+        )
+        .expect("completion must open");
     assert_eq!(
         projection
             .apply(
-                4,
+                5,
                 AttentionEvent::Acknowledged {
                     item_id: item_id("risk"),
                     observed_at: at(20),
@@ -557,9 +571,24 @@ fn acknowledgement_preserves_evidence_and_only_closes_open_non_blocking_items() 
             IgnoredAttentionReason::AcknowledgementRequiresOpenNonBlockingItem
         )
     );
+    assert_eq!(
+        projection
+            .apply(
+                6,
+                AttentionEvent::Acknowledged {
+                    item_id: item_id("completion"),
+                    observed_at: at(20),
+                    evidence_id: evidence_id("completion-ack"),
+                },
+            )
+            .expect("completion acknowledgement must be an ordered no-op"),
+        AttentionDisposition::Ignored(
+            IgnoredAttentionReason::AcknowledgementRequiresOpenNonBlockingItem
+        )
+    );
     projection
         .apply(
-            5,
+            7,
             AttentionEvent::Acknowledged {
                 item_id: item_id("failure"),
                 observed_at: at(21),
@@ -579,7 +608,7 @@ fn acknowledgement_preserves_evidence_and_only_closes_open_non_blocking_items() 
             .into_iter()
             .map(|item| item.item_id().as_str())
             .collect::<Vec<_>>(),
-        vec!["risk"]
+        vec!["risk", "completion"]
     );
 }
 
@@ -714,21 +743,21 @@ fn ordered_replay_matches_incremental_reduction_including_ignored_events() {
         (
             7,
             AttentionEvent::Opened(draft(
-                "completion",
-                "completion:run",
-                AttentionCategory::Completion,
-                AttentionSeverity::Informational,
+                "failure",
+                "failure:run",
+                AttentionCategory::Failure,
+                AttentionSeverity::Critical,
                 false,
                 130,
-                "completed",
+                "failed",
             )),
         ),
         (
             8,
             AttentionEvent::Acknowledged {
-                item_id: item_id("completion"),
+                item_id: item_id("failure"),
                 observed_at: at(140),
-                evidence_id: evidence_id("completion-ack"),
+                evidence_id: evidence_id("failure-ack"),
             },
         ),
     ];

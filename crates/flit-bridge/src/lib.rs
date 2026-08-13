@@ -17,6 +17,7 @@ use flit_git::{
     inspect_noexec_runner_at, observe_clean_change_baseline, observe_repository,
 };
 use flit_protocol::{
+    AttentionAcknowledgeRejectedReason, AttentionAcknowledgeRequest, AttentionAcknowledgeResponse,
     CapabilityStatus as ProtocolCapabilityStatus, CommandError, CommandErrorCode,
     DashboardChangeAttribution as ProtocolDashboardChangeAttribution, DashboardEventRecord,
     DashboardReadRequest, DashboardReadResponse, DashboardRunRecord, DashboardSnapshotReason,
@@ -73,7 +74,9 @@ use flit_store::{
     EffectiveNotificationPolicy as StoreEffectiveNotificationPolicy,
     GlobalNotificationPolicy as StoreGlobalNotificationPolicy, MAX_DASHBOARD_DELTA_EVENTS,
     MAX_LIVE_MANAGED_SESSIONS, MAX_MANAGED_GIT_CHANGE_PAGE_SIZE, MAX_PROJECT_PAGE_SIZE,
-    MAX_RUN_DETAIL_EVENTS, ManagedGitChangeAttribution as StoreManagedGitChangeAttribution,
+    MAX_RUN_DETAIL_EVENTS, ManagedAttentionAcknowledgeAction, ManagedAttentionAcknowledgeOutcome,
+    ManagedAttentionAcknowledgeRejectedReason as StoreAttentionAcknowledgeRejectedReason,
+    ManagedGitChangeAttribution as StoreManagedGitChangeAttribution,
     ManagedGitChangeSetMetadata as StoreManagedGitChangeSetMetadata,
     ManagedGitFileChange as StoreManagedGitFileChange,
     ManagedGitFileStatus as StoreManagedGitFileStatus,
@@ -2263,6 +2266,132 @@ fn run_active_attention_read_with(
 #[uniffi::export]
 pub fn run_active_attention_read_json(request_json: String) -> Result<String, BridgeError> {
     protect(|| run_active_attention_read_with(&CORE, &request_json))
+}
+
+fn attention_acknowledge_rejected_response(
+    request: &AttentionAcknowledgeRequest,
+    reason: AttentionAcknowledgeRejectedReason,
+) -> AttentionAcknowledgeResponse {
+    AttentionAcknowledgeResponse::Rejected {
+        protocol_version: PROTOCOL_VERSION.to_owned(),
+        run_id: request.run_id.clone(),
+        expected_run_version: request.expected_run_version,
+        attention_id: request.attention_id.clone(),
+        attention_version: request.attention_version,
+        reason,
+    }
+}
+
+fn attention_acknowledge_rejected_reason(
+    reason: StoreAttentionAcknowledgeRejectedReason,
+) -> AttentionAcknowledgeRejectedReason {
+    match reason {
+        StoreAttentionAcknowledgeRejectedReason::RunVersionStale => {
+            AttentionAcknowledgeRejectedReason::RunVersionStale
+        }
+        StoreAttentionAcknowledgeRejectedReason::AttentionMismatch => {
+            AttentionAcknowledgeRejectedReason::AttentionMismatch
+        }
+        StoreAttentionAcknowledgeRejectedReason::NotAcknowledgeable => {
+            AttentionAcknowledgeRejectedReason::NotAcknowledgeable
+        }
+        StoreAttentionAcknowledgeRejectedReason::AlreadyApplied => {
+            AttentionAcknowledgeRejectedReason::AlreadyApplied
+        }
+    }
+}
+
+fn attention_acknowledge_event_id(request: &AttentionAcknowledgeRequest) -> String {
+    let mut digest = Sha256::new();
+    for part in [
+        request.run_id.as_str(),
+        &request.expected_run_version.to_string(),
+        request.attention_id.as_str(),
+        &request.attention_version.to_string(),
+    ] {
+        digest.update(part.len().to_le_bytes());
+        digest.update(part.as_bytes());
+    }
+    format!("attention-acknowledged-{:x}", digest.finalize())
+}
+
+fn attention_acknowledge_with(
+    core_manager: &CoreManager,
+    request_json: &str,
+) -> Result<String, BridgeError> {
+    if request_json.len() > MAX_MANAGED_RUN_REQUEST_BYTES {
+        return run_command_json(|| -> Result<AttentionAcknowledgeResponse, _> {
+            Err(BridgeError::InvalidRunRequest)
+        });
+    }
+    let request = serde_json::from_str::<AttentionAcknowledgeRequest>(request_json)
+        .map_err(|_| BridgeError::InvalidRunRequest);
+    run_command_json(|| {
+        let request = request?;
+        if request.client_protocol_version != PROTOCOL_VERSION {
+            return Err(BridgeError::ProtocolMismatch);
+        }
+        if request.run_id.trim().is_empty()
+            || request.run_id.len() > MAX_PROJECT_ID_BYTES
+            || request.run_id.chars().any(char::is_control)
+            || request.attention_id.trim().is_empty()
+            || request.attention_id.len() > 256
+            || request.attention_id.chars().any(char::is_control)
+            || request.expected_run_version == 0
+            || request.expected_run_version > flit_protocol::MAX_JSON_SAFE_INTEGER
+            || request.attention_version == 0
+            || request.attention_version > flit_protocol::MAX_JSON_SAFE_INTEGER
+        {
+            return Err(BridgeError::InvalidRunRequest);
+        }
+        core_manager.with_ready_core(|core| {
+            let observed_at = core
+                .store
+                .current_utc_timestamp()
+                .map_err(|_| BridgeError::StorageFailure)?;
+            let outcome = core
+                .store
+                .acknowledge_managed_attention(ManagedAttentionAcknowledgeAction {
+                    run_id: request.run_id.clone(),
+                    expected_run_version: request.expected_run_version,
+                    attention_id: request.attention_id.clone(),
+                    attention_version: request.attention_version,
+                    event_id: attention_acknowledge_event_id(&request),
+                    observed_at,
+                })
+                .map_err(|error| match error {
+                    StoreError::MissingRun { .. } => BridgeError::RunNotFound,
+                    StoreError::InvalidManagedAttentionAcknowledge { .. } => {
+                        BridgeError::InvalidRunRequest
+                    }
+                    _ => BridgeError::StorageFailure,
+                })?;
+            match outcome {
+                ManagedAttentionAcknowledgeOutcome::Applied(event) => {
+                    Ok(AttentionAcknowledgeResponse::Applied {
+                        protocol_version: PROTOCOL_VERSION.to_owned(),
+                        run_id: request.run_id,
+                        previous_version: request.expected_run_version,
+                        event_id: event.event_id.clone(),
+                        event_version: event.ingest_seq,
+                        attention_id: request.attention_id,
+                        attention_version: request.attention_version,
+                    })
+                }
+                ManagedAttentionAcknowledgeOutcome::Rejected { reason, .. } => {
+                    Ok(attention_acknowledge_rejected_response(
+                        &request,
+                        attention_acknowledge_rejected_reason(reason),
+                    ))
+                }
+            }
+        })
+    })
+}
+
+#[uniffi::export]
+pub fn attention_acknowledge_json(request_json: String) -> Result<String, BridgeError> {
+    protect(|| attention_acknowledge_with(&CORE, &request_json))
 }
 
 fn run_change_head(oid: Option<String>) -> RunChangeHead {
@@ -4621,8 +4750,9 @@ mod tests {
         validated_codex_0_144_6_fingerprint, validated_codex_0_145_0_fingerprint,
     };
     use flit_store::{
-        InitialManagedSessionConnection, ManagedRunIntent, ManagedStuckAssessment,
-        ManagedStuckTransition, ProjectRegistration, ProjectTrustConfirmation,
+        InitialManagedSessionConnection, ManagedRunIntent, ManagedRunStartFailure,
+        ManagedStuckAssessment, ManagedStuckTransition, ProjectRegistration,
+        ProjectTrustConfirmation,
     };
 
     use super::*;
@@ -7438,6 +7568,161 @@ mod tests {
                 Ok(())
             })
             .expect("active attention read has no side effect");
+    }
+
+    #[test]
+    fn attention_acknowledge_is_exact_failure_only_and_retry_safe() {
+        let (_directory, manager, _) = managed_start_core("attention-acknowledge");
+        let (context, cursor) = manager
+            .with_ready_core(|core| {
+                core.store
+                    .create_managed_run_intent(ManagedRunIntent {
+                        id: "run-acknowledge".to_owned(),
+                        project_id: "project-observe".to_owned(),
+                        title: "A failed Run".to_owned(),
+                        goal: None,
+                        start_request: serde_json::Map::new(),
+                        git_baseline: GitBaselinePayload::Unavailable {
+                            project_id: "project-observe".to_owned(),
+                            reason: GitBaselineUnavailableReason::RunnerUnavailable,
+                        },
+                        git_baseline_observed_at: "2026-08-13T10:00:00Z".to_owned(),
+                        created_at: "2026-08-13T10:00:00Z".to_owned(),
+                        run_created_event_id: "event-acknowledge-created".to_owned(),
+                        git_baseline_event_id: "event-acknowledge-baseline".to_owned(),
+                        start_requested_event_id: "event-acknowledge-requested".to_owned(),
+                    })
+                    .expect("create failed Run");
+                core.store
+                    .fail_managed_run_start(ManagedRunStartFailure {
+                        run_id: "run-acknowledge".to_owned(),
+                        reason: "provider_start_failed".to_owned(),
+                        contract_version: "codex-app-server/0.145.0".to_owned(),
+                        failed_at: "2026-08-13T10:00:01Z".to_owned(),
+                        failed_event_id: "event-acknowledge-failed".to_owned(),
+                    })
+                    .expect("fail Run");
+                Ok((
+                    core.store
+                        .managed_run_active_attention_context("run-acknowledge")
+                        .expect("failure attention context"),
+                    core.store.latest_ingest_seq().expect("failure cursor"),
+                ))
+            })
+            .expect("seed failed Run");
+        let item = context.item.expect("failure attention item");
+        assert_eq!(item.category, "failure");
+        assert_eq!(item.source_event_type, "run.failed");
+        let request = AttentionAcknowledgeRequest {
+            run_id: "run-acknowledge".to_owned(),
+            expected_run_version: context.run_version,
+            attention_id: item.attention_id.clone(),
+            attention_version: item.attention_version,
+            client_protocol_version: PROTOCOL_VERSION.to_owned(),
+        };
+
+        let stale = AttentionAcknowledgeRequest {
+            expected_run_version: request.expected_run_version - 1,
+            ..request.clone()
+        };
+        let stale: AttentionAcknowledgeResponse = serde_json::from_str(
+            &attention_acknowledge_with(
+                &manager,
+                &serde_json::to_string(&stale).expect("stale request"),
+            )
+            .expect("stale response"),
+        )
+        .expect("typed stale response");
+        assert!(matches!(
+            stale,
+            AttentionAcknowledgeResponse::Rejected {
+                reason: AttentionAcknowledgeRejectedReason::RunVersionStale,
+                ..
+            }
+        ));
+
+        let wrong = AttentionAcknowledgeRequest {
+            attention_id: "lifecycle:event-not-current".to_owned(),
+            ..request.clone()
+        };
+        let wrong: AttentionAcknowledgeResponse = serde_json::from_str(
+            &attention_acknowledge_with(
+                &manager,
+                &serde_json::to_string(&wrong).expect("wrong item request"),
+            )
+            .expect("wrong item response"),
+        )
+        .expect("typed wrong item response");
+        assert!(matches!(
+            wrong,
+            AttentionAcknowledgeResponse::Rejected {
+                reason: AttentionAcknowledgeRejectedReason::AttentionMismatch,
+                ..
+            }
+        ));
+        manager
+            .with_ready_core(|core| {
+                assert_eq!(
+                    core.store.latest_ingest_seq().expect("no-write cursor"),
+                    cursor
+                );
+                Ok(())
+            })
+            .expect("rejections do not write");
+
+        let request_json = serde_json::to_string(&request).expect("acknowledgement request");
+        let applied: AttentionAcknowledgeResponse = serde_json::from_str(
+            &attention_acknowledge_with(&manager, &request_json).expect("applied response"),
+        )
+        .expect("typed applied response");
+        assert!(matches!(
+            applied,
+            AttentionAcknowledgeResponse::Applied {
+                previous_version,
+                event_version,
+                ref attention_id,
+                ..
+            } if previous_version == context.run_version
+                && event_version == cursor + 1
+                && attention_id == &item.attention_id
+        ));
+        let retry: AttentionAcknowledgeResponse = serde_json::from_str(
+            &attention_acknowledge_with(&manager, &request_json).expect("retry response"),
+        )
+        .expect("typed retry response");
+        assert!(matches!(
+            retry,
+            AttentionAcknowledgeResponse::Rejected {
+                reason: AttentionAcknowledgeRejectedReason::AlreadyApplied,
+                ..
+            }
+        ));
+        manager
+            .with_ready_core(|core| {
+                assert_eq!(
+                    core.store.latest_ingest_seq().expect("single write cursor"),
+                    cursor + 1
+                );
+                let acknowledged = core
+                    .store
+                    .managed_run_active_attention_context("run-acknowledge")
+                    .expect("acknowledged context");
+                assert_eq!(acknowledged.open_count, 0);
+                assert!(acknowledged.item.is_none());
+                Ok(())
+            })
+            .expect("verify exact acknowledgement");
+
+        let smuggled = format!(
+            r#"{{"run_id":"run-acknowledge","expected_run_version":{},"attention_id":"{}","attention_version":{},"client_protocol_version":"{PROTOCOL_VERSION}","resolution":"resolved"}}"#,
+            request.expected_run_version, request.attention_id, request.attention_version
+        );
+        assert_eq!(
+            command_error(
+                &attention_acknowledge_with(&manager, &smuggled).expect("fact-smuggling response")
+            ),
+            CommandError::for_code(CommandErrorCode::InvalidRunRequest)
+        );
     }
 
     #[test]

@@ -90,6 +90,99 @@ fn stuck_clear_event(ingest_seq: u64, occurrence_id: &str) -> ProjectionEvent {
 }
 
 #[test]
+fn authoritative_failure_acknowledgement_closes_only_the_exact_current_item() {
+    let failed = event(2, "run.failed", None, json!({}));
+    let mut acknowledged = event(
+        3,
+        "attention.acknowledged",
+        None,
+        json!({
+            "attention_id": "lifecycle:event-2",
+            "attention_version": 2,
+            "source_event_id": "event-2"
+        }),
+    );
+    acknowledged.protocol_version = "1.4".to_owned();
+    acknowledged.source_contract_version = Some("attention-action/1.0".to_owned());
+    let projection = replay_dashboard_projection(&[
+        event(1, "run.created", None, json!({})),
+        failed.clone(),
+        acknowledged.clone(),
+    ])
+    .expect("authoritative acknowledgement");
+    assert_eq!(projection.attention_open_count, 0);
+    assert_eq!(projection.dashboard_bucket, "Finished");
+
+    acknowledged.source_kind = "ui".to_owned();
+    let ignored = replay_dashboard_projection(&[
+        event(1, "run.created", None, json!({})),
+        failed,
+        acknowledged,
+    ])
+    .expect("lookalike acknowledgement remains audit-only");
+    assert_eq!(ignored.attention_open_count, 1);
+}
+
+#[test]
+fn resume_failure_opens_an_exact_acknowledgeable_failure_without_rewriting_terminal_lifecycle() {
+    let connected = event(2, "session.connected", Some("session-1"), json!({}));
+    let completed = event(3, "run.completed", Some("session-1"), json!({}));
+    let resume_failed = event(
+        4,
+        "run.resume_failed",
+        None,
+        json!({"resume_intent_id": "resume-1"}),
+    );
+    let mut acknowledged = event(
+        5,
+        "attention.acknowledged",
+        None,
+        json!({
+            "attention_id": "lifecycle:event-4",
+            "attention_version": 4,
+            "source_event_id": "event-4"
+        }),
+    );
+    acknowledged.protocol_version = "1.4".to_owned();
+    acknowledged.source_contract_version = Some("attention-action/1.0".to_owned());
+
+    let before = replay_dashboard_projection(&[
+        event(1, "run.created", None, json!({})),
+        connected.clone(),
+        completed.clone(),
+        resume_failed.clone(),
+    ])
+    .expect("resume failure attention");
+    assert_eq!(before.lifecycle, "Finished");
+    assert_eq!(before.attention_open_count, 2);
+    assert_eq!(
+        before
+            .primary_attention
+            .expect("resume failure is primary")
+            .source_event_type,
+        "run.resume_failed"
+    );
+
+    let after = replay_dashboard_projection(&[
+        event(1, "run.created", None, json!({})),
+        connected,
+        completed,
+        resume_failed,
+        acknowledged,
+    ])
+    .expect("acknowledged resume failure");
+    assert_eq!(after.lifecycle, "Finished");
+    assert_eq!(after.attention_open_count, 1);
+    assert_eq!(
+        after
+            .primary_attention
+            .expect("completion remains visible")
+            .source_event_type,
+        "run.completed"
+    );
+}
+
+#[test]
 fn explicit_stuck_transitions_own_dashboard_and_attention_replay() {
     let base = vec![
         event(1, "run.created", None, json!({})),

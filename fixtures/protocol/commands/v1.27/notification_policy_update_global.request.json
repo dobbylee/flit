@@ -1,0 +1,17 @@
+{
+  "expected_version": 0,
+  "kinds": {
+    "permission": true,
+    "question": true,
+    "failure": true,
+    "completion": false,
+    "stuck": true
+  },
+  "quiet_hours": {
+    "enabled": true,
+    "start_minute": 1320,
+    "end_minute": 480
+  },
+  "updated_at": "2026-08-13T01:00:00.000Z",
+  "client_protocol_version": "1.27"
+}

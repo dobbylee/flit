@@ -106,6 +106,36 @@ pub enum ManagedStillWorkingOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedAttentionAcknowledgeAction {
+    pub run_id: String,
+    pub expected_run_version: u64,
+    pub attention_id: String,
+    pub attention_version: u64,
+    pub event_id: String,
+    pub observed_at: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedAttentionAcknowledgeRejectedReason {
+    RunVersionStale,
+    AttentionMismatch,
+    NotAcknowledgeable,
+    AlreadyApplied,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ManagedAttentionAcknowledgeOutcome {
+    Applied(Box<EventEnvelope>),
+    Rejected {
+        run_id: String,
+        expected_run_version: u64,
+        attention_id: String,
+        attention_version: u64,
+        reason: ManagedAttentionAcknowledgeRejectedReason,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedStuckNotificationDelivery {
     pub run_id: String,
     pub expected_run_version: u64,
@@ -1002,6 +1032,26 @@ pub(crate) fn validate_still_working_action(
         .checked_add(600_000)
         .filter(|value| *value <= flit_protocol::MAX_JSON_SAFE_INTEGER)
         .ok_or("reset_monotonic_ms")?;
+    Ok(())
+}
+
+pub(crate) fn validate_attention_acknowledge_action(
+    action: &ManagedAttentionAcknowledgeAction,
+) -> Result<(), &'static str> {
+    validate_id(&action.run_id).map_err(|()| "run_id")?;
+    validate_id(&action.attention_id).map_err(|()| "attention_id")?;
+    validate_id(&action.event_id).map_err(|()| "event_id")?;
+    validate_timestamp(&action.observed_at).map_err(|()| "observed_at")?;
+    if action.expected_run_version == 0
+        || action.expected_run_version > flit_protocol::MAX_JSON_SAFE_INTEGER
+    {
+        return Err("expected_run_version");
+    }
+    if action.attention_version == 0
+        || action.attention_version > flit_protocol::MAX_JSON_SAFE_INTEGER
+    {
+        return Err("attention_version");
+    }
     Ok(())
 }
 

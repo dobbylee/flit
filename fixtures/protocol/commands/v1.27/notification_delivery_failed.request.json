@@ -1,0 +1,9 @@
+{
+  "notification_id": "notification-0123456789abcdef",
+  "run_id": "run-notification",
+  "kind": "failure",
+  "item_id": "attention-failure",
+  "item_version": 40,
+  "platform_id": "flit-0123456789abcdef",
+  "client_protocol_version": "1.27"
+}

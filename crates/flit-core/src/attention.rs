@@ -652,7 +652,10 @@ impl AttentionProjection {
         let Some(item) = self.item_mut(item_id) else {
             return AttentionDisposition::Ignored(IgnoredAttentionReason::ItemNotFound);
         };
-        if item.blocking || item.status != AttentionStatus::Open {
+        if item.category != AttentionCategory::Failure
+            || item.blocking
+            || item.status != AttentionStatus::Open
+        {
             return AttentionDisposition::Ignored(
                 IgnoredAttentionReason::AcknowledgementRequiresOpenNonBlockingItem,
             );

@@ -1,11 +1,11 @@
 use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use flit_protocol::{
-    CapabilityStatus, CommandError, DashboardReadRequest, DashboardReadResponse,
-    EVENT_PROTOCOL_VERSION, EventEnvelope, EventProtocolVersion, GitBaselinePayload,
-    GitObservationRequest, GitObservationResponse, GlobalNotificationPolicyUpdateRequest,
-    MAX_JSON_SAFE_INTEGER, ManagedRunObserveRequest, ManagedRunObserveResponse,
-    ManagedRunOpenInProviderRequest, ManagedRunPermissionRespondRequest,
+    AttentionAcknowledgeRequest, AttentionAcknowledgeResponse, CapabilityStatus, CommandError,
+    DashboardReadRequest, DashboardReadResponse, EVENT_PROTOCOL_VERSION, EventEnvelope,
+    EventProtocolVersion, GitBaselinePayload, GitObservationRequest, GitObservationResponse,
+    GlobalNotificationPolicyUpdateRequest, MAX_JSON_SAFE_INTEGER, ManagedRunObserveRequest,
+    ManagedRunObserveResponse, ManagedRunOpenInProviderRequest, ManagedRunPermissionRespondRequest,
     ManagedRunPermissionRespondResponse, ManagedRunStartRequest, ManagedRunStartResponse,
     ManagedRunStillWorkingRequest, ManagedRunStillWorkingResponse, ManagedRunsAssessStuckRequest,
     ManagedRunsAssessStuckResponse, ManagedStuckNotificationDeliveredRequest,
@@ -694,6 +694,44 @@ fn current_active_attention_read_is_required_bounded_exact_and_content_safe() {
     .expect("empty attention fixture should match Rust types");
     assert!(matches!(empty.item, RunActiveAttentionSlot::Null));
     assert_eq!(empty.open_count, 0);
+}
+
+#[test]
+fn current_attention_acknowledge_contract_is_exact_and_closed_to_unknown_input() {
+    let manifest = read_command_compatibility_manifest();
+    let current = &manifest.current;
+    assert_fixture_round_trip::<AttentionAcknowledgeRequest>(&command_fixture(
+        current,
+        "attention_acknowledge.request.json",
+    ));
+    for name in [
+        "attention_acknowledge.applied.response.json",
+        "attention_acknowledge.rejected.response.json",
+    ] {
+        assert_fixture_round_trip::<AttentionAcknowledgeResponse>(&command_fixture(current, name));
+    }
+
+    let mut unknown: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "attention_acknowledge.request.json",
+        )))
+        .expect("attention acknowledgement request fixture should be readable"),
+    )
+    .expect("attention acknowledgement request fixture should be JSON");
+    unknown["resolution"] = serde_json::json!("resolved");
+    assert!(serde_json::from_value::<AttentionAcknowledgeRequest>(unknown).is_err());
+
+    let mut mixed: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "attention_acknowledge.applied.response.json",
+        )))
+        .expect("applied acknowledgement response fixture should be readable"),
+    )
+    .expect("applied acknowledgement response fixture should be JSON");
+    mixed["reason"] = serde_json::json!("not_acknowledgeable");
+    assert!(serde_json::from_value::<AttentionAcknowledgeResponse>(mixed).is_err());
 }
 
 #[test]
@@ -1493,6 +1531,10 @@ fn generated_swift_project_contract_is_current_and_required_fields_fail_closed()
         "FlitRunActiveAttentionItem",
         "FlitRunActiveAttentionSlot",
         "FlitRunActiveAttentionReadResponse",
+        "FlitAttentionAcknowledgeRequest",
+        "FlitAttentionAcknowledgeStatus",
+        "FlitAttentionAcknowledgeRejectedReason",
+        "FlitAttentionAcknowledgeResponse",
         "FlitRunChangesReadRequest",
         "FlitRunChangeHead",
         "FlitRunFileChangeStatus",
