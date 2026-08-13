@@ -1,0 +1,14 @@
+{
+  "project_id": "project-notifications-1",
+  "expected_version": 0,
+  "master": "inherit",
+  "kinds": {
+    "permission": "on",
+    "question": "off",
+    "failure": "inherit",
+    "completion": "off",
+    "stuck": "inherit"
+  },
+  "updated_at": "2026-08-13T01:01:00.000Z",
+  "client_protocol_version": "1.25"
+}

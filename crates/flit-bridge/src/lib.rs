@@ -20,24 +20,30 @@ use flit_protocol::{
     CapabilityStatus as ProtocolCapabilityStatus, CommandError, CommandErrorCode,
     DashboardChangeAttribution as ProtocolDashboardChangeAttribution, DashboardEventRecord,
     DashboardReadRequest, DashboardReadResponse, DashboardRunRecord, DashboardSnapshotReason,
-    EVENT_PROTOCOL_VERSION, EventSourceKind, FingerprintAxis as ProtocolFingerprintAxis,
-    GitBaselinePayload, GitBaselineUnavailableReason, GitDirtySummary, GitHead,
-    GitNotWorktreeReason, GitObservationResponse, GitObservationUnavailableReason, HealthStatus,
-    ManagedRunObserveRequest, ManagedRunObserveResponse, ManagedRunOpenInProviderRequest,
-    ManagedRunPermissionRespondRequest, ManagedRunPermissionRespondResponse,
-    ManagedRunStartRequest, ManagedRunStillWorkingRejectedReason, ManagedRunStillWorkingRequest,
+    EVENT_PROTOCOL_VERSION, EffectiveNotificationPolicyRecord, EventSourceKind,
+    FingerprintAxis as ProtocolFingerprintAxis, GitBaselinePayload, GitBaselineUnavailableReason,
+    GitDirtySummary, GitHead, GitNotWorktreeReason, GitObservationResponse,
+    GitObservationUnavailableReason, GlobalNotificationPolicyRecord,
+    GlobalNotificationPolicyUpdateRequest, HealthStatus, ManagedRunObserveRequest,
+    ManagedRunObserveResponse, ManagedRunOpenInProviderRequest, ManagedRunPermissionRespondRequest,
+    ManagedRunPermissionRespondResponse, ManagedRunStartRequest,
+    ManagedRunStillWorkingRejectedReason, ManagedRunStillWorkingRequest,
     ManagedRunStillWorkingResponse, ManagedRunsAssessStuckRequest,
     ManagedStuckNotificationDeliveredRejectedReason, ManagedStuckNotificationDeliveredRequest,
     ManagedStuckNotificationDeliveredResponse, ManagedStuckNotificationDeliveryClaimRequest,
     ManagedStuckNotificationDeliveryClaimResponse, ManagedStuckNotificationDeliveryFailedRequest,
     ManagedStuckNotificationDeliveryFailedResponse, ManagedStuckNotificationDueRecord,
     ManagedStuckNotificationsDueReadRequest, ManagedStuckNotificationsDueReadResponse,
-    PROTOCOL_VERSION, ProjectInspectionResponse, ProjectListCursor as ProjectListCursorResponse,
-    ProjectRecord, ProjectRegistrationResponse, ProjectRegistrationStatus, ProjectTrustResponse,
-    ProjectTrustStatus, ProjectsListResponse, ProviderCapability as ProtocolProviderCapability,
-    ProviderCapabilityEntry, ProviderCompatibility as ProtocolProviderCompatibility,
-    ProviderDiagnosticsResponse, ProviderExecutionAfterQuit, ProviderKind as ProtocolProviderKind,
-    ProviderUnavailableReason, QuitImpactReason, QuitImpactResponse, QuitImpactRun,
+    NotificationKindOverridesRecord, NotificationKindsRecord, NotificationOverrideRecord,
+    NotificationPolicyReadRequest, NotificationPolicyResponse, PROTOCOL_VERSION,
+    ProjectInspectionResponse, ProjectListCursor as ProjectListCursorResponse,
+    ProjectNotificationMasterRecord, ProjectNotificationPolicyRecord,
+    ProjectNotificationPolicyUpdateRequest, ProjectRecord, ProjectRegistrationResponse,
+    ProjectRegistrationStatus, ProjectTrustResponse, ProjectTrustStatus, ProjectsListResponse,
+    ProviderCapability as ProtocolProviderCapability, ProviderCapabilityEntry,
+    ProviderCompatibility as ProtocolProviderCompatibility, ProviderDiagnosticsResponse,
+    ProviderExecutionAfterQuit, ProviderKind as ProtocolProviderKind, ProviderUnavailableReason,
+    QuietHoursRecord, QuitImpactReason, QuitImpactResponse, QuitImpactRun,
     RunActiveAttentionAction as ProtocolRunActiveAttentionAction,
     RunActiveAttentionCategory as ProtocolRunActiveAttentionCategory,
     RunActiveAttentionItem as ProtocolRunActiveAttentionItem, RunActiveAttentionReadRequest,
@@ -58,7 +64,9 @@ use flit_providers::{
 use flit_store::{
     AppendEventOutcome, DashboardChangeAttribution as StoreDashboardChangeAttribution,
     DashboardChangeSummary as StoreDashboardChangeSummary,
-    DashboardRunSnapshot as StoreDashboardRunSnapshot, MAX_DASHBOARD_DELTA_EVENTS,
+    DashboardRunSnapshot as StoreDashboardRunSnapshot,
+    EffectiveNotificationPolicy as StoreEffectiveNotificationPolicy,
+    GlobalNotificationPolicy as StoreGlobalNotificationPolicy, MAX_DASHBOARD_DELTA_EVENTS,
     MAX_LIVE_MANAGED_SESSIONS, MAX_MANAGED_GIT_CHANGE_PAGE_SIZE, MAX_PROJECT_PAGE_SIZE,
     MAX_RUN_DETAIL_EVENTS, ManagedGitChangeAttribution as StoreManagedGitChangeAttribution,
     ManagedGitChangeSetMetadata as StoreManagedGitChangeSetMetadata,
@@ -71,10 +79,15 @@ use flit_store::{
     ManagedStillWorkingRejectedReason as StoreStillWorkingRejectedReason,
     ManagedStuckNotificationDelivery, ManagedStuckNotificationDeliveryClaim,
     ManagedStuckNotificationDeliveryClaimOutcome, ManagedStuckNotificationDeliveryFailure,
-    ManagedStuckNotificationDeliveryFailureOutcome, ManagedStuckNotificationState, Project,
-    ProjectDirectoryInspection, ProjectListCursor as StoreProjectListCursor, ProjectRegistration,
+    ManagedStuckNotificationDeliveryFailureOutcome, ManagedStuckNotificationState,
+    NotificationKindOverrides as StoreNotificationKindOverrides,
+    NotificationKinds as StoreNotificationKinds, NotificationOverride as StoreNotificationOverride,
+    NotificationPolicySnapshot as StoreNotificationPolicySnapshot, Project,
+    ProjectDirectoryInspection, ProjectListCursor as StoreProjectListCursor,
+    ProjectNotificationMaster as StoreProjectNotificationMaster,
+    ProjectNotificationPolicy as StoreProjectNotificationPolicy, ProjectRegistration,
     ProjectRegistrationOutcome, ProjectTrustConfirmation, ProjectTrustOutcome,
-    RunActiveAttentionAction as StoreRunActiveAttentionAction,
+    QuietHours as StoreQuietHours, RunActiveAttentionAction as StoreRunActiveAttentionAction,
     RunActiveAttentionItem as StoreRunActiveAttentionItem, Store, StoreError,
 };
 #[cfg(test)]
@@ -116,6 +129,7 @@ const MAX_PROVIDER_DIAGNOSTICS_RESPONSE_BYTES: usize = 65_536;
 const MAX_QUIT_IMPACT_RESPONSE_BYTES: usize = 1_048_576;
 const MAX_MANAGED_RUN_REQUEST_BYTES: usize = 128 * 1_024;
 const MAX_DASHBOARD_REQUEST_BYTES: usize = 64 * 1_024;
+const MAX_NOTIFICATION_POLICY_REQUEST_BYTES: usize = 16 * 1_024;
 const MAX_DASHBOARD_RESPONSE_BYTES: usize = 8 * 1_024 * 1_024;
 const MAX_RUN_DETAIL_RESPONSE_BYTES: usize = 2 * 1_024 * 1_024;
 const MAX_CORE_INSTANCE_ID_BYTES: usize = 256;
@@ -158,6 +172,10 @@ pub enum BridgeError {
     ProjectIdentityMismatch,
     #[error("the Project response exceeds the native bridge limit")]
     ProjectResponseTooLarge,
+    #[error("the notification policy request is invalid")]
+    InvalidNotificationPolicy,
+    #[error("the notification policy version is stale")]
+    NotificationPolicyVersionStale,
     #[error("the provider diagnostics response exceeds the native bridge limit")]
     ProviderDiagnosticsResponseTooLarge,
     #[error("the explicit Quit impact response exceeds the native bridge limit")]
@@ -605,6 +623,10 @@ fn project_command_error(error: &BridgeError) -> Option<CommandError> {
     let code = match error {
         BridgeError::ProtocolMismatch => CommandErrorCode::ProtocolMismatch,
         BridgeError::InvalidProjectRequest => CommandErrorCode::InvalidProjectRequest,
+        BridgeError::InvalidNotificationPolicy => CommandErrorCode::InvalidNotificationPolicy,
+        BridgeError::NotificationPolicyVersionStale => {
+            CommandErrorCode::NotificationPolicyVersionStale
+        }
         BridgeError::ProjectInspectionFailure => CommandErrorCode::ProjectInspectionFailure,
         BridgeError::ProjectConflict => CommandErrorCode::ProjectConflict,
         BridgeError::ProjectNotFound => CommandErrorCode::ProjectNotFound,
@@ -646,6 +668,11 @@ fn project_command_json<T: serde::Serialize>(
 
 fn map_project_store_error(error: StoreError) -> BridgeError {
     match error {
+        StoreError::InvalidNotificationPolicy { .. } => BridgeError::InvalidNotificationPolicy,
+        StoreError::NotificationPolicyVersionStale { .. } => {
+            BridgeError::NotificationPolicyVersionStale
+        }
+        StoreError::NotificationPolicyProjectUnavailable { .. } => BridgeError::ProjectNotFound,
         StoreError::InvalidProjectRegistration { .. }
         | StoreError::InvalidProjectTrustConfirmation { .. }
         | StoreError::InvalidProjectPageLimit { .. } => BridgeError::InvalidProjectRequest,
@@ -1162,6 +1189,241 @@ pub fn projects_list_page_json(
                     }),
                 })
             })
+        })
+    })
+}
+
+fn protocol_notification_kinds(kinds: StoreNotificationKinds) -> NotificationKindsRecord {
+    NotificationKindsRecord {
+        permission: kinds.permission,
+        question: kinds.question,
+        failure: kinds.failure,
+        completion: kinds.completion,
+        stuck: kinds.stuck,
+    }
+}
+
+fn store_notification_kinds(kinds: NotificationKindsRecord) -> StoreNotificationKinds {
+    StoreNotificationKinds {
+        permission: kinds.permission,
+        question: kinds.question,
+        failure: kinds.failure,
+        completion: kinds.completion,
+        stuck: kinds.stuck,
+    }
+}
+
+fn protocol_quiet_hours(quiet_hours: StoreQuietHours) -> QuietHoursRecord {
+    QuietHoursRecord {
+        enabled: quiet_hours.enabled,
+        start_minute: quiet_hours.start_minute,
+        end_minute: quiet_hours.end_minute,
+    }
+}
+
+fn store_quiet_hours(quiet_hours: QuietHoursRecord) -> StoreQuietHours {
+    StoreQuietHours {
+        enabled: quiet_hours.enabled,
+        start_minute: quiet_hours.start_minute,
+        end_minute: quiet_hours.end_minute,
+    }
+}
+
+fn protocol_notification_override(value: StoreNotificationOverride) -> NotificationOverrideRecord {
+    match value {
+        StoreNotificationOverride::Inherit => NotificationOverrideRecord::Inherit,
+        StoreNotificationOverride::On => NotificationOverrideRecord::On,
+        StoreNotificationOverride::Off => NotificationOverrideRecord::Off,
+    }
+}
+
+fn store_notification_override(value: NotificationOverrideRecord) -> StoreNotificationOverride {
+    match value {
+        NotificationOverrideRecord::Inherit => StoreNotificationOverride::Inherit,
+        NotificationOverrideRecord::On => StoreNotificationOverride::On,
+        NotificationOverrideRecord::Off => StoreNotificationOverride::Off,
+    }
+}
+
+fn protocol_notification_overrides(
+    kinds: StoreNotificationKindOverrides,
+) -> NotificationKindOverridesRecord {
+    NotificationKindOverridesRecord {
+        permission: protocol_notification_override(kinds.permission),
+        question: protocol_notification_override(kinds.question),
+        failure: protocol_notification_override(kinds.failure),
+        completion: protocol_notification_override(kinds.completion),
+        stuck: protocol_notification_override(kinds.stuck),
+    }
+}
+
+fn store_notification_overrides(
+    kinds: NotificationKindOverridesRecord,
+) -> StoreNotificationKindOverrides {
+    StoreNotificationKindOverrides {
+        permission: store_notification_override(kinds.permission),
+        question: store_notification_override(kinds.question),
+        failure: store_notification_override(kinds.failure),
+        completion: store_notification_override(kinds.completion),
+        stuck: store_notification_override(kinds.stuck),
+    }
+}
+
+fn protocol_project_notification_master(
+    master: StoreProjectNotificationMaster,
+) -> ProjectNotificationMasterRecord {
+    match master {
+        StoreProjectNotificationMaster::Inherit => ProjectNotificationMasterRecord::Inherit,
+        StoreProjectNotificationMaster::Off => ProjectNotificationMasterRecord::Off,
+    }
+}
+
+fn store_project_notification_master(
+    master: ProjectNotificationMasterRecord,
+) -> StoreProjectNotificationMaster {
+    match master {
+        ProjectNotificationMasterRecord::Inherit => StoreProjectNotificationMaster::Inherit,
+        ProjectNotificationMasterRecord::Off => StoreProjectNotificationMaster::Off,
+    }
+}
+
+fn protocol_global_notification_policy(
+    policy: StoreGlobalNotificationPolicy,
+) -> GlobalNotificationPolicyRecord {
+    GlobalNotificationPolicyRecord {
+        version: policy.version,
+        kinds: protocol_notification_kinds(policy.kinds),
+        quiet_hours: protocol_quiet_hours(policy.quiet_hours),
+    }
+}
+
+fn protocol_project_notification_policy(
+    policy: StoreProjectNotificationPolicy,
+) -> ProjectNotificationPolicyRecord {
+    ProjectNotificationPolicyRecord {
+        version: policy.version,
+        master: protocol_project_notification_master(policy.master),
+        kinds: protocol_notification_overrides(policy.kinds),
+    }
+}
+
+fn protocol_effective_notification_policy(
+    policy: StoreEffectiveNotificationPolicy,
+) -> EffectiveNotificationPolicyRecord {
+    EffectiveNotificationPolicyRecord {
+        global_version: policy.global_version,
+        project_version: policy.project_version,
+        kinds: protocol_notification_kinds(policy.kinds),
+        quiet_hours: protocol_quiet_hours(policy.quiet_hours),
+    }
+}
+
+fn notification_policy_response(
+    snapshot: StoreNotificationPolicySnapshot,
+) -> NotificationPolicyResponse {
+    NotificationPolicyResponse {
+        protocol_version: PROTOCOL_VERSION.to_owned(),
+        global: protocol_global_notification_policy(snapshot.global),
+        project: snapshot.project.map(protocol_project_notification_policy),
+        effective: protocol_effective_notification_policy(snapshot.effective),
+    }
+}
+
+fn notification_policy_request<T: serde::de::DeserializeOwned>(
+    request_json: &str,
+) -> Result<T, BridgeError> {
+    if request_json.len() > MAX_NOTIFICATION_POLICY_REQUEST_BYTES {
+        return Err(BridgeError::InvalidNotificationPolicy);
+    }
+    serde_json::from_str(request_json).map_err(|_| BridgeError::InvalidNotificationPolicy)
+}
+
+#[uniffi::export]
+pub fn notification_policy_read_json(request_json: String) -> Result<String, BridgeError> {
+    protect(|| notification_policy_read_with(&CORE, request_json))
+}
+
+fn notification_policy_read_with(
+    manager: &CoreManager,
+    request_json: String,
+) -> Result<String, BridgeError> {
+    project_command_json(|| {
+        let request: NotificationPolicyReadRequest = notification_policy_request(&request_json)?;
+        validate_project_protocol(&request.client_protocol_version)?;
+        if let Some(project_id) = request.project_id.as_deref() {
+            validate_project_input(project_id, MAX_PROJECT_ID_BYTES)
+                .map_err(|_| BridgeError::InvalidNotificationPolicy)?;
+        }
+        manager.with_ready_core(|core| {
+            core.store
+                .notification_policy(request.project_id.as_deref())
+                .map(notification_policy_response)
+                .map_err(map_project_store_error)
+        })
+    })
+}
+
+#[uniffi::export]
+pub fn notification_policy_update_global_json(request_json: String) -> Result<String, BridgeError> {
+    protect(|| notification_policy_update_global_with(&CORE, request_json))
+}
+
+fn notification_policy_update_global_with(
+    manager: &CoreManager,
+    request_json: String,
+) -> Result<String, BridgeError> {
+    project_command_json(|| {
+        let request: GlobalNotificationPolicyUpdateRequest =
+            notification_policy_request(&request_json)?;
+        validate_project_protocol(&request.client_protocol_version)?;
+        if request.expected_version > flit_protocol::MAX_JSON_SAFE_INTEGER {
+            return Err(BridgeError::InvalidNotificationPolicy);
+        }
+        manager.with_ready_core(|core| {
+            core.store
+                .update_global_notification_policy(
+                    request.expected_version,
+                    store_notification_kinds(request.kinds),
+                    store_quiet_hours(request.quiet_hours),
+                    &request.updated_at,
+                )
+                .map(notification_policy_response)
+                .map_err(map_project_store_error)
+        })
+    })
+}
+
+#[uniffi::export]
+pub fn notification_policy_update_project_json(
+    request_json: String,
+) -> Result<String, BridgeError> {
+    protect(|| notification_policy_update_project_with(&CORE, request_json))
+}
+
+fn notification_policy_update_project_with(
+    manager: &CoreManager,
+    request_json: String,
+) -> Result<String, BridgeError> {
+    project_command_json(|| {
+        let request: ProjectNotificationPolicyUpdateRequest =
+            notification_policy_request(&request_json)?;
+        validate_project_protocol(&request.client_protocol_version)?;
+        validate_project_input(&request.project_id, MAX_PROJECT_ID_BYTES)
+            .map_err(|_| BridgeError::InvalidNotificationPolicy)?;
+        if request.expected_version > flit_protocol::MAX_JSON_SAFE_INTEGER {
+            return Err(BridgeError::InvalidNotificationPolicy);
+        }
+        manager.with_ready_core(|core| {
+            core.store
+                .update_project_notification_policy(
+                    &request.project_id,
+                    request.expected_version,
+                    store_project_notification_master(request.master),
+                    store_notification_overrides(request.kinds),
+                    &request.updated_at,
+                )
+                .map(notification_policy_response)
+                .map_err(map_project_store_error)
         })
     })
 }
@@ -4164,6 +4426,33 @@ mod tests {
         (directory, manager, project)
     }
 
+    fn notification_policy_command_state(
+        manager: &CoreManager,
+    ) -> (NotificationPolicyResponse, u64, Project) {
+        let response = notification_policy_read_with(
+            manager,
+            serde_json::to_string(&NotificationPolicyReadRequest {
+                project_id: Some("project-observe".to_owned()),
+                client_protocol_version: PROTOCOL_VERSION.to_owned(),
+            })
+            .expect("notification policy state request"),
+        )
+        .expect("notification policy state response");
+        let policy = serde_json::from_str(&response).expect("notification policy state JSON");
+        let (cursor, project) = manager
+            .with_ready_core(|core| {
+                Ok((
+                    core.store.latest_ingest_seq().expect("policy state cursor"),
+                    core.store
+                        .project("project-observe")
+                        .expect("policy state Project read")
+                        .expect("policy state Project"),
+                ))
+            })
+            .expect("notification policy Store state");
+        (policy, cursor, project)
+    }
+
     fn fixture_at(version: &str, name: &str) -> serde_json::Value {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -5122,6 +5411,365 @@ mod tests {
             .code,
             CommandErrorCode::ProtocolMismatch
         );
+    }
+
+    #[test]
+    fn notification_policy_commands_are_exact_versioned_and_core_owned() {
+        let (_directory, manager, _) = managed_start_core("notification-policy");
+        let read_request = serde_json::to_string(&NotificationPolicyReadRequest {
+            project_id: Some("project-observe".to_owned()),
+            client_protocol_version: PROTOCOL_VERSION.to_owned(),
+        })
+        .expect("notification policy read request");
+        let defaults: NotificationPolicyResponse = serde_json::from_str(
+            &notification_policy_read_with(&manager, read_request.clone())
+                .expect("read notification policy"),
+        )
+        .expect("notification policy response");
+        assert_eq!(defaults.global.version, 0);
+        assert_eq!(
+            defaults.project.as_ref().expect("Project policy").version,
+            0
+        );
+        assert!(defaults.effective.kinds.permission);
+        assert!(!defaults.effective.kinds.completion);
+        assert!(!defaults.effective.quiet_hours.enabled);
+
+        let global_request = GlobalNotificationPolicyUpdateRequest {
+            expected_version: 0,
+            kinds: NotificationKindsRecord {
+                permission: true,
+                question: true,
+                failure: true,
+                completion: false,
+                stuck: true,
+            },
+            quiet_hours: QuietHoursRecord {
+                enabled: true,
+                start_minute: 1_320,
+                end_minute: 480,
+            },
+            updated_at: "2026-08-13T01:00:00Z".to_owned(),
+            client_protocol_version: PROTOCOL_VERSION.to_owned(),
+        };
+        let global_request_json =
+            serde_json::to_string(&global_request).expect("global policy request");
+        let global: NotificationPolicyResponse = serde_json::from_str(
+            &notification_policy_update_global_with(&manager, global_request_json.clone())
+                .expect("update global policy"),
+        )
+        .expect("global policy response");
+        assert_eq!(global.global.version, 1);
+        assert!(global.project.is_none());
+        assert!(global.effective.quiet_hours.enabled);
+
+        assert_eq!(
+            command_error(
+                &notification_policy_update_global_with(&manager, global_request_json)
+                    .expect("stale global command error")
+            )
+            .code,
+            CommandErrorCode::NotificationPolicyVersionStale
+        );
+
+        let project_request = ProjectNotificationPolicyUpdateRequest {
+            project_id: "project-observe".to_owned(),
+            expected_version: 0,
+            master: ProjectNotificationMasterRecord::Inherit,
+            kinds: NotificationKindOverridesRecord {
+                permission: NotificationOverrideRecord::On,
+                question: NotificationOverrideRecord::Off,
+                failure: NotificationOverrideRecord::Inherit,
+                completion: NotificationOverrideRecord::Off,
+                stuck: NotificationOverrideRecord::Inherit,
+            },
+            updated_at: "2026-08-13T01:01:00Z".to_owned(),
+            client_protocol_version: PROTOCOL_VERSION.to_owned(),
+        };
+        let project: NotificationPolicyResponse = serde_json::from_str(
+            &notification_policy_update_project_with(
+                &manager,
+                serde_json::to_string(&project_request).expect("Project policy request"),
+            )
+            .expect("update Project policy"),
+        )
+        .expect("Project policy response");
+        assert_eq!(project.global.version, 1);
+        assert_eq!(project.project.as_ref().expect("Project policy").version, 1);
+        assert!(!project.effective.kinds.question);
+        assert!(project.effective.kinds.failure);
+
+        let accepted_state = notification_policy_command_state(&manager);
+        assert_eq!(accepted_state.0, project);
+        assert_eq!(
+            command_error(
+                &notification_policy_update_project_with(
+                    &manager,
+                    serde_json::to_string(&project_request).expect("stale Project policy request"),
+                )
+                .expect("stale Project policy command error")
+            )
+            .code,
+            CommandErrorCode::NotificationPolicyVersionStale
+        );
+        assert_eq!(notification_policy_command_state(&manager), accepted_state);
+
+        let invalid_quiet_hours = GlobalNotificationPolicyUpdateRequest {
+            expected_version: 1,
+            kinds: global.global.kinds,
+            quiet_hours: QuietHoursRecord {
+                enabled: true,
+                start_minute: 480,
+                end_minute: 480,
+            },
+            updated_at: "2026-08-13T01:02:00Z".to_owned(),
+            client_protocol_version: PROTOCOL_VERSION.to_owned(),
+        };
+        assert_eq!(
+            command_error(
+                &notification_policy_update_global_with(
+                    &manager,
+                    serde_json::to_string(&invalid_quiet_hours)
+                        .expect("invalid quiet hours request"),
+                )
+                .expect("invalid quiet hours command error")
+            )
+            .code,
+            CommandErrorCode::InvalidNotificationPolicy
+        );
+        assert_eq!(notification_policy_command_state(&manager), accepted_state);
+
+        let mut protocol_mismatch = invalid_quiet_hours;
+        protocol_mismatch.quiet_hours = global.global.quiet_hours;
+        protocol_mismatch.client_protocol_version = "1.24".to_owned();
+        assert_eq!(
+            command_error(
+                &notification_policy_update_global_with(
+                    &manager,
+                    serde_json::to_string(&protocol_mismatch)
+                        .expect("protocol mismatch policy request"),
+                )
+                .expect("protocol mismatch policy command error")
+            )
+            .code,
+            CommandErrorCode::ProtocolMismatch
+        );
+        assert_eq!(notification_policy_command_state(&manager), accepted_state);
+
+        let after: NotificationPolicyResponse = serde_json::from_str(
+            &notification_policy_read_with(&manager, read_request)
+                .expect("read updated notification policy"),
+        )
+        .expect("updated policy response");
+        assert_eq!(after, project);
+
+        let mut missing_project = project_request;
+        missing_project.project_id = "missing-project".to_owned();
+        assert_eq!(
+            command_error(
+                &notification_policy_update_project_with(
+                    &manager,
+                    serde_json::to_string(&missing_project).expect("missing Project request"),
+                )
+                .expect("missing Project command error")
+            )
+            .code,
+            CommandErrorCode::ProjectNotFound
+        );
+        assert_eq!(notification_policy_command_state(&manager), accepted_state);
+        assert_eq!(
+            command_error(
+                &notification_policy_read_with(
+                    &manager,
+                    format!(
+                        r#"{{"project_id":null,"client_protocol_version":"{PROTOCOL_VERSION}","timezone":"UTC"}}"#
+                    ),
+                )
+                .expect("unknown field command error")
+            )
+            .code,
+            CommandErrorCode::InvalidNotificationPolicy
+        );
+        assert_eq!(notification_policy_command_state(&manager), accepted_state);
+        assert_eq!(
+            command_error(
+                &notification_policy_read_with(
+                    &manager,
+                    " ".repeat(MAX_NOTIFICATION_POLICY_REQUEST_BYTES + 1),
+                )
+                .expect("oversized notification policy command error")
+            )
+            .code,
+            CommandErrorCode::InvalidNotificationPolicy
+        );
+        assert_eq!(notification_policy_command_state(&manager), accepted_state);
+    }
+
+    #[test]
+    fn notification_policy_archived_and_corrupt_store_fail_without_mutation() {
+        let (archived_directory, archived_manager, _) =
+            managed_start_core("notification-policy-archived");
+        let raw = rusqlite::Connection::open(archived_directory.0.join(DATABASE_FILE_NAME))
+            .expect("open archived notification policy Store");
+        raw.execute(
+            "UPDATE projects SET archived_at = ?1 WHERE id = 'project-observe'",
+            ["2026-08-13T01:03:00Z"],
+        )
+        .expect("archive notification policy Project");
+        let archived_row = raw
+            .query_row(
+                "SELECT archived_at, notification_policy_json, updated_at FROM projects WHERE id = 'project-observe'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+            )
+            .expect("archived notification policy row");
+        drop(raw);
+        let (archived_cursor, archived_project) = archived_manager
+            .with_ready_core(|core| {
+                Ok((
+                    core.store
+                        .latest_ingest_seq()
+                        .expect("archived policy cursor"),
+                    core.store
+                        .project("project-observe")
+                        .expect("archived Project read"),
+                ))
+            })
+            .expect("archived notification policy state");
+        let archived_read = NotificationPolicyReadRequest {
+            project_id: Some("project-observe".to_owned()),
+            client_protocol_version: PROTOCOL_VERSION.to_owned(),
+        };
+        assert_eq!(
+            command_error(
+                &notification_policy_read_with(
+                    &archived_manager,
+                    serde_json::to_string(&archived_read).expect("archived policy read request"),
+                )
+                .expect("archived policy read command error")
+            )
+            .code,
+            CommandErrorCode::ProjectNotFound
+        );
+        let archived_update = ProjectNotificationPolicyUpdateRequest {
+            project_id: "project-observe".to_owned(),
+            expected_version: 0,
+            master: ProjectNotificationMasterRecord::Inherit,
+            kinds: NotificationKindOverridesRecord {
+                permission: NotificationOverrideRecord::Inherit,
+                question: NotificationOverrideRecord::Inherit,
+                failure: NotificationOverrideRecord::Inherit,
+                completion: NotificationOverrideRecord::Inherit,
+                stuck: NotificationOverrideRecord::Inherit,
+            },
+            updated_at: "2026-08-13T01:04:00Z".to_owned(),
+            client_protocol_version: PROTOCOL_VERSION.to_owned(),
+        };
+        assert_eq!(
+            command_error(
+                &notification_policy_update_project_with(
+                    &archived_manager,
+                    serde_json::to_string(&archived_update)
+                        .expect("archived policy update request"),
+                )
+                .expect("archived policy update command error")
+            )
+            .code,
+            CommandErrorCode::ProjectNotFound
+        );
+        archived_manager
+            .with_ready_core(|core| {
+                assert_eq!(
+                    core.store
+                        .latest_ingest_seq()
+                        .expect("unchanged archived cursor"),
+                    archived_cursor
+                );
+                assert_eq!(
+                    core.store
+                        .project("project-observe")
+                        .expect("unchanged archived Project"),
+                    archived_project
+                );
+                Ok(())
+            })
+            .expect("inspect unchanged archived policy state");
+        let raw = rusqlite::Connection::open(archived_directory.0.join(DATABASE_FILE_NAME))
+            .expect("reopen archived notification policy Store");
+        let unchanged_archived_row = raw
+            .query_row(
+                "SELECT archived_at, notification_policy_json, updated_at FROM projects WHERE id = 'project-observe'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+            )
+            .expect("unchanged archived notification policy row");
+        assert_eq!(unchanged_archived_row, archived_row);
+        drop(raw);
+
+        let (corrupt_directory, corrupt_manager, _) =
+            managed_start_core("notification-policy-corrupt");
+        let raw = rusqlite::Connection::open(corrupt_directory.0.join(DATABASE_FILE_NAME))
+            .expect("open corrupt notification policy Store");
+        raw.execute(
+            "INSERT INTO app_settings(key, value_json, updated_at) VALUES('notification_policy', '{', ?1)",
+            ["2026-08-13T01:05:00Z"],
+        )
+        .expect("inject corrupt notification policy");
+        drop(raw);
+        let (corrupt_cursor, corrupt_project) = corrupt_manager
+            .with_ready_core(|core| {
+                Ok((
+                    core.store
+                        .latest_ingest_seq()
+                        .expect("corrupt policy cursor"),
+                    core.store
+                        .project("project-observe")
+                        .expect("corrupt Project read"),
+                ))
+            })
+            .expect("corrupt notification policy state");
+        let corrupt_read = NotificationPolicyReadRequest {
+            project_id: None,
+            client_protocol_version: PROTOCOL_VERSION.to_owned(),
+        };
+        assert_eq!(
+            command_error(
+                &notification_policy_read_with(
+                    &corrupt_manager,
+                    serde_json::to_string(&corrupt_read).expect("corrupt policy read request"),
+                )
+                .expect("corrupt policy command error")
+            )
+            .code,
+            CommandErrorCode::StorageUnavailable
+        );
+        corrupt_manager
+            .with_ready_core(|core| {
+                assert_eq!(
+                    core.store
+                        .latest_ingest_seq()
+                        .expect("unchanged corrupt cursor"),
+                    corrupt_cursor
+                );
+                assert_eq!(
+                    core.store
+                        .project("project-observe")
+                        .expect("unchanged corrupt Project"),
+                    corrupt_project
+                );
+                Ok(())
+            })
+            .expect("inspect unchanged corrupt policy state");
+        let raw = rusqlite::Connection::open(corrupt_directory.0.join(DATABASE_FILE_NAME))
+            .expect("reopen corrupt notification policy Store");
+        let unchanged_corrupt: String = raw
+            .query_row(
+                "SELECT value_json FROM app_settings WHERE key = 'notification_policy'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("unchanged corrupt notification policy");
+        assert_eq!(unchanged_corrupt, "{");
     }
 
     #[test]

@@ -3,16 +3,18 @@ use std::{collections::BTreeSet, fs, path::PathBuf};
 use flit_protocol::{
     CapabilityStatus, CommandError, DashboardReadRequest, DashboardReadResponse,
     EVENT_PROTOCOL_VERSION, EventEnvelope, EventProtocolVersion, GitBaselinePayload,
-    GitObservationRequest, GitObservationResponse, MAX_JSON_SAFE_INTEGER, ManagedRunObserveRequest,
-    ManagedRunObserveResponse, ManagedRunOpenInProviderRequest, ManagedRunPermissionRespondRequest,
+    GitObservationRequest, GitObservationResponse, GlobalNotificationPolicyUpdateRequest,
+    MAX_JSON_SAFE_INTEGER, ManagedRunObserveRequest, ManagedRunObserveResponse,
+    ManagedRunOpenInProviderRequest, ManagedRunPermissionRespondRequest,
     ManagedRunPermissionRespondResponse, ManagedRunStartRequest, ManagedRunStartResponse,
     ManagedRunStillWorkingRequest, ManagedRunStillWorkingResponse, ManagedRunsAssessStuckRequest,
     ManagedRunsAssessStuckResponse, ManagedStuckNotificationDeliveredRequest,
     ManagedStuckNotificationDeliveredResponse, ManagedStuckNotificationDeliveryClaimRequest,
     ManagedStuckNotificationDeliveryClaimResponse, ManagedStuckNotificationDeliveryFailedRequest,
     ManagedStuckNotificationDeliveryFailedResponse, ManagedStuckNotificationsDueReadRequest,
-    ManagedStuckNotificationsDueReadResponse, PROTOCOL_VERSION, PossiblyStuckPayload,
-    ProjectInspectionRequest, ProjectInspectionResponse, ProjectRegistrationRequest,
+    ManagedStuckNotificationsDueReadResponse, NotificationPolicyReadRequest,
+    NotificationPolicyResponse, PROTOCOL_VERSION, PossiblyStuckPayload, ProjectInspectionRequest,
+    ProjectInspectionResponse, ProjectNotificationPolicyUpdateRequest, ProjectRegistrationRequest,
     ProjectRegistrationResponse, ProjectTrustRequest, ProjectTrustResponse, ProjectsListRequest,
     ProjectsListResponse, ProviderCompatibility, ProviderDiagnosticsRequest,
     ProviderDiagnosticsResponse, ProviderExecutionAfterQuit, ProviderUnavailableReason,
@@ -1306,6 +1308,78 @@ fn command_manifest_retains_the_exact_previous_minor_health_contract() {
 }
 
 #[test]
+fn current_notification_policy_contract_is_exact_and_closed_to_unknown_input() {
+    let manifest = read_command_compatibility_manifest();
+    let current = &manifest.current;
+    assert_fixture_round_trip::<NotificationPolicyReadRequest>(&command_fixture(
+        current,
+        "notification_policy_read.request.json",
+    ));
+    assert_fixture_round_trip::<NotificationPolicyResponse>(&command_fixture(
+        current,
+        "notification_policy_read.response.json",
+    ));
+    assert_fixture_round_trip::<GlobalNotificationPolicyUpdateRequest>(&command_fixture(
+        current,
+        "notification_policy_update_global.request.json",
+    ));
+    assert_fixture_round_trip::<NotificationPolicyResponse>(&command_fixture(
+        current,
+        "notification_policy_update_global.response.json",
+    ));
+    assert_fixture_round_trip::<ProjectNotificationPolicyUpdateRequest>(&command_fixture(
+        current,
+        "notification_policy_update_project.request.json",
+    ));
+    assert_fixture_round_trip::<NotificationPolicyResponse>(&command_fixture(
+        current,
+        "notification_policy_update_project.response.json",
+    ));
+    assert_fixture_round_trip::<Vec<CommandError>>(&command_fixture(
+        current,
+        "notification_policy_errors.json",
+    ));
+
+    let mut unknown: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "notification_policy_update_global.request.json",
+        )))
+        .expect("global notification policy fixture should be readable"),
+    )
+    .expect("global notification policy fixture should be JSON");
+    unknown["timezone"] = serde_json::json!("Asia/Seoul");
+    assert!(serde_json::from_value::<GlobalNotificationPolicyUpdateRequest>(unknown).is_err());
+
+    let mut nested_unknown: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "notification_policy_update_global.request.json",
+        )))
+        .expect("global notification policy fixture should be readable"),
+    )
+    .expect("global notification policy fixture should be JSON");
+    nested_unknown["kinds"]["permission_sound"] = serde_json::json!(true);
+    assert!(
+        serde_json::from_value::<GlobalNotificationPolicyUpdateRequest>(nested_unknown).is_err()
+    );
+
+    let mut partial: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "notification_policy_update_project.request.json",
+        )))
+        .expect("Project notification policy fixture should be readable"),
+    )
+    .expect("Project notification policy fixture should be JSON");
+    partial["kinds"]
+        .as_object_mut()
+        .expect("notification kind overrides")
+        .remove("failure");
+    assert!(serde_json::from_value::<ProjectNotificationPolicyUpdateRequest>(partial).is_err());
+}
+
+#[test]
 fn generated_swift_project_contract_is_current_and_required_fields_fail_closed() {
     let generated = generated_swift_command_contract();
     assert!(generated.contains(&format!(
@@ -1323,6 +1397,18 @@ fn generated_swift_project_contract_is_current_and_required_fields_fail_closed()
         "FlitProjectTrustResponse",
         "FlitProjectsListRequest",
         "FlitProjectsListResponse",
+        "FlitNotificationKinds",
+        "FlitQuietHours",
+        "FlitGlobalNotificationPolicy",
+        "FlitNotificationOverride",
+        "FlitProjectNotificationMaster",
+        "FlitNotificationKindOverrides",
+        "FlitProjectNotificationPolicy",
+        "FlitEffectiveNotificationPolicy",
+        "FlitNotificationPolicyResponse",
+        "FlitNotificationPolicyReadRequest",
+        "FlitGlobalNotificationPolicyUpdateRequest",
+        "FlitProjectNotificationPolicyUpdateRequest",
         "FlitGitObservationRequest",
         "FlitGitObservationResponse",
         "FlitGitObservationUnavailableReason",

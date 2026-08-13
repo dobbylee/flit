@@ -4,7 +4,7 @@ use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: &str = "1.24";
+pub const PROTOCOL_VERSION: &str = "1.25";
 pub const EVENT_PROTOCOL_VERSION: &str = "1.4";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -130,6 +130,111 @@ pub struct ProjectsListResponse {
     pub protocol_version: String,
     pub projects: Vec<ProjectRecord>,
     pub next_cursor: Option<ProjectListCursor>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationKindsRecord {
+    pub permission: bool,
+    pub question: bool,
+    pub failure: bool,
+    pub completion: bool,
+    pub stuck: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuietHoursRecord {
+    pub enabled: bool,
+    pub start_minute: u16,
+    pub end_minute: u16,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlobalNotificationPolicyRecord {
+    pub version: u64,
+    pub kinds: NotificationKindsRecord,
+    pub quiet_hours: QuietHoursRecord,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationOverrideRecord {
+    Inherit,
+    On,
+    Off,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectNotificationMasterRecord {
+    Inherit,
+    Off,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationKindOverridesRecord {
+    pub permission: NotificationOverrideRecord,
+    pub question: NotificationOverrideRecord,
+    pub failure: NotificationOverrideRecord,
+    pub completion: NotificationOverrideRecord,
+    pub stuck: NotificationOverrideRecord,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectNotificationPolicyRecord {
+    pub version: u64,
+    pub master: ProjectNotificationMasterRecord,
+    pub kinds: NotificationKindOverridesRecord,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectiveNotificationPolicyRecord {
+    pub global_version: u64,
+    pub project_version: Option<u64>,
+    pub kinds: NotificationKindsRecord,
+    pub quiet_hours: QuietHoursRecord,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationPolicyResponse {
+    pub protocol_version: String,
+    pub global: GlobalNotificationPolicyRecord,
+    pub project: Option<ProjectNotificationPolicyRecord>,
+    pub effective: EffectiveNotificationPolicyRecord,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationPolicyReadRequest {
+    pub project_id: Option<String>,
+    pub client_protocol_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlobalNotificationPolicyUpdateRequest {
+    pub expected_version: u64,
+    pub kinds: NotificationKindsRecord,
+    pub quiet_hours: QuietHoursRecord,
+    pub updated_at: String,
+    pub client_protocol_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectNotificationPolicyUpdateRequest {
+    pub project_id: String,
+    pub expected_version: u64,
+    pub master: ProjectNotificationMasterRecord,
+    pub kinds: NotificationKindOverridesRecord,
+    pub updated_at: String,
+    pub client_protocol_version: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1277,6 +1382,8 @@ pub enum ManagedRunPermissionRespondResponse {
 pub enum CommandErrorCode {
     ProtocolMismatch,
     InvalidProjectRequest,
+    InvalidNotificationPolicy,
+    NotificationPolicyVersionStale,
     InvalidDashboardRequest,
     ProjectInspectionFailure,
     ProjectConflict,
@@ -1596,6 +1703,10 @@ impl CommandError {
         let message_key = match code {
             CommandErrorCode::ProtocolMismatch => "errors.protocolMismatch",
             CommandErrorCode::InvalidProjectRequest => "errors.invalidProjectRequest",
+            CommandErrorCode::InvalidNotificationPolicy => "errors.invalidNotificationPolicy",
+            CommandErrorCode::NotificationPolicyVersionStale => {
+                "errors.notificationPolicyVersionStale"
+            }
             CommandErrorCode::InvalidDashboardRequest => "errors.invalidDashboardRequest",
             CommandErrorCode::ProjectInspectionFailure => "errors.projectInspectionFailure",
             CommandErrorCode::ProjectConflict => "errors.projectConflict",
@@ -1783,6 +1894,135 @@ struct FlitProjectsListResponse: Codable, Equatable, Sendable {
         case protocolVersion = "protocol_version"
         case projects
         case nextCursor = "next_cursor"
+    }
+}
+
+struct FlitNotificationKinds: Codable, Equatable, Sendable {
+    let permission: Bool
+    let question: Bool
+    let failure: Bool
+    let completion: Bool
+    let stuck: Bool
+}
+
+struct FlitQuietHours: Codable, Equatable, Sendable {
+    let enabled: Bool
+    let startMinute: UInt16
+    let endMinute: UInt16
+
+    private enum CodingKeys: String, CodingKey {
+        case enabled
+        case startMinute = "start_minute"
+        case endMinute = "end_minute"
+    }
+}
+
+struct FlitGlobalNotificationPolicy: Codable, Equatable, Sendable {
+    let version: UInt64
+    let kinds: FlitNotificationKinds
+    let quietHours: FlitQuietHours
+
+    private enum CodingKeys: String, CodingKey {
+        case version
+        case kinds
+        case quietHours = "quiet_hours"
+    }
+}
+
+enum FlitNotificationOverride: String, Codable, Sendable {
+    case inherit
+    case on
+    case off
+}
+
+enum FlitProjectNotificationMaster: String, Codable, Sendable {
+    case inherit
+    case off
+}
+
+struct FlitNotificationKindOverrides: Codable, Equatable, Sendable {
+    let permission: FlitNotificationOverride
+    let question: FlitNotificationOverride
+    let failure: FlitNotificationOverride
+    let completion: FlitNotificationOverride
+    let stuck: FlitNotificationOverride
+}
+
+struct FlitProjectNotificationPolicy: Codable, Equatable, Sendable {
+    let version: UInt64
+    let master: FlitProjectNotificationMaster
+    let kinds: FlitNotificationKindOverrides
+}
+
+struct FlitEffectiveNotificationPolicy: Codable, Equatable, Sendable {
+    let globalVersion: UInt64
+    let projectVersion: UInt64?
+    let kinds: FlitNotificationKinds
+    let quietHours: FlitQuietHours
+
+    private enum CodingKeys: String, CodingKey {
+        case globalVersion = "global_version"
+        case projectVersion = "project_version"
+        case kinds
+        case quietHours = "quiet_hours"
+    }
+}
+
+struct FlitNotificationPolicyResponse: Codable, Equatable, Sendable {
+    let protocolVersion: String
+    let global: FlitGlobalNotificationPolicy
+    let project: FlitProjectNotificationPolicy?
+    let effective: FlitEffectiveNotificationPolicy
+
+    private enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case global
+        case project
+        case effective
+    }
+}
+
+struct FlitNotificationPolicyReadRequest: Codable, Equatable, Sendable {
+    let projectId: String?
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+struct FlitGlobalNotificationPolicyUpdateRequest: Codable, Equatable, Sendable {
+    let expectedVersion: UInt64
+    let kinds: FlitNotificationKinds
+    let quietHours: FlitQuietHours
+    let updatedAt: String
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case expectedVersion = "expected_version"
+        case kinds
+        case quietHours = "quiet_hours"
+        case updatedAt = "updated_at"
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+struct FlitProjectNotificationPolicyUpdateRequest: Codable, Equatable, Sendable {
+    let projectId: String
+    let expectedVersion: UInt64
+    let master: FlitProjectNotificationMaster
+    let kinds: FlitNotificationKindOverrides
+    let updatedAt: String
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case projectId = "project_id"
+        case expectedVersion = "expected_version"
+        case master
+        case kinds
+        case updatedAt = "updated_at"
+        case clientProtocolVersion = "client_protocol_version"
     }
 }
 
@@ -2832,6 +3072,8 @@ enum FlitRunChangeExternalOpenResponse: Codable, Equatable, Sendable {
 enum FlitCommandErrorCode: String, Codable, Sendable {
     case protocolMismatch = "PROTOCOL_MISMATCH"
     case invalidProjectRequest = "INVALID_PROJECT_REQUEST"
+    case invalidNotificationPolicy = "INVALID_NOTIFICATION_POLICY"
+    case notificationPolicyVersionStale = "NOTIFICATION_POLICY_VERSION_STALE"
     case invalidDashboardRequest = "INVALID_DASHBOARD_REQUEST"
     case projectInspectionFailure = "PROJECT_INSPECTION_FAILURE"
     case projectConflict = "PROJECT_CONFLICT"
