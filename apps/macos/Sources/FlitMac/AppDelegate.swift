@@ -3,6 +3,7 @@ import AppKit
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var windowController: NSWindowController?
+    private var settingsWindowController: NSWindowController?
     private var statusItemController: ApplicationStatusItemController?
     private let closeToTrayPreference: CloseToTrayPreference
     private let closeToTrayAlertPresenter: any CloseToTrayAlertPresenting
@@ -160,6 +161,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         mainMenu.addItem(applicationItem)
 
         let applicationMenu = NSMenu()
+        let settingsItem = NSMenuItem(
+            title: FoundationCopy.text(.menuSettings),
+            action: #selector(showNotificationSettings(_:)),
+            keyEquivalent: ","
+        )
+        settingsItem.target = self
+        settingsItem.identifier = NSUserInterfaceItemIdentifier("flit.mainMenu.settings")
+        applicationMenu.addItem(settingsItem)
+        applicationMenu.addItem(.separator())
         let quitItem = NSMenuItem(
             title: FoundationCopy.text(.menuQuit),
             action: #selector(requestExplicitQuit(_:)),
@@ -170,6 +180,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         applicationMenu.addItem(quitItem)
         applicationItem.submenu = applicationMenu
         NSApplication.shared.mainMenu = mainMenu
+    }
+
+    @objc
+    private func showNotificationSettings(_ sender: Any?) {
+        if let window = settingsWindowController?.window {
+            window.makeKeyAndOrderFront(nil)
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            return
+        }
+        let content = NotificationSettingsViewController()
+        let window = NSWindow(contentViewController: content)
+        window.title = FoundationCopy.text(.notificationSettingsTitle)
+        window.identifier = NSUserInterfaceItemIdentifier("flit.notificationSettingsWindow")
+        window.setAccessibilityIdentifier("flit.notificationSettingsWindow")
+        window.setContentSize(NSSize(width: 680, height: 720))
+        window.minSize = NSSize(width: 620, height: 650)
+        window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+        window.isReleasedWhenClosed = false
+        window.center()
+        let controller = NSWindowController(window: window)
+        settingsWindowController = controller
+        controller.showWindow(nil)
+        NSApplication.shared.activate(ignoringOtherApps: true)
     }
 
     @objc
@@ -188,6 +221,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         func testQuitFromStatusItem() {
             statusItemController?.quitFlit(nil)
+        }
+
+        func testShowNotificationSettings() {
+            showNotificationSettings(nil)
+        }
+
+        var testNotificationSettingsWindow: NSWindow? {
+            settingsWindowController?.window
         }
     #endif
 }

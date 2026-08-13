@@ -53,6 +53,32 @@ enum FoundationCopyKey: String {
     case menuBarTooltip = "lifecycle.menuBar.tooltip"
     case menuOpen = "lifecycle.menu.open"
     case menuQuit = "lifecycle.menu.quit"
+    case menuSettings = "lifecycle.menu.settings"
+    case notificationSettingsCompletion = "notification.settings.completion"
+    case notificationSettingsEffective = "notification.settings.effective"
+    case notificationSettingsFailure = "notification.settings.failure"
+    case notificationSettingsGlobal = "notification.settings.global"
+    case notificationSettingsInherit = "notification.settings.inherit"
+    case notificationSettingsInvalidTime = "notification.settings.invalidTime"
+    case notificationSettingsLocalTime = "notification.settings.localTime"
+    case notificationSettingsNoProjects = "notification.settings.noProjects"
+    case notificationSettingsOff = "notification.settings.off"
+    case notificationSettingsOn = "notification.settings.on"
+    case notificationSettingsPermission = "notification.settings.permission"
+    case notificationSettingsProject = "notification.settings.project"
+    case notificationSettingsProjectMaster = "notification.settings.projectMaster"
+    case notificationSettingsProjectPicker = "notification.settings.projectPicker"
+    case notificationSettingsQuestion = "notification.settings.question"
+    case notificationSettingsQuietEnd = "notification.settings.quietEnd"
+    case notificationSettingsQuietHours = "notification.settings.quietHours"
+    case notificationSettingsQuietStart = "notification.settings.quietStart"
+    case notificationSettingsReload = "notification.settings.reload"
+    case notificationSettingsSaveFailed = "notification.settings.saveFailed"
+    case notificationSettingsSaveGlobal = "notification.settings.saveGlobal"
+    case notificationSettingsSaveProject = "notification.settings.saveProject"
+    case notificationSettingsStuck = "notification.settings.stuck"
+    case notificationSettingsTitle = "notification.settings.title"
+    case notificationSettingsUnavailable = "notification.settings.unavailable"
     case notificationStuckBody = "notification.stuck.body"
     case notificationStuckTitle = "notification.stuck.title"
     case quitActiveRuns = "lifecycle.quit.activeRuns"
@@ -218,6 +244,36 @@ enum FoundationCopy {
         .menuBarTooltip: "Open Flit",
         .menuOpen: "Open Flit",
         .menuQuit: "Quit Flit",
+        .menuSettings: "Settings…",
+        .notificationSettingsCompletion: "Finished",
+        .notificationSettingsEffective: "Currently enabled: %@",
+        .notificationSettingsFailure: "Failed or interrupted",
+        .notificationSettingsGlobal: "Global notifications",
+        .notificationSettingsInherit: "Inherit",
+        .notificationSettingsInvalidTime:
+            "Enter two different local times in 24-hour HH:MM format.",
+        .notificationSettingsLocalTime:
+            "Uses this Mac's current local time. Overnight ranges are supported.",
+        .notificationSettingsNoProjects: "No active Projects are available.",
+        .notificationSettingsOff: "Off",
+        .notificationSettingsOn: "On",
+        .notificationSettingsPermission: "Permission requests",
+        .notificationSettingsProject: "Project overrides",
+        .notificationSettingsProjectMaster: "Project notifications",
+        .notificationSettingsProjectPicker: "Project",
+        .notificationSettingsQuestion: "Questions",
+        .notificationSettingsQuietEnd: "End (HH:MM)",
+        .notificationSettingsQuietHours: "Quiet hours",
+        .notificationSettingsQuietStart: "Start (HH:MM)",
+        .notificationSettingsReload: "Reload",
+        .notificationSettingsSaveFailed:
+            "Settings were not saved. Reload the authoritative policy and try again.",
+        .notificationSettingsSaveGlobal: "Save global settings",
+        .notificationSettingsSaveProject: "Save Project overrides",
+        .notificationSettingsStuck: "Possibly stuck",
+        .notificationSettingsTitle: "Notification Settings",
+        .notificationSettingsUnavailable:
+            "Notification settings are unavailable. The last accepted values were preserved.",
         .notificationStuckBody: "%@ · Possibly stuck",
         .notificationStuckTitle: "Flit needs your attention",
         .quitActiveRuns: "Active provider Runs:",

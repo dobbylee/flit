@@ -453,6 +453,416 @@ struct NativeHealthTests {
             FlitManagedStuckNotificationDeliveryFailedResponse.self,
             at: "\(fixtureRoot)/managed_stuck_notification_delivery_failed.response.json"
         )
+
+        try require(
+            notificationWallTimeMinute("00:00") == 0
+                && notificationWallTimeMinute("23:59") == 1_439
+                && notificationWallTimeMinute("24:00") == nil
+                && notificationWallTimeMinute("9:00") == nil
+                && notificationWallTimeMinute("09:60") == nil
+                && notificationWallTimeMinute("+9:00") == nil
+                && notificationWallTimeMinute("-0:30") == nil
+                && notificationWallTimeMinute("0a:00") == nil
+                && notificationWallTimeText(1_320) == "22:00"
+                && notificationWallTimeText(1_440) == nil,
+            "notification wall times must accept only exact bounded 24-hour input"
+        )
+        let policyReadFixture = try decodeFixture(
+            FlitNotificationPolicyResponse.self,
+            at: "\(fixtureRoot)/notification_policy_read.response.json"
+        )
+        let globalPolicyFixture = try decodeFixture(
+            FlitNotificationPolicyResponse.self,
+            at: "\(fixtureRoot)/notification_policy_update_global.response.json"
+        )
+        let projectPolicyFixture = try decodeFixture(
+            FlitNotificationPolicyResponse.self,
+            at: "\(fixtureRoot)/notification_policy_update_project.response.json"
+        )
+        var exactReadRequests: [FlitNotificationPolicyReadRequest] = []
+        var exactGlobalRequests: [FlitGlobalNotificationPolicyUpdateRequest] = []
+        var exactProjectRequests: [FlitProjectNotificationPolicyUpdateRequest] = []
+        let exactPolicyClient = NotificationPolicyClient(
+            readLoader: { request in
+                exactReadRequests.append(request)
+                return policyReadFixture
+            },
+            globalUpdateLoader: { request in
+                exactGlobalRequests.append(request)
+                return globalPolicyFixture
+            },
+            projectUpdateLoader: { request in
+                exactProjectRequests.append(request)
+                return projectPolicyFixture
+            },
+            now: { "2026-08-13T01:00:00.000Z" }
+        )
+        _ = try exactPolicyClient.read(projectId: "project-notifications-1")
+        _ = try exactPolicyClient.updateGlobal(
+            expectedVersion: 0,
+            kinds: globalPolicyFixture.global.kinds,
+            quietHours: globalPolicyFixture.global.quietHours
+        )
+        _ = try exactPolicyClient.updateProject(
+            projectId: "project-notifications-1",
+            expectedVersion: 0,
+            master: projectPolicyFixture.project!.master,
+            kinds: projectPolicyFixture.project!.kinds
+        )
+        try require(
+            exactReadRequests == [
+                FlitNotificationPolicyReadRequest(
+                    projectId: "project-notifications-1",
+                    clientProtocolVersion: flitClientProtocolVersion
+                )
+            ]
+                && exactGlobalRequests.count == 1
+                && exactGlobalRequests[0].expectedVersion == 0
+                && exactGlobalRequests[0].updatedAt == "2026-08-13T01:00:00.000Z"
+                && exactGlobalRequests[0].clientProtocolVersion == flitClientProtocolVersion
+                && exactProjectRequests.count == 1
+                && exactProjectRequests[0].projectId == "project-notifications-1"
+                && exactProjectRequests[0].expectedVersion == 0
+                && exactProjectRequests[0].clientProtocolVersion == flitClientProtocolVersion,
+            "native notification clients must send exact Protocol 1.25 identity and CAS versions"
+        )
+
+        let settingsProject = FlitProjectRecord(
+            id: "project-notifications-1",
+            displayName: "Notification Project",
+            canonicalPath: "/private/tmp/flit-notification-project",
+            filesystemId: "unix:1:2",
+            trusted: true,
+            defaultProvider: nil,
+            createdAt: "2026-08-13T00:00:00.000Z",
+            updatedAt: "2026-08-13T00:00:00.000Z"
+        )
+        let secondSettingsProject = FlitProjectRecord(
+            id: "project-notifications-2",
+            displayName: "Second Notification Project",
+            canonicalPath: "/private/tmp/flit-notification-project-2",
+            filesystemId: "unix:1:3",
+            trusted: true,
+            defaultProvider: nil,
+            createdAt: "2026-08-13T00:00:00.000Z",
+            updatedAt: "2026-08-13T00:00:00.000Z"
+        )
+        let globalVersionTwo = FlitGlobalNotificationPolicy(
+            version: 2,
+            kinds: FlitNotificationKinds(
+                permission: true,
+                question: true,
+                failure: true,
+                completion: true,
+                stuck: true
+            ),
+            quietHours: FlitQuietHours(
+                enabled: true,
+                startMinute: 1_395,
+                endMinute: 405
+            )
+        )
+        let inheritedProject = FlitProjectNotificationPolicy(
+            version: 0,
+            master: .inherit,
+            kinds: FlitNotificationKindOverrides(
+                permission: .inherit,
+                question: .inherit,
+                failure: .inherit,
+                completion: .inherit,
+                stuck: .inherit
+            )
+        )
+        let postGlobalRead = FlitNotificationPolicyResponse(
+            protocolVersion: flitClientProtocolVersion,
+            global: globalVersionTwo,
+            project: inheritedProject,
+            effective: FlitEffectiveNotificationPolicy(
+                globalVersion: 2,
+                projectVersion: 0,
+                kinds: globalVersionTwo.kinds,
+                quietHours: globalVersionTwo.quietHours
+            )
+        )
+        let globalUpdateResponse = FlitNotificationPolicyResponse(
+            protocolVersion: flitClientProtocolVersion,
+            global: globalVersionTwo,
+            project: nil,
+            effective: FlitEffectiveNotificationPolicy(
+                globalVersion: 2,
+                projectVersion: nil,
+                kinds: globalVersionTwo.kinds,
+                quietHours: globalVersionTwo.quietHours
+            )
+        )
+        let savedProject = FlitProjectNotificationPolicy(
+            version: 1,
+            master: .inherit,
+            kinds: FlitNotificationKindOverrides(
+                permission: .on,
+                question: .off,
+                failure: .inherit,
+                completion: .off,
+                stuck: .inherit
+            )
+        )
+        let postProjectRead = FlitNotificationPolicyResponse(
+            protocolVersion: flitClientProtocolVersion,
+            global: globalVersionTwo,
+            project: savedProject,
+            effective: FlitEffectiveNotificationPolicy(
+                globalVersion: 2,
+                projectVersion: 1,
+                kinds: FlitNotificationKinds(
+                    permission: true,
+                    question: false,
+                    failure: true,
+                    completion: false,
+                    stuck: true
+                ),
+                quietHours: globalVersionTwo.quietHours
+            )
+        )
+        var modelReadResponse = policyReadFixture
+        var modelGlobalRequests: [FlitGlobalNotificationPolicyUpdateRequest] = []
+        var modelProjectRequests: [FlitProjectNotificationPolicyUpdateRequest] = []
+        let settingsModel = NotificationSettingsModel(
+            policyClient: NotificationPolicyClient(
+                readLoader: { _ in modelReadResponse },
+                globalUpdateLoader: { request in
+                    modelGlobalRequests.append(request)
+                    modelReadResponse = postGlobalRead
+                    return globalUpdateResponse
+                },
+                projectUpdateLoader: { request in
+                    modelProjectRequests.append(request)
+                    modelReadResponse = postProjectRead
+                    return postProjectRead
+                },
+                now: { "2026-08-13T02:00:00.000Z" }
+            ),
+            projectClient: NotificationSettingsProjectClient(pageLoader: { cursor in
+                try require(cursor == nil, "one-page notification Project load must start empty")
+                return FlitProjectsListResponse(
+                    protocolVersion: flitClientProtocolVersion,
+                    projects: [settingsProject, secondSettingsProject],
+                    nextCursor: nil
+                )
+            })
+        )
+        settingsModel.reload()
+        try require(
+            settingsModel.isLoaded
+                && settingsModel.selectedProjectId == settingsProject.id
+                && settingsModel.globalKinds
+                    == NotificationKindsDraft(policyReadFixture.global.kinds)
+                && settingsModel.quietHoursStart == "22:00"
+                && settingsModel.quietHoursEnd == "08:00"
+                && settingsModel.projectVersionForTesting == 0,
+            "notification settings must load the exact authoritative global and Project snapshot"
+        )
+        settingsModel.globalKinds.completion = true
+        settingsModel.selectProject(secondSettingsProject.id)
+        settingsModel.selectProject(settingsProject.id)
+        try require(
+            settingsModel.selectedProjectId == settingsProject.id
+                && settingsModel.globalKinds.completion,
+            "Project selection must preserve the unsaved global notification draft"
+        )
+        settingsModel.quietHoursEnabled = true
+        for malformedStart in ["+9:00", "-0:30", "0a:00"] {
+            settingsModel.quietHoursStart = malformedStart
+            settingsModel.quietHoursEnd = "08:00"
+            settingsModel.saveGlobal()
+        }
+        try require(
+            modelGlobalRequests.isEmpty,
+            "non-digit quiet-hour input must fail before a bridge mutation"
+        )
+        settingsModel.quietHoursStart = "08:00"
+        settingsModel.quietHoursEnd = "08:00"
+        settingsModel.saveGlobal()
+        try require(
+            modelGlobalRequests.isEmpty
+                && settingsModel.errorCopy
+                    == FoundationCopy.text(.notificationSettingsInvalidTime),
+            "equal enabled quiet-hour boundaries must fail before a bridge mutation"
+        )
+        settingsModel.projectKinds.permission = .on
+        settingsModel.quietHoursStart = "23:15"
+        settingsModel.quietHoursEnd = "06:45"
+        settingsModel.saveGlobal()
+        try require(
+            modelGlobalRequests.count == 1
+                && modelGlobalRequests[0].expectedVersion == 1
+                && modelGlobalRequests[0].kinds.completion
+                && modelGlobalRequests[0].quietHours
+                    == FlitQuietHours(enabled: true, startMinute: 1_395, endMinute: 405)
+                && settingsModel.globalVersionForTesting == 2
+                && settingsModel.effectiveKinds == postGlobalRead.effective.kinds
+                && settingsModel.projectKinds.permission == .on
+                && settingsModel.errorCopy == nil,
+            "global notification save must reload authoritative policy without discarding the Project draft"
+        )
+        settingsModel.globalKinds.question = false
+        settingsModel.projectKinds.question = .off
+        settingsModel.projectKinds.completion = .off
+        settingsModel.saveProject()
+        try require(
+            modelProjectRequests.count == 1
+                && modelProjectRequests[0].projectId == settingsProject.id
+                && modelProjectRequests[0].expectedVersion == 0
+                && modelProjectRequests[0].kinds.question == .off
+                && settingsModel.projectVersionForTesting == 1
+                && settingsModel.effectiveKinds == postProjectRead.effective.kinds
+                && !settingsModel.globalKinds.question,
+            "Project notification save must preserve exact CAS and effective values without discarding the global draft"
+        )
+        let settingsController = NotificationSettingsViewController(model: settingsModel)
+        settingsController.loadView()
+        try require(
+            settingsController.hostedLeafCount == 1
+                && settingsController.view.accessibilityIdentifier()
+                    == "flit.settings.notifications.root",
+            "notification Settings must remain one accessible low-cardinality SwiftUI leaf"
+        )
+
+        var staleDraftUpdateCount = 0
+        let staleModel = NotificationSettingsModel(
+            policyClient: NotificationPolicyClient(
+                readLoader: { _ in policyReadFixture },
+                globalUpdateLoader: { _ in
+                    staleDraftUpdateCount += 1
+                    throw NotificationSettingsClientError.command(
+                        .notificationPolicyVersionStale
+                    )
+                }
+            ),
+            projectClient: NotificationSettingsProjectClient(pageLoader: { _ in
+                FlitProjectsListResponse(
+                    protocolVersion: flitClientProtocolVersion,
+                    projects: [settingsProject],
+                    nextCursor: nil
+                )
+            })
+        )
+        staleModel.reload()
+        staleModel.globalKinds.completion = true
+        staleModel.saveGlobal()
+        try require(
+            staleDraftUpdateCount == 1
+                && staleModel.globalKinds.completion
+                && staleModel.errorCopy
+                    == FoundationCopy.text(.notificationSettingsSaveFailed),
+            "stale notification CAS must preserve the displayed draft and expose fixed retry copy"
+        )
+
+        var selectionReadCount = 0
+        var selectionGlobalExpectedVersions: [UInt64] = []
+        let selectionConflictModel = NotificationSettingsModel(
+            policyClient: NotificationPolicyClient(
+                readLoader: { _ in
+                    selectionReadCount += 1
+                    return selectionReadCount == 1 ? policyReadFixture : postGlobalRead
+                },
+                globalUpdateLoader: { request in
+                    selectionGlobalExpectedVersions.append(request.expectedVersion)
+                    throw NotificationSettingsClientError.command(
+                        .notificationPolicyVersionStale
+                    )
+                }
+            ),
+            projectClient: NotificationSettingsProjectClient(pageLoader: { _ in
+                FlitProjectsListResponse(
+                    protocolVersion: flitClientProtocolVersion,
+                    projects: [settingsProject, secondSettingsProject],
+                    nextCursor: nil
+                )
+            })
+        )
+        selectionConflictModel.reload()
+        selectionConflictModel.globalKinds.completion = true
+        selectionConflictModel.selectProject(secondSettingsProject.id)
+        selectionConflictModel.saveGlobal()
+        try require(
+            selectionGlobalExpectedVersions == [1]
+                && selectionConflictModel.globalKinds.completion
+                && selectionConflictModel.errorCopy
+                    == FoundationCopy.text(.notificationSettingsSaveFailed),
+            "Project selection must keep the global draft bound to its original CAS version"
+        )
+
+        var projectSaveGlobalExpectedVersions: [UInt64] = []
+        let projectSaveConflictModel = NotificationSettingsModel(
+            policyClient: NotificationPolicyClient(
+                readLoader: { _ in policyReadFixture },
+                globalUpdateLoader: { request in
+                    projectSaveGlobalExpectedVersions.append(request.expectedVersion)
+                    throw NotificationSettingsClientError.command(
+                        .notificationPolicyVersionStale
+                    )
+                },
+                projectUpdateLoader: { _ in postProjectRead }
+            ),
+            projectClient: NotificationSettingsProjectClient(pageLoader: { _ in
+                FlitProjectsListResponse(
+                    protocolVersion: flitClientProtocolVersion,
+                    projects: [settingsProject],
+                    nextCursor: nil
+                )
+            })
+        )
+        projectSaveConflictModel.reload()
+        projectSaveConflictModel.globalKinds.completion = true
+        projectSaveConflictModel.projectKinds.question = .off
+        projectSaveConflictModel.saveProject()
+        projectSaveConflictModel.saveGlobal()
+        try require(
+            projectSaveGlobalExpectedVersions == [1]
+                && projectSaveConflictModel.globalKinds.completion
+                && projectSaveConflictModel.errorCopy
+                    == FoundationCopy.text(.notificationSettingsSaveFailed),
+            "Project save must keep the global draft bound to its original CAS version"
+        )
+
+        var globalRefreshReadCount = 0
+        var refreshedProjectExpectedVersions: [UInt64] = []
+        let projectConflictModel = NotificationSettingsModel(
+            policyClient: NotificationPolicyClient(
+                readLoader: { _ in
+                    globalRefreshReadCount += 1
+                    return globalRefreshReadCount == 1
+                        ? policyReadFixture
+                        : postProjectRead
+                },
+                globalUpdateLoader: { _ in globalUpdateResponse },
+                projectUpdateLoader: { request in
+                    refreshedProjectExpectedVersions.append(request.expectedVersion)
+                    throw NotificationSettingsClientError.command(
+                        .notificationPolicyVersionStale
+                    )
+                }
+            ),
+            projectClient: NotificationSettingsProjectClient(pageLoader: { _ in
+                FlitProjectsListResponse(
+                    protocolVersion: flitClientProtocolVersion,
+                    projects: [settingsProject],
+                    nextCursor: nil
+                )
+            })
+        )
+        projectConflictModel.reload()
+        projectConflictModel.projectKinds.question = .off
+        projectConflictModel.globalKinds.completion = true
+        projectConflictModel.saveGlobal()
+        projectConflictModel.saveProject()
+        try require(
+            refreshedProjectExpectedVersions == [0]
+                && projectConflictModel.projectKinds.question == .off
+                && projectConflictModel.errorCopy
+                    == FoundationCopy.text(.notificationSettingsSaveFailed),
+            "global save must keep the Project draft bound to its original CAS version"
+        )
         guard let dueNotification = dueNotificationFixture.notifications.first else {
             throw NativeHealthTestFailure.failed(
                 "notification fixture must contain one exact due item"
@@ -5047,6 +5457,42 @@ struct NativeHealthTests {
         lifecycleDelegate.applicationDidFinishLaunching(
             Notification(name: NSApplication.didFinishLaunchingNotification)
         )
+        let applicationMenuItems = NSApplication.shared.mainMenu?.items.first?.submenu?.items ?? []
+        try require(
+            applicationMenuItems.count == 3
+                && applicationMenuItems[0].title
+                    == FoundationCopy.text(.menuSettings)
+                && applicationMenuItems[0].keyEquivalent == ","
+                && applicationMenuItems[0].identifier?.rawValue
+                    == "flit.mainMenu.settings"
+                && applicationMenuItems[2].identifier?.rawValue
+                    == "flit.mainMenu.quit",
+            "application menu must expose keyboard-reachable Settings before Quit"
+        )
+        lifecycleDelegate.testShowNotificationSettings()
+        guard let notificationSettingsWindow =
+            lifecycleDelegate.testNotificationSettingsWindow
+        else {
+            throw NativeHealthTestFailure.failed(
+                "application Settings action must retain its notification window"
+            )
+        }
+        let notificationSettingsWindowIdentity = ObjectIdentifier(notificationSettingsWindow)
+        try require(
+            notificationSettingsWindow.isVisible
+                && notificationSettingsWindow.identifier?.rawValue
+                    == "flit.notificationSettingsWindow"
+                && notificationSettingsWindow.contentViewController
+                    is NotificationSettingsViewController,
+            "application Settings action must show the exact accessible notification surface"
+        )
+        lifecycleDelegate.testShowNotificationSettings()
+        try require(
+            lifecycleDelegate.testNotificationSettingsWindow.map(ObjectIdentifier.init)
+                == notificationSettingsWindowIdentity,
+            "repeated Settings actions must reuse one window and one policy model"
+        )
+        notificationSettingsWindow.orderOut(nil)
         guard let retainedWindow = lifecycleDelegate.testMainWindow else {
             throw NativeHealthTestFailure.failed(
                 "application launch must retain its main window"
