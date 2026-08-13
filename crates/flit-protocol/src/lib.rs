@@ -751,6 +751,7 @@ pub enum RunActiveAttentionStatus {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunActiveAttentionAction {
+    Acknowledge,
     PermissionResponse {
         request_id: String,
         request_version: u64,
@@ -2830,6 +2831,7 @@ enum FlitRunActiveAttentionStatus: String, Codable, Sendable {
 }
 
 enum FlitRunActiveAttentionAction: Codable, Equatable, Sendable {
+    case acknowledge
     case permissionResponse(requestId: String, requestVersion: UInt64)
     case stillWorking(occurrenceId: String)
     case unavailable(reason: String)
@@ -2844,6 +2846,7 @@ enum FlitRunActiveAttentionAction: Codable, Equatable, Sendable {
 
     private enum Kind: String, Codable {
         case permissionResponse = "permission_response"
+        case acknowledge
         case stillWorking = "still_working"
         case unavailable
     }
@@ -2851,6 +2854,8 @@ enum FlitRunActiveAttentionAction: Codable, Equatable, Sendable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         switch try container.decode(Kind.self, forKey: .kind) {
+        case .acknowledge:
+            self = .acknowledge
         case .permissionResponse:
             self = .permissionResponse(
                 requestId: try container.decode(String.self, forKey: .requestId),
@@ -2868,6 +2873,8 @@ enum FlitRunActiveAttentionAction: Codable, Equatable, Sendable {
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         switch self {
+        case .acknowledge:
+            try container.encode(Kind.acknowledge, forKey: .kind)
         case let .permissionResponse(requestId, requestVersion):
             try container.encode(Kind.permissionResponse, forKey: .kind)
             try container.encode(requestId, forKey: .requestId)

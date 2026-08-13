@@ -2159,6 +2159,18 @@ pub fn run_detail_read_json(request_json: String) -> Result<String, BridgeError>
 fn active_attention_item(
     item: StoreRunActiveAttentionItem,
 ) -> Result<ProtocolRunActiveAttentionItem, BridgeError> {
+    let acknowledgeable = item.category == "failure"
+        && item.status == "open"
+        && !item.blocking
+        && matches!(
+            item.source_event_type.as_str(),
+            "run.failed" | "run.interrupted" | "run.resume_failed"
+        )
+        && matches!(
+            &item.action,
+            StoreRunActiveAttentionAction::Unavailable { reason }
+                if reason == "attention_action_not_implemented"
+        );
     let category = match item.category.as_str() {
         "permission" => ProtocolRunActiveAttentionCategory::Permission,
         "permission_audit" => ProtocolRunActiveAttentionCategory::PermissionAudit,
@@ -2182,19 +2194,23 @@ fn active_attention_item(
         "delivery_unknown" => ProtocolRunActiveAttentionStatus::DeliveryUnknown,
         _ => return Err(BridgeError::StorageFailure),
     };
-    let action = match item.action {
-        StoreRunActiveAttentionAction::PermissionResponse {
-            request_id,
-            request_version,
-        } => ProtocolRunActiveAttentionAction::PermissionResponse {
-            request_id,
-            request_version,
-        },
-        StoreRunActiveAttentionAction::StillWorking { occurrence_id } => {
-            ProtocolRunActiveAttentionAction::StillWorking { occurrence_id }
-        }
-        StoreRunActiveAttentionAction::Unavailable { reason } => {
-            ProtocolRunActiveAttentionAction::Unavailable { reason }
+    let action = if acknowledgeable {
+        ProtocolRunActiveAttentionAction::Acknowledge
+    } else {
+        match item.action {
+            StoreRunActiveAttentionAction::PermissionResponse {
+                request_id,
+                request_version,
+            } => ProtocolRunActiveAttentionAction::PermissionResponse {
+                request_id,
+                request_version,
+            },
+            StoreRunActiveAttentionAction::StillWorking { occurrence_id } => {
+                ProtocolRunActiveAttentionAction::StillWorking { occurrence_id }
+            }
+            StoreRunActiveAttentionAction::Unavailable { reason } => {
+                ProtocolRunActiveAttentionAction::Unavailable { reason }
+            }
         }
     };
     Ok(ProtocolRunActiveAttentionItem {
@@ -7613,6 +7629,24 @@ mod tests {
         let item = context.item.expect("failure attention item");
         assert_eq!(item.category, "failure");
         assert_eq!(item.source_event_type, "run.failed");
+        let active: RunActiveAttentionReadResponse = serde_json::from_str(
+            &run_active_attention_read_with(
+                &manager,
+                &serde_json::to_string(&RunActiveAttentionReadRequest {
+                    run_id: "run-acknowledge".to_owned(),
+                    expected_run_version: context.run_version,
+                    client_protocol_version: PROTOCOL_VERSION.to_owned(),
+                })
+                .expect("failure attention read request"),
+            )
+            .expect("failure attention read response"),
+        )
+        .expect("typed failure attention response");
+        assert!(matches!(
+            active.item,
+            RunActiveAttentionSlot::Item(item)
+                if item.action == ProtocolRunActiveAttentionAction::Acknowledge
+        ));
         let request = AttentionAcknowledgeRequest {
             run_id: "run-acknowledge".to_owned(),
             expected_run_version: context.run_version,

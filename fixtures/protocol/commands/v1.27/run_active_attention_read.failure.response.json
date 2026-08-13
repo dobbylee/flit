@@ -1,0 +1,22 @@
+{
+  "protocol_version": "1.27",
+  "event_schema_version": "1.4",
+  "run_id": "run-1",
+  "run_version": 6,
+  "open_count": 1,
+  "item": {
+    "attention_id": "lifecycle:event-run-failed",
+    "attention_version": 6,
+    "category": "failure",
+    "severity": "critical",
+    "blocking": false,
+    "status": "open",
+    "source_event_id": "event-run-failed",
+    "source_event_type": "run.failed",
+    "source_observed_at": "2026-08-13T10:00:00Z",
+    "content_unavailable_reason": "raw_provider_content_not_retained",
+    "action": {
+      "kind": "acknowledge"
+    }
+  }
+}

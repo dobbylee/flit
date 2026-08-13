@@ -35,6 +35,7 @@ enum ActiveAttentionPresentationError: Error, Equatable {
 }
 
 enum ActiveAttentionPresentationAction: Equatable, Sendable {
+    case acknowledge
     case stillWorking(occurrenceId: String)
     case permissionDetailsUnavailable
     case unavailable
@@ -42,6 +43,7 @@ enum ActiveAttentionPresentationAction: Equatable, Sendable {
 
 struct ActiveAttentionCardPresentation: Equatable, Sendable {
     let attentionId: String
+    let attentionVersion: UInt64
     let category: FlitRunActiveAttentionCategory
     let severity: FlitRunActiveAttentionSeverity
     let status: FlitRunActiveAttentionStatus
@@ -91,6 +93,17 @@ func activeAttentionCard(
         }
         let action: ActiveAttentionPresentationAction
         switch item.action {
+        case .acknowledge:
+            guard
+                item.category == .failure,
+                item.status == .open,
+                !item.blocking,
+                ["run.failed", "run.interrupted", "run.resume_failed"]
+                .contains(item.sourceEventType)
+            else {
+                throw ActiveAttentionPresentationError.invalidItem
+            }
+            action = .acknowledge
         case let .permissionResponse(requestId, requestVersion):
             guard
                 item.category == .permission,
@@ -123,6 +136,7 @@ func activeAttentionCard(
         }
         return ActiveAttentionCardPresentation(
             attentionId: item.attentionId,
+            attentionVersion: item.attentionVersion,
             category: item.category,
             severity: item.severity,
             status: item.status,
@@ -132,6 +146,87 @@ func activeAttentionCard(
             contentUnavailableReason: item.contentUnavailableReason,
             action: action
         )
+    }
+}
+
+enum AttentionAcknowledgeClientError: Error, Equatable {
+    case contractMismatch
+    case identityMismatch
+    case invalidResponse
+}
+
+@MainActor
+struct AttentionAcknowledgeClient {
+    private let fixtureLoader:
+        ((FlitAttentionAcknowledgeRequest) throws
+            -> FlitAttentionAcknowledgeResponse)?
+
+    init(
+        fixtureLoader: ((FlitAttentionAcknowledgeRequest) throws
+            -> FlitAttentionAcknowledgeResponse)? = nil
+    ) {
+        self.fixtureLoader = fixtureLoader
+    }
+
+    func submit(
+        runId: String,
+        expectedRunVersion: UInt64,
+        attentionId: String,
+        attentionVersion: UInt64
+    ) throws -> FlitAttentionAcknowledgeResponse {
+        let request = FlitAttentionAcknowledgeRequest(
+            runId: runId,
+            expectedRunVersion: expectedRunVersion,
+            attentionId: attentionId,
+            attentionVersion: attentionVersion,
+            clientProtocolVersion: flitClientProtocolVersion
+        )
+        let response: FlitAttentionAcknowledgeResponse
+        if let fixtureLoader {
+            response = try fixtureLoader(request)
+        } else {
+            let requestData = try JSONEncoder().encode(request)
+            let rendered = try attentionAcknowledgeJson(
+                requestJson: String(decoding: requestData, as: UTF8.self)
+            )
+            response = try JSONDecoder().decode(
+                FlitAttentionAcknowledgeResponse.self,
+                from: Data(rendered.utf8)
+            )
+        }
+        guard response.protocolVersion == flitClientProtocolVersion else {
+            throw AttentionAcknowledgeClientError.contractMismatch
+        }
+        guard
+            response.runId == runId,
+            response.attentionId == attentionId,
+            response.attentionVersion == attentionVersion
+        else {
+            throw AttentionAcknowledgeClientError.identityMismatch
+        }
+        switch response.status {
+        case .applied:
+            guard
+                response.previousVersion == expectedRunVersion,
+                response.eventVersion.map({ $0 > expectedRunVersion }) == true,
+                response.eventId.map({ boundedAttentionToken($0, maximumBytes: 256) }) == true,
+                response.expectedRunVersion == nil,
+                response.reason == nil
+            else {
+                throw AttentionAcknowledgeClientError.invalidResponse
+            }
+        case .rejected:
+            guard
+                response.expectedRunVersion == expectedRunVersion,
+                response.previousVersion == nil,
+                response.eventId == nil,
+                response.eventVersion == nil,
+                response.reason != nil
+            else {
+                throw AttentionAcknowledgeClientError.invalidResponse
+            }
+        }
+        return response
     }
 }
 

@@ -299,7 +299,7 @@ private func stuckAttentionResponse(
     runVersion: UInt64,
     occurrenceId: String
 ) -> FlitRunActiveAttentionReadResponse {
-    FlitRunActiveAttentionReadResponse(
+    return FlitRunActiveAttentionReadResponse(
         protocolVersion: flitClientProtocolVersion,
         eventSchemaVersion: flitEventSchemaVersion,
         runId: runId,
@@ -327,7 +327,7 @@ private func permissionAttentionResponse(
     runId: String,
     runVersion: UInt64
 ) -> FlitRunActiveAttentionReadResponse {
-    FlitRunActiveAttentionReadResponse(
+    return FlitRunActiveAttentionReadResponse(
         protocolVersion: flitClientProtocolVersion,
         eventSchemaVersion: flitEventSchemaVersion,
         runId: runId,
@@ -351,6 +351,75 @@ private func permissionAttentionResponse(
                 )
             )
         )
+    )
+}
+
+private func failureAttentionResponse(
+    runId: String,
+    runVersion: UInt64,
+    sourceEventType: String = "run.failed",
+    category: FlitRunActiveAttentionCategory = .failure,
+    status: FlitRunActiveAttentionStatus = .open,
+    blocking: Bool = false
+) -> FlitRunActiveAttentionReadResponse {
+    let action: FlitRunActiveAttentionAction =
+        category == .failure
+        && status == .open
+        && !blocking
+        && ["run.failed", "run.interrupted", "run.resume_failed"].contains(sourceEventType)
+        ? .acknowledge
+        : .unavailable(reason: "attention_action_not_implemented")
+    return FlitRunActiveAttentionReadResponse(
+        protocolVersion: flitClientProtocolVersion,
+        eventSchemaVersion: flitEventSchemaVersion,
+        runId: runId,
+        runVersion: runVersion,
+        openCount: 1,
+        item: .item(
+            FlitRunActiveAttentionItem(
+                attentionId: "lifecycle:event-failure-native",
+                attentionVersion: runVersion,
+                category: category,
+                severity: .critical,
+                blocking: blocking,
+                status: status,
+                sourceEventId: "event-failure-native",
+                sourceEventType: sourceEventType,
+                sourceObservedAt: "2026-08-13T10:00:00.000Z",
+                contentUnavailableReason: "raw_provider_content_not_retained",
+                action: action
+            )
+        )
+    )
+}
+
+private func attentionAcknowledgeResponse(
+    status: String,
+    runId: String,
+    runVersion: UInt64,
+    attentionId: String,
+    attentionVersion: UInt64,
+    appliedEventVersion: UInt64? = nil,
+    reason: String? = nil
+) throws -> FlitAttentionAcknowledgeResponse {
+    var object: [String: Any] = [
+        "status": status,
+        "protocol_version": flitClientProtocolVersion,
+        "run_id": runId,
+        "attention_id": attentionId,
+        "attention_version": attentionVersion,
+    ]
+    if status == "applied" {
+        object["previous_version"] = runVersion
+        object["event_id"] = "attention-acknowledged-native"
+        object["event_version"] = appliedEventVersion ?? runVersion + 1
+    } else {
+        object["expected_run_version"] = runVersion
+        object["reason"] = reason ?? "attention_mismatch"
+    }
+    return try JSONDecoder().decode(
+        FlitAttentionAcknowledgeResponse.self,
+        from: JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     )
 }
 
@@ -3486,6 +3555,30 @@ struct NativeHealthTests {
                 && stillWorkingRejected.eventId == nil,
             "generated Still working contract must preserve exact CAS variants"
         )
+        let acknowledgeRequest = try decodeFixture(
+            FlitAttentionAcknowledgeRequest.self,
+            at: "\(fixtureRoot)/attention_acknowledge.request.json"
+        )
+        let acknowledgeApplied = try decodeFixture(
+            FlitAttentionAcknowledgeResponse.self,
+            at: "\(fixtureRoot)/attention_acknowledge.applied.response.json"
+        )
+        let acknowledgeRejected = try decodeFixture(
+            FlitAttentionAcknowledgeResponse.self,
+            at: "\(fixtureRoot)/attention_acknowledge.rejected.response.json"
+        )
+        try require(
+            acknowledgeRequest.clientProtocolVersion == flitClientProtocolVersion
+                && acknowledgeRequest.expectedRunVersion == 6
+                && acknowledgeRequest.attentionVersion == 6
+                && acknowledgeApplied.status == .applied
+                && acknowledgeApplied.eventVersion == 7
+                && acknowledgeApplied.reason == nil
+                && acknowledgeRejected.status == .rejected
+                && acknowledgeRejected.reason == .runVersionStale
+                && acknowledgeRejected.eventId == nil,
+            "generated acknowledgement contract must preserve exact CAS variants"
+        )
         for (name, expectedStatus) in [
             (
                 "managed_run_observe.permission_requested.response.json",
@@ -4007,6 +4100,254 @@ struct NativeHealthTests {
                     $0.contains("permission-native")
                 }),
             "permission attention must show bounded facts while exact response controls remain disabled without required scope"
+        )
+        let failureDashboardFixture = try changingDashboard(initialDashboardFixture) { object in
+            guard var runs = object["runs"] as? [[String: Any]], !runs.isEmpty else {
+                throw NativeHealthTestFailure.failed(
+                    "failure Dashboard fixture must contain one Run"
+                )
+            }
+            runs[0]["attention_level"] = "Critical"
+            runs[0]["attention_open_count"] = 1
+            runs[0]["dashboard_bucket"] = "NeedsAttention"
+            object["runs"] = runs
+        }
+        guard case let .snapshot(failureSnapshot) = failureDashboardFixture,
+            let failureRun = failureSnapshot.runs.first
+        else {
+            throw NativeHealthTestFailure.failed(
+                "failure presentation fixture must retain one Run"
+            )
+        }
+        for sourceType in ["run.failed", "run.interrupted", "run.resume_failed"] {
+            let card = try activeAttentionCard(
+                from: failureAttentionResponse(
+                    runId: failureRun.runId,
+                    runVersion: failureRun.version,
+                    sourceEventType: sourceType
+                ),
+                for: failureRun
+            )
+            try require(
+                card?.action == .acknowledge,
+                "\(sourceType) must expose only the exact acknowledgement action"
+            )
+        }
+        let ineligibleFailure = try activeAttentionCard(
+            from: failureAttentionResponse(
+                runId: failureRun.runId,
+                runVersion: failureRun.version,
+                sourceEventType: "run.completed"
+            ),
+            for: failureRun
+        )
+        try require(
+            ineligibleFailure?.action == .unavailable,
+            "a failure-shaped card with a non-failure source must not expose acknowledgement"
+        )
+        for response in [
+            failureAttentionResponse(
+                runId: failureRun.runId,
+                runVersion: failureRun.version,
+                status: .responsePending
+            ),
+            failureAttentionResponse(
+                runId: failureRun.runId,
+                runVersion: failureRun.version,
+                blocking: true
+            ),
+            failureAttentionResponse(
+                runId: failureRun.runId,
+                runVersion: failureRun.version,
+                category: .system
+            ),
+        ] {
+            let unavailableCard = try activeAttentionCard(from: response, for: failureRun)
+            try require(
+                unavailableCard?.action == .unavailable,
+                "pending, blocking, and non-failure items must keep acknowledgement unavailable"
+            )
+        }
+
+        let invalidAcknowledgeClient = AttentionAcknowledgeClient(
+            fixtureLoader: { request in
+                try attentionAcknowledgeResponse(
+                    status: "applied",
+                    runId: request.runId,
+                    runVersion: request.expectedRunVersion,
+                    attentionId: request.attentionId,
+                    attentionVersion: request.attentionVersion,
+                    appliedEventVersion: request.expectedRunVersion
+                )
+            }
+        )
+        do {
+            _ = try invalidAcknowledgeClient.submit(
+                runId: failureRun.runId,
+                expectedRunVersion: failureRun.version,
+                attentionId: "lifecycle:event-failure-native",
+                attentionVersion: failureRun.version
+            )
+            throw NativeHealthTestFailure.failed(
+                "acknowledgement client must reject a drifted applied version"
+            )
+        } catch let error as AttentionAcknowledgeClientError {
+            try require(
+                error == .invalidResponse,
+                "drifted acknowledgement receipt must retain a typed client failure"
+            )
+        }
+        let nonAdjacentAcknowledgeClient = AttentionAcknowledgeClient(
+            fixtureLoader: { request in
+                try attentionAcknowledgeResponse(
+                    status: "applied",
+                    runId: request.runId,
+                    runVersion: request.expectedRunVersion,
+                    attentionId: request.attentionId,
+                    attentionVersion: request.attentionVersion,
+                    appliedEventVersion: request.expectedRunVersion + 5
+                )
+            }
+        )
+        let nonAdjacent = try nonAdjacentAcknowledgeClient.submit(
+            runId: failureRun.runId,
+            expectedRunVersion: failureRun.version,
+            attentionId: "lifecycle:event-failure-native",
+            attentionVersion: failureRun.version
+        )
+        try require(
+            nonAdjacent.eventVersion == failureRun.version + 5,
+            "a valid global event cursor may advance beyond the target Run's adjacent version"
+        )
+
+        var submittedAcknowledgeRequest: FlitAttentionAcknowledgeRequest?
+        let failureController = FoundationViewController(
+            client: client,
+            dashboardClient: DashboardClient(fixtureLoader: { failureDashboardFixture }),
+            activeAttentionClient: ActiveAttentionClient(
+                fixtureLoader: { request in
+                    failureAttentionResponse(
+                        runId: request.runId,
+                        runVersion: request.expectedRunVersion
+                    )
+                }
+            ),
+            attentionAcknowledgeClient: AttentionAcknowledgeClient(
+                fixtureLoader: { request in
+                    submittedAcknowledgeRequest = request
+                    return try attentionAcknowledgeResponse(
+                        status: "applied",
+                        runId: request.runId,
+                        runVersion: request.expectedRunVersion,
+                        attentionId: request.attentionId,
+                        attentionVersion: request.attentionVersion
+                    )
+                }
+            )
+        )
+        _ = failureController.view
+        guard let acknowledgeButton = descendants(of: failureController.view).first(where: {
+            $0.accessibilityIdentifier()
+                == "flit.attention.acknowledge.run-dashboard-1"
+        }) as? NSButton else {
+            throw NativeHealthTestFailure.failed(
+                "eligible failure must expose one accessible acknowledgement action"
+            )
+        }
+        acknowledgeButton.performClick(nil)
+        let acknowledgedViews = descendants(of: failureController.view)
+        let acknowledgedCopy = acknowledgedViews.compactMap {
+            ($0 as? NSTextField)?.stringValue
+        }
+        let renderedAcknowledgeButton = acknowledgedViews.first(where: {
+            $0.accessibilityIdentifier()
+                == "flit.attention.acknowledge.run-dashboard-1"
+        }) as? NSButton
+        try require(
+            submittedAcknowledgeRequest?.runId == failureRun.runId
+                && submittedAcknowledgeRequest?.expectedRunVersion == failureRun.version
+                && submittedAcknowledgeRequest?.attentionId
+                    == "lifecycle:event-failure-native"
+                && submittedAcknowledgeRequest?.attentionVersion == failureRun.version
+                && submittedAcknowledgeRequest?.clientProtocolVersion
+                    == flitClientProtocolVersion
+                && acknowledgedViews.contains(where: {
+                    $0.accessibilityIdentifier() == "flit.attention.card.run-dashboard-1"
+                })
+                && acknowledgedCopy.contains(
+                    FoundationCopy.text(.attentionAcknowledgeApplied)
+                )
+                && renderedAcknowledgeButton?.isEnabled == false,
+            "applied acknowledgement must copy exact rendered identity, remain visible, and wait for authoritative convergence"
+        )
+
+        let rejectedFailureController = FoundationViewController(
+            client: client,
+            dashboardClient: DashboardClient(fixtureLoader: { failureDashboardFixture }),
+            activeAttentionClient: ActiveAttentionClient(
+                fixtureLoader: { request in
+                    failureAttentionResponse(
+                        runId: request.runId,
+                        runVersion: request.expectedRunVersion
+                    )
+                }
+            ),
+            attentionAcknowledgeClient: AttentionAcknowledgeClient(
+                fixtureLoader: { request in
+                    try attentionAcknowledgeResponse(
+                        status: "rejected",
+                        runId: request.runId,
+                        runVersion: request.expectedRunVersion,
+                        attentionId: request.attentionId,
+                        attentionVersion: request.attentionVersion,
+                        reason: "attention_mismatch"
+                    )
+                }
+            )
+        )
+        _ = rejectedFailureController.view
+        let rejectedButton = descendants(of: rejectedFailureController.view).first(where: {
+            $0.accessibilityIdentifier()
+                == "flit.attention.acknowledge.run-dashboard-1"
+        }) as? NSButton
+        rejectedButton?.performClick(nil)
+        try require(
+            descendants(of: rejectedFailureController.view).compactMap {
+                ($0 as? NSTextField)?.stringValue
+            }.contains(
+                FoundationCopy.format(.attentionAcknowledgeRejected, "attention_mismatch")
+            ),
+            "typed acknowledgement rejection must remain visibly stable"
+        )
+
+        let unavailableFailureController = FoundationViewController(
+            client: client,
+            dashboardClient: DashboardClient(fixtureLoader: { failureDashboardFixture }),
+            activeAttentionClient: ActiveAttentionClient(
+                fixtureLoader: { request in
+                    failureAttentionResponse(
+                        runId: request.runId,
+                        runVersion: request.expectedRunVersion
+                    )
+                }
+            ),
+            attentionAcknowledgeClient: AttentionAcknowledgeClient(
+                fixtureLoader: { _ in
+                    throw NativeHealthTestFailure.failed("acknowledgement unavailable")
+                }
+            )
+        )
+        _ = unavailableFailureController.view
+        let unavailableButton = descendants(of: unavailableFailureController.view).first(where: {
+            $0.accessibilityIdentifier()
+                == "flit.attention.acknowledge.run-dashboard-1"
+        }) as? NSButton
+        unavailableButton?.performClick(nil)
+        try require(
+            descendants(of: unavailableFailureController.view).compactMap {
+                ($0 as? NSTextField)?.stringValue
+            }.contains(FoundationCopy.text(.attentionAcknowledgeUnavailable)),
+            "transport-unavailable acknowledgement must remain visibly stable"
         )
         guard case let .snapshot(permissionSnapshot) = permissionDashboardFixture,
             let permissionRun = permissionSnapshot.runs.first

@@ -97,6 +97,49 @@ private struct StillWorkingPresentation {
     let result: StillWorkingPresentationResult
 }
 
+private struct AttentionAcknowledgeActionIdentity: Equatable {
+    let runId: String
+    let runVersion: UInt64
+    let attentionId: String
+    let attentionVersion: UInt64
+}
+
+private final class AttentionAcknowledgeButton: NSButton {
+    let identity: AttentionAcknowledgeActionIdentity
+
+    init(identity: AttentionAcknowledgeActionIdentity) {
+        self.identity = identity
+        super.init(frame: .zero)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
+}
+
+private enum AttentionAcknowledgePresentationResult: Equatable {
+    case applied
+    case rejected(FlitAttentionAcknowledgeRejectedReason)
+    case unavailable
+
+    var copy: String {
+        switch self {
+        case .applied:
+            FoundationCopy.text(.attentionAcknowledgeApplied)
+        case let .rejected(reason):
+            FoundationCopy.format(.attentionAcknowledgeRejected, reason.rawValue)
+        case .unavailable:
+            FoundationCopy.text(.attentionAcknowledgeUnavailable)
+        }
+    }
+}
+
+private struct AttentionAcknowledgePresentation {
+    let identity: AttentionAcknowledgeActionIdentity
+    let result: AttentionAcknowledgePresentationResult
+}
+
 private enum CachedActiveAttentionState {
     case card(ActiveAttentionCardPresentation)
     case empty
@@ -139,6 +182,7 @@ final class FoundationViewController: NSViewController {
     private let client: SystemHealthClient
     private let dashboardClient: DashboardClient
     private let activeAttentionClient: ActiveAttentionClient
+    private let attentionAcknowledgeClient: AttentionAcknowledgeClient
     private let stuckAssessmentClient: StuckAssessmentClient
     private let stillWorkingClient: StillWorkingClient
     private let stuckNotificationCoordinator: StuckNotificationCoordinator
@@ -158,6 +202,7 @@ final class FoundationViewController: NSViewController {
     private var monitoringTickInFlight = false
     private var monitoringFailure = false
     private var lastStillWorkingPresentation: StillWorkingPresentation?
+    private var lastAttentionAcknowledgePresentation: AttentionAcknowledgePresentation?
     private var activeAttentionCache: [String: CachedActiveAttention] = [:]
     private var activeRunDetail: RunDetailPresentationState?
     private var activeRunTitle: String?
@@ -177,6 +222,7 @@ final class FoundationViewController: NSViewController {
         client: SystemHealthClient,
         dashboardClient: DashboardClient = DashboardClient(),
         activeAttentionClient: ActiveAttentionClient = ActiveAttentionClient(),
+        attentionAcknowledgeClient: AttentionAcknowledgeClient = AttentionAcknowledgeClient(),
         stuckAssessmentClient: StuckAssessmentClient = StuckAssessmentClient(),
         stillWorkingClient: StillWorkingClient = StillWorkingClient(),
         stuckNotificationCoordinator: StuckNotificationCoordinator =
@@ -191,6 +237,7 @@ final class FoundationViewController: NSViewController {
         self.client = client
         self.dashboardClient = dashboardClient
         self.activeAttentionClient = activeAttentionClient
+        self.attentionAcknowledgeClient = attentionAcknowledgeClient
         self.stuckAssessmentClient = stuckAssessmentClient
         self.stillWorkingClient = stillWorkingClient
         self.stuckNotificationCoordinator = stuckNotificationCoordinator
@@ -436,6 +483,18 @@ final class FoundationViewController: NSViewController {
             identify(result, as: "flit.dashboard.stillWorking.result")
             dashboardStack.addArrangedSubview(result)
         }
+        if let presentation = lastAttentionAcknowledgePresentation {
+            let result = label(
+                presentation.result.copy,
+                size: 12,
+                weight: .semibold,
+                color: presentation.result == .applied
+                    ? .secondaryLabelColor
+                    : .systemRed
+            )
+            identify(result, as: "flit.attention.acknowledge.result")
+            dashboardStack.addArrangedSubview(result)
+        }
         for section in DashboardSection.allCases {
             let heading = label(section.title, size: 14, weight: .semibold)
             identify(heading, as: "flit.dashboard.section.\(section.rawValue)")
@@ -630,6 +689,24 @@ final class FoundationViewController: NSViewController {
         identify(content, as: "flit.attention.contentUnavailable.\(run.runId)")
         stack.addArrangedSubview(content)
         switch card.action {
+        case .acknowledge:
+            let identity = AttentionAcknowledgeActionIdentity(
+                runId: run.runId,
+                runVersion: run.version,
+                attentionId: card.attentionId,
+                attentionVersion: card.attentionVersion
+            )
+            let acknowledge = AttentionAcknowledgeButton(identity: identity)
+            acknowledge.title = FoundationCopy.text(.attentionAcknowledge)
+            acknowledge.bezelStyle = .inline
+            acknowledge.target = self
+            acknowledge.action = #selector(acknowledgeAttention(_:))
+            acknowledge.isEnabled = !(
+                lastAttentionAcknowledgePresentation?.identity == identity
+                    && lastAttentionAcknowledgePresentation?.result == .applied
+            )
+            identify(acknowledge, as: "flit.attention.acknowledge.\(run.runId)")
+            stack.addArrangedSubview(acknowledge)
         case let .stillWorking(occurrenceId):
             let identity = StillWorkingActionIdentity(
                 runId: run.runId,
@@ -683,6 +760,41 @@ final class FoundationViewController: NSViewController {
             stack.addArrangedSubview(unavailable)
         }
         return stack
+    }
+
+    @objc private func acknowledgeAttention(_ sender: AttentionAcknowledgeButton) {
+        let identity = sender.identity
+        let result: AttentionAcknowledgePresentationResult
+        do {
+            let response = try attentionAcknowledgeClient.submit(
+                runId: identity.runId,
+                expectedRunVersion: identity.runVersion,
+                attentionId: identity.attentionId,
+                attentionVersion: identity.attentionVersion
+            )
+            switch response.status {
+            case .applied:
+                result = .applied
+            case .rejected:
+                guard let reason = response.reason else {
+                    throw AttentionAcknowledgeClientError.invalidResponse
+                }
+                result = .rejected(reason)
+            }
+        } catch {
+            result = .unavailable
+        }
+        lastAttentionAcknowledgePresentation = AttentionAcknowledgePresentation(
+            identity: identity,
+            result: result
+        )
+        do {
+            dashboardState = try dashboardClient.convergedState(from: dashboardState)
+            monitoringFailure = false
+        } catch {
+            monitoringFailure = true
+        }
+        renderDashboard()
     }
 
     @objc private func confirmStillWorking(_ sender: StillWorkingButton) {

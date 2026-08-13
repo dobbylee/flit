@@ -1,6 +1,10 @@
 import Foundation
 
 enum FoundationCopyKey: String {
+    case attentionAcknowledge = "attention.acknowledge"
+    case attentionAcknowledgeApplied = "attention.acknowledge.applied"
+    case attentionAcknowledgeRejected = "attention.acknowledge.rejected"
+    case attentionAcknowledgeUnavailable = "attention.acknowledge.unavailable"
     case attentionActionUnavailable = "attention.action.unavailable"
     case attentionCardEvidence = "attention.card.evidence"
     case attentionCardFacts = "attention.card.facts"
@@ -189,6 +193,11 @@ enum FoundationCopyKey: String {
 
 enum FoundationCopy {
     private static let values: [FoundationCopyKey: String] = [
+        .attentionAcknowledge: "Acknowledge",
+        .attentionAcknowledgeApplied:
+            "Acknowledged. This does not mark the Run resolved.",
+        .attentionAcknowledgeRejected: "Acknowledgement was not applied: %@",
+        .attentionAcknowledgeUnavailable: "Acknowledgement could not be completed",
         .attentionActionUnavailable: "No action is available for this attention",
         .attentionCardEvidence: "Evidence: %@ · %@",
         .attentionCardFacts: "%@ · %@ · %@",

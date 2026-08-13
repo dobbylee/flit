@@ -633,6 +633,7 @@ fn current_active_attention_read_is_required_bounded_exact_and_content_safe() {
     ));
     for name in [
         "run_active_attention_read.permission.response.json",
+        "run_active_attention_read.failure.response.json",
         "run_active_attention_read.empty.response.json",
     ] {
         assert_fixture_round_trip::<RunActiveAttentionReadResponse>(&command_fixture(
@@ -694,6 +695,21 @@ fn current_active_attention_read_is_required_bounded_exact_and_content_safe() {
     .expect("empty attention fixture should match Rust types");
     assert!(matches!(empty.item, RunActiveAttentionSlot::Null));
     assert_eq!(empty.open_count, 0);
+
+    let failure: RunActiveAttentionReadResponse = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "run_active_attention_read.failure.response.json",
+        )))
+        .expect("failure attention fixture should be readable"),
+    )
+    .expect("failure attention fixture should match Rust types");
+    assert!(matches!(
+        failure.item,
+        RunActiveAttentionSlot::Item(item)
+            if item.category == flit_protocol::RunActiveAttentionCategory::Failure
+                && item.action == RunActiveAttentionAction::Acknowledge
+    ));
 }
 
 #[test]
