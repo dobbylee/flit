@@ -5964,15 +5964,16 @@ struct NativeHealthTests {
         )
         guard
             let mainMenuQuitItem = NSApplication.shared.mainMenu?
-                .items.first?.submenu?.items.first
+                .items.first?.submenu?.items.first(where: {
+                    $0.identifier?.rawValue == "flit.mainMenu.quit"
+                })
         else {
             throw NativeHealthTestFailure.failed(
                 "application menu must expose explicit Quit"
             )
         }
         try require(
-            mainMenuQuitItem.identifier?.rawValue == "flit.mainMenu.quit"
-                && mainMenuQuitItem.target === lifecycleDelegate,
+            mainMenuQuitItem.target === lifecycleDelegate,
             "application-menu Quit must target the shared explicit Quit coordinator"
         )
         _ = mainMenuQuitItem.target?.perform(
