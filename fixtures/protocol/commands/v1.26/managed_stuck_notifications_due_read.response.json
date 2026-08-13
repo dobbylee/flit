@@ -1,0 +1,13 @@
+{
+  "protocol_version": "1.26",
+  "event_schema_version": "1.4",
+  "notifications": [
+    {
+      "run_id": "run-managed-1",
+      "run_version": 7,
+      "occurrence_id": "stuck-run-managed-1-1",
+      "platform_id": "stuck-run-managed-1-1",
+      "delivery_claimed": false
+    }
+  ]
+}

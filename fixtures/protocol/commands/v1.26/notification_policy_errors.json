@@ -1,0 +1,18 @@
+[
+  {
+    "code": "INVALID_NOTIFICATION_POLICY",
+    "message_key": "errors.invalidNotificationPolicy"
+  },
+  {
+    "code": "NOTIFICATION_POLICY_VERSION_STALE",
+    "message_key": "errors.notificationPolicyVersionStale"
+  },
+  {
+    "code": "PROJECT_NOT_FOUND",
+    "message_key": "errors.projectNotFound"
+  },
+  {
+    "code": "STORAGE_UNAVAILABLE",
+    "message_key": "errors.storageUnavailable"
+  }
+]

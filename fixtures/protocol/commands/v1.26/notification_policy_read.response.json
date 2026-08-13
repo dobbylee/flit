@@ -1,0 +1,45 @@
+{
+  "protocol_version": "1.26",
+  "global": {
+    "version": 1,
+    "kinds": {
+      "permission": true,
+      "question": true,
+      "failure": true,
+      "completion": false,
+      "stuck": true
+    },
+    "quiet_hours": {
+      "enabled": false,
+      "start_minute": 1320,
+      "end_minute": 480
+    }
+  },
+  "project": {
+    "version": 0,
+    "master": "inherit",
+    "kinds": {
+      "permission": "inherit",
+      "question": "inherit",
+      "failure": "inherit",
+      "completion": "inherit",
+      "stuck": "inherit"
+    }
+  },
+  "effective": {
+    "global_version": 1,
+    "project_version": 0,
+    "kinds": {
+      "permission": true,
+      "question": true,
+      "failure": true,
+      "completion": false,
+      "stuck": true
+    },
+    "quiet_hours": {
+      "enabled": false,
+      "start_minute": 1320,
+      "end_minute": 480
+    }
+  }
+}

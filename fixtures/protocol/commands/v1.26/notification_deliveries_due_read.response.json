@@ -1,0 +1,17 @@
+{
+  "protocol_version": "1.26",
+  "notifications": [
+    {
+      "notification_id": "notification-0123456789abcdef",
+      "run_id": "run-notification",
+      "run_version": 42,
+      "project_id": "project-notification",
+      "kind": "failure",
+      "item_id": "attention-failure",
+      "item_version": 40,
+      "platform_id": "flit-0123456789abcdef",
+      "delivery_claimed": false,
+      "catch_up": true
+    }
+  ]
+}

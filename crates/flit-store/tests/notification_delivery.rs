@@ -408,6 +408,51 @@ fn completion_never_catches_up_and_policy_suppression_is_not_replayed() {
 }
 
 #[test]
+fn exact_completion_claim_at_quiet_boundary_persists_no_catch_up_suppression() {
+    let database = TestDatabase::new("completion-claim-boundary");
+    database.seed_attention(
+        "run-completion-boundary",
+        "completion",
+        "Informational",
+        false,
+    );
+    let mut store = database.open();
+    store
+        .update_global_notification_policy(
+            0,
+            NotificationKinds {
+                completion: true,
+                ..NotificationKinds::default()
+            },
+            QuietHours {
+                enabled: true,
+                start_minute: 22 * 60,
+                end_minute: 8 * 60,
+            },
+            "2026-08-13T21:58:00.000Z",
+        )
+        .expect("enable completion and quiet hours");
+    let candidate = store
+        .reconcile_notification_deliveries(22 * 60 - 1, "2026-08-13T21:59:00.000Z")
+        .expect("pre-quiet candidate")
+        .pop()
+        .expect("completion candidate");
+    let mut boundary_claim = claim(&candidate);
+    boundary_claim.local_minute = 22 * 60;
+    boundary_claim.claimed_at = "2026-08-13T22:00:00.000Z".to_owned();
+    assert!(matches!(
+        store.claim_notification_delivery(boundary_claim),
+        Err(flit_store::StoreError::NotificationDeliveryUnavailable { .. })
+    ));
+    assert!(
+        store
+            .reconcile_notification_deliveries(8 * 60, "2026-08-14T08:00:00.000Z")
+            .expect("post-quiet completion")
+            .is_empty()
+    );
+}
+
+#[test]
 fn stuck_requires_the_exact_due_occurrence_and_uses_a_stable_platform_id() {
     let database = TestDatabase::new("stuck-due");
     database.seed_attention("run-stuck", "stuck", "ActionRequired", false);

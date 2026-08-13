@@ -1,0 +1,26 @@
+{
+  "protocol_version": "1.26",
+  "provider": "codex",
+  "compatibility": "unavailable",
+  "executable_version": null,
+  "capabilities": [
+    {"capability": "launch", "status": "unavailable"},
+    {"capability": "list_managed", "status": "unavailable"},
+    {"capability": "resume", "status": "unavailable"},
+    {"capability": "reconcile", "status": "unavailable"},
+    {"capability": "structured_activity", "status": "unavailable"},
+    {"capability": "permission_detect", "status": "unavailable"},
+    {"capability": "permission_respond", "status": "unavailable"},
+    {"capability": "permission_mode_configure", "status": "unavailable"},
+    {"capability": "provider_outcome_observe", "status": "unavailable"},
+    {"capability": "question_detect", "status": "unavailable"},
+    {"capability": "question_respond", "status": "unavailable"},
+    {"capability": "completion_detect", "status": "unavailable"},
+    {"capability": "history", "status": "unavailable"},
+    {"capability": "open_in_provider", "status": "unavailable"},
+    {"capability": "continue_after_quit", "status": "unavailable"},
+    {"capability": "stop", "status": "unavailable"}
+  ],
+  "fingerprint_mismatches": [],
+  "unavailable_reason": "executable_not_found"
+}

@@ -4,7 +4,7 @@ use schemars::{JsonSchema, generate::SchemaSettings};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: &str = "1.25";
+pub const PROTOCOL_VERSION: &str = "1.26";
 pub const EVENT_PROTOCOL_VERSION: &str = "1.4";
 pub const MAX_JSON_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
@@ -1121,6 +1121,123 @@ pub struct ManagedRunsAssessStuckResponse {
 #[serde(deny_unknown_fields)]
 pub struct ManagedStuckNotificationsDueReadRequest {
     pub client_protocol_version: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationDeliveryKind {
+    Permission,
+    Question,
+    Failure,
+    Completion,
+    Stuck,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationDeliveriesDueReadRequest {
+    pub local_minute: u16,
+    pub client_protocol_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationDeliveryRecord {
+    pub notification_id: String,
+    pub run_id: String,
+    pub run_version: u64,
+    pub project_id: String,
+    pub kind: NotificationDeliveryKind,
+    pub item_id: String,
+    pub item_version: u64,
+    pub platform_id: String,
+    pub delivery_claimed: bool,
+    pub catch_up: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationDeliveriesDueReadResponse {
+    pub protocol_version: String,
+    pub notifications: Vec<NotificationDeliveryRecord>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationDeliveryClaimRequest {
+    pub notification_id: String,
+    pub run_id: String,
+    pub expected_run_version: u64,
+    pub kind: NotificationDeliveryKind,
+    pub item_id: String,
+    pub item_version: u64,
+    pub platform_id: String,
+    pub local_minute: u16,
+    pub client_protocol_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationDeliveryClaimResponse {
+    pub protocol_version: String,
+    pub notification_id: String,
+    pub run_id: String,
+    pub run_version: u64,
+    pub kind: NotificationDeliveryKind,
+    pub item_id: String,
+    pub item_version: u64,
+    pub platform_id: String,
+    pub already_claimed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationDeliveryFailedRequest {
+    pub notification_id: String,
+    pub run_id: String,
+    pub kind: NotificationDeliveryKind,
+    pub item_id: String,
+    pub item_version: u64,
+    pub platform_id: String,
+    pub client_protocol_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationDeliveryFailedResponse {
+    pub protocol_version: String,
+    pub notification_id: String,
+    pub run_id: String,
+    pub kind: NotificationDeliveryKind,
+    pub item_id: String,
+    pub item_version: u64,
+    pub platform_id: String,
+    pub released: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationDeliveredRequest {
+    pub notification_id: String,
+    pub run_id: String,
+    pub kind: NotificationDeliveryKind,
+    pub item_id: String,
+    pub item_version: u64,
+    pub platform_id: String,
+    pub client_protocol_version: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationDeliveredResponse {
+    pub protocol_version: String,
+    pub notification_id: String,
+    pub run_id: String,
+    pub kind: NotificationDeliveryKind,
+    pub item_id: String,
+    pub item_version: u64,
+    pub platform_id: String,
+    pub already_delivered: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -3353,6 +3470,192 @@ struct FlitManagedRunsAssessStuckResponse: Codable, Equatable, Sendable {
         case transitionsAppended = "transitions_appended"
         case unchangedRuns = "unchanged_runs"
         case unavailableRuns = "unavailable_runs"
+    }
+}
+
+enum FlitNotificationDeliveryKind: String, Codable, Sendable {
+    case permission
+    case question
+    case failure
+    case completion
+    case stuck
+}
+
+struct FlitNotificationDeliveriesDueReadRequest: Codable, Equatable, Sendable {
+    let localMinute: UInt16
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case localMinute = "local_minute"
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+struct FlitNotificationDeliveryRecord: Codable, Equatable, Sendable {
+    let notificationId: String
+    let runId: String
+    let runVersion: UInt64
+    let projectId: String
+    let kind: FlitNotificationDeliveryKind
+    let itemId: String
+    let itemVersion: UInt64
+    let platformId: String
+    let deliveryClaimed: Bool
+    let catchUp: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case notificationId = "notification_id"
+        case runId = "run_id"
+        case runVersion = "run_version"
+        case projectId = "project_id"
+        case kind
+        case itemId = "item_id"
+        case itemVersion = "item_version"
+        case platformId = "platform_id"
+        case deliveryClaimed = "delivery_claimed"
+        case catchUp = "catch_up"
+    }
+}
+
+struct FlitNotificationDeliveriesDueReadResponse: Codable, Equatable, Sendable {
+    let protocolVersion: String
+    let notifications: [FlitNotificationDeliveryRecord]
+
+    private enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case notifications
+    }
+}
+
+struct FlitNotificationDeliveryClaimRequest: Codable, Equatable, Sendable {
+    let notificationId: String
+    let runId: String
+    let expectedRunVersion: UInt64
+    let kind: FlitNotificationDeliveryKind
+    let itemId: String
+    let itemVersion: UInt64
+    let platformId: String
+    let localMinute: UInt16
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case notificationId = "notification_id"
+        case runId = "run_id"
+        case expectedRunVersion = "expected_run_version"
+        case kind
+        case itemId = "item_id"
+        case itemVersion = "item_version"
+        case platformId = "platform_id"
+        case localMinute = "local_minute"
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+struct FlitNotificationDeliveryClaimResponse: Codable, Equatable, Sendable {
+    let protocolVersion: String
+    let notificationId: String
+    let runId: String
+    let runVersion: UInt64
+    let kind: FlitNotificationDeliveryKind
+    let itemId: String
+    let itemVersion: UInt64
+    let platformId: String
+    let alreadyClaimed: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case notificationId = "notification_id"
+        case runId = "run_id"
+        case runVersion = "run_version"
+        case kind
+        case itemId = "item_id"
+        case itemVersion = "item_version"
+        case platformId = "platform_id"
+        case alreadyClaimed = "already_claimed"
+    }
+}
+
+struct FlitNotificationDeliveryFailedRequest: Codable, Equatable, Sendable {
+    let notificationId: String
+    let runId: String
+    let kind: FlitNotificationDeliveryKind
+    let itemId: String
+    let itemVersion: UInt64
+    let platformId: String
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case notificationId = "notification_id"
+        case runId = "run_id"
+        case kind
+        case itemId = "item_id"
+        case itemVersion = "item_version"
+        case platformId = "platform_id"
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+struct FlitNotificationDeliveryFailedResponse: Codable, Equatable, Sendable {
+    let protocolVersion: String
+    let notificationId: String
+    let runId: String
+    let kind: FlitNotificationDeliveryKind
+    let itemId: String
+    let itemVersion: UInt64
+    let platformId: String
+    let released: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case notificationId = "notification_id"
+        case runId = "run_id"
+        case kind
+        case itemId = "item_id"
+        case itemVersion = "item_version"
+        case platformId = "platform_id"
+        case released
+    }
+}
+
+struct FlitNotificationDeliveredRequest: Codable, Equatable, Sendable {
+    let notificationId: String
+    let runId: String
+    let kind: FlitNotificationDeliveryKind
+    let itemId: String
+    let itemVersion: UInt64
+    let platformId: String
+    let clientProtocolVersion: String
+
+    private enum CodingKeys: String, CodingKey {
+        case notificationId = "notification_id"
+        case runId = "run_id"
+        case kind
+        case itemId = "item_id"
+        case itemVersion = "item_version"
+        case platformId = "platform_id"
+        case clientProtocolVersion = "client_protocol_version"
+    }
+}
+
+struct FlitNotificationDeliveredResponse: Codable, Equatable, Sendable {
+    let protocolVersion: String
+    let notificationId: String
+    let runId: String
+    let kind: FlitNotificationDeliveryKind
+    let itemId: String
+    let itemVersion: UInt64
+    let platformId: String
+    let alreadyDelivered: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case notificationId = "notification_id"
+        case runId = "run_id"
+        case kind
+        case itemId = "item_id"
+        case itemVersion = "item_version"
+        case platformId = "platform_id"
+        case alreadyDelivered = "already_delivered"
     }
 }
 

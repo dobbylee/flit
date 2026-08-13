@@ -1,0 +1,7 @@
+{
+  "run_id": "run-managed-1",
+  "expected_run_version": 7,
+  "occurrence_id": "stuck-run-managed-1-1",
+  "platform_id": "stuck-run-managed-1-1",
+  "client_protocol_version": "1.26"
+}

@@ -1,0 +1,24 @@
+{
+  "protocol_version": "1.26",
+  "event_schema_version": "1.4",
+  "run_id": "run_01JZ8Y60R5M6V3Y2S0VJ3G8K1C",
+  "run_version": 1842,
+  "open_count": 1,
+  "item": {
+    "attention_id": "request:prm_01JZ8Y6BBQ9W2TQFJ19T5A4B0",
+    "attention_version": 1842,
+    "category": "permission",
+    "severity": "action_required",
+    "blocking": true,
+    "status": "open",
+    "source_event_id": "01JZ8Y6BBQ9W2TQFJ19T5A4AXK",
+    "source_event_type": "permission.requested",
+    "source_observed_at": "2026-07-21T10:02:33.419Z",
+    "content_unavailable_reason": "raw_provider_content_not_retained",
+    "action": {
+      "kind": "permission_response",
+      "request_id": "prm_01JZ8Y6BBQ9W2TQFJ19T5A4B0",
+      "request_version": 1842
+    }
+  }
+}

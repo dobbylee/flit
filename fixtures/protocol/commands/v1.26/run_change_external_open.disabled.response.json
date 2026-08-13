@@ -1,0 +1,8 @@
+{
+  "status": "disabled",
+  "protocol_version": "1.26",
+  "run_id": "run-changes-1",
+  "run_version": 5,
+  "change_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "reason": "target_identity_drift"
+}

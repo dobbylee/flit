@@ -12,9 +12,13 @@ use flit_protocol::{
     ManagedStuckNotificationDeliveredResponse, ManagedStuckNotificationDeliveryClaimRequest,
     ManagedStuckNotificationDeliveryClaimResponse, ManagedStuckNotificationDeliveryFailedRequest,
     ManagedStuckNotificationDeliveryFailedResponse, ManagedStuckNotificationsDueReadRequest,
-    ManagedStuckNotificationsDueReadResponse, NotificationPolicyReadRequest,
-    NotificationPolicyResponse, PROTOCOL_VERSION, PossiblyStuckPayload, ProjectInspectionRequest,
-    ProjectInspectionResponse, ProjectNotificationPolicyUpdateRequest, ProjectRegistrationRequest,
+    ManagedStuckNotificationsDueReadResponse, NotificationDeliveredRequest,
+    NotificationDeliveredResponse, NotificationDeliveriesDueReadRequest,
+    NotificationDeliveriesDueReadResponse, NotificationDeliveryClaimRequest,
+    NotificationDeliveryClaimResponse, NotificationDeliveryFailedRequest,
+    NotificationDeliveryFailedResponse, NotificationPolicyReadRequest, NotificationPolicyResponse,
+    PROTOCOL_VERSION, PossiblyStuckPayload, ProjectInspectionRequest, ProjectInspectionResponse,
+    ProjectNotificationPolicyUpdateRequest, ProjectRegistrationRequest,
     ProjectRegistrationResponse, ProjectTrustRequest, ProjectTrustResponse, ProjectsListRequest,
     ProjectsListResponse, ProviderCompatibility, ProviderDiagnosticsRequest,
     ProviderDiagnosticsResponse, ProviderExecutionAfterQuit, ProviderUnavailableReason,
@@ -1380,6 +1384,54 @@ fn current_notification_policy_contract_is_exact_and_closed_to_unknown_input() {
 }
 
 #[test]
+fn current_notification_delivery_contract_is_exact_bounded_and_content_free() {
+    let manifest = read_command_compatibility_manifest();
+    let current = &manifest.current;
+    for (name, round_trip) in [
+        ("notification_deliveries_due_read.request.json", 0_u8),
+        ("notification_deliveries_due_read.response.json", 1),
+        ("notification_delivery_claim.request.json", 2),
+        ("notification_delivery_claim.response.json", 3),
+        ("notification_delivery_failed.request.json", 4),
+        ("notification_delivery_failed.response.json", 5),
+        ("notification_delivered.request.json", 6),
+        ("notification_delivered.response.json", 7),
+    ] {
+        let path = command_fixture(current, name);
+        match round_trip {
+            0 => assert_fixture_round_trip::<NotificationDeliveriesDueReadRequest>(&path),
+            1 => assert_fixture_round_trip::<NotificationDeliveriesDueReadResponse>(&path),
+            2 => assert_fixture_round_trip::<NotificationDeliveryClaimRequest>(&path),
+            3 => assert_fixture_round_trip::<NotificationDeliveryClaimResponse>(&path),
+            4 => assert_fixture_round_trip::<NotificationDeliveryFailedRequest>(&path),
+            5 => assert_fixture_round_trip::<NotificationDeliveryFailedResponse>(&path),
+            6 => assert_fixture_round_trip::<NotificationDeliveredRequest>(&path),
+            7 => assert_fixture_round_trip::<NotificationDeliveredResponse>(&path),
+            _ => unreachable!(),
+        }
+    }
+
+    let fixture = fs::read_to_string(repository_path(&command_fixture(
+        current,
+        "notification_deliveries_due_read.response.json",
+    )))
+    .expect("notification delivery response fixture");
+    for forbidden in ["title", "display_name", "path", "content", "session_id"] {
+        assert!(!fixture.contains(forbidden), "forbidden field: {forbidden}");
+    }
+    let mut unknown: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(repository_path(&command_fixture(
+            current,
+            "notification_delivery_claim.request.json",
+        )))
+        .expect("notification claim fixture"),
+    )
+    .expect("notification claim JSON");
+    unknown["claimed_at"] = serde_json::json!("native-time");
+    assert!(serde_json::from_value::<NotificationDeliveryClaimRequest>(unknown).is_err());
+}
+
+#[test]
 fn generated_swift_project_contract_is_current_and_required_fields_fail_closed() {
     let generated = generated_swift_command_contract();
     assert!(generated.contains(&format!(
@@ -1466,6 +1518,15 @@ fn generated_swift_project_contract_is_current_and_required_fields_fail_closed()
         "FlitManagedRunObserveRequest",
         "FlitManagedRunsAssessStuckRequest",
         "FlitManagedRunsAssessStuckResponse",
+        "FlitNotificationDeliveryKind",
+        "FlitNotificationDeliveriesDueReadRequest",
+        "FlitNotificationDeliveriesDueReadResponse",
+        "FlitNotificationDeliveryClaimRequest",
+        "FlitNotificationDeliveryClaimResponse",
+        "FlitNotificationDeliveryFailedRequest",
+        "FlitNotificationDeliveryFailedResponse",
+        "FlitNotificationDeliveredRequest",
+        "FlitNotificationDeliveredResponse",
         "FlitManagedRunStillWorkingRequest",
         "FlitManagedRunStillWorkingStatus",
         "FlitManagedRunStillWorkingRejectedReason",

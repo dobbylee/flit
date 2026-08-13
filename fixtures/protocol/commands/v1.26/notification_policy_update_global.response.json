@@ -1,0 +1,35 @@
+{
+  "protocol_version": "1.26",
+  "global": {
+    "version": 1,
+    "kinds": {
+      "permission": true,
+      "question": true,
+      "failure": true,
+      "completion": false,
+      "stuck": true
+    },
+    "quiet_hours": {
+      "enabled": true,
+      "start_minute": 1320,
+      "end_minute": 480
+    }
+  },
+  "project": null,
+  "effective": {
+    "global_version": 1,
+    "project_version": null,
+    "kinds": {
+      "permission": true,
+      "question": true,
+      "failure": true,
+      "completion": false,
+      "stuck": true
+    },
+    "quiet_hours": {
+      "enabled": true,
+      "start_minute": 1320,
+      "end_minute": 480
+    }
+  }
+}

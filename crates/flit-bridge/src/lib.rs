@@ -34,6 +34,11 @@ use flit_protocol::{
     ManagedStuckNotificationDeliveryClaimResponse, ManagedStuckNotificationDeliveryFailedRequest,
     ManagedStuckNotificationDeliveryFailedResponse, ManagedStuckNotificationDueRecord,
     ManagedStuckNotificationsDueReadRequest, ManagedStuckNotificationsDueReadResponse,
+    NotificationDeliveredRequest, NotificationDeliveredResponse,
+    NotificationDeliveriesDueReadRequest, NotificationDeliveriesDueReadResponse,
+    NotificationDeliveryClaimRequest, NotificationDeliveryClaimResponse,
+    NotificationDeliveryFailedRequest, NotificationDeliveryFailedResponse,
+    NotificationDeliveryKind as ProtocolNotificationKind, NotificationDeliveryRecord,
     NotificationKindOverridesRecord, NotificationKindsRecord, NotificationOverrideRecord,
     NotificationPolicyReadRequest, NotificationPolicyResponse, PROTOCOL_VERSION,
     ProjectInspectionResponse, ProjectListCursor as ProjectListCursorResponse,
@@ -80,6 +85,13 @@ use flit_store::{
     ManagedStuckNotificationDelivery, ManagedStuckNotificationDeliveryClaim,
     ManagedStuckNotificationDeliveryClaimOutcome, ManagedStuckNotificationDeliveryFailure,
     ManagedStuckNotificationDeliveryFailureOutcome, ManagedStuckNotificationState,
+    NotificationDeliveryClaim as StoreNotificationDeliveryClaim,
+    NotificationDeliveryClaimOutcome as StoreNotificationDeliveryClaimOutcome,
+    NotificationDeliveryFailure as StoreNotificationDeliveryFailure,
+    NotificationDeliveryFailureOutcome as StoreNotificationDeliveryFailureOutcome,
+    NotificationDeliveryReceipt as StoreNotificationDeliveryReceipt,
+    NotificationDeliveryReceiptOutcome as StoreNotificationDeliveryReceiptOutcome,
+    NotificationKind as StoreNotificationKind,
     NotificationKindOverrides as StoreNotificationKindOverrides,
     NotificationKinds as StoreNotificationKinds, NotificationOverride as StoreNotificationOverride,
     NotificationPolicySnapshot as StoreNotificationPolicySnapshot, Project,
@@ -2895,6 +2907,324 @@ fn managed_runs_assess_stuck_with(
         )),
         Err(error) => Err(error),
     }
+}
+
+#[uniffi::export]
+pub fn notification_deliveries_due_read_json(request_json: String) -> Result<String, BridgeError> {
+    protect(|| notification_deliveries_due_read_with(&CORE, request_json))
+}
+
+fn notification_deliveries_due_read_with(
+    core_manager: &CoreManager,
+    request_json: String,
+) -> Result<String, BridgeError> {
+    let request = match notification_delivery_request::<NotificationDeliveriesDueReadRequest>(
+        &request_json,
+    ) {
+        Ok(request) => request,
+        Err(_) => {
+            return project_json(&CommandError::for_code(CommandErrorCode::InvalidRunRequest));
+        }
+    };
+    if request.client_protocol_version != PROTOCOL_VERSION {
+        return project_json(&CommandError::protocol_mismatch());
+    }
+    if request.local_minute >= 24 * 60 {
+        return project_json(&CommandError::for_code(CommandErrorCode::InvalidRunRequest));
+    }
+    let response = core_manager.with_ready_core(|core| {
+        let evaluated_at = core
+            .store
+            .current_utc_timestamp()
+            .map_err(|_| BridgeError::StorageFailure)?;
+        let notifications = core
+            .store
+            .reconcile_notification_deliveries(request.local_minute, &evaluated_at)
+            .map_err(map_notification_delivery_store_error)?
+            .into_iter()
+            .map(|candidate| NotificationDeliveryRecord {
+                notification_id: candidate.notification_id,
+                run_id: candidate.run_id,
+                run_version: candidate.run_version,
+                project_id: candidate.project_id,
+                kind: protocol_notification_kind(candidate.kind),
+                item_id: candidate.item_id,
+                item_version: candidate.item_version,
+                platform_id: candidate.platform_id,
+                delivery_claimed: candidate.delivery_claimed,
+                catch_up: candidate.catch_up,
+            })
+            .collect();
+        Ok(NotificationDeliveriesDueReadResponse {
+            protocol_version: PROTOCOL_VERSION.to_owned(),
+            notifications,
+        })
+    });
+    notification_delivery_command_response(response)
+}
+
+#[uniffi::export]
+pub fn notification_delivery_claim_json(request_json: String) -> Result<String, BridgeError> {
+    protect(|| notification_delivery_claim_with(&CORE, request_json))
+}
+
+fn notification_delivery_claim_with(
+    core_manager: &CoreManager,
+    request_json: String,
+) -> Result<String, BridgeError> {
+    let request =
+        match notification_delivery_request::<NotificationDeliveryClaimRequest>(&request_json) {
+            Ok(request) => request,
+            Err(_) => {
+                return project_json(&CommandError::for_code(CommandErrorCode::InvalidRunRequest));
+            }
+        };
+    if request.client_protocol_version != PROTOCOL_VERSION {
+        return project_json(&CommandError::protocol_mismatch());
+    }
+    if !valid_notification_delivery_identity(
+        &request.notification_id,
+        &request.run_id,
+        &request.item_id,
+        &request.platform_id,
+        request.item_version,
+    ) || request.expected_run_version == 0
+        || request.expected_run_version > flit_protocol::MAX_JSON_SAFE_INTEGER
+        || request.local_minute >= 24 * 60
+    {
+        return project_json(&CommandError::for_code(CommandErrorCode::InvalidRunRequest));
+    }
+    let response = core_manager.with_ready_core(|core| {
+        let claimed_at = core
+            .store
+            .current_utc_timestamp()
+            .map_err(|_| BridgeError::StorageFailure)?;
+        let outcome = core
+            .store
+            .claim_notification_delivery(StoreNotificationDeliveryClaim {
+                notification_id: request.notification_id.clone(),
+                run_id: request.run_id.clone(),
+                expected_run_version: request.expected_run_version,
+                kind: store_notification_kind(request.kind),
+                item_id: request.item_id.clone(),
+                item_version: request.item_version,
+                platform_id: request.platform_id.clone(),
+                local_minute: request.local_minute,
+                claimed_at,
+            })
+            .map_err(map_notification_delivery_store_error)?;
+        Ok(NotificationDeliveryClaimResponse {
+            protocol_version: PROTOCOL_VERSION.to_owned(),
+            notification_id: request.notification_id,
+            run_id: request.run_id,
+            run_version: request.expected_run_version,
+            kind: request.kind,
+            item_id: request.item_id,
+            item_version: request.item_version,
+            platform_id: request.platform_id,
+            already_claimed: matches!(
+                outcome,
+                StoreNotificationDeliveryClaimOutcome::AlreadyClaimed
+            ),
+        })
+    });
+    notification_delivery_command_response(response)
+}
+
+#[uniffi::export]
+pub fn notification_delivery_failed_json(request_json: String) -> Result<String, BridgeError> {
+    protect(|| notification_delivery_failed_with(&CORE, request_json))
+}
+
+fn notification_delivery_failed_with(
+    core_manager: &CoreManager,
+    request_json: String,
+) -> Result<String, BridgeError> {
+    let request =
+        match notification_delivery_request::<NotificationDeliveryFailedRequest>(&request_json) {
+            Ok(request) => request,
+            Err(_) => {
+                return project_json(&CommandError::for_code(CommandErrorCode::InvalidRunRequest));
+            }
+        };
+    if request.client_protocol_version != PROTOCOL_VERSION {
+        return project_json(&CommandError::protocol_mismatch());
+    }
+    if !valid_notification_delivery_identity(
+        &request.notification_id,
+        &request.run_id,
+        &request.item_id,
+        &request.platform_id,
+        request.item_version,
+    ) {
+        return project_json(&CommandError::for_code(CommandErrorCode::InvalidRunRequest));
+    }
+    let response = core_manager.with_ready_core(|core| {
+        let outcome = core
+            .store
+            .release_notification_delivery(StoreNotificationDeliveryFailure {
+                notification_id: request.notification_id.clone(),
+                run_id: request.run_id.clone(),
+                kind: store_notification_kind(request.kind),
+                item_id: request.item_id.clone(),
+                item_version: request.item_version,
+                platform_id: request.platform_id.clone(),
+            })
+            .map_err(map_notification_delivery_store_error)?;
+        Ok(NotificationDeliveryFailedResponse {
+            protocol_version: PROTOCOL_VERSION.to_owned(),
+            notification_id: request.notification_id,
+            run_id: request.run_id,
+            kind: request.kind,
+            item_id: request.item_id,
+            item_version: request.item_version,
+            platform_id: request.platform_id,
+            released: matches!(outcome, StoreNotificationDeliveryFailureOutcome::Released),
+        })
+    });
+    notification_delivery_command_response(response)
+}
+
+#[uniffi::export]
+pub fn notification_delivered_json(request_json: String) -> Result<String, BridgeError> {
+    protect(|| notification_delivered_with(&CORE, request_json))
+}
+
+fn notification_delivered_with(
+    core_manager: &CoreManager,
+    request_json: String,
+) -> Result<String, BridgeError> {
+    let request = match notification_delivery_request::<NotificationDeliveredRequest>(&request_json)
+    {
+        Ok(request) => request,
+        Err(_) => {
+            return project_json(&CommandError::for_code(CommandErrorCode::InvalidRunRequest));
+        }
+    };
+    if request.client_protocol_version != PROTOCOL_VERSION {
+        return project_json(&CommandError::protocol_mismatch());
+    }
+    if !valid_notification_delivery_identity(
+        &request.notification_id,
+        &request.run_id,
+        &request.item_id,
+        &request.platform_id,
+        request.item_version,
+    ) {
+        return project_json(&CommandError::for_code(CommandErrorCode::InvalidRunRequest));
+    }
+    let response = core_manager.with_ready_core(|core| {
+        let delivered_at = core
+            .store
+            .current_utc_timestamp()
+            .map_err(|_| BridgeError::StorageFailure)?;
+        let outcome = core
+            .store
+            .record_notification_delivery(StoreNotificationDeliveryReceipt {
+                notification_id: request.notification_id.clone(),
+                run_id: request.run_id.clone(),
+                kind: store_notification_kind(request.kind),
+                item_id: request.item_id.clone(),
+                item_version: request.item_version,
+                platform_id: request.platform_id.clone(),
+                delivered_at,
+            })
+            .map_err(map_notification_delivery_store_error)?;
+        Ok(NotificationDeliveredResponse {
+            protocol_version: PROTOCOL_VERSION.to_owned(),
+            notification_id: request.notification_id,
+            run_id: request.run_id,
+            kind: request.kind,
+            item_id: request.item_id,
+            item_version: request.item_version,
+            platform_id: request.platform_id,
+            already_delivered: matches!(
+                outcome,
+                StoreNotificationDeliveryReceiptOutcome::AlreadyDelivered
+            ),
+        })
+    });
+    notification_delivery_command_response(response)
+}
+
+fn notification_delivery_request<T: serde::de::DeserializeOwned>(
+    request_json: &str,
+) -> Result<T, BridgeError> {
+    if request_json.len() > MAX_MANAGED_RUN_REQUEST_BYTES {
+        return Err(BridgeError::InvalidRunRequest);
+    }
+    serde_json::from_str(request_json).map_err(|_| BridgeError::InvalidRunRequest)
+}
+
+fn notification_delivery_command_response<T: serde::Serialize>(
+    response: Result<T, BridgeError>,
+) -> Result<String, BridgeError> {
+    match response {
+        Ok(response) => bounded_json(
+            &response,
+            MAX_PROJECT_RESPONSE_BYTES,
+            BridgeError::ManagedRunResponseTooLarge,
+        ),
+        Err(BridgeError::InvalidRunRequest) => {
+            project_json(&CommandError::for_code(CommandErrorCode::InvalidRunRequest))
+        }
+        Err(BridgeError::RunVersionStale) => {
+            project_json(&CommandError::for_code(CommandErrorCode::RunVersionStale))
+        }
+        Err(BridgeError::StorageFailure) => project_json(&CommandError::for_code(
+            CommandErrorCode::StorageUnavailable,
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+fn map_notification_delivery_store_error(error: StoreError) -> BridgeError {
+    match error {
+        StoreError::InvalidNotificationDelivery { .. }
+        | StoreError::NotificationDeliveryIdentityMismatch { .. }
+        | StoreError::NotificationDeliveryUnclaimed { .. } => BridgeError::InvalidRunRequest,
+        StoreError::NotificationDeliveryUnavailable { .. } => BridgeError::RunVersionStale,
+        _ => BridgeError::StorageFailure,
+    }
+}
+
+fn protocol_notification_kind(kind: StoreNotificationKind) -> ProtocolNotificationKind {
+    match kind {
+        StoreNotificationKind::Permission => ProtocolNotificationKind::Permission,
+        StoreNotificationKind::Question => ProtocolNotificationKind::Question,
+        StoreNotificationKind::Failure => ProtocolNotificationKind::Failure,
+        StoreNotificationKind::Completion => ProtocolNotificationKind::Completion,
+        StoreNotificationKind::Stuck => ProtocolNotificationKind::Stuck,
+    }
+}
+
+fn store_notification_kind(kind: ProtocolNotificationKind) -> StoreNotificationKind {
+    match kind {
+        ProtocolNotificationKind::Permission => StoreNotificationKind::Permission,
+        ProtocolNotificationKind::Question => StoreNotificationKind::Question,
+        ProtocolNotificationKind::Failure => StoreNotificationKind::Failure,
+        ProtocolNotificationKind::Completion => StoreNotificationKind::Completion,
+        ProtocolNotificationKind::Stuck => StoreNotificationKind::Stuck,
+    }
+}
+
+fn valid_notification_delivery_identity(
+    notification_id: &str,
+    run_id: &str,
+    item_id: &str,
+    platform_id: &str,
+    item_version: u64,
+) -> bool {
+    valid_bounded_notification_token(notification_id, 96)
+        && valid_bounded_notification_token(run_id, 256)
+        && valid_bounded_notification_token(item_id, 256)
+        && valid_bounded_notification_token(platform_id, 256)
+        && item_version > 0
+        && item_version <= flit_protocol::MAX_JSON_SAFE_INTEGER
+}
+
+fn valid_bounded_notification_token(value: &str, max: usize) -> bool {
+    !value.trim().is_empty() && value.len() <= max && !value.chars().any(char::is_control)
 }
 
 #[uniffi::export]
@@ -5770,6 +6100,247 @@ mod tests {
             )
             .expect("unchanged corrupt notification policy");
         assert_eq!(unchanged_corrupt, "{");
+    }
+
+    #[test]
+    fn notification_delivery_commands_are_exact_bounded_and_retry_safe() {
+        let (directory, manager, _) = observation_core("notification-delivery");
+        let permission = open_permission(&manager);
+        let ManagedRunObserveResponse::PermissionRequested {
+            request_version, ..
+        } = permission
+        else {
+            panic!("expected open permission");
+        };
+        let due_request = NotificationDeliveriesDueReadRequest {
+            local_minute: 8 * 60,
+            client_protocol_version: PROTOCOL_VERSION.to_owned(),
+        };
+        let due: NotificationDeliveriesDueReadResponse = serde_json::from_str(
+            &notification_deliveries_due_read_with(
+                &manager,
+                serde_json::to_string(&due_request).expect("due request"),
+            )
+            .expect("due response"),
+        )
+        .expect("due response JSON");
+        assert_eq!(due.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(due.notifications.len(), 1);
+        let candidate = &due.notifications[0];
+        assert_eq!(candidate.run_id, "run-observe");
+        assert_eq!(candidate.project_id, "project-observe");
+        assert_eq!(candidate.kind, ProtocolNotificationKind::Permission);
+        assert_eq!(candidate.item_version, request_version);
+        assert!(!candidate.delivery_claimed);
+        assert!(!candidate.catch_up);
+
+        manager
+            .with_ready_core(|core| {
+                core.store
+                    .update_global_notification_policy(
+                        0,
+                        StoreNotificationKinds::default(),
+                        StoreQuietHours {
+                            enabled: true,
+                            start_minute: 0,
+                            end_minute: 12 * 60,
+                        },
+                        "2026-08-13T00:00:00Z",
+                    )
+                    .expect("enable test quiet hours");
+                Ok(())
+            })
+            .expect("quiet policy update");
+        let wrong_claim = NotificationDeliveryClaimRequest {
+            notification_id: "notification-wrong".to_owned(),
+            run_id: candidate.run_id.clone(),
+            expected_run_version: candidate.run_version,
+            kind: candidate.kind,
+            item_id: candidate.item_id.clone(),
+            item_version: candidate.item_version,
+            platform_id: candidate.platform_id.clone(),
+            local_minute: 8 * 60,
+            client_protocol_version: PROTOCOL_VERSION.to_owned(),
+        };
+        assert_eq!(
+            command_error(
+                &notification_delivery_claim_with(
+                    &manager,
+                    serde_json::to_string(&wrong_claim).expect("wrong claim request"),
+                )
+                .expect("wrong claim response")
+            ),
+            CommandError::for_code(CommandErrorCode::RunVersionStale)
+        );
+        let raw = rusqlite::Connection::open(directory.0.join(DATABASE_FILE_NAME))
+            .expect("inspect notification ledger");
+        let ledger_count: i64 = raw
+            .query_row("SELECT COUNT(*) FROM notification_deliveries", [], |row| {
+                row.get(0)
+            })
+            .expect("notification ledger count");
+        assert_eq!(ledger_count, 0);
+        drop(raw);
+        let boundary_claim = NotificationDeliveryClaimRequest {
+            notification_id: candidate.notification_id.clone(),
+            ..wrong_claim
+        };
+        assert_eq!(
+            command_error(
+                &notification_delivery_claim_with(
+                    &manager,
+                    serde_json::to_string(&boundary_claim).expect("boundary claim request"),
+                )
+                .expect("boundary claim response")
+            ),
+            CommandError::for_code(CommandErrorCode::RunVersionStale)
+        );
+        let raw = rusqlite::Connection::open(directory.0.join(DATABASE_FILE_NAME))
+            .expect("inspect quiet suppression");
+        let suppression: (String, String) = raw
+            .query_row(
+                "SELECT state, suppression_reason FROM notification_deliveries",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("quiet suppression row");
+        assert_eq!(
+            suppression,
+            ("suppressed".to_owned(), "quiet_hours".to_owned())
+        );
+        drop(raw);
+        manager
+            .with_ready_core(|core| {
+                core.store
+                    .update_global_notification_policy(
+                        1,
+                        StoreNotificationKinds::default(),
+                        StoreQuietHours::default(),
+                        "2026-08-13T00:01:00Z",
+                    )
+                    .expect("disable test quiet hours");
+                Ok(())
+            })
+            .expect("quiet policy reset");
+
+        let malformed = format!(
+            r#"{{"local_minute":480,"client_protocol_version":"{PROTOCOL_VERSION}","evaluated_at":"native-time"}}"#
+        );
+        assert_eq!(
+            command_error(
+                &notification_deliveries_due_read_with(&manager, malformed)
+                    .expect("malformed due response")
+            ),
+            CommandError::for_code(CommandErrorCode::InvalidRunRequest)
+        );
+
+        let claim = NotificationDeliveryClaimRequest {
+            notification_id: candidate.notification_id.clone(),
+            run_id: candidate.run_id.clone(),
+            expected_run_version: candidate.run_version,
+            kind: candidate.kind,
+            item_id: candidate.item_id.clone(),
+            item_version: candidate.item_version,
+            platform_id: candidate.platform_id.clone(),
+            local_minute: 8 * 60,
+            client_protocol_version: PROTOCOL_VERSION.to_owned(),
+        };
+        let claimed: NotificationDeliveryClaimResponse = serde_json::from_str(
+            &notification_delivery_claim_with(
+                &manager,
+                serde_json::to_string(&claim).expect("claim request"),
+            )
+            .expect("claim response"),
+        )
+        .expect("claim response JSON");
+        assert!(!claimed.already_claimed);
+        let duplicate_claimed: NotificationDeliveryClaimResponse = serde_json::from_str(
+            &notification_delivery_claim_with(
+                &manager,
+                serde_json::to_string(&claim).expect("duplicate claim request"),
+            )
+            .expect("duplicate claim response"),
+        )
+        .expect("duplicate claim response JSON");
+        assert!(duplicate_claimed.already_claimed);
+
+        let mut failed = NotificationDeliveryFailedRequest {
+            notification_id: claim.notification_id.clone(),
+            run_id: claim.run_id.clone(),
+            kind: claim.kind,
+            item_id: claim.item_id.clone(),
+            item_version: claim.item_version,
+            platform_id: claim.platform_id.clone(),
+            client_protocol_version: PROTOCOL_VERSION.to_owned(),
+        };
+        failed.item_id = "wrong-item".to_owned();
+        assert_eq!(
+            command_error(
+                &notification_delivery_failed_with(
+                    &manager,
+                    serde_json::to_string(&failed).expect("mismatch failure request"),
+                )
+                .expect("mismatch failure response")
+            ),
+            CommandError::for_code(CommandErrorCode::InvalidRunRequest)
+        );
+        failed.item_id = claim.item_id.clone();
+        let released: NotificationDeliveryFailedResponse = serde_json::from_str(
+            &notification_delivery_failed_with(
+                &manager,
+                serde_json::to_string(&failed).expect("failure request"),
+            )
+            .expect("failure response"),
+        )
+        .expect("failure response JSON");
+        assert!(released.released);
+
+        let claimed_again: NotificationDeliveryClaimResponse = serde_json::from_str(
+            &notification_delivery_claim_with(
+                &manager,
+                serde_json::to_string(&claim).expect("retry claim request"),
+            )
+            .expect("retry claim response"),
+        )
+        .expect("retry claim response JSON");
+        assert!(!claimed_again.already_claimed);
+        let delivered_request = NotificationDeliveredRequest {
+            notification_id: claim.notification_id,
+            run_id: claim.run_id,
+            kind: claim.kind,
+            item_id: claim.item_id,
+            item_version: claim.item_version,
+            platform_id: claim.platform_id,
+            client_protocol_version: PROTOCOL_VERSION.to_owned(),
+        };
+        let delivered: NotificationDeliveredResponse = serde_json::from_str(
+            &notification_delivered_with(
+                &manager,
+                serde_json::to_string(&delivered_request).expect("delivered request"),
+            )
+            .expect("delivered response"),
+        )
+        .expect("delivered response JSON");
+        assert!(!delivered.already_delivered);
+        let duplicate: NotificationDeliveredResponse = serde_json::from_str(
+            &notification_delivered_with(
+                &manager,
+                serde_json::to_string(&delivered_request).expect("duplicate delivered request"),
+            )
+            .expect("duplicate delivered response"),
+        )
+        .expect("duplicate delivered response JSON");
+        assert!(duplicate.already_delivered);
+
+        let empty: NotificationDeliveriesDueReadResponse = serde_json::from_str(
+            &notification_deliveries_due_read_with(
+                &manager,
+                serde_json::to_string(&due_request).expect("final due request"),
+            )
+            .expect("final due response"),
+        )
+        .expect("final due response JSON");
+        assert!(empty.notifications.is_empty());
     }
 
     #[test]

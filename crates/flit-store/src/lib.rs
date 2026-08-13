@@ -843,6 +843,175 @@ fn notification_delivery_matches(
         && stored.platform_id == candidate.platform_id
 }
 
+fn notification_claim_matches_candidate(
+    claim: &NotificationDeliveryClaim,
+    candidate: &NotificationDeliveryCandidate,
+) -> bool {
+    candidate.notification_id == claim.notification_id
+        && candidate.run_id == claim.run_id
+        && candidate.run_version == claim.expected_run_version
+        && candidate.kind == claim.kind
+        && candidate.item_id == claim.item_id
+        && candidate.item_version == claim.item_version
+        && candidate.platform_id == claim.platform_id
+}
+
+fn reconcile_notification_deliveries_on(
+    connection: &Connection,
+    local_minute: u16,
+    evaluated_at: &str,
+) -> Result<Vec<NotificationDeliveryCandidate>, StoreError> {
+    let sources = notification_source_candidates(connection)?;
+    let mut policies = BTreeMap::new();
+    let mut due = Vec::new();
+    let mut catch_up_by_project: BTreeMap<String, NotificationSourceCandidate> = BTreeMap::new();
+    let mut claimed_quiet_projects = BTreeSet::new();
+    for mut source in sources {
+        let policy = match policies.get(&source.candidate.project_id) {
+            Some(policy) => policy,
+            None => {
+                let policy =
+                    notification_policy_snapshot(connection, Some(&source.candidate.project_id))?
+                        .effective;
+                policies.insert(source.candidate.project_id.clone(), policy);
+                policies
+                    .get(&source.candidate.project_id)
+                    .expect("inserted notification policy")
+            }
+        };
+        let enabled = notification_kind_enabled(policy.kinds, source.candidate.kind);
+        let quiet = local_minute_is_quiet(
+            policy.quiet_hours.enabled,
+            policy.quiet_hours.start_minute,
+            policy.quiet_hours.end_minute,
+            local_minute,
+        );
+        let mut existing =
+            stored_notification_delivery(connection, &source.candidate.notification_id)?;
+        if let Some(existing) = &existing {
+            if existing.item_version > source.candidate.item_version {
+                return Err(StoreError::StoredNotificationDeliveryInvalid {
+                    notification_id: source.candidate.notification_id,
+                    field: "item_version",
+                });
+            }
+            source.candidate.item_version = existing.item_version;
+        }
+        if let Some(existing) = &existing
+            && !notification_delivery_matches(existing, &source.candidate)
+        {
+            return Err(StoreError::StoredNotificationDeliveryInvalid {
+                notification_id: source.candidate.notification_id,
+                field: "identity",
+            });
+        }
+        if existing.is_none()
+            && let Some(claimed_at) = source.legacy_claimed_at.as_deref()
+        {
+            connection
+                .execute(
+                    "INSERT INTO notification_deliveries(
+                        notification_id, run_id, project_id, kind, item_id, item_version,
+                        platform_id, state, claimed_at
+                     ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'claimed', ?8)",
+                    params![
+                        source.candidate.notification_id,
+                        source.candidate.run_id,
+                        source.candidate.project_id,
+                        source.candidate.kind.as_str(),
+                        source.candidate.item_id,
+                        source.candidate.item_version as i64,
+                        source.candidate.platform_id,
+                        claimed_at,
+                    ],
+                )
+                .map_err(StoreError::Sqlite)?;
+            existing = stored_notification_delivery(connection, &source.candidate.notification_id)?;
+        }
+
+        if !enabled || quiet {
+            if existing.is_none() {
+                connection
+                    .execute(
+                        "INSERT INTO notification_deliveries(
+                            notification_id, run_id, project_id, kind, item_id, item_version,
+                            platform_id, state, suppression_reason, suppressed_at
+                         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'suppressed', ?8, ?9)",
+                        params![
+                            source.candidate.notification_id,
+                            source.candidate.run_id,
+                            source.candidate.project_id,
+                            source.candidate.kind.as_str(),
+                            source.candidate.item_id,
+                            source.candidate.item_version as i64,
+                            source.candidate.platform_id,
+                            if enabled { "quiet_hours" } else { "policy" },
+                            evaluated_at,
+                        ],
+                    )
+                    .map_err(StoreError::Sqlite)?;
+            }
+            if existing
+                .as_ref()
+                .is_some_and(|row| row.state == NotificationDeliveryState::Claimed)
+            {
+                if existing
+                    .as_ref()
+                    .is_some_and(|row| row.suppression_reason.as_deref() == Some("quiet_hours"))
+                {
+                    claimed_quiet_projects.insert(source.candidate.project_id.clone());
+                }
+                source.candidate.delivery_claimed = true;
+                due.push(source);
+            }
+            continue;
+        }
+
+        match existing {
+            None => due.push(source),
+            Some(row) if row.state == NotificationDeliveryState::Claimed => {
+                if row.suppression_reason.as_deref() == Some("quiet_hours") {
+                    claimed_quiet_projects.insert(source.candidate.project_id.clone());
+                }
+                source.candidate.delivery_claimed = true;
+                due.push(source);
+            }
+            Some(row)
+                if row.state == NotificationDeliveryState::Suppressed
+                    && row.suppression_reason.as_deref() == Some("quiet_hours")
+                    && source.candidate.kind.catches_up() =>
+            {
+                source.candidate.catch_up = true;
+                let replace = catch_up_by_project
+                    .get(&source.candidate.project_id)
+                    .is_none_or(|current| {
+                        (source.priority, source.candidate.notification_id.as_str())
+                            < (current.priority, current.candidate.notification_id.as_str())
+                    });
+                if replace {
+                    catch_up_by_project.insert(source.candidate.project_id.clone(), source);
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    catch_up_by_project.retain(|project_id, _| !claimed_quiet_projects.contains(project_id));
+    due.extend(catch_up_by_project.into_values());
+    due.sort_by(|left, right| {
+        (
+            left.candidate.project_id.as_str(),
+            left.priority,
+            left.candidate.notification_id.as_str(),
+        )
+            .cmp(&(
+                right.candidate.project_id.as_str(),
+                right.priority,
+                right.candidate.notification_id.as_str(),
+            ))
+    });
+    Ok(due.into_iter().map(|source| source.candidate).collect())
+}
+
 impl Store {
     pub fn notification_policy(
         &self,
@@ -981,161 +1150,9 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(StoreError::Sqlite)?;
-        let sources = notification_source_candidates(&transaction)?;
-        let mut policies = BTreeMap::new();
-        let mut due = Vec::new();
-        let mut catch_up_by_project: BTreeMap<String, NotificationSourceCandidate> =
-            BTreeMap::new();
-
-        let mut claimed_quiet_projects = BTreeSet::new();
-        for mut source in sources {
-            let policy = match policies.get(&source.candidate.project_id) {
-                Some(policy) => policy,
-                None => {
-                    let policy = notification_policy_snapshot(
-                        &transaction,
-                        Some(&source.candidate.project_id),
-                    )?
-                    .effective;
-                    policies.insert(source.candidate.project_id.clone(), policy);
-                    policies
-                        .get(&source.candidate.project_id)
-                        .expect("inserted notification policy")
-                }
-            };
-            let enabled = notification_kind_enabled(policy.kinds, source.candidate.kind);
-            let quiet = local_minute_is_quiet(
-                policy.quiet_hours.enabled,
-                policy.quiet_hours.start_minute,
-                policy.quiet_hours.end_minute,
-                local_minute,
-            );
-            let mut existing =
-                stored_notification_delivery(&transaction, &source.candidate.notification_id)?;
-            if let Some(existing) = &existing {
-                if existing.item_version > source.candidate.item_version {
-                    return Err(StoreError::StoredNotificationDeliveryInvalid {
-                        notification_id: source.candidate.notification_id,
-                        field: "item_version",
-                    });
-                }
-                source.candidate.item_version = existing.item_version;
-            }
-            if let Some(existing) = &existing
-                && !notification_delivery_matches(existing, &source.candidate)
-            {
-                return Err(StoreError::StoredNotificationDeliveryInvalid {
-                    notification_id: source.candidate.notification_id,
-                    field: "identity",
-                });
-            }
-            if existing.is_none()
-                && let Some(claimed_at) = source.legacy_claimed_at.as_deref()
-            {
-                transaction
-                    .execute(
-                        "INSERT INTO notification_deliveries(
-                            notification_id, run_id, project_id, kind, item_id, item_version,
-                            platform_id, state, claimed_at
-                         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'claimed', ?8)",
-                        params![
-                            source.candidate.notification_id,
-                            source.candidate.run_id,
-                            source.candidate.project_id,
-                            source.candidate.kind.as_str(),
-                            source.candidate.item_id,
-                            source.candidate.item_version as i64,
-                            source.candidate.platform_id,
-                            claimed_at,
-                        ],
-                    )
-                    .map_err(StoreError::Sqlite)?;
-                existing =
-                    stored_notification_delivery(&transaction, &source.candidate.notification_id)?;
-            }
-
-            if !enabled || quiet {
-                if existing.is_none() {
-                    transaction
-                        .execute(
-                            "INSERT INTO notification_deliveries(
-                                notification_id, run_id, project_id, kind, item_id, item_version,
-                                platform_id, state, suppression_reason, suppressed_at
-                             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'suppressed', ?8, ?9)",
-                            params![
-                                source.candidate.notification_id,
-                                source.candidate.run_id,
-                                source.candidate.project_id,
-                                source.candidate.kind.as_str(),
-                                source.candidate.item_id,
-                                source.candidate.item_version as i64,
-                                source.candidate.platform_id,
-                                if enabled { "quiet_hours" } else { "policy" },
-                                evaluated_at,
-                            ],
-                        )
-                        .map_err(StoreError::Sqlite)?;
-                }
-                if existing
-                    .as_ref()
-                    .is_some_and(|row| row.state == NotificationDeliveryState::Claimed)
-                {
-                    if existing
-                        .as_ref()
-                        .is_some_and(|row| row.suppression_reason.as_deref() == Some("quiet_hours"))
-                    {
-                        claimed_quiet_projects.insert(source.candidate.project_id.clone());
-                    }
-                    source.candidate.delivery_claimed = true;
-                    due.push(source);
-                }
-                continue;
-            }
-
-            match existing {
-                None => due.push(source),
-                Some(row) if row.state == NotificationDeliveryState::Claimed => {
-                    if row.suppression_reason.as_deref() == Some("quiet_hours") {
-                        claimed_quiet_projects.insert(source.candidate.project_id.clone());
-                    }
-                    source.candidate.delivery_claimed = true;
-                    due.push(source);
-                }
-                Some(row)
-                    if row.state == NotificationDeliveryState::Suppressed
-                        && row.suppression_reason.as_deref() == Some("quiet_hours")
-                        && source.candidate.kind.catches_up() =>
-                {
-                    source.candidate.catch_up = true;
-                    let replace = catch_up_by_project
-                        .get(&source.candidate.project_id)
-                        .is_none_or(|current| {
-                            (source.priority, source.candidate.notification_id.as_str())
-                                < (current.priority, current.candidate.notification_id.as_str())
-                        });
-                    if replace {
-                        catch_up_by_project.insert(source.candidate.project_id.clone(), source);
-                    }
-                }
-                Some(_) => {}
-            }
-        }
-        catch_up_by_project.retain(|project_id, _| !claimed_quiet_projects.contains(project_id));
-        due.extend(catch_up_by_project.into_values());
-        due.sort_by(|left, right| {
-            (
-                left.candidate.project_id.as_str(),
-                left.priority,
-                left.candidate.notification_id.as_str(),
-            )
-                .cmp(&(
-                    right.candidate.project_id.as_str(),
-                    right.priority,
-                    right.candidate.notification_id.as_str(),
-                ))
-        });
+        let due = reconcile_notification_deliveries_on(&transaction, local_minute, evaluated_at)?;
         transaction.commit().map_err(StoreError::Sqlite)?;
-        Ok(due.into_iter().map(|source| source.candidate).collect())
+        Ok(due)
     }
 
     pub fn claim_notification_delivery(
@@ -1154,29 +1171,66 @@ impl Store {
         {
             return Err(StoreError::InvalidNotificationDelivery { field: "version" });
         }
-        let candidate = self
-            .reconcile_notification_deliveries(claim.local_minute, &claim.claimed_at)?
-            .into_iter()
-            .find(|candidate| candidate.notification_id == claim.notification_id)
-            .ok_or_else(|| StoreError::NotificationDeliveryUnavailable {
-                notification_id: claim.notification_id.clone(),
-            })?;
-        if candidate.run_id != claim.run_id
-            || candidate.run_version != claim.expected_run_version
-            || candidate.kind != claim.kind
-            || candidate.item_id != claim.item_id
-            || candidate.item_version != claim.item_version
-            || candidate.platform_id != claim.platform_id
-        {
-            return Err(StoreError::NotificationDeliveryIdentityMismatch {
-                notification_id: claim.notification_id,
+        if claim.local_minute >= 24 * 60 {
+            return Err(StoreError::InvalidNotificationDelivery {
+                field: "local_minute",
             });
         }
-
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(StoreError::Sqlite)?;
+        let due = reconcile_notification_deliveries_on(
+            &transaction,
+            claim.local_minute,
+            &claim.claimed_at,
+        )?;
+        let candidate = if let Some(candidate) = due
+            .into_iter()
+            .find(|candidate| candidate.notification_id == claim.notification_id)
+        {
+            candidate
+        } else {
+            let source = notification_source_candidates(&transaction)?
+                .into_iter()
+                .find(|source| source.candidate.notification_id == claim.notification_id);
+            let Some(mut candidate) = source.map(|source| source.candidate) else {
+                return Err(StoreError::NotificationDeliveryUnavailable {
+                    notification_id: claim.notification_id,
+                });
+            };
+            if let Some(stored) =
+                stored_notification_delivery(&transaction, &candidate.notification_id)?
+            {
+                if stored.item_version > candidate.item_version {
+                    return Err(StoreError::StoredNotificationDeliveryInvalid {
+                        notification_id: candidate.notification_id,
+                        field: "item_version",
+                    });
+                }
+                candidate.item_version = stored.item_version;
+                if !notification_delivery_matches(&stored, &candidate) {
+                    return Err(StoreError::StoredNotificationDeliveryInvalid {
+                        notification_id: candidate.notification_id,
+                        field: "identity",
+                    });
+                }
+            }
+            if notification_claim_matches_candidate(&claim, &candidate) {
+                transaction.commit().map_err(StoreError::Sqlite)?;
+                return Err(StoreError::NotificationDeliveryUnavailable {
+                    notification_id: claim.notification_id,
+                });
+            }
+            return Err(StoreError::NotificationDeliveryIdentityMismatch {
+                notification_id: claim.notification_id,
+            });
+        };
+        if !notification_claim_matches_candidate(&claim, &candidate) {
+            return Err(StoreError::NotificationDeliveryIdentityMismatch {
+                notification_id: claim.notification_id,
+            });
+        }
         let current_version = load_run_snapshot(&transaction, &claim.run_id)?
             .ok_or_else(|| StoreError::NotificationDeliveryUnavailable {
                 notification_id: claim.notification_id.clone(),

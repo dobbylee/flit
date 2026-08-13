@@ -1,0 +1,13 @@
+{
+  "status": "delivery_unknown",
+  "protocol_version": "1.26",
+  "run_id": "run-1",
+  "request_id": "request-1",
+  "request_version": 5,
+  "response_attempt_id": "attempt-1",
+  "decision": "deny",
+  "submitted_event_id": "event-response-submitted",
+  "submitted_version": 6,
+  "outcome_event_id": "event-response-unknown",
+  "outcome_version": 7
+}
