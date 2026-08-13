@@ -26,6 +26,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 mod managed_runs;
+mod notification_policy;
 mod projects;
 mod writer;
 
@@ -53,6 +54,11 @@ pub use managed_runs::{
     ManagedStuckNotificationDueContext, ManagedStuckNotificationState, ManagedStuckReset,
     ManagedStuckTransition, ManagedStuckTransitionOutcome, ManagedStuckWaitKind,
     ManagedTurnTerminalOutcome,
+};
+pub use notification_policy::{
+    EffectiveNotificationPolicy, GlobalNotificationPolicy, NotificationKindOverrides,
+    NotificationKinds, NotificationOverride, NotificationPolicySnapshot, ProjectNotificationMaster,
+    ProjectNotificationPolicy, QuietHours,
 };
 pub use projects::{
     MAX_PROJECT_PAGE_SIZE, Project, ProjectDirectoryInspection, ProjectIdentity,
@@ -445,7 +451,240 @@ pub struct ManagedGitChangePage {
     pub changes: Vec<ManagedGitFileChange>,
 }
 
+fn notification_policy_snapshot(
+    connection: &Connection,
+    project_id: Option<&str>,
+) -> Result<NotificationPolicySnapshot, StoreError> {
+    let global = load_global_notification_policy(connection)?;
+    let project = project_id
+        .map(|project_id| load_project_notification_policy(connection, project_id))
+        .transpose()?;
+    Ok(NotificationPolicySnapshot::new(global, project))
+}
+
+fn load_global_notification_policy(
+    connection: &Connection,
+) -> Result<GlobalNotificationPolicy, StoreError> {
+    let rendered = connection
+        .query_row(
+            "SELECT value_json FROM app_settings WHERE key = ?1",
+            [notification_policy::NOTIFICATION_POLICY_SETTINGS_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(StoreError::Sqlite)?;
+    let Some(rendered) = rendered else {
+        return Ok(GlobalNotificationPolicy::default());
+    };
+    let policy: GlobalNotificationPolicy = parse_notification_policy(&rendered, "global")?;
+    if policy.version == 0 || policy.version > MAX_JSON_SAFE_INTEGER {
+        return Err(StoreError::StoredNotificationPolicyInvalid { scope: "global" });
+    }
+    policy
+        .validate()
+        .map_err(|_| StoreError::StoredNotificationPolicyInvalid { scope: "global" })?;
+    Ok(policy)
+}
+
+fn load_project_notification_policy(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<ProjectNotificationPolicy, StoreError> {
+    validate_notification_policy_project_id(project_id)?;
+    let rendered = connection
+        .query_row(
+            "SELECT notification_policy_json
+             FROM projects
+             WHERE id = ?1 AND archived_at IS NULL",
+            [project_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(StoreError::Sqlite)?
+        .ok_or_else(|| StoreError::NotificationPolicyProjectUnavailable {
+            project_id: project_id.to_owned(),
+        })?;
+    let policy = if rendered.trim() == "{}" {
+        ProjectNotificationPolicy::default()
+    } else {
+        parse_notification_policy(&rendered, "project")?
+    };
+    if policy.version > MAX_JSON_SAFE_INTEGER {
+        return Err(StoreError::StoredNotificationPolicyInvalid { scope: "project" });
+    }
+    Ok(policy)
+}
+
+fn parse_notification_policy<T: serde::de::DeserializeOwned>(
+    rendered: &str,
+    scope: &'static str,
+) -> Result<T, StoreError> {
+    if rendered.len() > notification_policy::MAX_NOTIFICATION_POLICY_JSON_BYTES {
+        return Err(StoreError::StoredNotificationPolicyInvalid { scope });
+    }
+    serde_json::from_str(rendered)
+        .map_err(|_| StoreError::StoredNotificationPolicyInvalid { scope })
+}
+
+fn render_notification_policy<T: serde::Serialize>(
+    policy: &T,
+    scope: &'static str,
+) -> Result<String, StoreError> {
+    let rendered = serde_json::to_string(policy)
+        .map_err(|_| StoreError::StoredNotificationPolicyInvalid { scope })?;
+    if rendered.len() > notification_policy::MAX_NOTIFICATION_POLICY_JSON_BYTES {
+        return Err(StoreError::StoredNotificationPolicyInvalid { scope });
+    }
+    Ok(rendered)
+}
+
+fn validate_notification_policy_project_id(project_id: &str) -> Result<(), StoreError> {
+    if project_id.trim().is_empty()
+        || project_id.len() > 256
+        || project_id.chars().any(char::is_control)
+    {
+        return Err(StoreError::InvalidNotificationPolicy {
+            field: "project_id",
+        });
+    }
+    Ok(())
+}
+
+fn validate_notification_policy_timestamp(updated_at: &str) -> Result<(), StoreError> {
+    if updated_at.trim().is_empty()
+        || updated_at.len() > 128
+        || updated_at.chars().any(char::is_control)
+    {
+        return Err(StoreError::InvalidNotificationPolicy {
+            field: "updated_at",
+        });
+    }
+    Ok(())
+}
+
 impl Store {
+    pub fn notification_policy(
+        &self,
+        project_id: Option<&str>,
+    ) -> Result<NotificationPolicySnapshot, StoreError> {
+        notification_policy_snapshot(&self.connection, project_id)
+    }
+
+    pub fn update_global_notification_policy(
+        &mut self,
+        expected_version: u64,
+        kinds: NotificationKinds,
+        quiet_hours: QuietHours,
+        updated_at: &str,
+    ) -> Result<NotificationPolicySnapshot, StoreError> {
+        validate_notification_policy_timestamp(updated_at)?;
+        quiet_hours
+            .validate()
+            .map_err(|field| StoreError::InvalidNotificationPolicy { field })?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+        let current = load_global_notification_policy(&transaction)?;
+        if current.version != expected_version {
+            return Err(StoreError::NotificationPolicyVersionStale {
+                scope: "global",
+                expected: expected_version,
+                current: current.version,
+            });
+        }
+        let version =
+            expected_version
+                .checked_add(1)
+                .ok_or(StoreError::InvalidNotificationPolicy {
+                    field: "global.version",
+                })?;
+        if version > MAX_JSON_SAFE_INTEGER {
+            return Err(StoreError::InvalidNotificationPolicy {
+                field: "global.version",
+            });
+        }
+        let policy = GlobalNotificationPolicy {
+            version,
+            kinds,
+            quiet_hours,
+        };
+        let rendered = render_notification_policy(&policy, "global")?;
+        transaction
+            .execute(
+                "INSERT INTO app_settings(key, value_json, updated_at)
+                 VALUES(?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json,
+                                                updated_at = excluded.updated_at",
+                params![
+                    notification_policy::NOTIFICATION_POLICY_SETTINGS_KEY,
+                    rendered,
+                    updated_at,
+                ],
+            )
+            .map_err(StoreError::Sqlite)?;
+        let snapshot = notification_policy_snapshot(&transaction, None)?;
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(snapshot)
+    }
+
+    pub fn update_project_notification_policy(
+        &mut self,
+        project_id: &str,
+        expected_version: u64,
+        master: ProjectNotificationMaster,
+        kinds: NotificationKindOverrides,
+        updated_at: &str,
+    ) -> Result<NotificationPolicySnapshot, StoreError> {
+        validate_notification_policy_project_id(project_id)?;
+        validate_notification_policy_timestamp(updated_at)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::Sqlite)?;
+        let current = load_project_notification_policy(&transaction, project_id)?;
+        if current.version != expected_version {
+            return Err(StoreError::NotificationPolicyVersionStale {
+                scope: "project",
+                expected: expected_version,
+                current: current.version,
+            });
+        }
+        let version =
+            expected_version
+                .checked_add(1)
+                .ok_or(StoreError::InvalidNotificationPolicy {
+                    field: "project.version",
+                })?;
+        if version > MAX_JSON_SAFE_INTEGER {
+            return Err(StoreError::InvalidNotificationPolicy {
+                field: "project.version",
+            });
+        }
+        let policy = ProjectNotificationPolicy {
+            version,
+            master,
+            kinds,
+        };
+        let rendered = render_notification_policy(&policy, "project")?;
+        let updated = transaction
+            .execute(
+                "UPDATE projects
+                 SET notification_policy_json = ?1, updated_at = ?2
+                 WHERE id = ?3 AND archived_at IS NULL",
+                params![rendered, updated_at, project_id],
+            )
+            .map_err(StoreError::Sqlite)?;
+        if updated != 1 {
+            return Err(StoreError::NotificationPolicyProjectUnavailable {
+                project_id: project_id.to_owned(),
+            });
+        }
+        let snapshot = notification_policy_snapshot(&transaction, Some(project_id))?;
+        transaction.commit().map_err(StoreError::Sqlite)?;
+        Ok(snapshot)
+    }
+
     pub fn managed_stuck_notification_due_contexts(
         &self,
     ) -> Result<Vec<ManagedStuckNotificationDueContext>, StoreError> {
@@ -7719,6 +7958,20 @@ struct SchemaObject {
 
 #[derive(Debug)]
 pub enum StoreError {
+    InvalidNotificationPolicy {
+        field: &'static str,
+    },
+    StoredNotificationPolicyInvalid {
+        scope: &'static str,
+    },
+    NotificationPolicyVersionStale {
+        scope: &'static str,
+        expected: u64,
+        current: u64,
+    },
+    NotificationPolicyProjectUnavailable {
+        project_id: String,
+    },
     InvalidProjectPageLimit {
         limit: usize,
         max: usize,
@@ -8084,6 +8337,24 @@ pub enum StoreError {
 impl fmt::Display for StoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidNotificationPolicy { field } => {
+                write!(formatter, "invalid notification policy field: {field}")
+            }
+            Self::StoredNotificationPolicyInvalid { scope } => {
+                write!(formatter, "stored {scope} notification policy is invalid")
+            }
+            Self::NotificationPolicyVersionStale {
+                scope,
+                expected,
+                current,
+            } => write!(
+                formatter,
+                "{scope} notification policy expected version {expected}, current {current}"
+            ),
+            Self::NotificationPolicyProjectUnavailable { project_id } => write!(
+                formatter,
+                "Project notification policy is unavailable: {project_id}"
+            ),
             Self::InvalidProjectPageLimit { limit, max } => write!(
                 formatter,
                 "invalid Project page limit {limit}; expected 1..={max}"
