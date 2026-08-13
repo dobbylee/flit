@@ -79,6 +79,10 @@ enum FoundationCopyKey: String {
     case notificationSettingsStuck = "notification.settings.stuck"
     case notificationSettingsTitle = "notification.settings.title"
     case notificationSettingsUnavailable = "notification.settings.unavailable"
+    case notificationCompletionBody = "notification.completion.body"
+    case notificationFailureBody = "notification.failure.body"
+    case notificationPermissionBody = "notification.permission.body"
+    case notificationQuestionBody = "notification.question.body"
     case notificationStuckBody = "notification.stuck.body"
     case notificationStuckTitle = "notification.stuck.title"
     case quitActiveRuns = "lifecycle.quit.activeRuns"
@@ -274,6 +278,10 @@ enum FoundationCopy {
         .notificationSettingsTitle: "Notification Settings",
         .notificationSettingsUnavailable:
             "Notification settings are unavailable. The last accepted values were preserved.",
+        .notificationCompletionBody: "%@ · Run completed",
+        .notificationFailureBody: "%@ · Run failed",
+        .notificationPermissionBody: "%@ · Permission required",
+        .notificationQuestionBody: "%@ · Question waiting",
         .notificationStuckBody: "%@ · Possibly stuck",
         .notificationStuckTitle: "Flit needs your attention",
         .quitActiveRuns: "Active provider Runs:",

@@ -453,6 +453,10 @@ struct NativeHealthTests {
             FlitManagedStuckNotificationDeliveryFailedResponse.self,
             at: "\(fixtureRoot)/managed_stuck_notification_delivery_failed.response.json"
         )
+        let notificationDeliveryFixture = try decodeFixture(
+            FlitNotificationDeliveriesDueReadResponse.self,
+            at: "\(fixtureRoot)/notification_deliveries_due_read.response.json"
+        )
 
         try require(
             notificationWallTimeMinute("00:00") == 0
@@ -466,6 +470,417 @@ struct NativeHealthTests {
                 && notificationWallTimeText(1_320) == "22:00"
                 && notificationWallTimeText(1_440) == nil,
             "notification wall times must accept only exact bounded 24-hour input"
+        )
+        let baseNotification = notificationDeliveryFixture.notifications[0]
+        let notificationKinds: [(FlitNotificationDeliveryKind, String)] = [
+            (.permission, "Permission required"),
+            (.question, "Question waiting"),
+            (.failure, "Run failed"),
+            (.completion, "Run completed"),
+            (.stuck, "Possibly stuck"),
+        ]
+        let genericNotifications = notificationKinds.enumerated().map { index, entry in
+            FlitNotificationDeliveryRecord(
+                notificationId: "notification-native-\(index)",
+                runId: "run-native-\(index)",
+                runVersion: baseNotification.runVersion,
+                projectId: "project-native",
+                kind: entry.0,
+                itemId: "attention-native-\(index)",
+                itemVersion: baseNotification.itemVersion,
+                platformId: "flit-native-\(index)",
+                deliveryClaimed: false,
+                catchUp: index == 0
+            )
+        }
+        var genericDueMinutes: [UInt16] = []
+        var genericClaimMinutes: [UInt16] = []
+        var genericClaims: [FlitNotificationDeliveryClaimRequest] = []
+        var genericReceipts: [FlitNotificationDeliveredRequest] = []
+        var genericDue = genericNotifications
+        let genericClient = NotificationDeliveryClient(
+            dueLoader: { request in
+                genericDueMinutes.append(request.localMinute)
+                return FlitNotificationDeliveriesDueReadResponse(
+                    protocolVersion: flitClientProtocolVersion,
+                    notifications: genericDue
+                )
+            },
+            claimLoader: { request in
+                genericClaimMinutes.append(request.localMinute)
+                genericClaims.append(request)
+                return FlitNotificationDeliveryClaimResponse(
+                    protocolVersion: flitClientProtocolVersion,
+                    notificationId: request.notificationId,
+                    runId: request.runId,
+                    runVersion: request.expectedRunVersion,
+                    kind: request.kind,
+                    itemId: request.itemId,
+                    itemVersion: request.itemVersion,
+                    platformId: request.platformId,
+                    alreadyClaimed: false
+                )
+            },
+            failureLoader: { request in
+                FlitNotificationDeliveryFailedResponse(
+                    protocolVersion: flitClientProtocolVersion,
+                    notificationId: request.notificationId,
+                    runId: request.runId,
+                    kind: request.kind,
+                    itemId: request.itemId,
+                    itemVersion: request.itemVersion,
+                    platformId: request.platformId,
+                    released: true
+                )
+            },
+            receiptLoader: { request in
+                genericReceipts.append(request)
+                genericDue.removeAll { $0.notificationId == request.notificationId }
+                return FlitNotificationDeliveredResponse(
+                    protocolVersion: flitClientProtocolVersion,
+                    notificationId: request.notificationId,
+                    runId: request.runId,
+                    kind: request.kind,
+                    itemId: request.itemId,
+                    itemVersion: request.itemVersion,
+                    platformId: request.platformId,
+                    alreadyDelivered: false
+                )
+            }
+        )
+        let genericPlatform = RecordingStuckNotificationPlatform(
+            authorization: .authorized,
+            deliverOnAdd: true
+        )
+        let genericCoordinator = StuckNotificationCoordinator(
+            notificationClient: genericClient,
+            platform: genericPlatform
+        )
+        try genericCoordinator.reconcile(
+            projectNamesByRunId: Dictionary(
+                uniqueKeysWithValues: genericNotifications.map { ($0.runId, "Project Alpha") }
+            )
+        )
+        try require(
+            genericPlatform.added.map(\.identifier) == genericNotifications.map(\.platformId)
+                && genericPlatform.added.map(\.body) == notificationKinds.map {
+                    "Project Alpha · \($0.1)"
+                }
+                && genericClaims.count == 5
+                && genericReceipts.count == 5
+                && genericDueMinutes.count == 1
+                && genericDueMinutes.allSatisfy { $0 < 1_440 }
+                && genericClaimMinutes.count == 5
+                && genericClaimMinutes.allSatisfy { $0 < 1_440 },
+            "Protocol 1.26 native delivery must preserve all five kinds, exact IDs, local-minute facts, and delivered receipts"
+        )
+        try genericCoordinator.reconcile(
+            projectNamesByRunId: Dictionary(
+                uniqueKeysWithValues: genericNotifications.map { ($0.runId, "Project Alpha") }
+            )
+        )
+        try require(
+            genericPlatform.added.count == 5 && genericReceipts.count == 5,
+            "generic durable receipts must prevent duplicate native delivery"
+        )
+        var genericFailureCount = 0
+        let failedGenericClient = NotificationDeliveryClient(
+            dueLoader: { _ in
+                FlitNotificationDeliveriesDueReadResponse(
+                    protocolVersion: flitClientProtocolVersion,
+                    notifications: [genericNotifications[0]]
+                )
+            },
+            claimLoader: { request in
+                FlitNotificationDeliveryClaimResponse(
+                    protocolVersion: flitClientProtocolVersion,
+                    notificationId: request.notificationId, runId: request.runId,
+                    runVersion: request.expectedRunVersion, kind: request.kind,
+                    itemId: request.itemId, itemVersion: request.itemVersion,
+                    platformId: request.platformId, alreadyClaimed: false
+                )
+            },
+            failureLoader: { request in
+                genericFailureCount += 1
+                return FlitNotificationDeliveryFailedResponse(
+                    protocolVersion: flitClientProtocolVersion,
+                    notificationId: request.notificationId, runId: request.runId,
+                    kind: request.kind, itemId: request.itemId,
+                    itemVersion: request.itemVersion, platformId: request.platformId,
+                    released: true
+                )
+            },
+            receiptLoader: { _ in
+                throw NativeHealthTestFailure.failed("failed scheduling cannot record receipt")
+            }
+        )
+        let failedGenericPlatform = RecordingStuckNotificationPlatform(
+            authorization: .authorized,
+            addAccepted: false
+        )
+        let failedGenericCoordinator = StuckNotificationCoordinator(
+            notificationClient: failedGenericClient,
+            platform: failedGenericPlatform
+        )
+        try failedGenericCoordinator.reconcile(
+            projectNamesByRunId: [genericNotifications[0].runId: "Project Alpha"]
+        )
+        try require(
+            genericFailureCount == 1 && failedGenericPlatform.added.count == 1,
+            "generic scheduling failure must release the exact Core claim"
+        )
+
+        var genericRestartReceipts = 0
+        let claimedRestartItem = FlitNotificationDeliveryRecord(
+            notificationId: genericNotifications[0].notificationId,
+            runId: genericNotifications[0].runId,
+            runVersion: genericNotifications[0].runVersion,
+            projectId: genericNotifications[0].projectId,
+            kind: genericNotifications[0].kind,
+            itemId: genericNotifications[0].itemId,
+            itemVersion: genericNotifications[0].itemVersion,
+            platformId: genericNotifications[0].platformId,
+            deliveryClaimed: true,
+            catchUp: false
+        )
+        let restartGenericClient = NotificationDeliveryClient(
+            dueLoader: { _ in
+                FlitNotificationDeliveriesDueReadResponse(
+                    protocolVersion: flitClientProtocolVersion,
+                    notifications: [claimedRestartItem]
+                )
+            },
+            receiptLoader: { request in
+                genericRestartReceipts += 1
+                return FlitNotificationDeliveredResponse(
+                    protocolVersion: flitClientProtocolVersion,
+                    notificationId: request.notificationId, runId: request.runId,
+                    kind: request.kind, itemId: request.itemId,
+                    itemVersion: request.itemVersion, platformId: request.platformId,
+                    alreadyDelivered: false
+                )
+            }
+        )
+        let restartGenericPlatform = RecordingStuckNotificationPlatform(
+            authorization: .authorized
+        )
+        restartGenericPlatform.delivered.insert(claimedRestartItem.platformId)
+        let restartGenericCoordinator = StuckNotificationCoordinator(
+            notificationClient: restartGenericClient,
+            platform: restartGenericPlatform
+        )
+        try restartGenericCoordinator.reconcile(
+            projectNamesByRunId: [claimedRestartItem.runId: "Project Alpha"]
+        )
+        try require(
+            restartGenericPlatform.added.isEmpty && genericRestartReceipts == 1,
+            "generic restart must receipt an exact delivered claimed ID without rescheduling"
+        )
+        let dismissedGenericPlatform = RecordingStuckNotificationPlatform(
+            authorization: .authorized
+        )
+        let dismissedGenericCoordinator = StuckNotificationCoordinator(
+            notificationClient: restartGenericClient,
+            platform: dismissedGenericPlatform
+        )
+        try dismissedGenericCoordinator.reconcile(
+            projectNamesByRunId: [claimedRestartItem.runId: "Project Alpha"]
+        )
+        try require(
+            dismissedGenericPlatform.added.isEmpty && genericRestartReceipts == 1,
+            "dismissed claimed generic notifications must not be registered again"
+        )
+
+        var authorizationClaims = 0
+        var authorizationReceipts = 0
+        let authorizationClient = NotificationDeliveryClient(
+            dueLoader: { _ in
+                FlitNotificationDeliveriesDueReadResponse(
+                    protocolVersion: flitClientProtocolVersion,
+                    notifications: [genericNotifications[0]]
+                )
+            },
+            claimLoader: { request in
+                authorizationClaims += 1
+                return FlitNotificationDeliveryClaimResponse(
+                    protocolVersion: flitClientProtocolVersion,
+                    notificationId: request.notificationId, runId: request.runId,
+                    runVersion: request.expectedRunVersion, kind: request.kind,
+                    itemId: request.itemId, itemVersion: request.itemVersion,
+                    platformId: request.platformId, alreadyClaimed: false
+                )
+            },
+            receiptLoader: { request in
+                authorizationReceipts += 1
+                return FlitNotificationDeliveredResponse(
+                    protocolVersion: flitClientProtocolVersion,
+                    notificationId: request.notificationId, runId: request.runId,
+                    kind: request.kind, itemId: request.itemId,
+                    itemVersion: request.itemVersion, platformId: request.platformId,
+                    alreadyDelivered: false
+                )
+            }
+        )
+        let deniedGenericPlatform = RecordingStuckNotificationPlatform(authorization: .denied)
+        let deniedGenericCoordinator = StuckNotificationCoordinator(
+            notificationClient: authorizationClient,
+            platform: deniedGenericPlatform
+        )
+        try deniedGenericCoordinator.reconcile(
+            projectNamesByRunId: [genericNotifications[0].runId: "Project Alpha"]
+        )
+        try require(
+            deniedGenericPlatform.added.isEmpty
+                && deniedGenericPlatform.authorizationRequestCount == 0
+                && authorizationClaims == 0 && authorizationReceipts == 0,
+            "denied generic authorization must not prompt, claim, or add"
+        )
+        let requestDeniedGenericPlatform = RecordingStuckNotificationPlatform(
+            authorization: .notDetermined,
+            authorizationGrant: false
+        )
+        let requestDeniedGenericCoordinator = StuckNotificationCoordinator(
+            notificationClient: authorizationClient,
+            platform: requestDeniedGenericPlatform
+        )
+        try requestDeniedGenericCoordinator.reconcile(
+            projectNamesByRunId: [genericNotifications[0].runId: "Project Alpha"]
+        )
+        try require(
+            requestDeniedGenericPlatform.authorizationRequestCount == 1
+                && requestDeniedGenericPlatform.added.isEmpty
+                && authorizationClaims == 0 && authorizationReceipts == 0,
+            "a denied first generic authorization request must not claim or add"
+        )
+        let requestGrantedGenericPlatform = RecordingStuckNotificationPlatform(
+            authorization: .notDetermined,
+            authorizationGrant: true,
+            deliverOnAdd: true
+        )
+        let requestGrantedGenericCoordinator = StuckNotificationCoordinator(
+            notificationClient: authorizationClient,
+            platform: requestGrantedGenericPlatform
+        )
+        try requestGrantedGenericCoordinator.reconcile(
+            projectNamesByRunId: [genericNotifications[0].runId: "Project Alpha"]
+        )
+        try require(
+            requestGrantedGenericPlatform.authorizationRequestCount == 1
+                && requestGrantedGenericPlatform.added.count == 1
+                && authorizationClaims == 1 && authorizationReceipts == 1,
+            "a granted first generic authorization request must enter exact delivery"
+        )
+
+        var transientReleaseAttempts = 0
+        var genericTransientClaimed = false
+        var transientClaimCount = 0
+        let transientReleaseClient = NotificationDeliveryClient(
+            dueLoader: { _ in
+                let item = FlitNotificationDeliveryRecord(
+                    notificationId: genericNotifications[0].notificationId,
+                    runId: genericNotifications[0].runId,
+                    runVersion: genericNotifications[0].runVersion,
+                    projectId: genericNotifications[0].projectId,
+                    kind: genericNotifications[0].kind,
+                    itemId: genericNotifications[0].itemId,
+                    itemVersion: genericNotifications[0].itemVersion,
+                    platformId: genericNotifications[0].platformId,
+                    deliveryClaimed: genericTransientClaimed,
+                    catchUp: false
+                )
+                return FlitNotificationDeliveriesDueReadResponse(
+                    protocolVersion: flitClientProtocolVersion,
+                    notifications: [item]
+                )
+            },
+            claimLoader: { request in
+                genericTransientClaimed = true
+                transientClaimCount += 1
+                return FlitNotificationDeliveryClaimResponse(
+                    protocolVersion: flitClientProtocolVersion,
+                    notificationId: request.notificationId, runId: request.runId,
+                    runVersion: request.expectedRunVersion, kind: request.kind,
+                    itemId: request.itemId, itemVersion: request.itemVersion,
+                    platformId: request.platformId, alreadyClaimed: false
+                )
+            },
+            failureLoader: { request in
+                transientReleaseAttempts += 1
+                if transientReleaseAttempts == 1 {
+                    throw NativeHealthTestFailure.failed("transient release failure")
+                }
+                genericTransientClaimed = false
+                return FlitNotificationDeliveryFailedResponse(
+                    protocolVersion: flitClientProtocolVersion,
+                    notificationId: request.notificationId, runId: request.runId,
+                    kind: request.kind, itemId: request.itemId,
+                    itemVersion: request.itemVersion, platformId: request.platformId,
+                    released: true
+                )
+            }
+        )
+        let transientReleasePlatform = RecordingStuckNotificationPlatform(
+            authorization: .authorized,
+            addAccepted: false
+        )
+        let transientReleaseCoordinator = StuckNotificationCoordinator(
+            notificationClient: transientReleaseClient,
+            platform: transientReleasePlatform
+        )
+        try transientReleaseCoordinator.reconcile(
+            projectNamesByRunId: [genericNotifications[0].runId: "Project Alpha"]
+        )
+        transientReleasePlatform.addAccepted = true
+        try transientReleaseCoordinator.reconcile(
+            projectNamesByRunId: [genericNotifications[0].runId: "Project Alpha"]
+        )
+        try require(
+            transientReleaseAttempts == 2
+                && transientReleasePlatform.added.count == 2
+                && transientClaimCount == 2
+                && genericTransientClaimed,
+            "transient generic claim release must retry exactly before a new accepted claim"
+        )
+        try transientReleaseCoordinator.reconcile(
+            projectNamesByRunId: [genericNotifications[0].runId: "Project Alpha"]
+        )
+        try require(
+            transientReleaseAttempts == 2
+                && transientReleasePlatform.added.count == 2
+                && transientClaimCount == 2,
+            "an accepted generic retry must retain its claim without duplicate scheduling"
+        )
+
+        let mismatchedClaimClient = NotificationDeliveryClient(
+            dueLoader: { _ in
+                FlitNotificationDeliveriesDueReadResponse(
+                    protocolVersion: flitClientProtocolVersion,
+                    notifications: [genericNotifications[0]]
+                )
+            },
+            claimLoader: { request in
+                FlitNotificationDeliveryClaimResponse(
+                    protocolVersion: flitClientProtocolVersion,
+                    notificationId: request.notificationId, runId: request.runId,
+                    runVersion: request.expectedRunVersion + 1, kind: request.kind,
+                    itemId: request.itemId, itemVersion: request.itemVersion,
+                    platformId: request.platformId, alreadyClaimed: false
+                )
+            }
+        )
+        let mismatchedClaimPlatform = RecordingStuckNotificationPlatform(
+            authorization: .authorized
+        )
+        let mismatchedClaimCoordinator = StuckNotificationCoordinator(
+            notificationClient: mismatchedClaimClient,
+            platform: mismatchedClaimPlatform
+        )
+        try mismatchedClaimCoordinator.reconcile(
+            projectNamesByRunId: [genericNotifications[0].runId: "Project Alpha"]
+        )
+        try require(
+            mismatchedClaimPlatform.added.isEmpty,
+            "a generic claim response with the wrong Run version must never schedule"
         )
         let policyReadFixture = try decodeFixture(
             FlitNotificationPolicyResponse.self,
