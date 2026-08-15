@@ -1,6 +1,6 @@
 # Flit
 
-Flit is a local attention inbox for provider-native coding-agent sessions. It turns structured execution evidence into quiet, inspectable status and raises only moments that need human action. It does not require a worktree-centric IDE or an embedded terminal.
+Flit is a local workspace for coding-agent CLI sessions with a quiet, evidence-backed attention inbox. Its planned terminal base remains usable across provider updates, while verified provider integrations add structured lifecycle, attention, and safe controls without inferring facts from terminal output.
 
 The production application is an AppKit-first macOS app with selective SwiftUI and an in-process Rust Core connected through generated synchronous UniFFI bindings.
 
@@ -22,7 +22,9 @@ Every supported conclusion is backed by structured evidence. When exact Git fact
 
 ## Current boundaries
 
-- Flit does not provide a generic PTY, embedded terminal, terminal replay, worktree orchestration, editor, browser, or built-in diff.
+- The current build does not yet provide the planned Core-owned PTY and native terminal surface. Phase 5 first validates pinned upstream Ghostty before adding that production boundary.
+- Terminal bytes will not be parsed into structured lifecycle, permission, question, completion, or delivery facts. Once the terminal base lands, unknown provider versions will keep user-driven terminal interaction while only verified structured capabilities are disabled.
+- Flit does not provide worktree orchestration, an editor, a browser, or a built-in diff.
 - Raw provider content and secrets are not retained by default. The current native evidence surface exposes structured event locators and truthful raw-content availability.
 - Exact file-change counts require the verified Git observation boundary; unsupported or uncertain repository states remain unavailable.
 - Permission education and complete permission/question response controls are not yet available; unsupported actions remain visibly disabled until the required provider facts and documented delivery capability exist.

@@ -203,7 +203,7 @@ if (fs.existsSync(localRoot)) {
   const frIds = new Set([...prd.matchAll(/\*\*(FR-\d{3})\b/g)].map((match) => match[1]));
   const nfrIds = new Set([...prd.matchAll(/\*\*(NFR-\d{3})\b/g)].map((match) => match[1]));
 
-  if (frIds.size !== 24) errors.push(`expected 24 local FR definitions, found ${frIds.size}`);
+  if (frIds.size !== 25) errors.push(`expected 25 local FR definitions, found ${frIds.size}`);
   if (nfrIds.size !== 12) errors.push(`expected 12 local NFR definitions, found ${nfrIds.size}`);
   for (const id of [...frIds, ...nfrIds]) {
     const rows = [...traceability.matchAll(new RegExp(`^\\| ${id} `, `gm`))];

@@ -18,9 +18,9 @@ Inspect the current worktree and preserve user changes. Implement only the curre
 - Normal progress stays quiet; promote only moments that need human action.
 - Every summary or inference links to raw evidence or an explicit unavailable reason.
 - Lifecycle, current activity, and attention are independent state dimensions.
-- The app-process Rust Core is the sole event-ordering and SQLite writer. Swift does not create domain transitions or another data writer.
-- Provider-native runtimes own sessions and credentials. V1 has no Flit-owned Generic PTY or embedded terminal.
-- Provider behavior uses documented, version-probed capabilities. Uncertainty degrades to `Unknown`; never invent a fallback.
+- The app-process Rust Core is the sole event-ordering and SQLite writer. It also owns any Flit PTY child, byte ordering, and process lifecycle; Swift does not create domain transitions, another data writer, or process authority.
+- Provider-native runtimes own persisted conversations and credentials. A Flit terminal session owns only its PTY child and never derives provider session identity or structured facts from terminal bytes.
+- Provider behavior uses documented, version-probed capabilities. Uncertainty degrades structured features to `Unknown` while the distinct user-driven terminal remains available; never invent a structured fallback.
 - Permission and question responses require the exact current request identity and version. Reject stale and duplicate responses.
 - Never persist a permission rule for an action, path, or scope the user was not shown.
 - Provider history, raw evidence, and logs are local sensitive data; do not retain secrets or raw provider content by default.
