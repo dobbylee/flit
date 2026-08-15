@@ -24,6 +24,24 @@ private func canonicalJSON(from text: String) throws -> Data {
     return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
 }
 
+private func systemHealthFixture(
+    protocolVersion: String,
+    core: HealthStatus,
+    storage: HealthStatus,
+    providers: HealthStatus
+) throws -> String {
+    let data = try JSONSerialization.data(
+        withJSONObject: [
+            "protocol_version": protocolVersion,
+            "core": core.rawValue,
+            "storage": storage.rawValue,
+            "providers": providers.rawValue,
+        ],
+        options: [.sortedKeys]
+    )
+    return String(decoding: data, as: UTF8.self)
+}
+
 private func decodeFixture<T: Decodable>(_ type: T.Type, at path: String) throws -> T {
     try JSONDecoder().decode(type, from: Data(contentsOf: URL(fileURLWithPath: path)))
 }
@@ -1384,10 +1402,50 @@ struct NativeHealthTests {
                 "native health must remain ready after a supported provider probe"
             )
         }
+        guard case let .ready(health) = client.classify(providerUnavailableHealth) else {
+            throw NativeHealthTestFailure.failed(
+                "provider unavailability must not block a ready native Core and storage"
+            )
+        }
         try require(
-            client.classify(providerUnavailableHealth) == .unavailable(messageKey: nil),
-            "native health must become unavailable after a failed or unknown provider probe"
+            health.providers == .unavailable,
+            "native health must preserve the unavailable provider limitation"
         )
+        let foundationUnavailableHealthCases = [
+            (
+                "core unavailable",
+                try systemHealthFixture(
+                    protocolVersion: client.clientProtocolVersion,
+                    core: .unavailable,
+                    storage: .ready,
+                    providers: .ready
+                )
+            ),
+            (
+                "storage unavailable",
+                try systemHealthFixture(
+                    protocolVersion: client.clientProtocolVersion,
+                    core: .ready,
+                    storage: .unavailable,
+                    providers: .ready
+                )
+            ),
+            (
+                "storage not configured",
+                try systemHealthFixture(
+                    protocolVersion: client.clientProtocolVersion,
+                    core: .ready,
+                    storage: .notConfigured,
+                    providers: .ready
+                )
+            ),
+        ]
+        for (name, fixture) in foundationUnavailableHealthCases {
+            try require(
+                client.classify(fixture) == .unavailable(messageKey: nil),
+                "native foundation must fail closed when \(name)"
+            )
+        }
 
         let projectErrors = try decodeFixture(
             [FlitCommandError].self,
@@ -3999,6 +4057,34 @@ struct NativeHealthTests {
             )
         )
         _ = fixtureController.view
+        let providerUnavailableController = FoundationViewController(
+            client: SystemHealthClient(
+                fixtureLoader: { _ in providerUnavailableHealth }
+            ),
+            dashboardClient: DashboardClient(
+                fixtureLoader: { unavailableChangesDashboardFixture }
+            )
+        )
+        _ = providerUnavailableController.view
+        try require(
+            providerUnavailableController.currentState == .ready
+                && descendants(of: providerUnavailableController.view).contains(where: {
+                    $0.accessibilityIdentifier() == "flit.dashboard.scroll"
+                }),
+            "provider unavailability must preserve the native local Dashboard"
+        )
+        for (name, fixture) in foundationUnavailableHealthCases {
+            let unavailableController = FoundationViewController(
+                client: SystemHealthClient(
+                    fixtureLoader: { _ in fixture }
+                )
+            )
+            _ = unavailableController.view
+            try require(
+                unavailableController.currentState == .unavailable,
+                "native foundation controller must fail closed when \(name)"
+            )
+        }
         let fixtureViews = descendants(of: fixtureController.view)
         let fixtureIdentifiers = Set(
             fixtureViews.compactMap { $0.accessibilityIdentifier() }

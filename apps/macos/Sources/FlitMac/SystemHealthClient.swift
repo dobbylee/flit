@@ -37,14 +37,23 @@ enum FoundationHealth: Equatable, Sendable {
 
 struct SystemHealthClient: Sendable {
     let clientProtocolVersion: String
+    private let fixtureLoader: (@Sendable (String) throws -> String)?
 
-    init(clientProtocolVersion: String = flitClientProtocolVersion) {
+    init(
+        clientProtocolVersion: String = flitClientProtocolVersion,
+        fixtureLoader: (@Sendable (String) throws -> String)? = nil
+    ) {
         self.clientProtocolVersion = clientProtocolVersion
+        self.fixtureLoader = fixtureLoader
     }
 
     func load() -> FoundationHealth {
         do {
-            let rendered = try systemHealthJson(clientProtocolVersion: clientProtocolVersion)
+            let rendered = if let fixtureLoader {
+                try fixtureLoader(clientProtocolVersion)
+            } else {
+                try systemHealthJson(clientProtocolVersion: clientProtocolVersion)
+            }
             return classify(rendered)
         } catch {
             return .unavailable(messageKey: nil)
@@ -57,8 +66,7 @@ struct SystemHealthClient: Sendable {
         if let health = try? JSONDecoder().decode(SystemHealthPayload.self, from: data),
             health.protocolVersion == clientProtocolVersion,
             health.core == .ready,
-            health.storage == .ready,
-            health.providers != .unavailable
+            health.storage == .ready
         {
             return .ready(health)
         }
