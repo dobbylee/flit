@@ -22,7 +22,7 @@ Every supported conclusion is backed by structured evidence. When exact Git fact
 
 ## Current boundaries
 
-- The current build does not yet provide the planned Core-owned PTY and native terminal surface. Phase 5 confirmed that pinned public `libghostty-vt` is a consumable VT state engine but requires a Flit-owned renderer; choosing that scope or reopening another renderer is a product decision before adding a production dependency.
+- The current build does not yet provide the planned Core-owned PTY and terminal surface. Phase 5 found that public `libghostty-vt` requires a Flit-owned renderer, while the exact stable xterm stack passed the current AppKit/WKWebView 8-surface, 10-minute resource gate. xterm is the leading candidate, but current correctness, interaction, accessibility, security, and lifecycle gates still precede any production dependency.
 - Terminal bytes will not be parsed into structured lifecycle, permission, question, completion, or delivery facts. Once the terminal base lands, unknown provider versions will keep user-driven terminal interaction while only verified structured capabilities are disabled.
 - Flit does not provide worktree orchestration, an editor, a browser, or a built-in diff.
 - Raw provider content and secrets are not retained by default. The current native evidence surface exposes structured event locators and truthful raw-content availability.
