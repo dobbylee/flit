@@ -22,7 +22,7 @@ Every supported conclusion is backed by structured evidence. When exact Git fact
 
 ## Current boundaries
 
-- The current build does not yet provide the planned Core-owned PTY and terminal surface. Phase 5 found that public `libghostty-vt` requires a Flit-owned renderer, exact stable xterm failed the mandatory Korean IME gate, and exact SwiftTerm `v1.18.0` failed the mandatory macOS accessibility prerequisite after passing the retained-view-only and interaction gates. No production renderer candidate is accepted, and no terminal dependency or implementation starts before the next renderer/accessibility decision and complete feasibility.
+- The current build does not yet provide the planned Core-owned PTY and terminal surface. Phase 5 found that public `libghostty-vt` requires a Flit-owned renderer and exact stable xterm failed the mandatory Korean IME gate. Exact SwiftTerm `v1.18.0`, unchanged and exact-pinned, now passes retained-view-only continuity, interaction, and keyboard-only/VoiceOver accessibility when wrapped by a thin Flit-owned AppKit subclass that uses public APIs only. Security/privacy, resource/load, and Core-owned lifecycle gates remain before any production dependency or implementation.
 - Terminal bytes will not be parsed into structured lifecycle, permission, question, completion, or delivery facts. Once the terminal base lands, unknown provider versions will keep user-driven terminal interaction while only verified structured capabilities are disabled.
 - Flit does not provide worktree orchestration, an editor, a browser, or a built-in diff.
 - Raw provider content and secrets are not retained by default. The current native evidence surface exposes structured event locators and truthful raw-content availability.
